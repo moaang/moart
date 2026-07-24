@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1102</title>
+  <title>MoArt ver1103</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -251,6 +251,39 @@
       overflow: hidden;
       display: grid;
       grid-template-rows: auto minmax(0, 1fr);
+      /* ver1103: keep the shell out of the system's own touch regions. The page asks for the whole
+         screen (viewport-fit=cover + apple-mobile-web-app-status-bar-style: black-translucent), so once
+         it is launched from the home screen the web view really does start at y=0 — underneath the
+         clock and battery. The topbar is 26px tall and the iPad status bar is ~24px, so essentially the
+         ENTIRE bar sat in a strip the system eats first: visible, and untouchable. The bottom edge is
+         the same story from the other end, where the home-indicator swipe region overlaps the timeline's
+         horizontal scroll strip and steals the drag.
+         `* { box-sizing: border-box }` (top of this sheet) is what makes padding the right tool: it comes
+         out of the 100dvh instead of adding to it, so the grid simply gets a shorter content box and no
+         other rule has to know. env() is 0 everywhere else — a browser tab, desktop, Android — so this is
+         inert until it is needed. NOTE this cannot help position:fixed children (floating windows, the
+         phone tab bar): their containing block is the viewport, not this box, so each carries its own
+         inset — .phone-tab-bar already did, and that is why it must NOT be padded again here. */
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    /* ver1103: …and env() alone is not enough on the device this was reported from. In iPadOS 26 a
+       home-screen web app is a WINDOW, and Apple did not extend the safe-area insets to cover what that
+       window puts on top of the page — the status bar and the window controls sit over the content while
+       env(safe-area-inset-top) still reports 0. So on iOS-standalone the inset gets a floor: max() keeps
+       whatever the platform DOES report (an iPhone notch in landscape reports far more than this) and
+       only fills in when it reports nothing.
+       These two numbers are platform metrics the platform refuses to state — the iPad status bar is 24pt
+       and the home-indicator strip is 20pt — not layout constants of ours, which is why they are named and
+       sit here rather than being buried in the rule. If a future iPad needs more, this is the one edit.
+       Scoped to iOS specifically (body.ios-standalone, set from navigator.standalone) and NOT to
+       `@media (display-mode: standalone)` at large: an installed Android or desktop PWA already gets a
+       correctly inset viewport from its OS, and a floor there would be pure wasted screen. */
+    :root { --ios-standalone-top: 24px; --ios-standalone-bottom: 20px; }
+    body.ios-standalone .app {
+      padding-top: max(env(safe-area-inset-top, 0px), var(--ios-standalone-top));
+      padding-bottom: max(env(safe-area-inset-bottom, 0px), var(--ios-standalone-bottom));
     }
 
     /* UI scale (root zoom) compensation: 100dvh keeps its physical px value under zoom but renders x z,
@@ -8121,7 +8154,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1102</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1103</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13236,7 +13269,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1102';
+    const APP_DISPLAY_VERSION = '1103';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -14007,6 +14040,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const nav = typeof navigator !== 'undefined' ? navigator : null;
       return Boolean(nav && Number(nav.maxTouchPoints) > 0);
     }
+    // ver1103: "launched from the Home Screen, on iOS/iPadOS" — the one runtime where the page owns the
+    // whole screen including the strips the system reserves for itself. Deliberately narrower than
+    // mobileOrTabletRuntime(): the same iPad in a Safari TAB has browser chrome over those strips and
+    // needs no inset at all. navigator.standalone is the iOS-only flag for this and is checked first;
+    // the display-mode query is the standards-track fallback for when Apple finally drops it.
+    function iosStandaloneRuntime() {
+      const nav = typeof navigator !== 'undefined' ? navigator : null;
+      if (!nav) return false;
+      const ua = nav.userAgent || '';
+      const isApple = /iPhone|iPad|iPod/i.test(ua) || (nav.platform === 'MacIntel' && Number(nav.maxTouchPoints) > 1);
+      if (!isApple) return false;
+      if (nav.standalone === true) return true;
+      try { return window.matchMedia('(display-mode: standalone)').matches; } catch (e) { return false; }
+    }
 
     // ver566: phone-width detection, deliberately SEPARATE from mobileOrTabletRuntime() (which is
     // UA-based and also true for iPad — wrong signal here). This is a width threshold: the desktop
@@ -14652,6 +14699,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function updateRuntimeDeviceClasses() {
       if (!document.body) return;
       document.body.classList.toggle('mobile-tablet-runtime', mobileOrTabletRuntime());
+      document.body.classList.toggle('ios-standalone', iosStandaloneRuntime()); // ver1103: drives the safe-area floor
       updatePhoneLayoutClass();
     }
 
@@ -34101,6 +34149,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return 'undo';
     }
 
+    // ver1103: the three pinch surfaces (用紙 / conte video preview / genga) each keep a pointerId→{x,y}
+    // Map and treat "two entries" as a pinch. That is only true while every entry is a LIVE finger, and
+    // an entry can outlive its finger: the end event has to be dispatched for us to hear it, and it is
+    // not always dispatched at all. The known ways out — the touch's target node is re-rendered away
+    // mid-gesture (a detached node's pointerup never reaches the document janitor, which is capture-phase
+    // on document and can only drain what it SEES), or iPadOS claims the touch for a system gesture and
+    // WebKit sends neither pointerup nor pointercancel.
+    //
+    // A corpse is not inert. It sits at a fixed coordinate, so the NEXT single finger makes size 2 and
+    // arms a pinch against a point that cannot move — and since zoom is startZoom * dist / startDist,
+    // dragging that one finger up and down drives the zoom directly. That is the field report: one
+    // finger, vertical drag, the view zooming wildly. It breaks the gesture from the other side too —
+    // with one corpse held, two real fingers make size 3 and a `size === 2` arm never fires at all.
+    //
+    // isPrimary is the fix because it is the platform's own statement, not a guess of ours: a touch
+    // pointerdown is primary only when no other touch is active. So `isPrimary && map.size` is a
+    // contradiction that can only be resolved one way — the map is stale, all of it. (This is not the
+    // invented self-healing that no-runtime-correction forbids; that rule is about DATA repairing
+    // itself behind our back. Here we are believing the OS over our own bookkeeping.)
+    function pinchPointersSweepStale(map, ev, teardown) {
+      if (!ev || ev.isPrimary !== true || !map || !map.size) return false;
+      map.clear();
+      // A gesture that ended without an event is never a tap — same verdict a pointercancel gets.
+      if (teardown) teardown('pointercancel');
+      return true;
+    }
+
     // When a two-finger pan/zoom gesture starts over the drawing canvas, the first finger may have
     // already begun a raster stroke. Discard that half-drawn stroke so the gesture takes over cleanly.
     // ver837: callers now run this on the CONFIRMED-pinch edge, not on the second pointerdown.
@@ -34215,8 +34290,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
       surface.addEventListener('pointerdown', function(event) {
         if (event.pointerType !== 'touch' || !videoPreviewPinchActive()) return;
+        pinchPointersSweepStale(videoPreviewPointers, event, teardownVideoPreviewPinch); // ver1103
         videoPreviewPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-        if (videoPreviewPointers.size === 2) {
+        // ver1103: `>= 2 && !pinch` where this read `=== 2`. Exact equality only arms on the frame the
+        // map is exactly two, so one survivor made a real two-finger pinch (size 3) unreachable; the
+        // `!pinch` guard is what equality was really buying — don't re-anchor an armed gesture.
+        if (videoPreviewPointers.size >= 2 && !videoPreviewPinch) {
           const v = videoPreviewPinchVals();
           if (v) {
             // Anchor on the start geometry and compute every frame ABSOLUTELY from it (same rule as
@@ -50608,8 +50687,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // lands, so a finger lifted off-stage can't strand the gesture (the ver581 lockup).
       stage.addEventListener('pointerdown', function(event) {
         if (event.pointerType !== 'touch' || !paperZoomControlsActive()) return;
+        pinchPointersSweepStale(paperPointers, event, teardownPaperPinch); // ver1103
         paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-        if (paperPointers.size === 2) {
+        if (paperPointers.size >= 2 && !paperPinch) { // ver1103: see the video surface for why not `=== 2`
           const v = paperPinchVals();
           if (v) {
             // Anchor on the start geometry and compute every frame ABSOLUTELY from it, so neither the
@@ -65188,8 +65268,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // iPad model (match conte), ONE input model = Pointer Events: single touch — finger OR pencil — DRAWS on the
       // paper; a finger in the dark-gray MARGIN flips (ユビパラ); a SECOND touch pointer starts a pinch (zoom+pan).
       if (ev.pointerType === 'touch') {
+        pinchPointersSweepStale(gengaPointers, ev, teardownGengaPinch); // ver1103
         gengaPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
-        if (gengaPointers.size >= 2) { // 2nd finger → pinch. Do NOT release capture:
+        if (gengaPointers.size >= 2 && !gengaPinch) { // 2nd finger → pinch. Do NOT release capture:
           // iOS implicitly captures each touch to the canvas where it began, so its pointerup fires here even if the
           // finger lifts off-canvas → gengaDrawEnd always cleans up (no stale pointers, no "dead until refresh").
           // ver837: finger 1's draw/flip is dropped once the pinch is CONFIRMED (gengaPinchMove), not here —
