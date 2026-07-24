@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1124</title>
+  <title>MoArt ver1126</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8185,7 +8185,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1124</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1126</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13402,7 +13402,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1124';
+    const APP_DISPLAY_VERSION = '1126';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -68655,6 +68655,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const left = ((d.nextStart - 1) * cw + 1) + 'px';
         d.block.style.left = left;
         mirrors.forEach(function(m) { if (m.block) m.block.style.left = left; });
+        // ver1126: a single-koma body drag can cross layers too — grab the thumbnail and drag up/down, no
+        // prior selection needed. Track the lane under the pointer, shift the card toward it, and mark it.
+        const srcLane = document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(String(d.layerId)) + '"]');
+        const tgtId = gengaLaneLayerAtY(ev.clientY);
+        d.targetLayerId = gengaCrossLayerMoveAllowed(d.layerId, tgtId) ? String(tgtId) : null;
+        let dy = 0;
+        if (d.targetLayerId) {
+          const tgtLane = document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(d.targetLayerId) + '"]');
+          if (srcLane && tgtLane) dy = Math.round(tgtLane.getBoundingClientRect().top - srcLane.getBoundingClientRect().top);
+        }
+        document.querySelectorAll('#gengaStage .genga-lane.genga-drop-target').forEach(function(el) { el.classList.remove('genga-drop-target'); });
+        if (d.targetLayerId) { const t2 = document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(d.targetLayerId) + '"]'); if (t2) t2.classList.add('genga-drop-target'); }
+        d.block.style.transform = dy ? ('translateY(' + dy + 'px)') : '';
       }
       // live: keep the content-box + pre/post behavior buttons following the koma edges during the drag (no commit lag)
       const lane = d.block.parentElement;
@@ -68694,6 +68707,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function gengaExpPointerUp(ev) {
       const d = gengaExpDrag; gengaExpDrag = null; if (!d) return; // ver990: unbinding belongs to beginDragStrand now
       if (ev && ev.type === 'pointercancel') { rerenderGengaLayerRows(d.layerId); return; } // discard only the touched row previews, no full timeline rebuild
+      // ver1126: a body drag that ended over another layer's lane is a cross-layer move — same machinery the
+      // selection/region drag uses, so cel groups behave identically. Only the 'move' mode can cross (the
+      // head/tail handles resize in place).
+      document.querySelectorAll('#gengaStage .genga-lane.genga-drop-target').forEach(function(el) { el.classList.remove('genga-drop-target'); });
+      if (d.mode === 'move' && d.targetLayerId && String(d.targetLayerId) !== String(d.layerId)) {
+        gengaMoveKomasToLayer(d.layerId, [d.expId], d.nextStart - d.origStart, d.targetLayerId);
+        selectGengaLayer(String(d.targetLayerId));
+        return;
+      }
       // ver1108: a press on a koma that moved and resized NOTHING is a plain click — which is how you pick
       // an instance — so the playhead lands on it. ver1107 put this on the cell-selection gesture, but that
       // only lives on the thin number strip under the koma; a hand reaches for the koma BODY, and that press
@@ -69068,12 +69090,46 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       return out;
     }
+    // ver1126: the cel-group-aware cross-layer move, extracted so BOTH a selection/region batch drag and a
+    // single-koma body drag can call it. komaIds are exposure ids in srcLayer; delta is the horizontal shift.
+    function gengaMoveKomasToLayer(srcLayerId, komaIds, delta, tgtLayerId) {
+      const idset = new Set((komaIds || []).map(String));
+      runCommand('原画コマレイヤー移動', function(proj) {
+        const layers = (proj.gengaTimeline && proj.gengaTimeline.layers) || [];
+        const src = layers.find(function(x) { return String(x.id) === String(srcLayerId); });
+        const tgt = layers.find(function(x) { return String(x.id) === String(tgtLayerId); });
+        if (!src || !tgt) return;
+        const group = src.cellGroupId ? layers.filter(function(l) { return l.cellGroupId === src.cellGroupId; }) : [src];
+        const siblings = group.filter(function(l) { return l !== src; });
+        const moving = (src.exposures || []).filter(function(e) { return idset.has(String(e.id)); });
+        if (!moving.length) return;
+        const removeIds = new Set(), blankIds = new Set();
+        moving.forEach(function(e) {
+          const drawnElsewhere = siblings.some(function(m) {
+            const me = (m.exposures || []).find(function(x) { return String(x.id) === String(e.id); });
+            return me && gengaExposureDrawing(m, me);
+          });
+          (drawnElsewhere ? blankIds : removeIds).add(String(e.id));
+        });
+        moving.forEach(function(e) {
+          const dr = gengaExposureDrawing(src, e);
+          const ns = Math.max(1, e.startFrame + delta);
+          const nx = { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+            startFrame: ns, holdFrames: Math.max(1, e.holdFrames), instanceValue: null, drawing: null,
+            dougaOffsets: Array.isArray(e.dougaOffsets) ? e.dougaOffsets.slice() : [], serifuId: '', silFix: [] };
+          tgt.exposures = gengaEatRange(tgt.exposures, ns, ns + Math.max(1, nx.holdFrames) - 1);
+          gengaSetExposureDrawing(tgt, nx, dr);
+          tgt.exposures = (tgt.exposures || []).concat([nx]);
+        });
+        if (blankIds.size) (src.exposures || []).forEach(function(e) { if (blankIds.has(String(e.id))) gengaSetExposureDrawing(src, e, null); });
+        if (removeIds.size) group.forEach(function(m) { m.exposures = (m.exposures || []).filter(function(e) { return !removeIds.has(String(e.id)); }); });
+      });
+    }
     // ver1123: may these komas move from srcLayer INTO tgtLayer? Not onto itself, not paper/locked either
     // side, same role (a cel stays a cel), and not while the source is a cel-GROUP (mirrored sublayers make
     // a cross-layer move ambiguous — left for later; the drag stays horizontal).
-    function gengaCrossLayerMoveAllowed(srcLayerId, tgtLayerId, mirrorLanes) {
+    function gengaCrossLayerMoveAllowed(srcLayerId, tgtLayerId) {
       if (!tgtLayerId || String(tgtLayerId) === String(srcLayerId)) return false;
-      if (mirrorLanes && mirrorLanes.length) return false;
       const src = gengaLayerById(srcLayerId), tgt = gengaLayerById(tgtLayerId);
       if (!src || !tgt) return false;
       if (tgt.locked || gengaLayerIsPaper(tgt) || gengaLayerIsPaper(src)) return false;
@@ -69100,7 +69156,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // it; nothing commits until release. dy is a lane-top delta, so the cards sit over the target row.
       const srcLane = document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(String(d.layerId)) + '"]');
       const tgtId = gengaLaneLayerAtY(ev.clientY);
-      d.targetLayerId = gengaCrossLayerMoveAllowed(d.layerId, tgtId, mirrors) ? String(tgtId) : null;
+      d.targetLayerId = gengaCrossLayerMoveAllowed(d.layerId, tgtId) ? String(tgtId) : null;
       let dy = 0;
       if (d.targetLayerId) {
         const tgtLane = document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(d.targetLayerId) + '"]');
@@ -69143,21 +69199,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!d.delta && !crossLayer) { if (d.kind === 'sel') rerenderGengaLayerRows(d.layerId); return; }
       const delta = d.delta, idset = d.idset;
       if (crossLayer) {
-        // ver1123: move the dragged komas from their layer into the one under the pointer, at [start+delta],
-        // eating whatever they land on there. The komas themselves survive (their heads are not eaten); a
-        // target koma whose head IS covered is consumed. Selection follows them to the new layer.
-        runCommand('原画コマレイヤー移動', function(proj) {
-          const layers = (proj.gengaTimeline && proj.gengaTimeline.layers) || [];
-          const src = layers.find(function(x) { return String(x.id) === String(d.layerId); });
-          const tgt = layers.find(function(x) { return String(x.id) === String(d.targetLayerId); });
-          if (!src || !tgt) return;
-          const moving = (src.exposures || []).filter(function(e) { return idset.has(String(e.id)); })
-            .map(function(e) { return Object.assign({}, e, { startFrame: Math.max(1, e.startFrame + delta) }); });
-          if (!moving.length) return;
-          src.exposures = (src.exposures || []).filter(function(e) { return !idset.has(String(e.id)); });
-          moving.forEach(function(D) { tgt.exposures = gengaEatRange(tgt.exposures, D.startFrame, D.startFrame + Math.max(1, D.holdFrames) - 1); });
-          tgt.exposures = (tgt.exposures || []).concat(moving);
-        });
+        // ver1125/1126: move the dragged komas' drawings into the layer under the pointer, with cel-group
+        // semantics — see gengaMoveKomasToLayer.
+        gengaMoveKomasToLayer(d.layerId, Array.from(idset), delta, d.targetLayerId);
         if (d.kind === 'sel') {
           state.gengaCellSel = { layerId: String(d.targetLayerId), start: d.selStart + delta, end: d.selEnd + delta };
         }
