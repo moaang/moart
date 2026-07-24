@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1134</title>
+  <title>MoArt ver1135</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8187,7 +8187,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1134</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1135</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13451,7 +13451,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1134';
+    const APP_DISPLAY_VERSION = '1135';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -42101,6 +42101,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       project.cuts.splice(insertIndex, 0, cut);
       resetCutOrders(project);
       shiftTimelineMediaAfterFrame(project, insertFrame, frames);
+      // ver1135: the default first cut also opens with one empty layer koma (previously the cut existed but its
+      // layer lane was empty, so a fresh conte could not be drawn on until the user added a layer). The cut has a
+      // real cutNo, so normalizeConteLayers materialises exactly one default layer for it via its standard path
+      // (a blank/no-cutNo slot is still skipped by that same function, so empty grid cells stay empty).
+      normalizeConteLayers(project);
       return cut;
     }
     function addConteCutAfterSelection() {
@@ -51500,6 +51505,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!drag || drag.pointerId !== event.pointerId) return false;
       state.paintSpacePanDrag = null;
       updatePaintSpacePanCursorClass();
+      if (state.project && state.project.kind === 'genga' && perfSoftwareCanvas()) gengaScheduleViewDraw(); // ver1135: redraw once at full smoothing (the pan used nearest)
       // ver747: genga never persisted pan via saveEditorUiState (its own gengaPanDrag end didn't either) —
       // keep that behavior; only the conte video-transform backend's pan position is part of editorUiState.
       if (!(state.project && state.project.kind === 'genga')) saveEditorUiState();
@@ -65393,7 +65399,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       gengaPreviewXform = { ox: ox, oy: oy, scale: scale, pw: pw, ph: ph };
       // 100%+ zoom → nearest-neighbor: show the paper's REAL pixels crisp (no resample blur), so AA-off strokes
       // read as actual pixels when magnified. Below 100% keep smoothing (nearest shimmers when minified).
-      ctx.imageSmoothingEnabled = viewWantsSmoothing(vrot, scale < 1); // ver1005: an off-axis rotation resamples every pixel, so nearest would stair-step
+      ctx.imageSmoothingEnabled = gengaViewGestureNearest() ? false : viewWantsSmoothing(vrot, scale < 1); // ver1135 sw-canvas gesture=nearest; ver1005: an off-axis rotation resamples every pixel, so nearest would stair-step
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(ox, oy, dw, dh);
       // parapara/yubipara flip: temporarily show another frame's composite (no onion during the flip)
@@ -66733,7 +66739,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function gengaPokeWheelViewLock() { // wheel has no down/up — hold the lock across the burst, drop it on idle
       if (!gengaWheelViewToken) gengaWheelViewToken = {};
       clearTimeout(gengaWheelViewTimer);
-      gengaWheelViewTimer = setTimeout(function() { gengaWheelViewToken = null; }, 300);
+      gengaWheelViewTimer = setTimeout(function() { gengaWheelViewToken = null; if (perfSoftwareCanvas()) drawGengaPreview(); }, 300); // ver1135: final frame at full smoothing
     }
     // ver1134: coalesce VIEW-gesture redraws (wheel zoom / space-pan) into one draw per animation frame. A pan
     // pointermove or a trackpad wheel fires far faster than a full-viewport blit can complete — on a software
@@ -66746,6 +66752,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (gengaViewDrawPending) return;
       gengaViewDrawPending = true;
       requestAnimationFrame(function() { gengaViewDrawPending = false; drawGengaPreview(); });
+    }
+    // ver1135: is the 2D canvas running on the CPU (Chrome hardware acceleration OFF / no GPU)? Probed ONCE via
+    // the WebGL renderer string — a software backend reports SwiftShader / "Basic Render Driver" / WARP /
+    // llvmpipe. On such a canvas every scaled blit costs many ms, so the view gestures below drop to
+    // nearest-neighbour (2–4× cheaper than bilinear on software Skia) WHILE moving, then snap back to the
+    // designed smoothing on idle. On a GPU canvas this returns false and nothing changes — bilinear is free
+    // there, so motion stays fully smooth. The user runs with hardware acceleration disabled by choice.
+    let _perfSoftwareCanvas = null;
+    function perfSoftwareCanvas() {
+      if (_perfSoftwareCanvas !== null) return _perfSoftwareCanvas;
+      let sw = false;
+      try {
+        const c = document.createElement('canvas');
+        const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (!gl) { sw = true; }
+        else {
+          const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+          const r = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '') : '';
+          sw = /swiftshader|basic render|warp|llvmpipe|softpipe|software|microsoft basic|paravirtual/i.test(r);
+        }
+      } catch (e) { sw = false; }
+      _perfSoftwareCanvas = sw;
+      return sw;
+    }
+    // true while a genga view gesture (space-pan or wheel-zoom, NOT rotate) is live on a software canvas —
+    // rotate is excluded because nearest stair-steps an off-axis image badly even in motion.
+    function gengaViewGestureNearest() {
+      if (!perfSoftwareCanvas()) return false;
+      if (gengaCamDrag) return false; // camera drag renders through its own snapshot path
+      const pan = state.paintSpacePanDrag;
+      if (pan && pan.inGenga) return pan.mode !== 'rotate';
+      return Boolean(gengaWheelViewToken);
     }
     let gengaCamDragComposite = null; // ver1044 perf: { canvas, token, frame, pad } — the layer composite snapshotted at the drag's first frame and reused for the rest (a camera-frame drag never touches layer pixels, so recompositing every move — blur + per-layer FX transforms — was pure waste)
     let gengaCamKeyHandleScreenCache = []; // ver1042: [{keyframe,index,point:{x,y}}] in SCREEN px, refreshed each camera-mode draw, read by the pointerdown hit test
