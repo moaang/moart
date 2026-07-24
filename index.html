@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1110</title>
+  <title>MoArt ver1111</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8184,7 +8184,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1110</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1111</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -8501,7 +8501,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     /* ver1026: width is capped to a share of the koma so a 1-frame block's head/tail handles stay inside their
        OWN block. At 8px flat they filled a narrow koma edge-to-edge and butted against the neighbour's handle,
        which made picking the right one guesswork exactly where komas are packed 1 frame apart. */
-    .genga-exp-h { position: absolute; width: min(8px, 40%); height: 8px; background: #fff; border: 1px solid #5b708a; box-sizing: border-box; border-radius: 1px; cursor: ew-resize; z-index: 3; touch-action: none; }
+    .genga-exp-h { position: absolute; width: min(13px, 40%); height: 13px; background: #fff; border: 1px solid #5b708a; box-sizing: border-box; border-radius: 1px; cursor: ew-resize; z-index: 3; touch-action: none; }
+    /* ver1111: 1.6× the drawn box on a koma wide enough for it, and a hit area larger again. The 40%
+       share is deliberately UNCHANGED from ver1026 — that cap is what keeps a 1-frame koma's two handles
+       from butting into each other, so the px number is the only part that grows. The halo is a
+       pseudo-element, not padding: padding would move the border it draws, while ::after only adds
+       hit-testable area around it — the reason to touch these at all is that a finger misses 8px. */
+    .genga-exp-h::after { content: ''; position: absolute; inset: -4px; }
     .genga-exp-h-tl { left: 0; top: 0; }
     /* bottom-right handle sits at the THUMBNAIL's bottom-right corner (above the value strip):
        card bottom → padding 1px + value strip 17px + gap 1px = 19px up to the thumb's bottom edge */
@@ -13368,7 +13374,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1110';
+    const APP_DISPLAY_VERSION = '1111';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -58029,6 +58035,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // audio mix warning two lines up in that caller.
       let failed = 0;
       await Promise.all(Array.from(urls).map(function(u) { return new Promise(function(res) { let img = gengaImageCache.get(u); if (img && img.complete) { res(); return; } img = new Image(); img.onload = res; img.onerror = function() { failed += 1; res(); }; img.src = u; gengaImageCache.set(u, img); }); }));
+      // ver1111: with every drawing decoded, build the in-between silhouettes NOW if this export wants
+      // them. gengaDougaSilhouetteFor returns 'pending' while a source image is still decoding and the
+      // compositor answers that by drawing NOTHING for the layer on that frame — on screen a redraw
+      // arrives later and fixes it, but an export renders each frame once and never comes back. The await
+      // above is what makes this deterministic: the images are ready, so every call here resolves to a
+      // real silhouette (or null, meaning there is nothing to interpolate toward) and lands in the cache.
+      if (gengaDougaFillActive()) {
+        const pw = Math.max(1, Math.round(gt.paper.w)), ph = Math.max(1, Math.round(gt.paper.h));
+        (gt.layers || []).forEach(function(l) {
+          (l.exposures || []).forEach(function(e) {
+            if (!Array.isArray(e.dougaOffsets)) return;
+            for (let k = 0; k < e.dougaOffsets.length; k++) gengaDougaSilhouetteFor(l, e, k, pw, ph, null);
+          });
+        });
+      }
       if (failed > 0) {
         console.warn('[gengaExport] ' + failed + '/' + urls.size + ' image(s) failed to decode — those drawings are missing from the export');
         if (onStatus) onStatus(t('msg.export.missingImages', failed, urls.size));
@@ -58127,9 +58148,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const pw = Math.max(1, Math.round(gt.paper.w)), ph = Math.max(1, Math.round(gt.paper.h));
       const frame = gengaCurrentFrame();
       gengaSoloBypass = true;
+      gengaDougaFillForce = false; // ver1111: unchanged behaviour, now stated — a still export is final art, not a timing check
       gengaClearOnionCache();
       const comp = gengaCompositeFrame(frame, 0, true);
       gengaSoloBypass = false;
+      gengaDougaFillForce = null;
       gengaClearOnionCache();
       const canvas = document.createElement('canvas');
       canvas.width = pw; canvas.height = ph;
@@ -64006,7 +64029,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // 動画フィル: on a ・-marked span show the interpolated silhouette instead of the held drawing
           // (rel MUST come from rs.localFrame, not the raw `frame` — repeat post/pre-behavior wraps the
           // playhead past the loop point, and using `frame` there picked the wrong in-between index)
-          if (gengaDougaFillActive() && !gengaSoloBypass && e && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length && rs.localFrame >= e.startFrame) {
+          // ver1111: the `!gengaSoloBypass` that used to be here is GONE, and it is the whole reason
+          // ver1110's switch did nothing. gengaSoloBypass means "an export is rendering" — it is set so
+          // the compositor ignores solo-view — and this branch borrowed it to mean "and therefore skip the
+          // in-betweens". So 自動動画 was unexportable by construction: the checkbox could ask for it and
+          // the compositor threw the request away one line later. The gate is now the switch itself.
+          // (The still-image export keeps its old output by forcing the switch OFF at its own call site,
+          // which states that intent instead of inheriting it from an unrelated flag. 診断 silhouette
+          // below still uses gengaSoloBypass on purpose — that one IS a diagnosis overlay, never output.)
+          if (gengaDougaFillActive() && e && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length && rs.localFrame >= e.startFrame) {
             const rel = rs.localFrame - e.startFrame;
             let k = -1;
             for (let di = 0; di < e.dougaOffsets.length; di++) { if (e.dougaOffsets[di] <= rel) k = di; }
@@ -64104,8 +64135,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // the previous and next drawings — each drawing becomes a solid envelope (non-white=ink, closing cascade),
     // its outer contour is resampled to 256 arc-length points, and the in-between is a POINT-WISE lerp of the
     // best circular correspondence (tips/notches map onto each other and survive). Pale-yellow vector fill.
-    // Preview aid only: export (gengaSoloBypass) never includes it. Cached per (pair × t); cleared with the
-    // onion cache on every command/undo. ----
+    // ver1111: no longer preview-only — a video export can include it (the dialog's 自動動画を含める). The
+    // still-image export forces it off. Cached per (pair × t); cleared with the onion cache on every
+    // command/undo. ----
     const gengaDougaCache = new Map();
     state.gengaDougaFill = (function() { try { return localStorage.getItem('gengaDougaFill') === '1'; } catch (e) { return false; } })();
     state.gengaSilDebug = (function() { try { return localStorage.getItem('gengaSilDebug') === '1'; } catch (e) { return false; } })(); // ver1093: syncGengaSilNotice() runs on the genga render path, so a restored ON state shows the notice too // 診断: paint each instance drawing's computed silhouette in the preview
