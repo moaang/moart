@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1121</title>
+  <title>MoArt ver1122</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8185,7 +8185,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1121</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1122</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -8502,12 +8502,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     /* ver1026: width is capped to a share of the koma so a 1-frame block's head/tail handles stay inside their
        OWN block. At 8px flat they filled a narrow koma edge-to-edge and butted against the neighbour's handle,
        which made picking the right one guesswork exactly where komas are packed 1 frame apart. */
-    .genga-exp-h { position: absolute; width: min(13px, 40%); height: auto; aspect-ratio: 1; background: #fff; border: 1px solid #5b708a; box-sizing: border-box; border-radius: 1px; cursor: ew-resize; z-index: 3; touch-action: none; }
+    .genga-exp-h { position: absolute; width: 13px; height: 13px; background: #fff; border: 1px solid #5b708a; box-sizing: border-box; border-radius: 1px; cursor: ew-resize; z-index: 3; touch-action: none; }
     /* ver1111: 1.6× the drawn box on a koma wide enough for it, and a hit area larger again. The 40%
-       share is deliberately UNCHANGED from ver1026 — that cap is what keeps a 1-frame koma's two handles
-       from butting into each other, so the px number is the only part that grows. The halo is a
-       pseudo-element, not padding: padding would move the border it draws, while ::after only adds
-       hit-testable area around it — the reason to touch these at all is that a finger misses 8px. */
+       to ver1026. ver1122: the 40% cap is GONE — the user would rather keep the full grab size than shrink
+       it on a 1-frame koma. On a narrow koma the two handles now overlap over the card centre (the top-left
+       one reaches right, the bottom-right one reaches left); that is accepted, and each still sits against
+       its own edge so head vs tail stays unambiguous where it matters — at the ends. */
     .genga-exp-h::after { content: ''; position: absolute; inset: -4px; }
     .genga-exp-h-tl { left: 0; top: 0; }
     /* bottom-right handle sits at the THUMBNAIL's bottom-right corner (above the value strip):
@@ -13398,7 +13398,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1121';
+    const APP_DISPLAY_VERSION = '1122';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -68557,6 +68557,60 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         onCommit: function() { gengaExpPointerUp({ type: 'pointerup' }); }
       });
     }
+    // ver1122: the whole head-handle model in one place. Given the drag delta, it returns the new
+    // {start, hold, gone} for every koma of the layer, so the live preview and the commit can never
+    // disagree. The rules, all from the user + TVPaint's left handle:
+    //   • LEFT  — the head grows left, eating earlier komas (trim tail / consume). (ver804)
+    //   • RIGHT within its own span — the head shrinks; the vacated left cells go to the immediately-
+    //     previous CONTIGUOUS koma, which grows to fill them (the left koma eats rightward). (ver1026)
+    //   • RIGHT past its own end, WHEN a contiguous left koma exists — this koma removes itself and the
+    //     left koma keeps eating right, swallowing it and any later komas up to the handle. (the user's
+    //     「자기 한계 넘어서 자기 없애고 왼쪽 코마가 다 먹는」)
+    //   • RIGHT past its own end, WITHOUT a left koma (first koma, or a カラ gap on the left) — 1 frame is
+    //     the limit; it cannot slide further and the vacated cells stay empty. (the user's 「1코마가 한계」)
+    function gengaHeadDragLayout(d, delta) {
+      const origStart = d.origStart, E = origStart + d.origHold - 1;
+      const earlier = (d.earlier || []).map(function(x) { return { id: String(x.id), start: x.startFrame, hold: x.holdFrames }; });
+      const later = (d.later || []).map(function(x) { return { id: String(x.id), start: x.origStart, hold: x.holdFrames }; });
+      const out = new Map();
+      earlier.concat(later).forEach(function(k) { out.set(k.id, { start: k.start, hold: k.hold, gone: false }); });
+      const last = earlier.length - 1;
+      const prev = (last >= 0 && earlier[last].start + earlier[last].hold === origStart) ? earlier[last] : null; // contiguous left koma
+      const rawNs = origStart + delta;
+      let self;
+      if (rawNs < origStart) {
+        // LEFT: head grows, eats earlier komas under [ns, E]
+        const ns = Math.max(1, rawNs);
+        self = { start: ns, hold: E - ns + 1, gone: false };
+        earlier.forEach(function(k) {
+          const ke = k.start + k.hold - 1;
+          if (ke < ns) return;                                              // fully left → untouched
+          if (k.start < ns) out.set(k.id, { start: k.start, hold: ns - k.start, gone: false }); // trim tail
+          else out.set(k.id, { start: k.start, hold: 0, gone: true });      // consumed
+        });
+      } else if (rawNs <= E) {
+        // RIGHT within span: shrink, give the freed cells to the contiguous left koma
+        const ns = rawNs;
+        self = { start: ns, hold: E - ns + 1, gone: false };
+        if (prev) out.set(prev.id, { start: prev.start, hold: ns - prev.start, gone: false });
+      } else if (prev) {
+        // RIGHT past end, absorbed by the left koma: self gone, prev grows to the handle, eating laters
+        const ns = rawNs, boundary = ns - 1;
+        self = { start: 0, hold: 0, gone: true };
+        out.set(prev.id, { start: prev.start, hold: boundary - prev.start + 1, gone: false });
+        later.forEach(function(k) {
+          const ke = k.start + k.hold - 1;
+          if (k.start > boundary) return;                                   // beyond the handle → untouched
+          if (ke <= boundary) out.set(k.id, { start: k.start, hold: 0, gone: true });    // consumed
+          else out.set(k.id, { start: boundary + 1, hold: ke - boundary, gone: false }); // trim head
+        });
+      } else {
+        // RIGHT past end, nothing to absorb into: 1-frame limit
+        self = { start: E, hold: 1, gone: false };
+      }
+      out.set(String(d.expId), self);
+      return { out: out, self: self };
+    }
     function gengaExpPointerMove(ev) {
       const d = gengaExpDrag; if (!d) return;
       const cw = gengaCellW();
@@ -68574,41 +68628,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (b.el) b.el.style.left = left;
           mirrors.forEach(function(m) { const me = m.later[i] && m.later[i].el; if (me) me.style.left = left; });
         });
-      } else if (d.mode === 'head') {
-        // ver1120: the top-left handle EATS-AND-MOVES in both directions (TVPaint 왼측 핸들 + the user's
-        // rule — eats its own cells and moves right). Its span is [ns, ne]:
-        //   drag LEFT  -> ns < origStart, ne = origEnd: the head grows left, eating earlier komas (ver804).
-        //   drag RIGHT -> the head moves right, eating THIS koma's own leading cells. While ns <= origEnd the
-        //                right end stays put and the koma shrinks; once ns passes origEnd it is a 1-frame koma
-        //                that keeps sliding right, now eating LATER komas. Nothing is handed back — the vacated
-        //                cells are eaten, which is what makes the two directions symmetric (ver1026's give-back
-        //                to the previous koma is gone: it was the opposite of eating).
-        const ns = Math.max(1, d.origStart + delta);
-        const ne = Math.max(ns, d.origStart + d.origHold - 1);
-        d.nextStart = ns;
-        d.nextHold = ne - ns + 1;
-        const left0 = ((ns - 1) * cw + 1) + 'px', width0 = (d.nextHold * cw - 1) + 'px';
-        d.block.style.left = left0;
-        d.block.style.width = width0;
-        mirrors.forEach(function(m) { if (m.block) { m.block.style.left = left0; m.block.style.width = width0; } });
-        // one overlap rule for every OTHER koma, earlier and later alike — the exact filter the commit runs,
-        // so the preview can never promise something the commit will not do.
-        const previewOthers = function(list, mirrorKey) {
-          (list || []).forEach(function(x, i) {
-            const xEnd = x.startFrame + x.holdFrames - 1;
-            if (xEnd < ns || x.startFrame > ne) { x.nextHold = x.holdFrames; x.gone = false; }        // untouched
-            else if (x.startFrame < ns) { x.nextHold = ns - x.startFrame; x.gone = false; }           // trim its tail
-            else { x.nextHold = 0; x.gone = true; }                                                   // fully covered
-            const display = x.gone ? 'none' : '';
-            const width = x.gone ? null : (x.nextHold * cw - 1) + 'px';
-            if (x.el) { x.el.style.display = display; if (!x.gone) x.el.style.width = width; }
-            mirrors.forEach(function(m) { const me = m[mirrorKey] && m[mirrorKey][i] && m[mirrorKey][i].el; if (me) { me.style.display = display; if (!x.gone) me.style.width = width; } });
-          });
+            } else if (d.mode === 'head') {
+        // ver1122: everything the head handle does is decided by gengaHeadDragLayout — see its note. Here we
+        // only paint that layout: the self card, then every earlier/later card (and their cel-group mirrors).
+        const layout = gengaHeadDragLayout(d, delta);
+        d.headLayout = layout.out;                 // carried to the commit so it lands exactly as previewed
+        d.selfGone = !!layout.self.gone;
+        d.nextStart = layout.self.gone ? d.origStart : layout.self.start;
+        d.nextHold = layout.self.gone ? 0 : layout.self.hold;
+        const paint = function(el, mirrorEls, spec) {
+          if (!el || !spec) return;
+          if (spec.gone) { el.style.display = 'none'; (mirrorEls || []).forEach(function(me) { if (me) me.style.display = 'none'; }); return; }
+          const left = ((spec.start - 1) * cw + 1) + 'px', width = (Math.max(1, spec.hold) * cw - 1) + 'px';
+          el.style.display = ''; el.style.left = left; el.style.width = width;
+          (mirrorEls || []).forEach(function(me) { if (me) { me.style.display = ''; me.style.left = left; me.style.width = width; } });
         };
-        // later items store origStart (their start never moves on a head-drag); normalise to startFrame
-        const laterAsStart = (d.later || []).map(function(x) { return { startFrame: x.origStart, holdFrames: x.holdFrames, el: x.el, nextHold: 0, gone: false }; });
-        previewOthers(d.earlier, 'earlier');
-        previewOthers(laterAsStart, 'later');
+        paint(d.block, mirrors.map(function(m) { return m.block; }), layout.self);
+        (d.earlier || []).forEach(function(x, i) { paint(x.el, mirrors.map(function(m) { return m.earlier[i] && m.earlier[i].el; }), layout.out.get(String(x.id))); });
+        (d.later || []).forEach(function(x, i) { paint(x.el, mirrors.map(function(m) { return m.later[i] && m.later[i].el; }), layout.out.get(String(x.id))); });
       } else {
         d.nextStart = Math.max(1, d.origStart + delta);
         const left = ((d.nextStart - 1) * cw + 1) + 'px';
@@ -68677,27 +68714,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           (L.exposures || []).forEach(function(x) { if (String(x.id) !== String(d.expId) && x.startFrame > dragStart) x.startFrame = Math.max(1, x.startFrame + shift); });
         });
       } else if (d.mode === 'head') {
-        // ver1120: eat-and-move in both directions (see the live-preview note). [ns, ne] is the koma's new
-        // span; the filter below eats every koma under it, self excepted — earlier on a left drag, later once
-        // the head has slid past its own end on a right drag.
-        if (d.nextStart === d.origStart) { rerenderGengaLayerRows(d.layerId); return; }
+        // ver1122: the layout the live preview last computed IS the commit — apply gengaHeadDragLayout's
+        // per-id result to the data (start/hold, or drop when gone). Preview and commit cannot diverge
+        // because they are the same numbers.
+        const layout = d.headLayout;
+        if (!layout || (d.nextStart === d.origStart && !d.selfGone)) { rerenderGengaLayerRows(d.layerId); return; }
         runCommand('原画コマ頭変更', function(proj) {
           const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(l) { return String(l.id) === String(d.layerId); }); if (!L) return;
-          const e = (L.exposures || []).find(function(x) { return String(x.id) === String(d.expId); }); if (!e) return;
-          const ns = Math.max(1, d.nextStart), ne = ns + Math.max(1, d.nextHold) - 1;
-          e.startFrame = ns; e.holdFrames = Math.max(1, d.nextHold);
-          // ver804: whatever the grown head now covers gets trimmed, and is DROPPED when fully covered — that is
-          // how the handle can replace an earlier koma outright (and cascade through several of them).
           L.exposures = (L.exposures || []).filter(function(x) {
-            if (String(x.id) === String(e.id)) return true;
-            const xEnd = x.startFrame + Math.max(1, x.holdFrames) - 1;
-            if (xEnd < ns || x.startFrame > ne) return true;   // no overlap
-            if (x.startFrame < ns) { x.holdFrames = ns - x.startFrame; return true; } // trim its tail
-            return false;                                      // fully covered → consumed
+            const spec = layout.get(String(x.id));
+            if (spec && spec.gone) return false;                 // consumed / self absorbed
+            if (spec) { x.startFrame = spec.start; x.holdFrames = Math.max(1, spec.hold); }
+            return true;
           });
-          // ver1120: no give-back. Dragging the head right EATS this koma's own leading cells (they become
-          // empty region), the same way dragging it left eats the earlier komas — the filter above already
-          // trimmed/consumed anything under [ns, ne], including later komas once the head slid past origEnd.
         });
       } else if (d.mode === 'move') {
         if (d.nextStart === d.origStart) { rerenderGengaLayerRows(d.layerId); return; }
