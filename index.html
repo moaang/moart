@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1166</title>
+  <title>MoArt ver1167</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8188,7 +8188,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1166</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1167</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13559,7 +13559,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1166';
+    const APP_DISPLAY_VERSION = '1167';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -18880,6 +18880,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function resetProjectForNewProject() {
+      try { stopActiveAudioRecording(); } catch (error) {} // ver1167 (audit F5.3): a new project must not leave the mic recording into the old one (finalize discards on the projectId mismatch)
       teardownProjectFloatingWindows();
       resetProjectTransientRuntime();
       try { clearTransientMediaObjectUrls({ pictures: true, audio: true, layers: true }); } catch (error) {
@@ -20940,6 +20941,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         clearCameraKeyframeSelection();
         changed = true;
       }
+      // ver1167 (audit F3.1): also drop the conte-LAYER selection (bar + cell highlight). An investigation
+      // confirmed this is safe — the draw target is re-derived every stroke (videoConteLayerPaintTargetForPoint
+      // → playheadConteLayerRowIndex row-0 fallback) and re-selected on every pointerdown, and an empty layer
+      // selection is the fresh-project initial state that beginMemoPageDraw already produces routinely. The cut
+      // context (currentPicturePanelId) and the panel Set are LEFT intact — you stay on the current cut; only your
+      // specific clip / camera-kf / layer highlights clear.
+      if (state.selectedConteLayerId || (state.selectedConteLayerIds && state.selectedConteLayerIds.size) || state.selectedConteLayerLineKey) {
+        clearConteLayerSelection({ clearLineKey: true });
+        changed = true;
+      }
       if (!changed) return;
       if (state.activeConteSelectionType === 'video' || state.activeConteSelectionType === 'audio') {
         state.activeConteSelectionType = selectedPicturePanelSet().size ? 'panel' : (currentPicturePanelId() ? 'cut' : '');
@@ -20957,7 +20968,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // under itself. Non-left button (right=menu), Shift/Ctrl/Meta (additive), and presses off the timeline are skipped.
     function conteTimelineOutsidePress(ev) {
       if (!state.selectedVideoClipId && !state.selectedAudioClipId && !state.selectedCameraKeyframeId
-          && !(state.selectedCameraKeyframeIds && state.selectedCameraKeyframeIds.size)) return;
+          && !(state.selectedCameraKeyframeIds && state.selectedCameraKeyframeIds.size)
+          && !state.selectedConteLayerId && !(state.selectedConteLayerIds && state.selectedConteLayerIds.size)
+          && !state.selectedConteLayerLineKey) return;
       if (ev.button != null && ev.button !== 0) return;
       if (ev.shiftKey || ev.ctrlKey || ev.metaKey) return;
       const tgt = ev.target;
@@ -29161,6 +29174,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           startFrame: Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0)),
           startedAt: performance.now(),
           mimeType: actualMime,
+          projectId: String((state.project && state.project.projectId) || ''), // ver1167 (audit F5.3): pin the target project so a mid-recording swap can't misroute this clip
           stopRequested: false,
           finalizeStarted: false
         };
@@ -29419,6 +29433,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ? await session.fileHandle.getFile()
         : (session.recordedChunks && session.recordedChunks.length ? new Blob(session.recordedChunks, { type: session.mimeType || 'audio/webm' }) : null);
       if (!recordedFile || !recordedFile.size) {
+        state.timelineStatus = t('status.genga.audioRecording.discardedEmpty');
+        guardedRender('timing', renderTimingDashboard);
+        return;
+      }
+      // ver1167 (audit F5.3): the project was swapped mid-recording. Finalize reads state.project LIVE, so
+      // pushing now would misroute this clip into the wrong (current) project — and in workspace mode point its
+      // storage at the new project's folder while the bytes sit in the old one. The session captured its target
+      // projectId at start; if it no longer matches, discard rather than misroute. (The mic/stream was already
+      // released at the top of finalize.)
+      if (String(session.projectId || '') !== String((state.project && state.project.projectId) || '')) {
         state.timelineStatus = t('status.genga.audioRecording.discardedEmpty');
         guardedRender('timing', renderTimingDashboard);
         return;
@@ -70565,6 +70589,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return content ? Math.max(1, gengaFrameAtClientX(ev.clientX, content.getBoundingClientRect().left)) : 1;
     }
     function gengaOpenEmptyAreaMenu(ev, layerId) { // shared opener for the lane / empty-cell card / notation
+      if (trailingClickGuard.consume('gengaRegionMenu')) { ev.preventDefault(); return; } // ver1167 (audit): a right-drag on an empty cell / mid-gap just moved the whole region — suppress the trailing blank-area menu, matching gengaLaneContextMenu / gengaExpContextMenu
       const lyr = gengaLayerById(layerId); if (!lyr) return;
       ev.preventDefault(); ev.stopPropagation();
       selectGengaLayer(layerId);
