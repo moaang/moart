@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1160</title>
+  <title>MoArt ver1161</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8188,7 +8188,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1160</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1161</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13559,7 +13559,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1160';
+    const APP_DISPLAY_VERSION = '1161';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -56311,6 +56311,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const menu = document.getElementById('conteLayerContextMenu');
         if (menu && !menu.hidden && !event.target.closest('#conteLayerContextMenu')) hideConteLayerContextMenu();
       }, true);
+      // ver1161: press empty timeline space (below the last layer, the gutter, another cell) → drop the cell
+      // selection. CAPTURE so a child's stopPropagation can't hide it; see the function for the skip rules.
+      document.addEventListener('pointerdown', gengaClearCellSelOnOutsidePress, true);
       document.addEventListener('keydown', function(event) {
         if (event.key === 'Escape') hideConteLayerContextMenu();
       });
@@ -63018,6 +63021,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       gengaUpdateStandaloneDom(); updateGengaCellSelDom();
     }
+    // ver1161: ONE structural rule for "press empty timeline space → drop the cell selection" — the deselect
+    // every timeline/xsheet/NLE tool has (Premiere, Resolve, Final Cut, and the universal file-manager/canvas
+    // convention: a plain click on blank space clears, no modifier; clicking another cell REPLACES). Bound at
+    // the document in CAPTURE phase so a child's stopPropagation() can't hide the press (same reason the
+    // context-menu closer is capture) and it runs BEFORE the cell/koma handlers, so a press that starts a NEW
+    // selection simply overwrites the (already-cleared) old one — no click-vs-drag gate needed because our
+    // marquee (cell drag-select) replaces the selection anyway. Scoped to the CELL selection; camera/fx
+    // keyframe, solo and audio selections keep their own handlers. Skipped for: non-left buttons (right =
+    // menu, middle = pan), Shift (range-extend), the context menu, presses outside the timeline body, and —
+    // critically — a press INSIDE a multi-cell selection, which is how you grab the set to batch-drag it AND
+    // how a long-press keeps the selection alive for 選択セルを削除 (ver807/809).
+    function gengaClearCellSelOnOutsidePress(ev) {
+      if (!state.gengaCellSel) return;
+      if (ev.button != null && ev.button !== 0) return;
+      if (ev.shiftKey) return;
+      const tgt = ev.target;
+      if (!tgt || !tgt.closest) return;
+      if (!tgt.closest('#gengaStage .genga-dopesheet')) return; // only presses on the timeline body deselect
+      if (tgt.closest('#conteLayerContextMenu')) return;
+      const cs = state.gengaCellSel;
+      const el = tgt.closest('.genga-lane[data-genga-layer], .genga-exp[data-genga-layer], .genga-exp-num[data-genga-layer], .genga-midbehavior[data-genga-layer]');
+      if (el && String(el.getAttribute('data-genga-layer')) === String(cs.layerId)) {
+        const frame = gengaClickFrameFromEvent(ev);
+        if (frame >= cs.start && frame <= cs.end) return; // inside the selection (any size) → keep it (batch-drag / long-press-delete)
+      }
+      state.gengaCellSel = null;
+      updateGengaCellSelDom();
+    }
     // genga drawing (P2b first slice) — genga-native pen on the preview. A stroke draws onto a paper-res
     // working canvas seeded from the (selected layer, current frame) exposure; committed to exposure.drawing
     // on pointerup as ONE undo step. Stored INLINE (dataURL) for now — move to IndexedDB refs before heavy
@@ -69030,29 +69061,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // behaviour intact. Suppressed when a long-press already opened the menu: the whole point is that the menu
       // sees no selection, so 貼り付け inserts instead of overwriting.
       let jumpToSel = !canceled && !!(d && d.moved); // a drag-select already wrote the selection as it went
-      // ver1160: gate on !d.moved (a tap/click), NOT d.pending — pending is FALSE for touch by design (ver809),
-      // so the whole branch used to be MOUSE-only. The outside-dismiss must run on touch too, or a mobile cell
-      // drag-selection can never be tapped away (the user's report). The mouse-only sub-branches (mid-gap
-      // リピート toggle, single-cell pick) stay gated on d.pending; the dismiss is pending-independent.
-      if (!canceled && d && !d.moved && !gengaCellSelLongPressed) {
+      // ver809 / ver1161: a plain MOUSE click (pending=true; touch keeps pending=false so a finger can rest to
+      // long-press without selecting) toggles リピート on an empty mid-gap, otherwise picks that single cell.
+      // DESELECTION is NOT handled here anymore — the capture-phase gengaClearCellSelOnOutsidePress drops the
+      // selection on ANY press outside it (mouse AND touch), so a press that lands on a fresh cell simply
+      // re-selects here after the old selection was already cleared on pointerdown.
+      if (!canceled && d && d.pending && !d.moved && !gengaCellSelLongPressed) {
         const cl = gengaLayerById(d.layerId);
         const gap = cl ? gengaMidGapAt(cl, d.anchor) : null;
-        const cs = state.gengaCellSel;
-        const outside = cs && (String(cs.layerId) !== String(d.layerId) || d.anchor < cs.start || d.anchor > cs.end);
-        if (d.pending && gap && !cl.locked && !gengaLayerIsPaper(cl)) {
-          // ver858 (mouse): a plain click on an empty mid-gap toggles that gap's リピート (anchored at its start).
+        if (gap && !cl.locked && !gengaLayerIsPaper(cl)) {
           const existing = gengaRepeatAt(cl, d.anchor);
           if (existing) gengaToggleRepeat(d.layerId, existing.startFrame, false);
           else gengaToggleRepeat(d.layerId, gap.start, true);
-        } else if (outside) {
-          // a plain TAP/click OUTSIDE the active selection dismisses it — mouse AND touch.
-          gengaClearStandalone();
-        } else if (d.pending) {
-          // mouse, no active selection (or a click inside it): pick / collapse to the single cell.
+        } else {
           gengaSetCellSel(d.layerId, d.anchor, d.anchor);
           jumpToSel = true; // ver1107 — the repeat-toggle branch changes no selection, so it must not jump
         }
-        // a touch tap with no selection (or inside it) does nothing — the rest-to-long-press affordance survives.
       }
       gengaCellSelLongPressed = false;
       updateGengaCellSelDom();
