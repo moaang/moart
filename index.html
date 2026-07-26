@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1207</title>
+  <title>MoArt ver1208</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8663,7 +8663,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1207</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1208</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14228,7 +14228,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1207';
+    const APP_DISPLAY_VERSION = '1208';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -63279,6 +63279,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const win = gengaTimesheetWindowEl();
       win.hidden = false;
       state.gengaTimesheetOpen = true;
+      gengaTimesheetBindStage(win); // ver1208: Ctrl+wheel zoom (idempotent — guarded by a dataset flag)
       gengaTimesheetDraw();
     }
     function toggleGengaTimesheetWindow() {
@@ -63302,8 +63303,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (parts.length < 3) return null;
         const from = parseTc(parts[0]), to = parseTc(parts[1]);
         if (!from || !to || to < from) return null;
-        const hasLabel = parts.length > 3;
-        return { from: from, to: to, label: hasLabel ? parts[2] : '', text: parts.slice(hasLabel ? 3 : 2).join(' ') };
+        // ver1208: the sheet line is  start | end | labelA | directive | labelB. The END LABEL was being swept
+        // into the directive text (parts.slice(3).join(' ')), which is why the preview printed 「A PAN B」 as one
+        // string instead of a ring at each end with PAN between them.
+        const label = parts.length > 3 ? parts[2] : '';
+        const text = parts.length > 3 ? parts[3] : parts.slice(2).join(' ');
+        const endLabel = parts.length > 4 ? parts[4] : '';
+        return { from: from, to: to, label: label, text: text, endLabel: endLabel };
       }).filter(Boolean);
     }
     function gengaTimesheetDraw() {
@@ -63363,6 +63369,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       svg.innerHTML = '';
       svg.setAttribute('viewBox', '0 0 ' + PAGE_W + ' ' + PAGE_H);
       svg.removeAttribute('width'); svg.removeAttribute('height'); // CSS scales the page to the panel
+      gengaTimesheetApplyZoom(svg); // ver1208: Ctrl+wheel zoom, re-applied after every redraw
       rect(0, 0, PAGE_W, PAGE_H, 'none', 0, '#fff');
       // header band: structural 7-field form filled read-only from the project (input/CSV/memo chrome intentionally dropped)
       const np = state.project.nameParts || {};
@@ -63405,17 +63412,82 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
         // カメラ spans intersecting this block: guide line + RED caps (only at the real ends) + directive text
         const camMid = xInb + cameraW / 2;
+        // ver1208: drawn the way Auto Sheet draws it, not approximated. #sheet's camera column is a 持続線 down
+        // the lane with a DASH across it at each real endpoint, the frame name in a RING beside that dash, and the
+        // directive text on the SECOND frame of the span (drawCameraMarkerEndpoint / drawCircledCameraEndpointLabel /
+        // drawCameraSecondFrameText). This preview used to draw red bars and cram 「label + text + endLabel」 into
+        // one string at the top, which matched nothing that gets printed.
+        // ⚠and it lost the frame SIZE outright when ver1207 moved Fr out of the directive text and onto the label:
+        // the preview never read the new per-endpoint map. It reads the same gengaSheetCameraEndpointFr the sheet
+        // payload carries, so the three surfaces (lane, preview, printed sheet) now all say the same thing.
+        const camFr = gengaSheetCameraEndpointFr(gt);
+        const ringR = Math.min(cameraW * 0.16, ROWH * 0.62, 11);
+        const camEndpoint = function(y, labelText) {
+          line(camMid - 9, y, camMid + 11, y, '#111', 1.8);           // the dash IS the endpoint mark (#sheet '-')
+          const lb = String(labelText || '').trim();
+          if (!lb) return;
+          const cx = camMid + 20 + ringR;
+          if (lb.length === 1) {
+            node('circle', { cx: cx, cy: y, r: ringR, fill: 'none', stroke: '#111', 'stroke-width': 1.1 });
+            text(cx, y, lb, 12, '#111');
+          } else text(cx, y, '(' + lb + ')', 10, '#111');
+          const fr = camFr[lb];
+          if (fr) text(cx + ringR + 3, y, fr, 9, '#111', 'start');   // the size belongs to this frame name (ver1207)
+        };
         camSpans.forEach(function(s) {
           if (s.to < start || s.from > Math.min(total, blockEnd)) return;
           const from = Math.max(s.from, start), to = Math.min(s.to, blockEnd, total);
-          const y = TOP + NAMEH + (from - start) * ROWH, h = (to - from + 1) * ROWH;
-          line(camMid, y, camMid, y + h, '#111', 1.1);
-          if (s.from >= start) { line(xInb + 8, y, xCam - 8, y, RED, 2.6); text(camMid, y + Math.min(h / 2, 16), (s.label ? s.label + ' ' : '') + s.text, 10, '#111'); }
-          if (s.to <= blockEnd) line(xInb + 8, y + h, xCam - 8, y + h, RED, 2.6);
+          const yTop = TOP + NAMEH + (from - start) * ROWH, yBot = yTop + (to - from + 1) * ROWH;
+          line(camMid, yTop, camMid, yBot, '#111', 1.1);              // 持続線, drawn first so the marks sit on it
+          if (s.from >= start) camEndpoint(yTop, s.label);
+          if (s.to <= blockEnd) camEndpoint(yBot, s.endLabel);
+          // directive on the SECOND frame of the work, clear of the endpoint mark and its ring
+          const tf = Math.min(to, from + 1);
+          if (s.text) text(camMid, TOP + NAMEH + (tf - start + 0.5) * ROWH, s.text, 10, '#111');
         });
       });
       svg.__tsGeom = { page: page, pageFrames: pageFrames, pageW: PAGE_W, TOP: TOP, NAMEH: NAMEH, ROWH: ROWH, blocks: blocks };
       gengaTimesheetSyncPlayhead();
+    }
+    // ver1208: Ctrl+wheel zoom on the timesheet preview. The page is drawn once in PAGE units and CSS scales it,
+    // so zooming is purely the rendered WIDTH: at 100% the sheet fits the panel, above that it overflows and the
+    // stage's own scrollbars (overflow:auto, both axes) appear — which is where the horizontal bar comes from, since
+    // a width:100% sheet can never overflow sideways. Ctrl is required so a plain wheel still scrolls the sheet.
+    const GENGA_TS_ZOOM_MIN = 1, GENGA_TS_ZOOM_MAX = 6;
+    // ⚠NOT clampNumber — that one ROUNDS (it exists for cell widths and column counts), so 1 x 1.12 came back
+    // as 1 and every zoom step was swallowed by the no-change guard below. A zoom factor is a float.
+    function gengaTsClampZoom(v) {
+      const n = Number(v);
+      if (!isFinite(n)) return 1;
+      return Math.max(GENGA_TS_ZOOM_MIN, Math.min(GENGA_TS_ZOOM_MAX, n));
+    }
+    function gengaTimesheetZoom() { return gengaTsClampZoom(state.gengaTsZoom); }
+    function gengaTimesheetApplyZoom(svgEl) {
+      const svg = svgEl || (document.getElementById('gengaTimesheetWindow') || document).querySelector('.genga-ts-svg');
+      if (!svg) return;
+      const z = gengaTimesheetZoom();
+      svg.style.width = (z * 100) + '%';
+      svg.style.maxWidth = 'none';
+    }
+    function gengaTimesheetBindStage(win) {
+      const stage = win && win.querySelector('.genga-ts-stage');
+      if (!stage || stage.dataset.tsZoomBound === 'true') return;
+      stage.dataset.tsZoomBound = 'true';
+      stage.addEventListener('wheel', function(ev) {
+        if (!ev.ctrlKey) return;                       // plain wheel keeps scrolling
+        ev.preventDefault();
+        const before = gengaTimesheetZoom();
+        // anchor the zoom on the pointer, the way the genga canvas wheel does — otherwise the sheet walks away
+        const r = stage.getBoundingClientRect();
+        const px = (stage.scrollLeft + (ev.clientX - r.left)) / before;
+        const py = (stage.scrollTop + (ev.clientY - r.top)) / before;
+        const next = gengaTsClampZoom(before * (ev.deltaY < 0 ? 1.12 : 1 / 1.12));
+        if (next === before) return;
+        state.gengaTsZoom = next;
+        gengaTimesheetApplyZoom();
+        stage.scrollLeft = px * next - (ev.clientX - r.left);
+        stage.scrollTop = py * next - (ev.clientY - r.top);
+      }, { passive: false });
     }
     function gengaTimesheetSyncPlayhead() {
       const win = document.getElementById('gengaTimesheetWindow');
