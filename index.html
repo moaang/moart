@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1195</title>
+  <title>MoArt ver1196</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8664,7 +8664,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1195</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1196</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14124,7 +14124,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1195';
+    const APP_DISPLAY_VERSION = '1196';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -49585,13 +49585,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver956 P4④: opts joins the timeline-thumbnail crop scan into this kernel — minAlpha (its AA-skirt cut
     // was alpha>8) and suppressNearWhite (opaque near-white = paper background, not ink). Defaults keep the
     // historical any-alpha contract for every existing caller.
+    // ver1196 (union-scan): opts.rect narrows the READBACK to a caller-PROVEN superset of the ink. The
+    // readback — not the walk — is the cost: measured on a paper-res (1754x1240) canvas, getImageData is
+    // ~30ms right after drawing into it vs 4.7ms on a cold one, while the walk itself is 4.5ms either way.
+    // Bounds always come back in CANVAS coordinates (the walk runs in the sub-rect's own space and the
+    // offsets are added back on the way out), so a caller reads identical numbers with or without a rect —
+    // that equality is the whole contract, and it holds only for a rect that really does contain every
+    // inked pixel. An unproven rect crops art silently, so see gengaCommitCanvas for what "proven" means.
     function alphaInkBoundsScan(canvas, opts) {
       if (!canvas) return { ok: true, bounds: null };
-      const w = Math.max(1, Math.round(Number(canvas.width) || 1));
-      const h = Math.max(1, Math.round(Number(canvas.height) || 1));
+      const cw = Math.max(1, Math.round(Number(canvas.width) || 1));
+      const ch = Math.max(1, Math.round(Number(canvas.height) || 1));
+      let ox = 0, oy = 0, w = cw, h = ch;
+      const scanRect = opts && opts.rect;
+      if (scanRect) {
+        const sx = Number(scanRect.x) || 0, sy = Number(scanRect.y) || 0;
+        const x0 = Math.max(0, Math.min(cw, Math.floor(sx)));
+        const y0 = Math.max(0, Math.min(ch, Math.floor(sy)));
+        const x1 = Math.max(x0, Math.min(cw, Math.ceil(sx + (Number(scanRect.w) || 0))));
+        const y1 = Math.max(y0, Math.min(ch, Math.ceil(sy + (Number(scanRect.h) || 0))));
+        ox = x0; oy = y0; w = x1 - x0; h = y1 - y0;
+        if (w <= 0 || h <= 0) return { ok: true, bounds: null }; // a proven-empty window == an empty canvas
+      }
       let data = null;
       try {
-        data = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+        data = canvas.getContext('2d').getImageData(ox, oy, w, h).data;
       } catch (error) {
         console.warn('[alphaInkBoundsScan] getImageData failed', error);
         return { ok: false, bounds: null };
@@ -49614,7 +49632,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         for (let x = 0; x < minX; x++) { if (ink(row + x * 4)) { minX = x; break; } }
         for (let x = w - 1; x > maxX; x--) { if (ink(row + x * 4)) { maxX = x; break; } }
       }
-      return { ok: true, bounds: { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } };
+      return { ok: true, bounds: { x: ox + minX, y: oy + minY, w: maxX - minX + 1, h: maxY - minY + 1 } };
     }
     function canvasAlphaBounds(canvas) {
       if (!canvas) return null;
@@ -60262,17 +60280,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // null still means EMPTY. A failure used to escape as an uncaught throw — no caller catches it, and it
     // must NOT become null either: gengaTrimCanvasToDrawing reads null as "empty" and would drop the stroke.
     // Full rect = commit the whole canvas untrimmed, i.e. lose the size optimization, never the art.
-    function gengaCanvasInkBounds(cv) {
+    // ver1196: scanRect (optional) = a PROVEN superset of the ink — see gengaCommitCanvas. Omitting it scans
+    // the whole canvas, which is what every non-stroke caller (import / bake / merge) still does.
+    function gengaCanvasInkBounds(cv, scanRect) {
       if (!cv) return null;
-      const r = alphaInkBoundsScan(cv);
+      const r = alphaInkBoundsScan(cv, scanRect ? { rect: scanRect } : null);
+      // The failure rect stays the FULL canvas, never the scan window: a misread must lose the size
+      // optimization, and the untrimmed commit is only correct if it really is the whole canvas.
       if (!r.ok) { console.warn('[gengaCanvasInkBounds] ink scan failed — committing untrimmed (full rect)'); return { x: 0, y: 0, w: Math.max(1, Math.round(Number(cv.width) || 1)), h: Math.max(1, Math.round(Number(cv.height) || 1)) }; }
       return r.bounds;
     }
     // crop a paper-res canvas to its ink bbox → {dataUrl,w,h,x,y} (integer offsets, 1:1 crop = zero drift), or
     // null when empty. Encoding only the ink region keeps per-stroke toDataURL + decoded memory small at large
     // paper sizes.
-    function gengaTrimCanvasToDrawing(cv) {
-      const b = gengaCanvasInkBounds(cv); if (!b) return null;
+    function gengaTrimCanvasToDrawing(cv, scanRect) {
+      const b = gengaCanvasInkBounds(cv, scanRect); if (!b) return null;
       const t = document.createElement('canvas'); t.width = b.w; t.height = b.h;
       t.getContext('2d').drawImage(cv, b.x, b.y, b.w, b.h, 0, 0, b.w, b.h);
       return { dataUrl: t.toDataURL('image/png'), w: b.w, h: b.h, x: b.x, y: b.y };
@@ -69038,17 +69060,28 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       b.lineWidth = sess.shapeLineWidth;
       b.strokeStyle = sess.shapeColor; b.fillStyle = sess.shapeColor;
       const ax = sess.shapeAnchor.x, ay = sess.shapeAnchor.y;
+      // ver1196: the shape buffer is cleared and re-traced every move, so only the LAST trace survives to the
+      // commit — marking every intermediate one is a superset either way, and a superset is all we need.
+      const shapePad = (Number(sess.shapeLineWidth) || 1) / 2 + 1;
+      gengaScanMark(sess, p.x, p.y, shapePad);
       b.beginPath();
       if (sess.shape === 'curve' && sess.curveChord) { // ver608: bend phase — quadratic through the pointer
         const A = sess.curveChord.a, B = sess.curveChord.b;
+        const qcx = 2 * p.x - (A.x + B.x) / 2, qcy = 2 * p.y - (A.y + B.y) / 2;
         b.moveTo(A.x, A.y);
-        b.quadraticCurveTo(2 * p.x - (A.x + B.x) / 2, 2 * p.y - (A.y + B.y) / 2, B.x, B.y);
+        b.quadraticCurveTo(qcx, qcy, B.x, B.y);
         b.stroke();
+        // A quadratic lies inside the convex hull of {start, control, end} — and the control point is
+        // DOUBLE the pointer's offset from the chord midpoint, i.e. reliably outside the marked pointer.
+        gengaScanMark(sess, A.x, A.y, shapePad);
+        gengaScanMark(sess, B.x, B.y, shapePad);
+        gengaScanMark(sess, qcx, qcy, shapePad);
       } else if (sess.shape === 'line' || sess.shape === 'curve') { // curve phase 1 = its chord
         let tx = p.x, ty = p.y;
         if (ev.shiftKey) { const s = paintSnapChordAngle(ax, ay, tx, ty); tx = s.x; ty = s.y; } // ver872 G1: shared 15° snap
         b.moveTo(ax, ay); b.lineTo(tx, ty); b.stroke();
         sess.lastShapePt = { x: tx, y: ty };
+        gengaScanMark(sess, tx, ty, shapePad); // ver1196: the SNAPPED end is what got drawn
       } else if (sess.shape === 'lasso-fill') {
         // ver617: no fill while dragging — the buffer stays empty (canvas = base) and drawGengaPreview
         // renders a dashed lasso marquee from shapeLassoPts; the fill is built once at gengaDrawEnd.
@@ -69058,6 +69091,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } else { // rect / ellipse — Shift: 正方形/正円, Alt: 中心から
         const r = paintConstrainRect(ax, ay, p.x, p.y, ev.shiftKey, ev.altKey); // ver872 G1: shared 正方形/中心 constraint
         const x0 = r.x0, y0 = r.y0, x1 = r.x1, y1 = r.y1;
+        // ver1196: the CONSTRAINED corners, not the pointer — Alt (中心から) puts one of them on the far
+        // side of the anchor, past anything the pointer itself marked.
+        gengaScanMark(sess, x0, y0, shapePad);
+        gengaScanMark(sess, x1, y1, shapePad);
         if (sess.shape === 'rect') b.rect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
         else b.ellipse((x0 + x1) / 2, (y0 + y1) / 2, Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2, 0, 0, Math.PI * 2);
         if (paintShapeStrokeWantsFill(sess.shape)) b.fill(); else b.stroke();
@@ -69068,6 +69105,75 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ev.preventDefault();
     }
     // ## SECTION: GENGA: DRAWING / SELECTION ........ stroke pipeline, selection quad, transform, merge
+
+    // ── ver1196: the commit-time ink scan's readback window (the "union scan") ────────────────────────
+    // Every drawing commit has to find the ink bbox of a paper-res canvas, and that readback is the single
+    // most expensive thing a stroke does: measured at ver1187, pointerup costs ~40ms of which ~30ms is one
+    // getImageData over the whole paper — a FIXED cost, independent of stroke length (20 pts and 400 pts
+    // both measured 38.6ms) and of brush size. It does not need the whole paper. The session canvas is
+    // SEEDED from the stored drawing and then only ever drawn into, so
+    //
+    //     ink(commit)  ⊆  footprint(seed drawing)  ∪  (everything this session drew)
+    //
+    // and both terms are known exactly — the first from the stored drawing's placement, the second from the
+    // points the tools drew through. Erasers (destination-out), 透明度保護 (source-atop), 背面描画
+    // (destination-over), the blend modes and the selection clip all leave the destination untouched where
+    // the source is transparent, so none of them can put ink OUTSIDE that union; they only remove from it.
+    // Scanning the union therefore returns the exact same bounds the full scan would.
+    //
+    // `sess.scan === null` means THIS SESSION OPTED OUT and its commit scans the whole canvas exactly as
+    // before. That is the safe default and the reason the opt-out is a null rather than a flag: an
+    // UNDER-reported window does not throw, it silently crops the drawing. Opted out today:
+    //   • bucket fill (塗りつぶし) — a flood spreads wherever the region goes; no geometry bounds it
+    //   • the 1px nudge (原画移動) — the wrap is toroidal, so ink lands on the OPPOSITE edge
+    //   • a session seeded from a LIFTED selection — the float's pixels sit wherever the transform put
+    //     them and no cheap proven footprint for them exists
+    // (the first two never open a session at all: they commit with no rect, which is the same thing.)
+    // Every other commit path — transform / delete-selection / stamp / import / bake / merge — likewise
+    // passes no rect and keeps the full scan.
+    let gengaUnionScanEnabled = true; // A/B switch: false = every commit full-scans. Never written by app code.
+    const GENGA_SCAN_PAD = 2;         // AA skirt + integer-rounding slack added around every marked point
+    // The stored drawing's paper-space footprint, read AT SEED TIME. Never re-read at commit: the exposure
+    // can be re-keyed or re-committed in between (gengaCommitSelection alone does it), and a stale footprint
+    // is exactly the silent-crop bug. null = the seed put no ink down, so the session's own ink is the union.
+    function gengaDrawingSeedRect(dr, pw, ph) {
+      if (!dr || !dr.dataUrl) return null;
+      // A trimmed drawing is placed 1:1 at x,y — and the decode-race fallback (gengaDrawDrawingInto paints
+      // gengaLastStrokeCanvas at 0,0) is gated on the same dataUrl, whose ink bbox IS this rect, so both
+      // seed paths land inside it.
+      if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) {
+        return {
+          x: Math.floor(Number(dr.x)), y: Math.floor(Number(dr.y)),
+          w: Math.max(0, Math.ceil(Number(dr.w) || 0)), h: Math.max(0, Math.ceil(Number(dr.h) || 0))
+        };
+      }
+      return { x: 0, y: 0, w: pw, h: ph }; // legacy full-paper bitmap: scaled over the whole paper
+    }
+    // The accumulator a session carries: {x0,y0,x1,y1} in canvas space, seeded with the footprint above.
+    function gengaScanSeed(seedRect) {
+      if (!seedRect) return { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }; // empty; grows with the ink
+      return { x0: seedRect.x, y0: seedRect.y, x1: seedRect.x + seedRect.w, y1: seedRect.y + seedRect.h };
+    }
+    // Mark a drawn point: everything within `pad` of (x,y) may now hold ink. `pad` is the largest radius the
+    // renderer can put there (half the stroke width for the AA paths, the stamp's half-extent for 2値化).
+    function gengaScanMark(sess, x, y, pad) {
+      const s = sess && sess.scan; if (!s) return;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) { sess.scan = null; return; } // unbounded input → opt out, never guess
+      const r = (Number.isFinite(pad) ? Math.abs(pad) : 0) + GENGA_SCAN_PAD;
+      if (x - r < s.x0) s.x0 = x - r;
+      if (y - r < s.y0) s.y0 = y - r;
+      if (x + r > s.x1) s.x1 = x + r;
+      if (y + r > s.y1) s.y1 = y + r;
+    }
+    // The readback window for this session's commit: integer, clamped to the canvas. null = scan it all.
+    function gengaScanRectFor(sess, cv) {
+      const s = gengaUnionScanEnabled && sess && sess.scan; if (!s || !cv) return null;
+      if (!(s.x1 > s.x0 && s.y1 > s.y0)) return null; // nothing seeded and nothing marked: fall back rather than guess
+      const x0 = Math.max(0, Math.floor(s.x0)), y0 = Math.max(0, Math.floor(s.y0));
+      const x1 = Math.min(cv.width, Math.ceil(s.x1)), y1 = Math.min(cv.height, Math.ceil(s.y1));
+      if (x1 <= x0 || y1 <= y0) return null;
+      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    }
 
     function gengaDrawStart(ev) {
       if (!state.project || state.project.kind !== 'genga') return;
@@ -69150,14 +69256,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const c = cv.getContext('2d');
       // bake any floating selection (lasso/transform) first — synchronous seed avoids the dataUrl-reload race.
       let seedCanvas = null;
+      let seedRect = null;       // ver1196 (union-scan): the seed's footprint, captured HERE and nowhere else
+      let scanEligible = true;   // ver1196: a lifted float's pixels are wherever the transform left them
       if (gengaSelLifted(gengaSel) && String(gengaSel.layerId) === String(layer.id) && gengaSel.frame === frame) {
         seedCanvas = gengaSelCompositeFrom(gengaSel); // ver764: a select-only marquee has nothing floating to seed — the stored art already is the truth
         gengaCommitSelection();
+        scanEligible = false;
       }
       if (seedCanvas) {
         c.drawImage(seedCanvas, 0, 0);
       } else {
         const existingDr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
+        seedRect = gengaDrawingSeedRect(existingDr, pw, ph); // ver1196: read BEFORE the seed draw, from the same drawing
         // placement-aware seed (trimmed 1:1 at x,y / legacy scaled); falls back to the kept last-stroke canvas
         // while the freshly-committed dataUrl is still decoding (rapid strokes).
         gengaDrawDrawingInto(c, existingDr, pw, ph, drawGengaPreview);
@@ -69198,8 +69308,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           shapeEraser: eraser, shapeAlphaLock: Boolean(!eraser && layer.alphaLock),
           shapeColor: eraser ? '#000000' : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
           shapeLineWidth: c.lineWidth,
-          shapeOpacity: paintBrushOpacityVal() // ver609: shapes honor the brush opacity too
+          shapeOpacity: paintBrushOpacityVal(), // ver609: shapes honor the brush opacity too
+          scan: scanEligible ? gengaScanSeed(seedRect) : null // ver1196
         };
+        gengaScanMark(gengaDrawSession, p.x, p.y, c.lineWidth / 2); // ver1196: every shape grows out of its anchor
         try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
         if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); } // ver994: drawing retargeted the layer — show which one
         drawGengaPreview();
@@ -69251,8 +69363,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         penGamma: penGamma, // ver623: alpha curve shares the shape gamma
         penGain: penGain,   // ver626: alpha curve shares the gain too
         penOutline: penOutlineMode,
-        pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure }] : null
+        pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure }] : null,
+        scan: scanEligible ? gengaScanSeed(seedRect) : null // ver1196
       };
+      // ver1196: the start dot. penBaseWidth bounds every later mark too — paintVariableWidthRadii caps each
+      // radius at baseWidth/2 (paintPressureCurve returns ≤ 1) and a per-segment width is Math.round of the
+      // same product — so half the wider of {base, start} is the largest radius this session can produce.
+      gengaScanMark(gengaDrawSession, p.x, p.y, Math.max(startWidth, c.lineWidth) / 2 + 1);
       if (startStamp && startWidth !== c.lineWidth) gengaDrawSession.pxStampCache[String(startWidth)] = startStamp; // ver943: outline implies !startStamp, guard dropped
       if (penOpacity < 1 || penOutlineMode || gengaStrokeClipFor(gengaDrawSession) || (!eraser && paintBrushModeIsBlend(paintBrushModeVal()))) {
         // ver869 (tool-unify G0): a real BLEND mode (multiply/screen/dodge/colorize) also forces the buffer path —
@@ -69354,6 +69471,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const usePressure = penSess.smoothP != null ? penSess.smoothP : 0.5;
         if (penSess.penOutline) { // ver621: outline mode just accumulates; ONE whole redraw after the loop
           penSess.pts.push({ x: p.x, y: p.y, p: usePressure });
+          gengaScanMark(penSess, p.x, p.y, (penSess.penBaseWidth || 1) / 2 + 1); // ver1196: radii cap at baseWidth/2
           penSess.lastX = p.x; penSess.lastY = p.y;
           drewAny = true;
           continue;
@@ -69366,6 +69484,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (penSess.penPressureAlpha && rawPressure != null) {
           segAlpha = paintPressureCurve(usePressure, 0.15, penSess.penGamma, penSess.penGain); // ver723: shared alpha curve
         }
+        // ver1196: BOTH ends of the segment, at the width this segment is stroked with — the previous point
+        // was marked with its own (possibly narrower) width, and lineWidth is constant along a segment.
+        gengaScanMark(penSess, penSess.lastX, penSess.lastY, segWidth / 2 + 1);
+        gengaScanMark(penSess, p.x, p.y, segWidth / 2 + 1);
         target.save();
         target.globalAlpha = target.globalAlpha * segAlpha;
         if (penSess.pxStamp) { // AA off: hard pixel stamping, per-width stamps cached
@@ -69457,7 +69579,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             gengaShapeComposite(shapeSess);
           }
           if (paintToolBinarizeOn(shapeSess.shape)) { paintBinarizeCanvasAlpha(shapeSess.shapeBuf); gengaShapeComposite(shapeSess); } // ver614: per-tool 2値化
-          gengaCommitCanvas(shapeSess.layerId, shapeSess.frame, shapeSess.canvas, '図形描画');
+          gengaCommitCanvas(shapeSess.layerId, shapeSess.frame, shapeSess.canvas, '図形描画', gengaScanRectFor(shapeSess, shapeSess.canvas)); // ver1196
         } else {
           drawGengaPreview(); // degenerate tap: the layer is untouched, just drop the session preview
         }
@@ -69472,7 +69594,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver943 — binarized pressure-size strokes stamp live, so no commit binarize exists here.)
         gengaPenOutlineRedraw(sess);
       }
-      gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画'); // ink-bbox trimmed + decode-race fallback
+      gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas)); // ink-bbox trimmed + decode-race fallback; ver1196 union scan
       try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
     }
     // ── ver581: document-level gesture-state janitor — THE intermittent iPad lockup, finally caught
@@ -69667,8 +69789,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // trim a paper-res canvas to its ink bbox and commit it (all drawing-type commits route here). The full
     // canvas is kept as the decode-race fallback so the preview never blinks while the new PNG decodes.
-    function gengaCommitCanvas(layerId, frame, cv, label) {
-      const trimmed = gengaTrimCanvasToDrawing(cv);
+    // ver1196: scanRect (optional) = the union window described at the top of this section — a PROVEN
+    // superset of this canvas's ink, so the trim reads back only that window instead of the whole paper.
+    // Omit it (or pass null) and the full canvas is scanned, which is what every non-session commit does.
+    // gengaLastStrokeCanvas stays keyed to the trimmed dataUrl, and the trimmed rect is still the exact ink
+    // bbox, so the decode-race fallback keeps painting the same pixels in the same place.
+    function gengaCommitCanvas(layerId, frame, cv, label, scanRect) {
+      const trimmed = gengaTrimCanvasToDrawing(cv, scanRect);
       if (trimmed) {
         gengaLastStrokeCanvas = { dataUrl: trimmed.dataUrl, canvas: cv };
         gengaImageFor(trimmed.dataUrl, drawGengaPreview);
