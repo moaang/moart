@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1168</title>
+  <title>MoArt ver1169</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8202,7 +8202,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1168</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1169</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13577,7 +13577,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1168';
+    const APP_DISPLAY_VERSION = '1169';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -59106,34 +59106,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return pal;
     }
-    function gifNearest(pal, r, g, b, cache) {
-      const key = (r << 16) | (g << 8) | b, hit = cache.get(key); if (hit !== undefined) return hit;
-      let best = 0, bd = Infinity;
-      for (let i = 0; i < pal.length; i++) { const p = pal[i], dr = p[0] - r, dg = p[1] - g, db = p[2] - b, d = dr * dr + dg * dg + db * db; if (d < bd) { bd = d; best = i; if (d === 0) break; } }
-      cache.set(key, best); return best;
-    }
+    // ver1169: GIF-LZW with an INTEGER-key dictionary (was a string key — a `prefix + ',' + k` allocation and
+    // string hash PER PIXEL, which dominated the encode time). key = prefixCode*256 + byte fits an int; single
+    // symbols are their own code so the dict only holds multi-symbol sequences. Output grows a Uint8Array
+    // instead of a per-byte Array.push. Algorithm (emit-before-add, code-size bump on next>2^size) is unchanged.
     function gifLzwEncode(indexed, minCodeSize) {
-      const out = [], clearCode = 1 << minCodeSize, eoiCode = clearCode + 1;
-      let codeSize = minCodeSize + 1, dict, next;
-      function resetDict() { dict = new Map(); for (let i = 0; i < clearCode; i++) dict.set(String(i), i); next = eoiCode + 1; }
-      resetDict();
+      const clearCode = 1 << minCodeSize, eoiCode = clearCode + 1;
+      let codeSize = minCodeSize + 1, dict = new Map(), next = eoiCode + 1;
+      let out = new Uint8Array(4096), olen = 0;
+      function push(v) { if (olen >= out.length) { const nb = new Uint8Array(out.length * 2); nb.set(out); out = nb; } out[olen++] = v; }
       let cur = 0, curBits = 0;
-      function emit(code) { cur |= (code << curBits); curBits += codeSize; while (curBits >= 8) { out.push(cur & 0xFF); cur >>= 8; curBits -= 8; } }
+      function emit(code) { cur |= (code << curBits); curBits += codeSize; while (curBits >= 8) { push(cur & 0xFF); cur >>= 8; curBits -= 8; } }
       emit(clearCode);
-      let prefix = String(indexed[0]);
+      let prefix = indexed[0];
       for (let i = 1; i < indexed.length; i++) {
-        const combo = prefix + ',' + indexed[i];
-        if (dict.has(combo)) { prefix = combo; }
+        const k = indexed[i], key = prefix * 256 + k, found = dict.get(key);
+        if (found !== undefined) { prefix = found; }
         else {
-          emit(dict.get(prefix)); dict.set(combo, next++);
+          emit(prefix); dict.set(key, next++);
           if (next > (1 << codeSize) && codeSize < 12) codeSize++;
-          else if (next > 4095) { emit(clearCode); resetDict(); codeSize = minCodeSize + 1; }
-          prefix = String(indexed[i]);
+          else if (next > 4095) { emit(clearCode); dict = new Map(); next = eoiCode + 1; codeSize = minCodeSize + 1; }
+          prefix = k;
         }
       }
-      emit(dict.get(prefix)); emit(eoiCode);
-      if (curBits > 0) out.push(cur & 0xFF);
-      return out;
+      emit(prefix); emit(eoiCode);
+      if (curBits > 0) push(cur & 0xFF);
+      return out.subarray(0, olen);
     }
     function gengaEncodeGif(frames, opts) {
       opts = opts || {};
@@ -59142,29 +59140,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const pal = opts.palette || gifBuildPalette(frames, w, h, Math.max(2, Math.min(256, opts.colors || 256)));
       let bits = 1; while ((1 << bits) < pal.length) bits++; bits = Math.max(1, Math.min(8, bits));
       const gctSize = 1 << bits, minCodeSize = Math.max(2, bits);
-      const bytes = [];
-      function u8(v) { bytes.push(v & 0xFF); }
-      function u16(v) { bytes.push(v & 0xFF, (v >> 8) & 0xFF); }
-      function str(s) { for (let i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i)); }
+      let buf = new Uint8Array(1 << 20), len = 0;
+      function ensure(n) { if (len + n > buf.length) { let nl = buf.length; while (nl < len + n) nl *= 2; const nb = new Uint8Array(nl); nb.set(buf); buf = nb; } }
+      function u8(v) { ensure(1); buf[len++] = v & 0xFF; }
+      function u16(v) { ensure(2); buf[len++] = v & 0xFF; buf[len++] = (v >> 8) & 0xFF; }
+      function str(s) { ensure(s.length); for (let i = 0; i < s.length; i++) buf[len++] = s.charCodeAt(i); }
       str('GIF89a'); u16(w); u16(h); u8(0x80 | 0x70 | (bits - 1)); u8(0); u8(0);
       for (let i = 0; i < gctSize; i++) { const c = pal[i] || [0, 0, 0]; u8(c[0]); u8(c[1]); u8(c[2]); }
       if (infinite) { u8(0x21); u8(0xFF); u8(0x0B); str('NETSCAPE2.0'); u8(0x03); u8(0x01); u16(0); u8(0x00); }
-      const cache = new Map();
+      // ver1169: nearest-colour via a 5-bit-per-channel LUT (32768 cells, filled on demand). Per pixel is one
+      // Int16Array read after the first hit, vs the old Map-keyed full-RGB cache + linear palette scan.
+      const lut = new Int16Array(32768).fill(-1);
+      function idxOf(r, g, b) {
+        const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+        const v = lut[key]; if (v >= 0) return v;
+        let best = 0, bd = Infinity;
+        for (let i = 0; i < pal.length; i++) { const p = pal[i], dr = p[0] - r, dg = p[1] - g, db = p[2] - b, d = dr * dr + dg * dg + db * db; if (d < bd) { bd = d; best = i; if (d === 0) break; } }
+        lut[key] = best; return best;
+      }
+      const indexed = new Uint8Array(w * h);
       for (let f = 0; f < frames.length; f++) {
         u8(0x21); u8(0xF9); u8(0x04); u8(0x04); u16(delayCs); u8(0x00); u8(0x00); // GCE: disposal=none, no transparency
         u8(0x2C); u16(0); u16(0); u16(w); u16(h); u8(0x00);                        // image descriptor, no local table
         u8(minCodeSize);
-        const d = frames[f], indexed = new Uint8Array(w * h); let j = 0;
-        for (let p = 0; p < d.length; p += 4) {
-          let r, g, b; if (d[p + 3] < 8) { r = 255; g = 255; b = 255; } else { r = d[p]; g = d[p + 1]; b = d[p + 2]; }
-          indexed[j++] = gifNearest(pal, r, g, b, cache);
-        }
+        const d = frames[f]; let j = 0;
+        for (let p = 0; p < d.length; p += 4) { let r, g, b; if (d[p + 3] < 8) { r = 255; g = 255; b = 255; } else { r = d[p]; g = d[p + 1]; b = d[p + 2]; } indexed[j++] = idxOf(r, g, b); }
         const lzw = gifLzwEncode(indexed, minCodeSize);
-        for (let i = 0; i < lzw.length;) { const nb = Math.min(255, lzw.length - i); u8(nb); for (let k = 0; k < nb; k++) u8(lzw[i + k]); i += nb; }
+        for (let i = 0; i < lzw.length;) { const nb = Math.min(255, lzw.length - i); u8(nb); ensure(nb); buf.set(lzw.subarray(i, i + nb), len); len += nb; i += nb; }
         u8(0x00);
       }
       u8(0x3B);
-      return new Uint8Array(bytes);
+      return buf.subarray(0, len);
     }
     async function gengaExportGif(opts, onStatus) {
       opts = opts || {};
@@ -59186,8 +59192,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < recFrames; i++) {
         gengaRenderExportFrame(canvas, startFrame + i, outW, outH);
         frames.push(ctx.getImageData(0, 0, outW, outH).data);
-        if (onStatus && (i % 3 === 0)) onStatus(t('msg.export.encoding', Math.round((i + 1) / recFrames * 90)));
-        await new Promise(function (res) { setTimeout(res, 0); }); // yield: keep the status painting / UI alive
+        if (i % 6 === 0) { // ver1169: yield every few frames (setTimeout clamps to ~4ms, so per-frame was 4ms×frames of dead time)
+          if (onStatus) onStatus(t('msg.export.encoding', Math.round((i + 1) / recFrames * 85)));
+          await new Promise(function (res) { setTimeout(res, 0); });
+        }
       }
       if (onStatus) onStatus(t('msg.export.encoding', 95));
       const bytes = gengaEncodeGif(frames, { width: outW, height: outH, delayCs: delayCs, loop: opts.loop !== false, colors: Math.max(2, Math.min(256, opts.colors || 256)) });
