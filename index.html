@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1225</title>
+  <title>MoArt ver1226</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8663,7 +8663,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1225</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1226</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14094,6 +14094,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'status.genga.clipboardPaste.done': { ja: 'クリップボード画像をレイヤーに貼り付けました', ko: '클립보드 이미지를 레이어에 붙여넣었습니다', en: 'Pasted the clipboard image onto the layer.' },
         'status.genga.stamp.captured': { ja: 'スタンプ取得：タップで配置（ドラッグで位置決め）/ 右クリックで終了', ko: '스탬프 획득: 탭으로 배치 (드래그로 위치 조정) / 우클릭으로 종료', en: 'Stamp captured: tap to place (drag to position) / right-click to exit' },
         'status.genga.regionMove.armed': { ja: '存在範囲の移動：このレイヤーをドラッグしてください（1回で解除）', ko: '존재 범위 이동: 이 레이어를 드래그해주세요 (1회 사용 후 해제)', en: 'Existence-range move: drag this layer (disarms after one use)' },
+        'status.genga.layer.copied': { ja: 'レイヤーをコピーしました', ko: '레이어를 복사했습니다', en: 'Layer copied.' },
+        'status.genga.layer.pasted': { ja: 'レイヤーを貼り付けました（独立レイヤー）', ko: '레이어를 붙여넣었습니다 (독립 레이어)', en: 'Layer pasted as an independent layer.' },
+        'status.genga.layer.cut': { ja: 'レイヤーを切り取りました', ko: '레이어를 잘라냈습니다', en: 'Layer cut.' },
         // ---- timing.* (6) ----
         'timing.legend.pause': { ja: '間', ko: '포즈', en: 'Pause' },
         'timing.duration.current': { ja: '現在総尺', ko: '현재 총 길이', en: 'Current total duration' },
@@ -14292,7 +14295,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1225';
+    const APP_DISPLAY_VERSION = '1226';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -58253,6 +58256,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (handleGengaDeleteKey(event)) return;
       if (handleGengaCellClipboardKey(event)) return;
+      if (handleGengaLayerClipboardKey(event)) return;
       if (handlePaintSpacePanKeydown(event)) return;
       if (handlePaintTransformEnterKey(event)) return;
       if (handleConfiguredShortcut(event)) return; // ver942: undo/redo now dispatched from here too (editUndo/editRedo) — the old inline Ctrl+Z/Y duplicate below is gone
@@ -65575,6 +65579,75 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.gengaSelectedLayerId = sub.id; // select the new sub-layer once the command's refresh re-renders the row
         gengaRequestCenterLayer(sub.id); // ver994: deferred — the row is created by THIS command, so it cannot be measured yet
       });
+    }
+    // ---- ver1226: whole-layer clipboard (Ctrl+C/X/V on a selected layer's name/thumbnail) — a SEPARATE
+    // clipboard from gengaKomaClipboard (koma range copy) and state.conteLayerClipboard (conte video-edit
+    // layers). Paste always produces a fully independent layer: cellGroupId is dropped (never joins the
+    // copied layer's サブレイヤー group) and every exposure/serifu-section/repeat id is reissued so the
+    // pasted copy can never be mistaken for — or accidentally kept in lockstep with — its source by any code
+    // that keys off those ids. tagOff and the drawings themselves (via fastClone's deep copy of
+    // sharedDrawings) are carried over as-is: "paste" means a byte-identical, independently editable twin.
+    let gengaLayerClipboard = null;
+
+    function gengaCloneLayerForPaste(layer) {
+      const clone = fastClone(layer);
+      clone.id = 'genga-layer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+      clone.cellGroupId = ''; // independent layer — never inherits the source's サブレイヤー group
+      const serifuIdMap = {};
+      clone.serifuSections = (clone.serifuSections || []).map(function(s) {
+        const newId = 'genga-serifu-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+        serifuIdMap[s.id] = newId;
+        return Object.assign({}, s, { id: newId });
+      });
+      clone.exposures = (clone.exposures || []).map(function(e) {
+        return Object.assign({}, e, {
+          id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          serifuId: (e.serifuId && serifuIdMap[e.serifuId]) ? serifuIdMap[e.serifuId] : ''
+        });
+      });
+      clone.repeats = (clone.repeats || []).map(function(r) {
+        return Object.assign({}, r, { id: 'genga-rep-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8) });
+      });
+      return clone;
+    }
+
+    function gengaCopyLayer() {
+      const layer = gengaSelectedLayer();
+      if (!layer || layer.role === 'paper') return; // 用紙 is a project-wide singleton — never copyable
+      gengaLayerClipboard = fastClone(layer);
+      state.timelineStatus = t('status.genga.layer.copied');
+      // copy alone doesn't go through runCommand (nothing in the project actually changes), so it needs its
+      // own status-text paint — same one-line pattern gengaDisarmRegionMove uses for the same reason.
+      const st = document.querySelector('.timeline-status');
+      if (st) st.textContent = state.timelineStatus;
+    }
+
+    function gengaPasteLayer() {
+      if (!gengaLayerClipboard) return;
+      if (!(state.project && state.project.kind === 'genga' && state.project.gengaTimeline)) return;
+      const clipped = gengaLayerClipboard;
+      const isCel = clipped.role !== 'bgbook';
+      if (isCel && gengaTaggableLayerCount(state.project.gengaTimeline) >= 26 && !clipped.tagOff) { alert(t('msg.genga.layer.limitReached')); return; }
+      const refLayerId = state.gengaSelectedLayerId;
+      state.timelineStatus = t('status.genga.layer.pasted');
+      runCommand('レイヤー貼り付け', function(p) {
+        const gt = p.gengaTimeline; if (!gt) return;
+        gt.layers = Array.isArray(gt.layers) ? gt.layers : [];
+        const clone = gengaCloneLayerForPaste(clipped);
+        const refIndex = gt.layers.findIndex(function(l) { return String(l.id) === String(refLayerId); });
+        gt.layers.splice(refIndex >= 0 ? refIndex + 1 : gt.layers.length, 0, clone);
+        state.gengaSelectedLayerId = clone.id;
+        if (state.gengaSelectedLayerIds) state.gengaSelectedLayerIds.clear();
+        gengaRequestCenterLayer(clone.id);
+      });
+    }
+
+    function gengaCutLayer() {
+      const layer = gengaSelectedLayer();
+      if (!layer || layer.role === 'paper') return;
+      gengaCopyLayer();
+      state.timelineStatus = t('status.genga.layer.cut'); // overwrite gengaCopyLayer's "copied" status — this is a cut
+      deleteGengaLayer(layer.id);
     }
     function ungroupGengaCellLayer(layerId) {
       if (!state.project || state.project.kind !== 'genga') return;
@@ -72971,6 +73044,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         setTimeout(function() { if (gengaPendingKeydownPaste) { gengaPendingKeydownPaste = false; gengaPasteCells(); } }, 0);
         return true;
       }
+      return false;
+    }
+    // ver1226: whole-LAYER Ctrl+C/X/V (name/thumbnail selection, no koma range) — see gengaCopyLayer/
+    // gengaPasteLayer/gengaCutLayer. A koma-range selection (state.gengaCellSel) always wins the same
+    // keys via handleGengaCellClipboardKey right above; this only fires when no such range is active.
+    function handleGengaLayerClipboardKey(event) {
+      if (!(state.project && state.project.kind === 'genga')) return false;
+      if (isTypingTarget(event.target) || !(event.ctrlKey || event.metaKey)) return false;
+      if (state.gengaCellSel) return false;
+      const k = String(event.key || '').toLowerCase();
+      const layer = gengaSelectedLayer();
+      if (k === 'c' && layer) { event.preventDefault(); event.stopImmediatePropagation(); gengaCopyLayer(); return true; }
+      if (k === 'x' && layer) { event.preventDefault(); event.stopImmediatePropagation(); gengaCutLayer(); return true; }
+      if (k === 'v' && gengaLayerClipboard) { event.preventDefault(); event.stopImmediatePropagation(); gengaPasteLayer(); return true; }
       return false;
     }
     function gengaFindExposure(proj, layerId, expId) {
