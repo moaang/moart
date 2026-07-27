@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1231</title>
+  <title>MoArt ver1232</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8660,7 +8660,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1231</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1232</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14325,7 +14325,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1231';
+    const APP_DISPLAY_VERSION = '1232';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -48057,6 +48057,340 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const PAINT_TIP_LIBRARY = {};
     function paintRegisterTip(id, image) { if (id && image) PAINT_TIP_LIBRARY[id] = image; }
     function paintGetTip(id) { return id ? (PAINT_TIP_LIBRARY[id] || null) : null; }
+
+    // ===========================================================================================
+    // ## SECTION: BRUSH IMPORT — minimal SQLite3 table-scan reader (for .sut, a plain SQLite3 file)
+    // Not a SQL engine — walks one named table's b-tree and returns every row's column values, in
+    // rowid order. Ported line-for-line from a Python reference (mini_sqlite_reader.py) that was
+    // validated against real .sut files: every row/column of every table matched Python's own
+    // sqlite3 module exactly (622 column-checks, both sample files), including BLOB columns that
+    // overflow onto multiple overflow pages and a genuinely 2-level interior b-tree (sqlite_master
+    // itself, in both files). See docs/brush_import_engine_plan_2026-07-27.md for the investigation
+    // history. Reference: https://www.sqlite.org/fileformat2.html
+    // ===========================================================================================
+    function sqliteReadVarint(buf, offset) {
+      // SQLite's own varint (NOT protobuf varint): up to 9 bytes, first 8 each contribute 7 bits
+      // (MSB = continuation), a 9th byte (if reached) contributes its full 8 bits with no
+      // continuation semantics. Values here never exceed 32 safe-integer bits in practice (page
+      // sizes/rowids/lengths), so plain Number arithmetic is fine — no BigInt needed.
+      let value = 0;
+      for (let i = 0; i < 8; i++) {
+        const byte = buf[offset + i];
+        value = value * 128 + (byte & 0x7F);
+        if ((byte & 0x80) === 0) return { value: value, offset: offset + i + 1 };
+      }
+      value = value * 256 + buf[offset + 8];
+      return { value: value, offset: offset + 9 };
+    }
+    function sqliteReadUint32BE(buf, offset) {
+      return ((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
+    }
+    function sqliteParseDbHeader(data) {
+      if (data.length < 100) throw new Error('File too small to be a SQLite database');
+      for (let i = 0; i < 16; i++) { if (data[i] !== SQLITE_MAGIC_BYTES[i]) throw new Error('Not a SQLite3 database file (bad magic header string)'); }
+      let pageSize = (data[16] << 8) | data[17];
+      if (pageSize === 1) pageSize = 65536; // on-disk 0x0001 means 65536 (doesn't fit a uint16 any other way)
+      const reservedSpace = data[20];
+      const textEncoding = ((data[56] << 24) | (data[57] << 16) | (data[58] << 8) | data[59]) >>> 0;
+      if (textEncoding !== 1 && textEncoding !== 2 && textEncoding !== 3) throw new Error('Unexpected text encoding code: ' + textEncoding);
+      return { pageSize: pageSize, reservedSpace: reservedSpace, textEncoding: textEncoding, usableSize: pageSize - reservedSpace };
+    }
+    const SQLITE_MAGIC_BYTES = [0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00]; // "SQLite format 3\0"
+    const SQLITE_PAGE_TYPE_INTERIOR_TABLE = 5, SQLITE_PAGE_TYPE_LEAF_TABLE = 13;
+    function sqliteGetPageBytes(db, pageNumber) {
+      const start = (pageNumber - 1) * db.header.pageSize;
+      return { pageBytes: db.data.subarray(start, start + db.header.pageSize), headerStart: pageNumber === 1 ? 100 : 0 };
+    }
+    function sqliteParseBTreePageHeader(pageBytes, headerStart) {
+      const pageType = pageBytes[headerStart];
+      let cellContentStart = (pageBytes[headerStart + 5] << 8) | pageBytes[headerStart + 6];
+      if (cellContentStart === 0) cellContentStart = 65536;
+      const isInterior = pageType === SQLITE_PAGE_TYPE_INTERIOR_TABLE;
+      return {
+        pageType: pageType,
+        cellCount: (pageBytes[headerStart + 3] << 8) | pageBytes[headerStart + 4],
+        cellContentStart: cellContentStart,
+        rightMostPointer: isInterior ? sqliteReadUint32BE(pageBytes, headerStart + 8) : null,
+        headerLen: isInterior ? 12 : 8
+      };
+    }
+    function sqliteReadCellPointerArray(pageBytes, headerStart, btreeHeader) {
+      const ptrArrayStart = headerStart + btreeHeader.headerLen;
+      const pointers = [];
+      for (let i = 0; i < btreeHeader.cellCount; i++) {
+        const off = ptrArrayStart + i * 2;
+        pointers.push((pageBytes[off] << 8) | pageBytes[off + 1]);
+      }
+      return pointers;
+    }
+    function sqliteComputeLocalPayloadSize(payloadSize, usableSize) {
+      // Table B-Tree Leaf Cell local-payload-size formula (sqlite.org/fileformat2.html section 1.5/1.6) —
+      // piecewise, not a simple "usable_size - 35" approximation.
+      const U = usableSize, P = payloadSize, X = U - 35;
+      if (P <= X) return { localSize: P, hasOverflow: false };
+      const M = Math.floor((U - 12) * 32 / 255) - 23;
+      const K = M + ((P - M) % (U - 4));
+      return { localSize: K <= X ? K : M, hasOverflow: true };
+    }
+    function sqliteReadOverflowChain(db, firstOverflowPage, remainingBytes) {
+      const usableSize = db.header.usableSize, contentPerPage = usableSize - 4;
+      const out = new Uint8Array(remainingBytes);
+      let outOff = 0, pageNumber = firstOverflowPage, remaining = remainingBytes;
+      while (remaining > 0) {
+        if (pageNumber === 0) throw new Error('Overflow chain ended early: ' + remaining + ' bytes still needed');
+        const pageBytes = sqliteGetPageBytes(db, pageNumber).pageBytes;
+        const nextPageNumber = sqliteReadUint32BE(pageBytes, 0);
+        const take = Math.min(remaining, contentPerPage);
+        out.set(pageBytes.subarray(4, 4 + take), outOff);
+        outOff += take; remaining -= take; pageNumber = nextPageNumber;
+      }
+      return out;
+    }
+    function sqliteReadTableLeafCell(db, pageBytes, cellOffset) {
+      let r = sqliteReadVarint(pageBytes, cellOffset);
+      const payloadSize = r.value;
+      r = sqliteReadVarint(pageBytes, r.offset);
+      const rowid = r.value, off0 = r.offset;
+      const lp = sqliteComputeLocalPayloadSize(payloadSize, db.header.usableSize);
+      const localPayload = pageBytes.slice(off0, off0 + lp.localSize);
+      let fullPayload = localPayload;
+      if (lp.hasOverflow) {
+        const overflowPageNumber = sqliteReadUint32BE(pageBytes, off0 + lp.localSize);
+        const overflowBytes = sqliteReadOverflowChain(db, overflowPageNumber, payloadSize - lp.localSize);
+        fullPayload = new Uint8Array(payloadSize);
+        fullPayload.set(localPayload, 0);
+        fullPayload.set(overflowBytes, lp.localSize);
+      }
+      if (fullPayload.length !== payloadSize) throw new Error('Payload assembly mismatch: expected ' + payloadSize + ' bytes, got ' + fullPayload.length);
+      return { rowid: rowid, payload: fullPayload };
+    }
+    function sqliteWalkTableBTree(db, rootPageNumber, out) {
+      out = out || [];
+      const g = sqliteGetPageBytes(db, rootPageNumber), pageBytes = g.pageBytes, headerStart = g.headerStart;
+      const btreeHeader = sqliteParseBTreePageHeader(pageBytes, headerStart);
+      const pointers = sqliteReadCellPointerArray(pageBytes, headerStart, btreeHeader);
+      if (btreeHeader.pageType === SQLITE_PAGE_TYPE_LEAF_TABLE) {
+        pointers.forEach(function(cellOffset) { out.push(sqliteReadTableLeafCell(db, pageBytes, cellOffset)); });
+      } else if (btreeHeader.pageType === SQLITE_PAGE_TYPE_INTERIOR_TABLE) {
+        pointers.forEach(function(cellOffset) {
+          const leftChildPage = sqliteReadUint32BE(pageBytes, cellOffset); // interior table cells: 4-byte child page + varint key (key unused — pure routing)
+          sqliteWalkTableBTree(db, leftChildPage, out);
+        });
+        sqliteWalkTableBTree(db, btreeHeader.rightMostPointer, out); // highest-keyed subtree — always visited last
+      } else {
+        throw new Error('Page ' + rootPageNumber + ' has page_type=' + btreeHeader.pageType + ', not a table b-tree page (expected 5 or 13)');
+      }
+      return out;
+    }
+    function sqliteDecodeSignedBE(bytes) {
+      let value = 0;
+      for (let i = 0; i < bytes.length; i++) value = value * 256 + bytes[i];
+      const signBit = Math.pow(2, 8 * bytes.length - 1);
+      if (value >= signBit) value -= Math.pow(2, 8 * bytes.length);
+      return value;
+    }
+    const SQLITE_UTF8_DECODER = new TextDecoder('utf-8'), SQLITE_UTF16LE_DECODER = new TextDecoder('utf-16le');
+    function sqliteDecodeUtf16be(bytes) { // TextDecoder has no native utf-16be; byte-swap into a utf-16le buffer
+      const swapped = new Uint8Array(bytes.length);
+      for (let i = 0; i + 1 < bytes.length; i += 2) { swapped[i] = bytes[i + 1]; swapped[i + 1] = bytes[i]; }
+      return SQLITE_UTF16LE_DECODER.decode(swapped);
+    }
+    function sqliteDecodeSerialValue(payload, offset, serialType, textEncoding) {
+      if (serialType === 0) return { value: null, offset: offset };                          // NULL
+      if (serialType >= 1 && serialType <= 6) {                                                // int8/16/24/32/48/64
+        const len = [1, 2, 3, 4, 6, 8][serialType - 1];
+        return { value: sqliteDecodeSignedBE(payload.subarray(offset, offset + len)), offset: offset + len };
+      }
+      if (serialType === 7) {                                                                  // float64 (IEEE754 BE)
+        const b = payload.subarray(offset, offset + 8);
+        const dv = new DataView(b.buffer, b.byteOffset, 8);
+        return { value: dv.getFloat64(0, false), offset: offset + 8 };
+      }
+      if (serialType === 8) return { value: 0, offset: offset };                               // integer constant 0, zero bytes stored
+      if (serialType === 9) return { value: 1, offset: offset };                               // integer constant 1, zero bytes stored
+      if (serialType >= 12 && serialType % 2 === 0) {                                          // BLOB
+        const length = (serialType - 12) / 2;
+        return { value: payload.slice(offset, offset + length), offset: offset + length };
+      }
+      if (serialType >= 13 && serialType % 2 === 1) {                                          // TEXT
+        const length = (serialType - 13) / 2;
+        const raw = payload.subarray(offset, offset + length);
+        const value = textEncoding === 1 ? SQLITE_UTF8_DECODER.decode(raw) : textEncoding === 2 ? SQLITE_UTF16LE_DECODER.decode(raw) : sqliteDecodeUtf16be(raw);
+        return { value: value, offset: offset + length };
+      }
+      throw new Error('Encountered reserved/unused serial type ' + serialType + ' -- file is malformed');
+    }
+    function sqliteReadRecord(payload, textEncoding) {
+      let r = sqliteReadVarint(payload, 0);
+      const headerLength = r.value;
+      const serialTypes = [];
+      let off = r.offset;
+      while (off < headerLength) { r = sqliteReadVarint(payload, off); serialTypes.push(r.value); off = r.offset; }
+      if (off !== headerLength) throw new Error('Record header parsing overran: header_length=' + headerLength + ' but stopped at ' + off);
+      let bodyOff = headerLength;
+      const values = serialTypes.map(function(serialType) {
+        const d = sqliteDecodeSerialValue(payload, bodyOff, serialType, textEncoding);
+        bodyOff = d.offset;
+        return d.value;
+      });
+      return values;
+    }
+    const SQLITE_MASTER_COLUMNS = ['type', 'name', 'tbl_name', 'rootpage', 'sql'];
+    function sqliteReadMaster(db) {
+      return sqliteWalkTableBTree(db, 1).map(function(cell) {
+        const values = sqliteReadRecord(cell.payload, db.header.textEncoding);
+        const row = {}; SQLITE_MASTER_COLUMNS.forEach(function(name, i) { row[name] = values[i]; });
+        row.rowid = cell.rowid;
+        return row;
+      });
+    }
+    function sqliteGetSchema(db) { // {tableName: {rootpage, sql}} — read sqlite_master ONCE, not once per table lookup
+      const schema = {};
+      sqliteReadMaster(db).forEach(function(row) { if (row.type === 'table') schema[row.name] = { rootpage: row.rootpage, sql: row.sql }; });
+      return schema;
+    }
+    function sqliteSplitTopLevelCommas(text) {
+      const parts = []; let depth = 0, current = '';
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '(') { depth++; current += ch; }
+        else if (ch === ')') { depth--; current += ch; }
+        else if (ch === ',' && depth === 0) { parts.push(current); current = ''; }
+        else current += ch;
+      }
+      if (current) parts.push(current);
+      return parts;
+    }
+    function sqliteStripIdentifierQuoting(name) {
+      name = name.trim();
+      if (name.length >= 2) {
+        if ((name[0] === '"' && name[name.length - 1] === '"') || (name[0] === '`' && name[name.length - 1] === '`')) return name.slice(1, -1);
+        if (name[0] === '[' && name[name.length - 1] === ']') return name.slice(1, -1);
+      }
+      return name;
+    }
+    const SQLITE_TABLE_CONSTRAINT_KEYWORDS = ['PRIMARY', 'UNIQUE', 'CHECK', 'FOREIGN', 'CONSTRAINT'];
+    // NULL is deliberately a stop keyword, not a type name: SQLite's grammar lets a bare `NULL` after a column
+    // name mean the (no-op) nullable constraint, and `PRAGMA table_info` on real .sut files confirms columns
+    // written as e.g. `Foo NULL DEFAULT NULL` really do get declared-type = '' — this reproduces that, not just
+    // approximates it (see mini_sqlite_reader.py's validation notes).
+    const SQLITE_COLUMN_DEF_STOP_KEYWORDS = { PRIMARY: 1, NOT: 1, NULL: 1, UNIQUE: 1, CHECK: 1, DEFAULT: 1, COLLATE: 1, REFERENCES: 1, GENERATED: 1, CONSTRAINT: 1, AS: 1 };
+    function sqliteComputeTypeAffinity(typeText) { // sqlite.org/datatype3.html "Determination Of Column Affinity" — first matching rule wins
+      const t = typeText.toUpperCase();
+      if (t.indexOf('INT') >= 0) return 'INTEGER';
+      if (t.indexOf('CHAR') >= 0 || t.indexOf('CLOB') >= 0 || t.indexOf('TEXT') >= 0) return 'TEXT';
+      if (t.indexOf('BLOB') >= 0 || t === '') return 'BLOB';
+      if (t.indexOf('REAL') >= 0 || t.indexOf('FLOA') >= 0 || t.indexOf('DOUB') >= 0) return 'REAL';
+      return 'NUMERIC';
+    }
+    function sqliteParseCreateTableColumns(sql) {
+      const openParen = sql.indexOf('(');
+      let depth = 0, closeParen = -1;
+      for (let i = openParen; i < sql.length; i++) {
+        if (sql[i] === '(') depth++;
+        else if (sql[i] === ')') { depth--; if (depth === 0) { closeParen = i; break; } }
+      }
+      if (closeParen < 0) throw new Error('Malformed CREATE TABLE statement (unbalanced parens): ' + sql);
+      const columnListText = sql.slice(openParen + 1, closeParen);
+      const columns = [];
+      sqliteSplitTopLevelCommas(columnListText).forEach(function(rawDef) {
+        const definition = rawDef.trim();
+        if (!definition) return;
+        const upperDef = definition.toUpperCase();
+        if (SQLITE_TABLE_CONSTRAINT_KEYWORDS.some(function(kw) { return upperDef.indexOf(kw) === 0; })) return; // table-level constraint, not a column def
+        const firstSpace = definition.search(/\s/);
+        const colName = sqliteStripIdentifierQuoting(firstSpace < 0 ? definition : definition.slice(0, firstSpace));
+        const rest = firstSpace < 0 ? '' : definition.slice(firstSpace + 1);
+        const tokens = rest.split(/\s+/).filter(Boolean);
+        const typeTokens = [];
+        let i = 0;
+        while (i < tokens.length) {
+          const tokenKey = tokens[i].toUpperCase().replace(/[(),]+$/, '');
+          if (SQLITE_COLUMN_DEF_STOP_KEYWORDS[tokenKey]) break;
+          typeTokens.push(tokens[i]); i++;
+        }
+        const typeText = typeTokens.join(' ');
+        const remainingUpper = tokens.slice(i).join(' ').toUpperCase();
+        let isRowidAlias = false;
+        if (typeText.trim().toUpperCase() === 'INTEGER' && remainingUpper.indexOf('PRIMARY KEY') === 0) {
+          const beforeAutoincrement = remainingUpper.split('AUTOINCREMENT')[0];
+          if (beforeAutoincrement.indexOf('DESC') < 0) isRowidAlias = true; // "INTEGER PRIMARY KEY DESC" is NOT a rowid alias
+        }
+        columns.push({ name: colName, isRowidAlias: isRowidAlias, affinity: sqliteComputeTypeAffinity(typeText) });
+      });
+      return columns;
+    }
+    function sqliteReadTableRows(db, tableName, schema) {
+      const entry = schema && schema[tableName];
+      if (!entry) throw new Error('Table ' + tableName + ' not found in schema');
+      const columns = sqliteParseCreateTableColumns(entry.sql);
+      const columnNames = columns.map(function(c) { return c.name; });
+      let rowidAliasIndex = -1;
+      columns.forEach(function(c, i) { if (c.isRowidAlias && rowidAliasIndex < 0) rowidAliasIndex = i; });
+      const rows = [];
+      sqliteWalkTableBTree(db, entry.rootpage).forEach(function(cell) {
+        let values = sqliteReadRecord(cell.payload, db.header.textEncoding);
+        if (values.length < columnNames.length) values = values.concat(new Array(columnNames.length - values.length).fill(null)); // ALTER TABLE ADD COLUMN: older rows lack trailing columns -> NULL
+        if (rowidAliasIndex >= 0) {
+          if (values[rowidAliasIndex] != null) throw new Error('table=' + tableName + ' rowid=' + cell.rowid + ': INTEGER PRIMARY KEY column was NOT null on disk — unexpected');
+          values[rowidAliasIndex] = cell.rowid;
+        }
+        // (Python's reference cast a REAL-affinity int to float() here — a real distinction there, since
+        // Python keeps int/float as separate types. JS has one Number type, so 42 and 42.0 are already
+        // indistinguishable; nothing to cast.)
+        const row = {}; columnNames.forEach(function(name, i) { row[name] = values[i]; });
+        row._rowid = cell.rowid;
+        rows.push(row);
+      });
+      return { columnNames: columnNames, rows: rows };
+    }
+    function sqliteLoadDatabase(bytes) { // bytes: Uint8Array of the whole .sut/.sqlite file
+      return { data: bytes, header: sqliteParseDbHeader(bytes) };
+    }
+    // ===========================================================================================
+    // ## SECTION: BRUSH IMPORT — minimal tar reader (a .sut's MaterialFile.FileData BLOB is a plain
+    // tar archive). POSIX ustar: 512-byte header per entry (name/size/typeflag fields at fixed
+    // offsets, size is octal ASCII) + ceil(size/512)*512 bytes of data, ending at two all-zero
+    // blocks. ustar's `prefix` field (long-path extension) is honored; GNU longname (typeflag 'L')
+    // is NOT — none of the .sut sample files' tar members needed it, and this only needs to read
+    // .sut/.brush archives this app creates no other way, not arbitrary tarballs.
+    // ===========================================================================================
+    function tarParseOctal(bytes) {
+      let s = '';
+      for (let i = 0; i < bytes.length; i++) {
+        const c = bytes[i];
+        if (c === 0 || c === 32) break; // NUL or space terminates the field
+        s += String.fromCharCode(c);
+      }
+      return s ? parseInt(s, 8) : 0;
+    }
+    function tarReadNullTerminated(bytes, decoder) {
+      let len = 0;
+      while (len < bytes.length && bytes[len] !== 0) len++;
+      return decoder.decode(bytes.subarray(0, len));
+    }
+    function tarReadEntries(bytes) { // -> [{ name, data: Uint8Array }], directories/links/etc. skipped
+      const decoder = new TextDecoder('utf-8');
+      const entries = [];
+      let offset = 0;
+      while (offset + 512 <= bytes.length) {
+        const header = bytes.subarray(offset, offset + 512);
+        let allZero = true;
+        for (let i = 0; i < 512 && allZero; i++) { if (header[i] !== 0) allZero = false; }
+        if (allZero) break; // end-of-archive marker
+        let name = tarReadNullTerminated(header.subarray(0, 100), decoder);
+        const prefix = tarReadNullTerminated(header.subarray(345, 500), decoder);
+        if (prefix) name = prefix + '/' + name;
+        const size = tarParseOctal(header.subarray(124, 136));
+        const typeflag = header[156];
+        offset += 512;
+        if (typeflag === 0 || typeflag === 48 /* ASCII '0' = regular file; skip dirs('5'), links, etc. */) {
+          entries.push({ name: name, data: bytes.slice(offset, offset + size) });
+        }
+        offset += Math.ceil(size / 512) * 512;
+      }
+      return entries;
+    }
     // Tips are shape-only alpha masks (like every real brush-tip format) — this tints one to the
     // stroke's color ONCE per stroke render (not per dab: source-in on a tip-sized offscreen canvas is
     // cheap, and the whole stroke already re-renders whole per move under ver621/641's model, so a
