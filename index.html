@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1233</title>
+  <title>MoArt ver1234</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8660,7 +8660,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1233</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1234</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14344,7 +14344,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1233';
+    const APP_DISPLAY_VERSION = '1234';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -17363,10 +17363,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return JSON.stringify(out);
     }
     function gengaLayerGlobalRenderSignature(gt) {
+      const dur = Math.max(1, Math.round(Number(gt && gt.totalFrames) || 1));
       return JSON.stringify(((gt && gt.layers) || []).map(function(layer) {
         // These fields participate in the bottom-up A-Z/header structure, so one layer can change labels
         // rendered in other heads. They are an all-generated-content boundary, not a keyed-row edit.
-        return [String(layer.id), String(layer.role || ''), Boolean(layer.tagOff), String(layer.cellGroupId || '')];
+        // ver1234: the layer-FX transform RUN COUNT joined them for the same reason — since ver1233 the
+        // a/b/c.. boundary labels are ONE sequence continuing across layers (gengaFxTransformRuns' startSeq),
+        // so adding/removing a run on a lower layer shifts every higher layer's labels. Only the COUNT is a
+        // cross-layer dependency (a label is startSeq+i); moving a key WITHIN a run changes neither the count
+        // nor any other layer's labels, so those edits stay on the cheap keyed-row path.
+        return [String(layer.id), String(layer.role || ''), Boolean(layer.tagOff), String(layer.cellGroupId || ''),
+                gengaFxTransformRuns(layer, dur).length];
       }));
     }
     // ver1197: the dopesheet row's geometry, read from the SAME --genga-row-h / --genga-fx-track-h the CSS
@@ -51231,8 +51238,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.gengaFrame = 1;
       if (tlTut) tlTut.fired = {}; // ver1148: reset requireAll progress
       normalizeProject(state.project);
-      guardedRender('stage', renderGengaView);
-      if (typeof drawGengaPreview === 'function') drawGengaPreview();
+      // ver1234: through refresh() like every other path that REPLACES timeline data (this swaps gt.layers
+      // wholesale), so an open timesheet cannot survive a lesson change showing the previous lesson's rows.
+      // gengaTimesheetRefresh is a no-op while that window is closed, which it normally is during the tutorial.
+      refresh({ skipChrome: true, gengaRenderPlan: { scope: 'all', reason: 'tutorial-lesson' } });
     }
 
     // ver1144: the mini host reparents the REAL #gengaStage (the dope-sheet) into a guidebook container, so the
@@ -72605,8 +72614,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // is the CONTE video timeline (#timingDashboard, body gated on state.videoEditMode which is ALWAYS false for genga),
       // so it silently did nothing here — camera-key diamonds / ◆ state only refreshed on reload. Rebuild the genga
       // view (rebuilds the camera lane), then repaint the preview onto the fresh canvas.
-      guardedRender('stage', renderGengaView);
-      try { drawGengaPreview(); } catch (e) {}
+      // ver1234: through refresh() now, for the same reason the layer-patch twin changed — see runGengaCameraCommand.
+      refresh({ skipChrome: true, gengaRenderPlan: { scope: 'all', reason: 'camera-history' } });
     }
     function runGengaCameraCommand(name, mutator) {
       const before = captureGengaCameraState(state.project);
@@ -72617,8 +72626,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver707 (stale-render fix): renderGengaView is genga's dope-sheet renderer, NOT renderTimingDashboard
       // (the conte video timeline, a no-op for genga) — see applyGengaCameraHistoryState. Rebuild the lane so a
       // newly-set / removed / moved camera key shows on the timeline immediately, then repaint the preview.
-      guardedRender('stage', renderGengaView);
-      try { drawGengaPreview(); } catch (e) {}
+      // ver1234: …and go through refresh() to do it, instead of poking guardedRender('stage') directly. That
+      // bypass was the real cause of "the timesheet doesn't update until I touch something else": refresh() is
+      // the ONE place that calls gengaTimesheetRefresh, and every camera edit that is not a live drag (the ◆
+      // toggle, a right-click key delete, a key retime, undo/redo) came through here and skipped it. A live
+      // drag looked fine only because gengaCameraApply calls gengaTimesheetDraw itself per frame.
+      // scope:'all' is required, not conservative: the camera lane is only rebuilt on a non-partial render.
+      refresh({ skipChrome: true, gengaRenderPlan: { scope: 'all', reason: 'camera' } });
       try { scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS); } catch (e) {}
     }
     // ── ver754 (PERF-9/TICKET-E1): lean per-LAYER genga history — the conte runConteLayerCutPatchCommand
@@ -72657,9 +72671,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const byId = new Map();
       payload.layers.forEach(function(item) { if (item && item.id && item.layer) byId.set(String(item.id), fastClone(item.layer)); });
       const rowHeightBefore = new Map();
+      const layerBefore = new Map();
       (gt.layers || []).forEach(function(layer) {
         const id = String(layer && layer.id || '');
-        if (byId.has(id)) rowHeightBefore.set(id, gengaLayerRenderRowHeight(layer));
+        if (byId.has(id)) { rowHeightBefore.set(id, gengaLayerRenderRowHeight(layer)); layerBefore.set(id, fastClone(layer)); }
       });
       (gt.layers || []).forEach(function(l) {
         const id = String(l && l.id || '');
@@ -72671,13 +72686,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const tagOverlay = layerIds.some(function(id) {
         return rowHeightBefore.get(id) !== gengaLayerRenderRowHeight(byId.get(id));
       });
+      // ver1234: same FX-label-sequence escalation runGengaLayerPatchCommand does — undoing/redoing a key
+      // that adds or removes a run shifts every higher layer's labels too, which a keyed-row patch can't repaint.
+      const fxSeqShifted = gengaFxRunCountShifted(layerIds.map(function(id) {
+        return { before: layerBefore.get(id), after: byId.get(id) };
+      }), gt.totalFrames);
       if (!(options && options.skipStage)) {
-        guardedRender('stage', function() { renderGengaView(null, { scope: 'partial', layerIds: layerIds, audio: false, tagOverlay: tagOverlay }); });
+        // ver1234: route through refresh() instead of poking guardedRender('stage') directly — that bypass is
+        // why an undone/redone FX key left the open timesheet window stale (refresh() is what calls
+        // gengaTimesheetRefresh). renderGengaView's own tail still repaints the canvas, so nothing else changes.
+        refresh({ skipChrome: true, gengaRenderPlan: fxSeqShifted
+          ? { scope: 'all', reason: 'fx-label-seq' }
+          : { scope: 'partial', layerIds: layerIds, audio: false, tagOverlay: tagOverlay } });
       } else {
         try { drawGengaPreview(); } catch (e) {}
         try { drawGengaLayerThumbs(layerIds); } catch (e) {}
+        gengaTimesheetRefresh(); // ver1234: skipStage skips the dopesheet, NOT the timesheet — the data changed either way
       }
       gengaFxPanelSync();                     // FX window numbers follow an undone/redone key
+    }
+    // ver1234: the two LEAN per-layer paths (runGengaLayerPatchCommand and applyGengaLayerPatchHistoryState)
+    // build their own partial plan and deliberately never run gengaRenderPlanForProjects' signature
+    // comparison — so the one cross-layer dependency they can still trip has to be checked explicitly:
+    // a change in a patched layer's FX transform RUN COUNT shifts every HIGHER layer's a/b/c.. boundary
+    // labels, since ver1233 made that one sequence continue across layers (gengaFxTransformRuns' startSeq;
+    // the same reasoning put run count into gengaLayerGlobalRenderSignature). A keyed-row patch physically
+    // cannot repaint those other rows, so such an edit must escalate to a full render.
+    function gengaFxRunCountShifted(pairs, dur) {
+      const d = Math.max(1, Math.round(Number(dur) || 1));
+      return (pairs || []).some(function(p) {
+        if (!p || !p.before || !p.after) return false;
+        return gengaFxTransformRuns(p.before, d).length !== gengaFxTransformRuns(p.after, d).length;
+      });
     }
     // runCommand's exact tail contract (same refreshOptions), minus the two whole-project clones, the
     // cell-group sync and normalizeProject — so a call site swaps in without changing what it renders.
@@ -72690,7 +72730,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const tagOverlay = after.layers.some(function(item) {
         return gengaLayerRenderRowHeight(beforeById.get(String(item.id))) !== gengaLayerRenderRowHeight(item.layer);
       });
-      const gengaRenderPlan = { scope: 'partial', layerIds: ids, audio: false, tagOverlay: tagOverlay };
+      const fxSeqShifted = gengaFxRunCountShifted(after.layers.map(function(item) {
+        return { before: beforeById.get(String(item.id)), after: item.layer };
+      }), (state.project.gengaTimeline || {}).totalFrames);
+      const gengaRenderPlan = fxSeqShifted
+        ? { scope: 'all', reason: 'fx-label-seq' }
+        : { scope: 'partial', layerIds: ids, audio: false, tagOverlay: tagOverlay };
       pushUndoCommand({ name: name, before: before, after: after, gengaLayerPatchEdit: true, gengaRenderPlan: gengaRenderPlan });
       if (tlTut) { try { tlTutOnCommand(name); } catch (e) {} } // ver1148: layer-patch ops (post/preBehavior, onion, eye…) are detectable too
       state.redoStack = [];
@@ -76563,6 +76608,28 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // options = { skipSource, skipMemo, skipStage, skipInspector, skipChrome, skipTiming }
     // 호출자가 영향 범위를 안다면 해당 영역만 갱신해 비용 절감 (renderSource는 770 blocks DOM 통째 재생성이 가장 비쌈).
     // 옵션 미지정 시 기존 동작 100% 보존.
+    //
+    // ==== ver1234 — GENGA REFRESH CONTRACT (read this before adding another genga render call) ====
+    // refresh() is the ONLY place that rebuilds an open timesheet window (gengaTimesheetRefresh). Therefore:
+    //
+    //   ANY mutation of gengaTimeline DATA must land here. Never call guardedRender('stage', renderGengaView)
+    //   directly for a data change — that bypass is what left the timesheet frozen until an unrelated edit
+    //   happened to come through, and it was independently re-introduced by three different call sites
+    //   (runGengaCameraCommand, applyGengaCameraHistoryState, applyGengaLayerPatchHistoryState).
+    //
+    // Calling renderGengaView directly is correct ONLY for a VIEW-local change that no other surface derives
+    // anything from — cell-width zoom, shown-frame geometry, which FX tracks a row displays, a status line.
+    // Those legitimately skip the timesheet because its content did not change.
+    //
+    // Choosing gengaRenderPlan.scope:
+    //   'all'     — the camera lane, or any cross-layer label sequence, may have changed. The camera lane and
+    //               the a/b/c.. FX label sequence are only rebuilt on a non-partial render.
+    //   'partial' — ONE layer's own row content changed and nothing outside that row derives from it. The two
+    //               lean paths must still run gengaFxRunCountShifted() and escalate to 'all' when it is true.
+    //   'none'    — nothing visible changed; the stage render is skipped (the timesheet still refreshes).
+    // The two plan PRODUCERS are gengaRenderPlanForProjects (signature diff, used by runCommand) and the
+    // hand-built plans in the lean per-layer paths; keep any new cross-layer dependency in step with BOTH.
+    // ============================================================================================
     function refresh(options) {
       options = options || {};
       gengaClearOnionCache(); // project may have changed (command/undo/redo) → tinted onion frames are stale
