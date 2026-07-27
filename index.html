@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1239</title>
+  <title>MoArt ver1240</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8660,7 +8660,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1239</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1240</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14347,7 +14347,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1239';
+    const APP_DISPLAY_VERSION = '1240';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -58351,7 +58351,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         box.addEventListener('change', function() {
           if (!state.shortcuts.__hold) state.shortcuts.__hold = {};
           state.shortcuts.__hold[box.dataset.shortcutHold] = box.checked;
-          if (!box.checked && shortcutHoldActive && shortcutHoldActive.actionId === box.dataset.shortcutHold) endShortcutHold(); // turning it off mid-hold must not strand the tool on the held one
+          if (!box.checked && paintToolHoldActive && paintToolHoldActive.actionId === box.dataset.shortcutHold) endPaintToolHold(); // turning it off mid-hold must not strand the tool on the held one
           saveShortcutSettings();
         });
       });
@@ -58440,33 +58440,79 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // unlike that one-off, this drives it through the REAL tool-entry functions (setActivePaintTool /
     // selectPaintEditTool) rather than poking state fields directly, so every side effect those already carry
     // (genga selection lift, transform-box setup, FX-panel close, etc.) replays correctly on both ends.
-    let shortcutHoldActive = null; // { actionId, rawKey, prevTool, prevEditTool }
+    // ver1240: a hold is "temporarily become another tool, then go back", and the only thing that differs between
+    // holds is what STARTS and ENDS one. So the save/restore core lives here once and each trigger is a thin
+    // caller: the held shortcut key (ver1225) and the stylus eraser end (below).
+    let paintToolHoldActive = null; // { source:'shortcut'|'pen-eraser', actionId?, rawKey?, pointerId?, prevTool, prevEditTool }
 
-    function beginShortcutHold(def, event) {
-      if (shortcutHoldActive) endShortcutHold(); // only one hold in flight — settle the previous one first
+    function beginPaintToolHold(source, meta, enter) {
+      if (paintToolHoldActive) endPaintToolHold(); // only one hold in flight — settle the previous one first
       const prevTool = state.paintTool;
       const prevEditTool = state.paintEditTool;
-      def.run(event, { inGenga: !!(state.project && state.project.kind === 'genga') });
-      shortcutHoldActive = { actionId: def.id, rawKey: String(event.key || '').toLowerCase(), prevTool: prevTool, prevEditTool: prevEditTool };
-      document.addEventListener('keyup', onShortcutHoldKeyUp, true);
-      window.addEventListener('blur', endShortcutHold, true); // key-up never fires if focus leaves the window mid-hold
+      enter();
+      paintToolHoldActive = Object.assign({ source: source, prevTool: prevTool, prevEditTool: prevEditTool }, meta || {});
+      if (source === 'shortcut') document.addEventListener('keyup', onShortcutHoldKeyUp, true);
+      window.addEventListener('blur', endPaintToolHold, true); // the release event never fires if focus leaves the window mid-hold
     }
 
-    function endShortcutHold() {
-      const hold = shortcutHoldActive;
+    function endPaintToolHold() {
+      const hold = paintToolHoldActive;
       if (!hold) return;
-      shortcutHoldActive = null;
+      paintToolHoldActive = null;
       document.removeEventListener('keyup', onShortcutHoldKeyUp, true);
-      window.removeEventListener('blur', endShortcutHold, true);
+      window.removeEventListener('blur', endPaintToolHold, true);
       if (hold.prevEditTool) selectPaintEditTool(hold.prevEditTool);
       else setActivePaintTool(hold.prevTool || 'pen');
       updatePaintUI();
     }
 
+    function beginShortcutHold(def, event) {
+      beginPaintToolHold('shortcut', { actionId: def.id, rawKey: String(event.key || '').toLowerCase() }, function() {
+        def.run(event, { inGenga: !!(state.project && state.project.kind === 'genga') });
+      });
+    }
+
     function onShortcutHoldKeyUp(event) {
-      if (!shortcutHoldActive) return;
-      if (String(event.key || '').toLowerCase() !== shortcutHoldActive.rawKey) return; // a different key released — not ours
-      endShortcutHold();
+      const hold = paintToolHoldActive;
+      if (!hold || hold.source !== 'shortcut') return;
+      if (String(event.key || '').toLowerCase() !== hold.rawKey) return; // a different key released — not ours
+      endPaintToolHold();
+    }
+
+    // ver1240: the stylus's ERASER END erases, the way Flash and CLIP STUDIO do it. Pointer Events reports a
+    // stylus whose eraser is in contact as button 5 / buttons bit 5; the two barrel buttons use 2 and 4, so
+    // nothing else can be mistaken for it. This is a pure fix as well as a feature: memoPrimaryPointerDownAllowed
+    // passes ANY pen press regardless of button, so until now the eraser end simply drew.
+    const PEN_ERASER_BUTTON = 5;
+    const PEN_ERASER_BUTTONS_BIT = 32;
+    // Every stroke entry point — beginPaintStroke on #memoCanvas, gengaDrawStart on #gengaPreviewCanvas,
+    // beginVideoPaintStroke on #conteVideoStage, and beginPaintDrawFromViewport's .editor-stage re-dispatch —
+    // reads state.paintTool when it BUILDS the stroke, so one capture-phase listener on document can swap the tool
+    // before any of them run. That keeps the rule in a single place instead of one copy per entry point.
+    const PAINT_DRAW_SURFACE_SELECTOR = '#memoCanvas, #gengaPreviewCanvas, #conteVideoStage, .editor-stage';
+
+    function pointerEventIsPenEraser(event) {
+      if (!event || event.pointerType !== 'pen') return false;
+      return event.button === PEN_ERASER_BUTTON || Boolean(Number(event.buttons) & PEN_ERASER_BUTTONS_BIT);
+    }
+
+    function onPenEraserPointerDown(event) {
+      if (!pointerEventIsPenEraser(event) || paintToolHoldActive) return;
+      if (state.paintEditTool) return;                         // transform / lasso / perspective / camera keep their armed state — the eraser end must not tear it down
+      if (state.paintTool === 'eraser') return;                // already erasing: nothing to swap, nothing to restore
+      if (PAINT_DRAW_TOOL_IDS.indexOf(state.paintTool) < 0) return;
+      if (!event.target || !event.target.closest || !event.target.closest(PAINT_DRAW_SURFACE_SELECTOR)) return;
+      beginPaintToolHold('pen-eraser', { pointerId: event.pointerId }, activatePaintEraser);
+    }
+
+    // Restoring at the capture phase is safe even though the stroke commits later: every builder bakes `tool` into
+    // the stroke object at pointerdown and no end/commit path re-reads state.paintTool. Bound on document rather
+    // than on the surfaces because an element's own pointerup/pointercancel is not guaranteed to be delivered.
+    function onPenEraserPointerUp(event) {
+      const hold = paintToolHoldActive;
+      if (!hold || hold.source !== 'pen-eraser') return;
+      if (event && typeof event.pointerId === 'number' && event.pointerId !== hold.pointerId) return;
+      endPaintToolHold();
     }
 
     // ver942: single resolver replaces the old parallel handleConfiguredShortcut if-chain + handleGengaShortcut
@@ -59251,6 +59297,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       document.addEventListener('pointerdown', handlePaintSpacePanPointerDown);
       document.addEventListener('pointerdown', beginPaintTransformFromViewport);
       document.addEventListener('pointerdown', beginPaintDrawFromViewport);
+      // ver1240: capture phase, so the eraser end is already the active tool by the time the surface handlers
+      // above build their stroke. Release is captured too — an element's own pointerup is not guaranteed.
+      document.addEventListener('pointerdown', onPenEraserPointerDown, true);
+      document.addEventListener('pointerup', onPenEraserPointerUp, true);
+      document.addEventListener('pointercancel', onPenEraserPointerUp, true);
       // Same iPad Apple Pencil scroll-hijack guard as the draw canvas, but for strokes that run in the
       // gray stage area (outside the canvas): while a stroke is active, cancel the pencil's touchmove
       // so WebKit does not start its scroll decision and eat the input.
