@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1216</title>
+  <title>MoArt ver1217</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8663,7 +8663,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1216</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1217</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14270,7 +14270,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1216';
+    const APP_DISPLAY_VERSION = '1217';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -63392,6 +63392,41 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // parse a "from|to|label|text" camera/fx manual string into spans (mirror of #preview
     // parseSheetEditorManualBlocks; timecodes are the sheet's own "sec+ff" at SHEET_FIXED_FPS).
+    // ver1218: MoArt had NO position-allocation concept at all for overlapping camera/layer-FX work — every
+    // span drew on the exact same X (camMid = column centre), so a camera keyframe run and a layer's own FX
+    // run covering the same frames (a real, common case: gengaBuildCameraManual + gengaBuildLayerFxManual
+    // are concatenated into ONE camSpans list) sat fully on top of each other. #sheet already solves this
+    // (assignLanes/assignCameraLanes, a standard greedy interval-scheduling "meeting rooms" pass, no lane
+    // cap — it just happens that real sheets rarely need more than two at once). Ported verbatim rather than
+    // inventing a new scheme, including the "a connected/unbroken run stays on its predecessor's lane" rule.
+    function gengaAssignCameraLanes(segments) {
+      const sorted = segments.slice().sort(function(a, b) { return a.from - b.from || a.to - b.to; });
+      const laneEnds = [];
+      sorted.forEach(function(seg) {
+        let lane = laneEnds.findIndex(function(end) { return seg.from > end; });
+        if (lane === -1) { lane = laneEnds.length; laneEnds.push(seg.to); }
+        else laneEnds[lane] = seg.to;
+        seg.lane = lane;
+      });
+      const normLabel = function(v) { return String(v || '').normalize('NFKC').trim().toUpperCase(); };
+      const labelsMatch = function(a, b) { const aa = normLabel(a), bb = normLabel(b); return !!aa && aa === bb; };
+      sorted.forEach(function(seg) {
+        const previous = sorted.find(function(other) { return other !== seg && other.to === seg.from && labelsMatch(other.endLabel, seg.label); });
+        if (previous && Number.isFinite(previous.lane)) seg.lane = previous.lane;
+      });
+      return sorted;
+    }
+    // ver1218: #sheet's own lane-center formula (getDistributedLaneX), ported as-is — including its
+    // single-lane placement (areaX + inset, near the column's LEFT edge, not the centre conte used to draw
+    // at). That is a deliberate part of "match #sheet", not an accidental side effect: a lone camera work now
+    // sits where #sheet has always drawn it.
+    function gengaDistributedLaneX(areaX, areaW, lane, laneCount, inset) {
+      const pad = inset || 12;
+      if (laneCount <= 1) return areaX + pad;
+      const usable = Math.max(0, areaW - pad * 2);
+      const step = usable / Math.max(1, laneCount - 1);
+      return areaX + pad + step * lane;
+    }
     function gengaTimesheetParseManual(raw) {
       const parseTc = function(v) {
         const p = String(v || '').split('+');
@@ -63468,7 +63503,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         return g;
       });
-      const camSpans = gengaTimesheetParseManual([gengaBuildCameraManual(gt), gengaBuildLayerFxManual(gt)].filter(Boolean).join('\n'));
+      // ver1219: build the camera-column TEXT from the live-drag shadow, not the raw committed gt — the sheet
+      // koma grid/header below keeps using the real gt (nothing there can be mid-drag).
+      const camGt = gengaTimesheetLiveGt(gt);
+      const camSpans = gengaAssignCameraLanes(gengaTimesheetParseManual([gengaBuildCameraManual(camGt), gengaBuildLayerFxManual(camGt)].filter(Boolean).join('\n')));
+      const camLaneCount = Math.max.apply(null, camSpans.map(function(s) { return (s.lane || 0) + 1; }).concat([1]));
       svg.innerHTML = '';
       svg.setAttribute('viewBox', '0 0 ' + PAGE_W + ' ' + PAGE_H);
       svg.removeAttribute('width'); svg.removeAttribute('height'); // CSS scales the page to the panel
@@ -63516,7 +63555,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
         });
         // カメラ spans intersecting this block: guide line + RED caps (only at the real ends) + directive text
-        const camMid = xInb + cameraW / 2;
         // ver1208: drawn the way Auto Sheet draws it, not approximated. #sheet's camera column is a 持続線 down
         // the lane with a DASH across it at each real endpoint, the frame name in a RING beside that dash, and the
         // directive text on the SECOND frame of the span (drawCameraMarkerEndpoint / drawCircledCameraEndpointLabel /
@@ -63525,9 +63563,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ⚠and it lost the frame SIZE outright when ver1207 moved Fr out of the directive text and onto the label:
         // the preview never read the new per-endpoint map. It reads the same gengaSheetCameraEndpointFr the sheet
         // payload carries, so the three surfaces (lane, preview, printed sheet) now all say the same thing.
-        const camFr = gengaSheetCameraEndpointFr(gt);
+        const camFr = gengaSheetCameraEndpointFr(camGt);
         const ringR = Math.min(cameraW * 0.16, ROWH * 0.62, 11);
-        const camEndpoint = function(y, labelText) {
+        const camEndpoint = function(camMid, y, labelText) {
           line(camMid - 9, y, camMid + 11, y, '#111', 1.8);           // the dash IS the endpoint mark (#sheet '-')
           const lb = String(labelText || '').trim();
           if (!lb) return;
@@ -63542,6 +63580,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         camSpans.forEach(function(s) {
           if (s.to < start || s.from > Math.min(total, blockEnd)) return;
           const from = Math.max(s.from, start), to = Math.min(s.to, blockEnd, total);
+          // ver1218: per-SPAN lane X, not one shared column-centre X — see gengaAssignCameraLanes above.
+          const camMid = gengaDistributedLaneX(xInb, cameraW, s.lane || 0, camLaneCount, 12);
           // ver1210: the endpoint mark and its ring sit at the ROW'S MIDDLE, inside the koma — that is what
           // #sheet's drawCameraMarkerEndpoint does (midY = rowTop + rowH/2 for both the dash and the label).
           // ver1208 put them on the row's top/bottom EDGE, i.e. on a grid line, so the dash read as sitting on
@@ -63574,8 +63614,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             seg.push([px, py]);
           }
           flushSeg();
-          if (s.from >= start) camEndpoint(yA, s.label);
-          if (s.to <= blockEnd) camEndpoint(yB, s.endLabel);
+          if (s.from >= start) camEndpoint(camMid, yA, s.label);
+          if (s.to <= blockEnd) camEndpoint(camMid, yB, s.endLabel);
           if (s.text) text(camMid + bow, yMidRange, s.text, 10, '#111'); // in the curve's hole, centred on it
 
         });
@@ -63658,6 +63698,60 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function gengaTimesheetRefresh() {
       const win = document.getElementById('gengaTimesheetWindow');
       if (win && !win.hidden) gengaTimesheetDraw();
+    }
+    // ver1219: LIVE-drag awareness, coalesced to one redraw per animation frame — the same discipline
+    // gengaScheduleViewDraw already uses for the canvas. Camera-gizmo and layer-FX drags write ONLY a live
+    // overlay (state.gengaCamFxLive / gengaFxLive) and call drawGengaPreview() directly per event, on
+    // purpose, for performance — the committed data (gt.cameraWork.keyframes / layer.fx.*) doesn't change
+    // until release, which is exactly why the timesheet used to sit frozen for the whole gesture and only
+    // jump at the end. Un-throttled per-event, a SECOND full sheet rebuild stacked on top of every drag
+    // tick's canvas repaint is the exact perf trap this app has hit more than once — so this schedules at
+    // most one rebuild per frame, never runs synchronously off a pointermove, and only touches the DOM at
+    // all when the window is actually open.
+    let gengaTsLiveDrawPending = false;
+    function gengaScheduleTimesheetLiveDraw() {
+      const win = document.getElementById('gengaTimesheetWindow');
+      if (!win || win.hidden) return;
+      if (gengaTsLiveDrawPending) return;
+      gengaTsLiveDrawPending = true;
+      requestAnimationFrame(function() { gengaTsLiveDrawPending = false; gengaTimesheetDraw(); });
+    }
+    // A SHADOW gt with the in-progress drag value spliced in at the current frame — never written back to
+    // state.project, so a cancelled drag or an interrupted redraw can never leak a live value into the real
+    // project. Falls straight through to the real gt (no clone) once nothing is live, so the common case
+    // (nothing being dragged) costs nothing extra.
+    function gengaTimesheetLiveGt(gt) {
+      // ver1219: same priority as drawGengaPreview's own wcam ternary (line ~69223) — the on-canvas gizmo
+      // drag (gengaCamDrag.live) wins over the カメラFX window's own live buffer (state.gengaCamFxLive);
+      // they are never both active at once, but this keeps the two surfaces from ever disagreeing about
+      // which one is authoritative if that ever changed.
+      const camLive = gengaCamDrag ? gengaCamDrag.live : state.gengaCamFxLive;
+      if (!camLive && !gengaFxLive) return gt;
+      const frame = gengaCurrentFrame();
+      const shadow = Object.assign({}, gt);
+      if (camLive) {
+        const live = camLive;
+        const kfs = ((gt.cameraWork && gt.cameraWork.keyframes) || []).slice();
+        const idx = kfs.findIndex(function(k) { return k.frame === frame; });
+        const patched = Object.assign({}, kfs[idx] || { frame: frame }, { x: live.x, y: live.y, w: live.w, h: live.h, rotation: live.rotation });
+        if (idx === -1) kfs.push(patched); else kfs[idx] = patched;
+        kfs.sort(function(a, b) { return a.frame - b.frame; });
+        shadow.cameraWork = Object.assign({}, gt.cameraWork, { keyframes: kfs });
+      }
+      if (gengaFxLive) {
+        shadow.layers = (gt.layers || []).map(function(L) {
+          if (String(L.id) !== String(gengaFxLive.layerId)) return L;
+          const track = gengaFxLive.track;
+          const arr = ((L.fx && L.fx[track]) || []).slice();
+          const idx = arr.findIndex(function(k) { return k.frame === frame; });
+          const patched = Object.assign({}, arr[idx] || { frame: frame }, gengaFxLive.patch);
+          if (idx === -1) arr.push(patched); else arr[idx] = patched;
+          arr.sort(function(a, b) { return a.frame - b.frame; });
+          const fx = Object.assign({}, L.fx); fx[track] = arr;
+          return Object.assign({}, L, { fx: fx });
+        });
+      }
+      return shadow;
     }
 
     // recurse a dropped directory handle. Returns {json, images, jsonNames, hasConteProject, parseErrors} for
@@ -67053,9 +67147,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gengaFxLive = { layerId: s.layerId, track: s.track, patch: s.d.patch(s.value) };
         gengaFxSetFieldDisplay(s.el, s.d, s.value);
         drawGengaPreview();
+        gengaScheduleTimesheetLiveDraw(); // ver1219
       },
       preRelease: function() { gengaFxLive = null; fxQualityInteractive = false; fxMipPrebuildPending = false; }, // ver749 (fix_design 2-4): always drop the overlay on release — a stranded live buffer kept the preview frozen off-data. ver848 §5: the quality flag returns to final on EVERY exit (fxScrubUp calls preRelease before commit, clickType AND pointercancel — the mode-branch-must-exit round trip)
-      cancel: function(s) { gengaFxSetFieldDisplay(s.el, s.d, s.startValue); drawGengaPreview(); setTimeout(gengaFxPanelSync, 0); }, // ver749: discard preview, no auto-key, no numeric entry
+      cancel: function(s) { gengaFxSetFieldDisplay(s.el, s.d, s.startValue); drawGengaPreview(); gengaScheduleTimesheetLiveDraw(); setTimeout(gengaFxPanelSync, 0); }, // ver749: discard preview, no auto-key, no numeric entry
       commit: function(s) { gengaFxWriteValue(s.layerId, s.track, s.d.patch(s.value), gengaCurrentFrame()); setTimeout(gengaFxPanelSync, 0); }, // ver1202
       clickType: function(s) {
         drawGengaPreview();
@@ -67343,9 +67438,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // at pointerup, which reads as "it only moves after you let go". cameraFxWindowSync's own
           // `if (cameraFxScrub) return` guard still blocks the window->window write-back, so no feedback loop.
           read: function() { return dispFromRect(gengaCamDrag ? gengaCamDrag.live : (state.gengaCamFxLive || gengaCameraWorkAt(gt, gengaCurrentFrame()))); },
-          applyLive: function(dp) { state.gengaCamFxLive = rectFromDisp(dp); drawGengaPreview(); },
+          applyLive: function(dp) { state.gengaCamFxLive = rectFromDisp(dp); drawGengaPreview(); gengaScheduleTimesheetLiveDraw(); },
           commit: function(dp) { state.gengaCamFxLive = null; gengaSetCameraKeyframe(gengaCurrentFrame(), rectFromDisp(dp)); drawGengaPreview(); },
-          cancelLive: function() { if (state.gengaCamFxLive) { state.gengaCamFxLive = null; drawGengaPreview(); } },
+          cancelLive: function() { if (state.gengaCamFxLive) { state.gengaCamFxLive = null; drawGengaPreview(); gengaScheduleTimesheetLiveDraw(); } },
           clearAll: function() {
             const keys = (gt.cameraWork.keyframes || []).length;
             if (!keys) return;
@@ -71906,6 +72001,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       cam.x = next.x; cam.y = next.y; cam.w = next.w; cam.h = next.h; cam.rotation = next.rotation;
       drawGengaPreview(); // ev.preventDefault() is done in gengaCameraPointerMove (this runs in a rAF tick)
+      // ver1219: this whole function already runs at most once per animation frame (gengaCameraTick's
+      // rAF-latest gate above), so a direct call here is automatically frame-coalesced — no separate
+      // scheduler needed, unlike the FX-scrub paths below which fire once per raw pointermove.
+      if (gengaCamDrag) gengaTimesheetDraw();
     }
     function gengaCameraPointerEnd(ev) {
       if (!gengaCamDrag) return;
