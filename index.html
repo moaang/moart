@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1222</title>
+  <title>MoArt ver1223</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8663,7 +8663,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1222</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1223</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -9235,6 +9235,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     .genga-ts-stage::-webkit-scrollbar-corner { background: transparent; }
     .genga-ts-stage::-webkit-scrollbar-thumb { background: var(--sh-surface-3, #b9b9ae); border: 2px solid transparent; background-clip: padding-box; border-radius: 5px; }
     .genga-ts-stage::-webkit-scrollbar-thumb:hover { background: var(--sh-accent, #8a8a80); background-clip: padding-box; }
+    /* ver1225: middle-click drag pans the stage (gengaTimesheetBindStage) — cursor feedback only, the
+       actual scroll is a direct scrollLeft/scrollTop write, no different from dragging the scrollbars. */
+    .genga-ts-stage.genga-ts-panning { cursor: grabbing; user-select: none; }
     .genga-ts-window.side-docked .genga-ts-stage { width: auto; height: 100%; }
     /* ver1213: the ver1212 hand-drawn corner grip is REVERTED. Inventing a new affordance for one window is
        exactly the divergence the UI rules forbid, and it did not match the shell's grip either. It would not have
@@ -14270,7 +14273,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1222';
+    const APP_DISPLAY_VERSION = '1223';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -63427,6 +63430,55 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const step = usable / Math.max(1, laneCount - 1);
       return areaX + pad + step * lane;
     }
+    // ver1225: #sheet's OL/FI/FO special-shape detection, ported as pure logic (the DRAWING half —
+    // gengaRenderCameraSpecialShape/gengaDrawWithinCutOlLabels — lives as local closures inside
+    // gengaTimesheetDraw itself, next to camEndpoint, since they need that call's own node/text helpers).
+    // Simplified from #sheet's originals in one place only: #sheet's getCameraSpecialShapeInfo also checks
+    // a manual per-line previewStyle override (state.cameraPreviewStyles, a right-click "force this shape"
+    // authoring feature) — conte's read-only preview has no such per-line override in its data at all, so
+    // that candidate is dropped rather than faked.
+    function gengaNormalizeCameraShapeToken(value) {
+      return String(value || '')
+        .normalize('NFKC')
+        .replace(/[.\s_\-・/\\()（）\[\]【】]+/g, '')
+        .toUpperCase();
+    }
+    function gengaCameraSpecialShapeTokenInfo(value) {
+      const token = gengaNormalizeCameraShapeToken(value);
+      if (!token) return null;
+      if (/^(FI|FADEIN|FADEINN|フェードイン|フェイドイン)$/.test(token)) return { shape: 'fi', label: 'FI' };
+      if (/^(FO|FADEOUT|フェードアウト|フェイドアウト)$/.test(token)) return { shape: 'fo', label: 'FO' };
+      if (/^(OL|OVERLAP|OVERLAPPU|オーバーラップ)$/.test(token)) return { shape: 'ol', label: 'OL' };
+      return null;
+    }
+    function gengaCameraSpecialShapeInfo(seg) {
+      const candidates = [
+        { field: 'label', value: seg && seg.label },
+        { field: 'text', value: seg && seg.text },
+        { field: 'endLabel', value: seg && seg.endLabel }
+      ];
+      for (let i = 0; i < candidates.length; i++) {
+        const info = gengaCameraSpecialShapeTokenInfo(candidates[i].value);
+        if (info) return Object.assign({ field: candidates[i].field }, info);
+      }
+      return null;
+    }
+    function gengaIsCameraTargetShapeSegment(seg, shapeInfo) {
+      const info = shapeInfo || gengaCameraSpecialShapeInfo(seg);
+      return !!(info && info.field === 'label' && String(seg && seg.text || '').trim());
+    }
+    // ver1225: within-cut O.L — "<cel>OL" in the middle text, A1/A2 states in start/end labels. A bare
+    // FI/FO/OL as the LABEL itself is a shape directive, not a frame name, so that case is excluded here
+    // (mirrors #sheet's isCameraTargetShapeDirective guard, minus the previewStyle/marker-token machinery
+    // that guard also covers — conte's segments never carry either).
+    function gengaWithinCutOlInfo(seg) {
+      if (!seg || gengaCameraSpecialShapeTokenInfo(seg.label)) return null;
+      const text = String(seg.text || '').trim();
+      if (!text) return null;
+      const m = text.normalize('NFKC').match(/^(.*?)\s*O\.?\s*L$/i);
+      if (!m) return null;
+      return { cel: String(m[1] || '').trim(), from: String(seg.label || '').trim(), to: String(seg.endLabel || '').trim() };
+    }
     function gengaTimesheetParseManual(raw) {
       const parseTc = function(v) {
         const p = String(v || '').split('+');
@@ -63577,6 +63629,62 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // the preview never read the new per-endpoint map. It reads the same gengaSheetCameraEndpointFr the sheet
         // payload carries, so the three surfaces (lane, preview, printed sheet) now all say the same thing.
         const camFr = gengaSheetCameraEndpointFr(camGt);
+        // ver1225: OL/FI/FO special shapes, ported from #sheet's renderCameraSpecialShape/
+        // drawCameraTargetShapeText/drawWithinCutOlLabels — this preview had NO shape rendering at all
+        // (only the plain persistent-line/curve case), so a genuine 転換 (OL/FI/FO) camera direction drew
+        // as an ordinary line with cryptic text instead of the shape #sheet has always printed. Local
+        // closures (not top-level functions) because they need THIS call's own node/text, same as
+        // camEndpoint below.
+        const gengaAppendCamShapePolygon = function(points, fill, stroke) {
+          node('polygon', { points: points.map(function(p) { return p[0] + ',' + p[1]; }).join(' '), fill: fill || 'rgba(31,111,235,.42)', stroke: stroke || '#111', 'stroke-width': 1.4 });
+        };
+        const gengaRenderCamShape = function(shape, areaX, areaW, rowTop, height, lane, laneCount) {
+          if (!shape) return false;
+          const laneX = gengaDistributedLaneX(areaX, areaW, lane || 0, laneCount, 12);
+          const laneW = areaW / Math.max(3, Math.max(1, laneCount));
+          const baseW = Math.max(18, Math.min(areaW - 10, laneW * 0.82));
+          const usableW = Math.min(Math.max(8, areaW - 8), Math.max(18, baseW * (2 / 3)));
+          const minX = areaX + 4, maxX = areaX + areaW - 4;
+          let x1 = laneX - usableW / 2, x2 = laneX + usableW / 2;
+          if (x1 < minX) { x1 = minX; x2 = x1 + usableW; }
+          if (x2 > maxX) { x2 = maxX; x1 = x2 - usableW; }
+          const cx = (x1 + x2) / 2;
+          const y1 = rowTop + 2, y2 = rowTop + Math.max(4, height - 2);
+          const midY = (y1 + y2) / 2;
+          if (y2 <= y1 + 2) return false;
+          if (shape === 'fi') { gengaAppendCamShapePolygon([[cx, y1], [x2, y2], [x1, y2]]); return { x1: x1, x2: x2, cx: cx, y1: y1, y2: y2, midY: midY }; }
+          if (shape === 'fo') { gengaAppendCamShapePolygon([[x1, y1], [x2, y1], [cx, y2]]); return { x1: x1, x2: x2, cx: cx, y1: y1, y2: y2, midY: midY }; }
+          if (shape === 'ol') { gengaAppendCamShapePolygon([[x1, y1], [x2, y1], [cx, midY]]); gengaAppendCamShapePolygon([[cx, midY], [x2, y2], [x1, y2]]); return { x1: x1, x2: x2, cx: cx, y1: y1, y2: y2, midY: midY }; }
+          return false;
+        };
+        const gengaDrawCamTargetShapeText = function(areaX, areaW, shapeLayout, seg, shapeInfo) {
+          if (!shapeLayout || !gengaIsCameraTargetShapeSegment(seg, shapeInfo)) return;
+          const targetText = String(seg && seg.text || '').trim();
+          const shapeLabel = String(shapeInfo && shapeInfo.label || '').trim();
+          if (!targetText || !shapeLabel) return;
+          const textX = Math.min(areaX + areaW - 4, Math.max(areaX + 4, shapeLayout.x2 - 10));
+          const endLabel = String(seg && seg.endLabel || '').trim();
+          if (shapeLabel === 'OL' && endLabel) {
+            text(textX, shapeLayout.y1 + 11, targetText, 14, RED, 'start');
+            text(textX, shapeLayout.midY, 'O.L', 14, RED, 'start');
+            text(textX, shapeLayout.y2 - 11, endLabel, 14, RED, 'start');
+            return;
+          }
+          const lineGap = 15, textY = shapeLayout.midY;
+          text(textX, textY - lineGap / 2, targetText, 15, RED, 'start');
+          text(textX, textY + lineGap / 2, shapeLabel === 'OL' ? 'O.L' : shapeLabel, 15, RED, 'start');
+        };
+        // ver1225: A1/A2 centred on the shape (layout.cx) — matches the #sheet fix in the same conversation
+        // (they sat 'start'-anchored near the shape's right edge before, reading as "slightly off to the
+        // right" of a shape that is wide right where these two labels sit — y1/y2, the triangles' bases,
+        // not the narrow waist at midY the O.L text sits beside instead).
+        const gengaDrawWithinCutOlLabels = function(layout, seg, info) {
+          if (!layout || !info) return;
+          if (info.from) text(layout.cx, layout.y1 + 11, info.from, 14, '#111', 'middle');
+          const textX = Math.min(xInb + cameraW - 4, Math.max(xInb + 4, layout.x2 - 10));
+          text(textX, layout.midY, (info.cel || '') + 'O.L', 13, '#111', 'start');
+          if (info.to) text(layout.cx, layout.y2 - 11, info.to, 14, '#111', 'middle');
+        };
         const camEndpoint = function(camMid, y, labelText) {
           line(camMid - 9, y, camMid + 11, y, '#111', 1.8);           // the dash IS the endpoint mark (#sheet '-')
           const lb = String(labelText || '').trim();
@@ -63607,41 +63715,58 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const yFill0 = TOP + NAMEH + (from - start) * ROWH;         // first koma, TOP edge
           const yFill1 = TOP + NAMEH + (to - start + 1) * ROWH;       // last koma, BOTTOM edge
           const yMidRange = (yFill0 + yFill1) / 2;
-          line(camMid, yFill0, camMid, yFill1, '#111', 1.1);          // (a) unbroken
-          // ver1224 (corrects ver1221's misreading — that shrank the DOMAIN before evaluating the curve,
-          // which is not the same thing): the curve's basis is EXACTLY the row-centre on both ends (yA/yB —
-          // the same spot the ring sits at), full stop. What gets a 5px hole is the DRAWN curve itself, at
-          // both its own ends — the same "skip samples near a point" technique gapH already uses for the
-          // text hole in the middle, just two more of them at t=0 and t=1 instead of one at the middle. So
-          // one work's curve never reads as fused to its neighbour's (the persistent LINE, untouched, is
-          // what says "this is one continuous path"; each curve is its own distinct mark).
-          const curveTop = yA;
-          const curveBottom = yB;
-          // (b) the range curve, bowing RIGHT off the rule, sampled so the gap is just skipped samples and both
-          // arcs stay pieces of the SAME curve.
-          const gapH = s.text ? Math.min(ROWH * 0.62, (yFill1 - yFill0) * 0.42) : 0;
-          // ver1220: also capped by the lane gap (camLaneGap, same one the label offset above derives from) —
-          // otherwise a generous vertical span could bow the curve past a lane packed in right next to it.
-          const bow = Math.min(15, Math.max(5, (yFill1 - yFill0) * 0.11), Math.max(4, camLaneGap * 0.3)); // ver1214: bows RIGHT (was negative = left)
-          const ctrlX = camMid + bow * 2;
-          let seg = [];
-          const flushSeg = function() {
-            if (seg.length > 1) node('path', { d: 'M' + seg.map(function(p) { return p[0].toFixed(2) + ' ' + p[1].toFixed(2); }).join('L'), fill: 'none', stroke: '#111', 'stroke-width': 1, 'stroke-linecap': 'round' });
-            seg = [];
-          };
-          if (curveTop < curveBottom) for (let k2 = 0; k2 <= 48; k2++) {
-            const t2 = k2 / 48, mt = 1 - t2;
-            const px = mt * mt * camMid + 2 * mt * t2 * ctrlX + t2 * t2 * camMid;
-            const py = curveTop + (curveBottom - curveTop) * t2;
-            if (py - curveTop < 5 || curveBottom - py < 5) { flushSeg(); continue; }   // ver1224: the two end holes
-            if (gapH && Math.abs(py - yMidRange) < gapH) { flushSeg(); continue; }
-            seg.push([px, py]);
+          // ver1225: OL/FI/FO shapes pre-empt the plain line+curve entirely, same as #sheet's
+          // if(withinCutOl){...} else if(cameraShape){...} else{...}. cameraTargetShape (not cameraShape)
+          // is what gates the endpoint rings below — a shape token that came from the text/endLabel field
+          // rather than label still renders its shape here but keeps its normal A/B rings, matching #sheet.
+          const cameraShapeInfo = gengaCameraSpecialShapeInfo(s);
+          const cameraShape = cameraShapeInfo ? cameraShapeInfo.shape : '';
+          const cameraTargetShape = gengaIsCameraTargetShapeSegment(s, cameraShapeInfo);
+          const withinCutOl = gengaWithinCutOlInfo(s);
+          if (withinCutOl) {
+            const olLayout = gengaRenderCamShape('ol', xInb, cameraW, yFill0, yFill1 - yFill0, s.lane || 0, camLaneCount);
+            if (olLayout) gengaDrawWithinCutOlLabels(olLayout, s, withinCutOl);
+          } else if (cameraShape) {
+            const shapeLayout = gengaRenderCamShape(cameraShape, xInb, cameraW, yFill0, yFill1 - yFill0, s.lane || 0, camLaneCount);
+            gengaDrawCamTargetShapeText(xInb, cameraW, shapeLayout, s, cameraShapeInfo);
+          } else {
+            line(camMid, yFill0, camMid, yFill1, '#111', 1.1);          // (a) unbroken
+            // ver1224 (corrects ver1221's misreading — that shrank the DOMAIN before evaluating the curve,
+            // which is not the same thing): the curve's basis is EXACTLY the row-centre on both ends (yA/yB —
+            // the same spot the ring sits at), full stop. What gets a 5px hole is the DRAWN curve itself, at
+            // both its own ends — the same "skip samples near a point" technique gapH already uses for the
+            // text hole in the middle, just two more of them at t=0 and t=1 instead of one at the middle. So
+            // one work's curve never reads as fused to its neighbour's (the persistent LINE, untouched, is
+            // what says "this is one continuous path"; each curve is its own distinct mark).
+            const curveTop = yA;
+            const curveBottom = yB;
+            // (b) the range curve, bowing RIGHT off the rule, sampled so the gap is just skipped samples and both
+            // arcs stay pieces of the SAME curve.
+            const gapH = s.text ? Math.min(ROWH * 0.62, (yFill1 - yFill0) * 0.42) : 0;
+            // ver1220: also capped by the lane gap (camLaneGap, same one the label offset above derives from) —
+            // otherwise a generous vertical span could bow the curve past a lane packed in right next to it.
+            const bow = Math.min(15, Math.max(5, (yFill1 - yFill0) * 0.11), Math.max(4, camLaneGap * 0.3)); // ver1214: bows RIGHT (was negative = left)
+            const ctrlX = camMid + bow * 2;
+            let seg = [];
+            const flushSeg = function() {
+              if (seg.length > 1) node('path', { d: 'M' + seg.map(function(p) { return p[0].toFixed(2) + ' ' + p[1].toFixed(2); }).join('L'), fill: 'none', stroke: '#111', 'stroke-width': 1, 'stroke-linecap': 'round' });
+              seg = [];
+            };
+            if (curveTop < curveBottom) for (let k2 = 0; k2 <= 48; k2++) {
+              const t2 = k2 / 48, mt = 1 - t2;
+              const px = mt * mt * camMid + 2 * mt * t2 * ctrlX + t2 * t2 * camMid;
+              const py = curveTop + (curveBottom - curveTop) * t2;
+              if (py - curveTop < 5 || curveBottom - py < 5) { flushSeg(); continue; }   // ver1224: the two end holes
+              if (gapH && Math.abs(py - yMidRange) < gapH) { flushSeg(); continue; }
+              seg.push([px, py]);
+            }
+            flushSeg();
+            if (s.text) text(camMid + bow, yMidRange, s.text, 10, '#111'); // in the curve's hole, centred on it
           }
-          flushSeg();
-          if (s.from >= start) camEndpoint(camMid, yA, s.label);
-          if (s.to <= blockEnd) camEndpoint(camMid, yB, s.endLabel);
-          if (s.text) text(camMid + bow, yMidRange, s.text, 10, '#111'); // in the curve's hole, centred on it
-
+          if (!withinCutOl && !cameraTargetShape) {
+            if (s.from >= start) camEndpoint(camMid, yA, s.label);
+            if (s.to <= blockEnd) camEndpoint(camMid, yB, s.endLabel);
+          }
         });
       });
       svg.__tsGeom = { page: page, pageFrames: pageFrames, pageW: PAGE_W, TOP: TOP, NAMEH: NAMEH, ROWH: ROWH, blocks: blocks };
@@ -63686,6 +63811,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         stage.scrollLeft = px * next - (ev.clientX - r.left);
         stage.scrollTop = py * next - (ev.clientY - r.top);
       }, { passive: false });
+      // ver1225: middle-mouse-button (wheel-click) drag pans the stage — its own scrollLeft/scrollTop, the
+      // same thing the native scrollbars already drive. No rAF needed: this only writes two scroll
+      // properties per event (the browser's own compositor handles the repaint), nothing like a full
+      // gengaTimesheetDraw rebuild.
+      let tsPan = null;
+      stage.addEventListener('pointerdown', function(ev) {
+        if (ev.button !== 1) return;
+        ev.preventDefault();
+        tsPan = { pointerId: ev.pointerId, startX: ev.clientX, startY: ev.clientY, startLeft: stage.scrollLeft, startTop: stage.scrollTop };
+        try { stage.setPointerCapture(ev.pointerId); } catch (e) {}
+        stage.classList.add('genga-ts-panning');
+      });
+      stage.addEventListener('pointermove', function(ev) {
+        if (!tsPan || ev.pointerId !== tsPan.pointerId) return;
+        ev.preventDefault();
+        stage.scrollLeft = tsPan.startLeft - (ev.clientX - tsPan.startX);
+        stage.scrollTop = tsPan.startTop - (ev.clientY - tsPan.startY);
+      });
+      const endTsPan = function(ev) {
+        if (!tsPan || (ev && ev.pointerId !== tsPan.pointerId)) return;
+        try { stage.releasePointerCapture(tsPan.pointerId); } catch (e) {}
+        stage.classList.remove('genga-ts-panning');
+        tsPan = null;
+      };
+      stage.addEventListener('pointerup', endTsPan);
+      stage.addEventListener('pointercancel', endTsPan);
     }
     function gengaTimesheetSyncPlayhead() {
       const win = document.getElementById('gengaTimesheetWindow');
