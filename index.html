@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1278</title>
+  <title>MoArt ver1279</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8700,7 +8700,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1278</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1279</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14684,7 +14684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1278';
+    const APP_DISPLAY_VERSION = '1279';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -16963,17 +16963,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.selectedVideoTrackId = '';
     }
 
-    function pushLayerDrawingEditCommand(name, before, refs) {
+    // ver1279: selectionHistory({before,after})를 받으면 그림과 선택이 한 undo 스텝에 함께 실린다.
+    // 변형 확정처럼 둘을 한 번에 바꾼 조작은 되돌릴 때도 한 번에 되돌아가야 한다 — 따로 push하면 Enter
+    // 한 번을 취소하는 데 Ctrl+Z를 두 번 눌러야 한다. 필드 이름은 이미 같은 일을 하고 있는
+    // audioTimelineStateEdit의 before/afterSelection 관례를 그대로 따랐다.
+    function pushLayerDrawingEditCommand(name, before, refs, selectionHistory) {
       const list = (refs || []).map(function(ref) { return String(ref || ''); }).filter(Boolean);
       if (!list.length || !before) return;
       const after = captureLayerDrawingEditState(state.project, list);
-      pushUndoCommand({
+      const command = {
         name: name || 'Edit conte layer drawing',
         layerDrawingEdit: true,
         drawingContext: captureLayerDrawingEditContext(),
         before: before,
         after: after
-      });
+      };
+      if (selectionHistory) {
+        command.hasPaintSelection = true;   // null도 "선택 없음"이라는 유효 상태라 존재 여부는 이 플래그로 판정
+        command.beforeSelection = selectionHistory.before || null;
+        command.afterSelection = selectionHistory.after || null;
+      }
+      pushUndoCommand(command);
       state.redoStack = [];
     }
 
@@ -18833,14 +18843,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (command.layerDrawingEdit) {
         pushOther(command);
+        // ver1279: 그림과 함께 실린 선택도 같은 스텝에서 되돌린다(변형 확정 등). 안 실렸으면 undefined라
+        // 선택을 건드리지 않는다 — null은 "선택 없음"이라는 유효 상태이므로 플래그로 구분한다.
+        const selectionPayload = command.hasPaintSelection ? (undoing ? command.beforeSelection : command.afterSelection) : undefined;
         if (layerDrawingEditIsPositionOnly(command.before, command.after)) { // ver534: pure-position nudge → no re-decode/rebuild (flicker fix)
           applyLayerDrawingPositionOnlyState(state.project, payload);
+          if (selectionPayload !== undefined) applyPaintSelectionSnapshot(selectionPayload);
           restoreTimelineViewportForHistory(historyViewport);
           return;
         }
         const refs = applyLayerDrawingEditState(state.project, payload);
         restoreLayerDrawingEditContext(command.drawingContext);
         refreshLayerDrawingEditHistory(refs);
+        if (selectionPayload !== undefined) applyPaintSelectionSnapshot(selectionPayload);
         restoreTimelineViewportForHistory(historyViewport);
         return;
       }
@@ -51306,7 +51321,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (options.skipMemoRedraw !== true) {
             scheduleMemoCanvasRedraw(); // ver718: the video glass canvas is gone — paper memo only
           }
-          pushLayerDrawingEditCommand(options.historyName || 'Edit conte layer drawing', beforeHistory, [ref]);
+          pushLayerDrawingEditCommand(options.historyName || 'Edit conte layer drawing', beforeHistory, [ref], options.selectionHistory);
           updatePaintUndoRedoButtonsOnly();
           scheduleIndexedDbAutosave(options.autosaveDelay || INDEXED_DB_AUTOSAVE_DELAY_MS);
           return true;
@@ -51370,7 +51385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (options.skipMemoRedraw !== true) {
         scheduleMemoCanvasRedraw(); // ver718: the video glass canvas is gone — paper memo only
       }
-      pushLayerDrawingEditCommand(options.historyName || 'Edit conte layer drawing', beforeHistory, [ref]);
+      pushLayerDrawingEditCommand(options.historyName || 'Edit conte layer drawing', beforeHistory, [ref], options.selectionHistory);
       updatePaintUndoRedoButtonsOnly();
       scheduleIndexedDbAutosave(options.autosaveDelay || INDEXED_DB_AUTOSAVE_DELAY_MS);
       return true;
@@ -52571,11 +52586,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const rawPreview = state.paintTransformPreview;
       const transformPreview = rawPreview && paintTransformUiRefValid(rawPreview.drawingRef) ? rawPreview : null;
       const selection = state.paintSelection;
-      if (selection && selection.maskCanvas && selection.bounds
-          && !(transformPreview && String(transformPreview.drawingRef || '') === String(selection.drawingRef || ''))) {
+      // ver1279: 변형 프리뷰가 뜨면 선택 앤츠를 통째로 숨기고 있었다 — 드래그 중 "지금 뭘 옮기는 중인지"가
+      // 화면에서 사라진다. 순수 이동이면 마스크 모양은 그대로고 위치만 델타만큼 밀면 되므로 원본 마스크를
+      // 옮긴 자리에 그린다. 새 캔버스도 추가 스캔도 없다 — 어차피 매 프레임 같은 마스크의 외곽선을 그리고
+      // 있었으므로 비용 증가 0.
+      // 스케일/회전/퍼스펙티브 드래그는 매 프레임 마스크를 워프하고 외곽선을 다시 훑어야 해서 실측 없이
+      // 넣을 비용이 아니다. 그 경우엔 변형 quad 박스가 이미 보이므로 종전대로 앤츠는 숨긴다.
+      const previewOwnsSelection = !!(transformPreview && selection
+        && String(transformPreview.drawingRef || '') === String(selection.drawingRef || ''));
+      let overlaySelection = previewOwnsSelection ? null : selection;
+      if (previewOwnsSelection && paintTransformIsPureMove(transformPreview)) {
+        overlaySelection = {
+          maskCanvas: selection.maskCanvas,
+          bounds: selection.bounds,
+          bitmapX: paintSelectionBitmapX(selection) + Math.round(transformPreview.moveDx || 0),
+          bitmapY: paintSelectionBitmapY(selection) + Math.round(transformPreview.moveDy || 0)
+        };
+      }
+      if (overlaySelection && overlaySelection.maskCanvas && overlaySelection.bounds) {
         ctx.save();
-        ctx.translate(Math.round(Number(selection.bitmapX) || 0), Math.round(Number(selection.bitmapY) || 0));
-        drawPaintMaskOutline(ctx, selection.maskCanvas, MARQUEE_COLOR, marqueePx);
+        ctx.translate(Math.round(Number(overlaySelection.bitmapX) || 0), Math.round(Number(overlaySelection.bitmapY) || 0));
+        drawPaintMaskOutline(ctx, overlaySelection.maskCanvas, MARQUEE_COLOR, marqueePx);
         ctx.restore();
       }
       const lasso = state.paintLassoPreview;
@@ -54247,8 +54278,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const before = preview.beforeDataUrl !== undefined ? preview.beforeDataUrl : layerDrawingSnapshot(drawing);
       const result = paintTransformResultCanvas(preview);
       if (!result || !result.canvas || !result.bounds) return false;
+      const selectionBefore = snapshotPaintSelection(); // ver1279: 그림과 같은 undo 스텝에 실을 값
       if (preview.source.selection && state.paintSelection && String(state.paintSelection.drawingRef || '') === ref) {
-        state.paintSelection = paintSelectionAfterTransform(preview); // ver1278: follows the content
+        state.paintSelection = paintSelectionAfterTransform(preview); // ver1278: 선택이 그림을 따라간다
       }
       state.paintTransformPreview = null;
       state.paintTransformBox = null;
@@ -54259,7 +54291,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         bitmapY: result.bounds.y - offsetY,
         bitmapWidth: result.bounds.w,
         bitmapHeight: result.bounds.h,
-        trimAlpha: true
+        trimAlpha: true,
+        selectionHistory: { before: selectionBefore, after: snapshotPaintSelection() }, // ver1279
       });
       refreshPaintEditOverlays(ref);
       updatePaintUI();
