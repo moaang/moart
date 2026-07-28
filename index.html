@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1275</title>
+  <title>MoArt ver1276</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8701,7 +8701,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1275</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1276</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14685,7 +14685,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1275';
+    const APP_DISPLAY_VERSION = '1276';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -17312,8 +17312,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function editorUiStatePayload() {
       return {
-        videoEditMode: Boolean(state.videoEditMode),
-        timelineFramePx: clampNumber(state.timelineFramePx, 1, 6, 5),
+          timelineFramePx: clampNumber(state.timelineFramePx, 1, 6, 5),
         timelineScrollLeft: Math.max(0, Math.round(Number(state.timelineScrollLeft) || 0)),
         // Playhead position (video-edit timeline scrub/seek). Persisted the same way as scroll position
         // (settle-point save, not every frame during playback) -- see the scheduleEditorUiStateSave calls in
@@ -17440,7 +17439,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           ui[newKey] = ui[oldKey];
         }
       });
-      state.videoEditMode = Boolean(ui.videoEditMode);
+      // ver1276: the view mode is NOT a restored preference any more. Persisting it meant a session that
+      // happened to end on the 用紙 view reopened there, which is the "가끔 콘티용지보기로 시작" the user
+      // asked to remove. A conte project always opens in 映像編集; 用紙 stays one click away
+      // (#conteYoushiViewBtn), and genga forces this false in renderStageView regardless.
+      state.videoEditMode = true;
       state.timelineFramePx = clampNumber(ui.timelineFramePx, 1, 6, state.timelineFramePx);
       state.timelineScrollLeft = Math.max(0, Math.round(Number(ui.timelineScrollLeft) || 0));
       if (Object.prototype.hasOwnProperty.call(ui, 'videoPlayheadFrames')) state.videoPlayheadFrames = Math.max(0, Math.round(Number(ui.videoPlayheadFrames) || 0));
@@ -20432,18 +20435,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // during one restore — without this, two overlapping calls each clear+rebuild the same live <div>
     // and both sets of appendChild calls land, duplicating every tab. A stale call bails right after the
     // one real await instead of appending on top of a newer call's content.
+    let projectTabBarSig = '';       // ver1276: what the bar currently SHOWS
+    // ver1276: this used to clear the live bar and then await IndexedDB before refilling it, so every
+    // caller flashed an empty tab bar for the length of two DB reads. Conte hit it on every undo/redo
+    // (refresh() -> refreshChromeControls -> updateWorkspaceUI -> here) while genga's per-layer undo
+    // passes skipChrome:true and never got here — that was the whole "only conte flickers" asymmetry,
+    // not anything about the DOM. Now: read first, touch nothing; then bail if the render would be
+    // identical (undo/redo does not change the project list, so it does no DOM work at all); only a
+    // real change builds a detached fragment and swaps it in one shot.
     async function renderProjectTabBar() {
       const bar = document.getElementById('projectTabBar');
       if (!bar) return;
       const seq = ++projectTabBarRenderSeq;
-      bar.innerHTML = '';
-      if (!state.projectActive) return;
-      const fixedGroup = document.createElement('div');
-      fixedGroup.className = 'project-tab-group-fixed';
-      const backupGroup = document.createElement('div');
-      backupGroup.className = 'project-tab-group-backup';
-      bar.appendChild(fixedGroup);
-      bar.appendChild(backupGroup);
+      if (!state.projectActive) {
+        if (bar.childNodes.length) { bar.innerHTML = ''; projectTabBarSig = ''; }
+        return;
+      }
       const currentId = ensureCurrentProjectId();
       const currentKind = state.project && state.project.kind === 'genga' ? 'genga' : 'conte';
       const currentTitle = String(state.project && state.project.title || '');
@@ -20467,6 +20474,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (seq !== projectTabBarRenderSeq) return; // superseded while awaiting — a newer render owns the DOM now
       const slotsById = {};
       indexSlots.forEach(function(s) { slotsById[s.id] = s; });
+      const backupSlots = indexSlots
+        .filter(function(slot) { return pinnedIds.indexOf(slot.id) === -1; })
+        .sort(function(a, b) { return String(b.savedAt).localeCompare(String(a.savedAt)); });
+      // Everything the two builders read, in render order. If this matches what is on screen the bar is
+      // already correct — leaving it alone is both the flicker fix and the reason undo/redo costs 0 DOM.
+      const sig = JSON.stringify([currentId, currentTitle, currentKind, PINNED_PROJECT_MAX, pinnedIds,
+        backupSlots.map(function(slot) { return [slot.id, slot.title, slot.kind, slot.savedAt]; })]);
+      if (sig === projectTabBarSig && bar.childNodes.length) return;
+      const fixedGroup = document.createElement('div');
+      fixedGroup.className = 'project-tab-group-fixed';
+      const backupGroup = document.createElement('div');
+      backupGroup.className = 'project-tab-group-backup';
       for (let i = 0; i < PINNED_PROJECT_MAX; i++) {
         const id = pinnedIds[i];
         if (!id) { fixedGroup.appendChild(buildProjectTabEmptyEl()); continue; }
@@ -20474,10 +20493,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const meta = isCurrent ? { id: currentId, title: currentTitle, kind: currentKind } : (slotsById[id] || { id: id, title: '', kind: 'conte' });
         fixedGroup.appendChild(buildProjectTabEl(meta, isCurrent, true));
       }
-      indexSlots
-        .filter(function(slot) { return pinnedIds.indexOf(slot.id) === -1; })
-        .sort(function(a, b) { return String(b.savedAt).localeCompare(String(a.savedAt)); })
-        .forEach(function(slot) { backupGroup.appendChild(buildBackupChipEl(slot, slot.id === currentId)); });
+      backupSlots.forEach(function(slot) { backupGroup.appendChild(buildBackupChipEl(slot, slot.id === currentId)); });
+      const next = document.createDocumentFragment();
+      next.appendChild(fixedGroup);
+      next.appendChild(backupGroup);
+      bar.replaceChildren(next);   // one shot: the bar is never observed empty
+      projectTabBarSig = sig;
     }
 
     function showLoadingOverlay(message) {
