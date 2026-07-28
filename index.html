@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1274</title>
+  <title>MoArt ver1275</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8701,7 +8701,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1274</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1275</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14685,7 +14685,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1274';
+    const APP_DISPLAY_VERSION = '1275';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -35833,8 +35833,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // on the preview screen, reusing the export compositor (renderConteVideoFrameToCanvas + its
     // base cache: composite once per cut+camera, then blit). The DOM stack underneath stays frozen
     // -> ZERO innerHTML rebuilds while the canvas is up. Anything the compositor cannot reproduce
-    // (v1 media clip, no-drawing cuts, OL dissolve, onion skin, paper frame, hidden conte track,
+    // (v1 media clip, no-drawing cuts, OL dissolve, paper frame, hidden conte track,
     // camera/FX/memo editing) falls back to the DOM pipeline (which still has P0+P1).
+    // ver1275: onion skin is NO LONGER on that list — the compositor draws the ghosts itself now.
     function playbackCompositorEligible() {
       if (state.playbackCompositorBroken) return false;
       if (!state.videoEditMode) return false;
@@ -35844,7 +35845,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (cameraToolActive()) return false;         // camera editing needs the DOM frame overlay
       if (videoTrackIsHidden(state.project)) return false;        // compositor always draws conte layers
       if (activePaperFrameSettings(state.project)) return false;  // paper-frame look is DOM-only
-      if (onionSkinEnabled(state.project)) return false;          // onion ghosts are DOM-only
       if (videoOverlapAtFrame(state.project, state.videoPlayheadFrames)) return false; // OL dissolve stays DOM
       const slot = videoSlotAtFrame(state.project, state.videoPlayheadFrames);
       if (!slot || !slot.cut) return false;
@@ -35913,6 +35913,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (img && img.complete && img.naturalWidth) cache.set(layer.drawingRef, img);
           else ready = false;
         }
+        // ver1275: ghost sources go through the SAME preload + readiness gate as the cut's own layers.
+        // They have to: renderConteVideoFrameToCanvas is called below WITHOUT await (with a complete
+        // cache its body never suspends), so a ghost that had to be fetched mid-draw would be marked
+        // drawn before it existed. Gating here instead means a cold ghost simply keeps the DOM pipeline
+        // for a frame or two — exactly what happened before ver1275, and then it takes over.
+        // They also join sigParts, so editing a NEIGHBOUR cut resets the base cache like editing this one.
+        if (onionSkinEnabled(state.project)) {
+          onionSkinForEachGhostSlot(state.project, slot, function(ghost) {
+            onionSkinEntriesForSlot(state.project, ghost.item).forEach(function(entry) {
+              const gLayer = entry && entry.layer;
+              if (!gLayer || !gLayer.drawingRef) return;
+              const gDrawing = getLayerDrawingData(state.project, gLayer.drawingRef);
+              if (!gDrawing || !gDrawing.bitmapDataUrl) return;
+              const gKey = videoLayerBitmapPreloadKey(gLayer.drawingRef, gDrawing);
+              sigParts.push('g' + ghost.direction + ghost.k + ':' + gKey);
+              let gImg = state.videoPreloadedLayerImages ? state.videoPreloadedLayerImages[gKey] : null;
+              if (!gImg) {
+                preloadVideoLayerBitmap(gLayer.drawingRef, gDrawing);
+                gImg = state.videoPreloadedLayerImages ? state.videoPreloadedLayerImages[gKey] : null;
+              }
+              if (gImg && gImg.complete && gImg.naturalWidth) cache.set(gLayer.drawingRef, gImg);
+              else ready = false;
+            });
+          });
+        }
         if (!ready) return canvas.dataset.compositorDrawn === '1';
         // Staleness guard: the export base cache keys on cut+camera+width only, so reset it when this
         // activation starts or when the cut's drawing set / versions change mid-playback (undo, layer
@@ -35941,6 +35966,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         renderConteVideoFrameToCanvas(canvas, state.videoPlayheadFrames, {
           outWidth: outWidth,
           cache: cache,
+          onion: true,      // ver1275: playback shows the ghosts; an export never passes this
           subtitle: false,  // subtitles remain an export feature
           bold: false       // live bold plates come from the DOM .preview-bold-layer (z-index above this
                             // canvas) — drawing them here too double-renders them at export positions,
@@ -60890,7 +60916,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // state — it used to keep painting layers while the paused DOM hid them (and the base cache
       // would serve the stale composite after the eye toggled). Gate + discriminate the key.
       const conteTrackHidden = videoTrackIsHidden(project);
-      const baseKey = cutId + '|' + camKey + '|' + outW + kfTag + (conteTrackHidden ? '|th' : '');
+      // ver1275: with opts.onion the base composite CONTAINS the ghosts, so the key has to carry the
+      // onion state — otherwise an export (which never sets opts.onion) could be handed a ghosted base
+      // out of this single-entry shared cache, and a bar toggle or a neighbour edit would serve a stale
+      // one. onionSkinPreviewKeyForSlot already encodes settings + every ghost drawing's version.
+      const onionKey = opts.onion ? '|on' + onionSkinPreviewKeyForSlot(project, slot) : '';
+      const baseKey = cutId + '|' + camKey + '|' + outW + kfTag + (conteTrackHidden ? '|th' : '') + onionKey;
       const useCache = opts.cacheFrames !== false;
       let base = (useCache && videoExportBaseCache && videoExportBaseCache.key === baseKey) ? videoExportBaseCache.canvas : null;
       if (!base) {
@@ -60917,6 +60948,39 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             const s = 1 / Math.max(0.05, cam.scale);
             octx.scale(s, s);
             octx.translate(-cx, -cy);
+          }
+          // ver1275: onion ghosts sit UNDER this cut's layers and inside the camera transform — the same
+          // stacking the DOM preview builds ([picture][clip][ghosts][layers] inside .video-preview-camera-target).
+          // The ghost canvases come from the shared onionGhostCanvas cache under the SAME key the DOM path
+          // uses (content key | direction | tint | size), so the two surfaces reuse each other's work
+          // instead of each rasterising its own copy.
+          if (opts.onion) {
+            // collected first, then walked with a real loop: the source rule below is the SAME one the
+            // layer loop uses (`opts.cache ? cache.get(ref) : await loadImageForExport(src)`) and that
+            // needs await, which a forEach callback cannot do. Depending on opts.cache alone would make
+            // this silently draw a ghost-less frame for any caller that does not prewarm.
+            const ghosts = [];
+            onionSkinForEachGhostSlot(project, slot, function(ghost) {
+              onionSkinEntriesForSlot(project, ghost.item).forEach(function(entry) {
+                const gLayer = entry && entry.layer;
+                if (gLayer && gLayer.drawingRef) ghosts.push({ ref: gLayer.drawingRef, direction: ghost.direction, opacity: ghost.opacity });
+              });
+            });
+            for (let gi = 0; gi < ghosts.length; gi += 1) {
+              const g = ghosts[gi];
+              const gDrawing = getLayerDrawingData(project, g.ref);
+              const gSrc = gDrawing && gDrawing.bitmapDataUrl;
+              if (!gSrc) continue;
+              const gImg = opts.cache ? opts.cache.get(g.ref) : await loadImageForExport(gSrc);
+              if (!gImg) continue;
+              const gRect = layerDrawingBitmapRect(gDrawing);
+              const gCanvas = onionGhostCanvas(layerDrawingContentKey(g.ref, gDrawing) + '|' + g.direction,
+                g.direction, gRect.w, gRect.h, function(gx, gw, gh) { gx.drawImage(gImg, 0, 0, gw, gh); return true; });
+              if (!gCanvas) continue;
+              octx.globalAlpha = g.opacity;
+              octx.drawImage(gCanvas, conteLayerToFrameX(gRect.x) * sx, conteLayerToFrameY(gRect.y) * sx, gRect.w * sx, gRect.h * sx);
+              octx.globalAlpha = 1;
+            }
           }
           const entries = conteTrackHidden ? [] : layerDrawingEntriesForCut(project, slot.cut.id); // ver556: honor the C1 eye
           const leLocal = cameraLocalFrameForSlot(slot, f);
