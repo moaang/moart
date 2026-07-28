@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1271</title>
+  <title>MoArt ver1272</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8701,7 +8701,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1271</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1272</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14685,7 +14685,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1271';
+    const APP_DISPLAY_VERSION = '1272';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -38815,70 +38815,121 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // chrome gradients (.go-prev/.go-next) already echo it.
     const ONION_TINT_PREV = '#31ab56'; // 前 = green
     const ONION_TINT_NEXT = '#e08523'; // 後 = orange
-    function onionSkinTintColor(direction) {
-      const hex = direction === 'next' ? ONION_TINT_NEXT : ONION_TINT_PREV;
-      return { r: parseInt(hex.slice(1, 3), 16), g: parseInt(hex.slice(3, 5), 16), b: parseInt(hex.slice(5, 7), 16) };
+    function onionTintRgb(hexOrDirection) {
+      const hex = String(hexOrDirection || '').charAt(0) === '#'
+        ? String(hexOrDirection)
+        : (hexOrDirection === 'next' ? ONION_TINT_NEXT : ONION_TINT_PREV);
+      return { key: hex, r: parseInt(hex.slice(1, 3), 16), g: parseInt(hex.slice(3, 5), 16), b: parseInt(hex.slice(5, 7), 16) };
+    }
+
+    // ── ver1272: ONE tinted-ghost rasterizer + ONE cache, for conte AND genga ──────────────────────
+    // A ghost is a neighbour drawing repainted in the direction tint. The law below is conte's, now
+    // canon for both (ver951 already made conte's two hues the canon):
+    //   • opaque near-white is PAPER, not ink → knocked out. BOTH modes can hold such art — a genga
+    //     image import whose 白抜き box was left off, a conte layer baked over paper — and the shared
+    //     alphaInkBoundsScan already models exactly this case with its suppressNearWhite option.
+    //     Without the knockout that art ghosts as a solid tinted rectangle.
+    //   • everything else becomes the FLAT tint, its alpha weighted by how dark the source pixel was,
+    //     so a light pencil ghosts lighter than a solid line.
+    // Genga used to tint with a 60% source-atop fill instead (no knockout, no ink weighting), so its
+    // ghosts are now brighter and purely tinted. Conte's pixels are unchanged.
+    // The cache is genga's (LRU, byte-budgeted), now serving both: conte had NONE and re-decoded the
+    // PNG plus re-ran this pixel loop for every ghost on every preview rebuild.
+    const onionGhostCache = new Map();
+    function onionClearGhostCache() { onionGhostCache.clear(); }
+    function onionGhostTintInPlace(ctx, w, h, tint) {
+      let imageData = null;
+      try {
+        imageData = ctx.getImageData(0, 0, w, h);
+      } catch (error) {
+        return false;
+      }
+      const data = imageData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i];
+        const g = data[i + 1];
+        const b = data[i + 2];
+        const a = data[i + 3];
+        if (!a) continue;
+        const luma = r * 0.299 + g * 0.587 + b * 0.114;
+        const nearWhite = r > 244 && g > 244 && b > 244;
+        const ink = Math.max(0, Math.min(1, (255 - luma) / 180));
+        if (nearWhite || ink < 0.035) {
+          data[i + 3] = 0;
+          continue;
+        }
+        data[i] = tint.r;
+        data[i + 1] = tint.g;
+        data[i + 2] = tint.b;
+        data[i + 3] = Math.max(0, Math.min(255, Math.round(a * Math.max(0.35, ink))));
+      }
+      ctx.putImageData(imageData, 0, 0);
+      return true;
+    }
+    // contentKey must identify the ART, not where it sits — the same drawing on ten exposures, or on
+    // two different distance bars, is ONE ghost. paint(ctx,w,h) draws the source and returns false when
+    // it is not decoded yet: a not-ready paint must NOT be cached (genga's was, which is why a blank
+    // ghost could stick around until the next command cleared the whole map).
+    function onionGhostCanvas(contentKey, tintHexOrDirection, w, h, paint) {
+      const tint = onionTintRgb(tintHexOrDirection);
+      const cw = Math.max(1, Math.round(w)), ch = Math.max(1, Math.round(h));
+      const key = contentKey + '|' + tint.key + '|' + cw + 'x' + ch;
+      const hit = onionGhostCache.get(key);
+      if (hit !== undefined) { onionGhostCache.delete(key); onionGhostCache.set(key, hit); return hit; } // LRU touch
+      // NOT createReadbackCanvas(): this canvas is read back exactly ONCE, when it is built, and then
+      // blitted on every render for the rest of its cached life. willReadFrequently would pin it to CPU
+      // memory and make each of those blits pay a texture upload — the wrong side of the trade here.
+      const cv = document.createElement('canvas');
+      cv.width = cw;
+      cv.height = ch;
+      const cx = cv.getContext('2d');
+      if (paint(cx, cw, ch) === false) return null;
+      if (!onionGhostTintInPlace(cx, cw, ch, tint)) return null;
+      budgetedMapSet(onionGhostCache, key, cv, 48, 'onion');
+      return cv;
     }
 
     function drawOnionSkinLayerCanvas(canvas) {
       const ref = canvas && canvas.dataset ? String(canvas.dataset.layerDrawingRef || '') : '';
       if (!canvas || !ref) return;
       const drawing = getLayerDrawingData(state.project, ref);
-      const onionUrl = layerDrawingDisplayDataUrl(ref, drawing); // ver674: flush-then-read (erased strokes stayed in the onion ghost)
-      if (!drawing || !onionUrl) return;
+      if (!drawing) return;
       const rect = layerDrawingBitmapRect(drawing);
       const direction = String(canvas.dataset.onionDirection || 'previous');
-      const key = [
-        ref,
-        Math.max(0, Math.round(Number(drawing.version) || 0)),
-        String(drawing.bitmapDataUrl || '').length,
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        direction
-      ].join(':');
+      // ver1272: the SAME content key the decoded-image cache uses (version-based while a live canvas
+      // backs the ref, dataUrl identity once loaded) — so an edit/undo mints a new key on its own and
+      // this cache needs no sweeping, exactly like layerPreviewImageCache.
+      const contentKey = layerDrawingContentKey(ref, drawing);
+      const key = contentKey + '|' + direction;
       canvas.dataset.onionDrawKey = key;
       applyLayerCanvasBitmapRectGeometry(canvas, rect);
+      const blit = function(source) {
+        if (canvas.dataset.onionDrawKey !== key) return;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (!source) return;
+        const ghost = onionGhostCanvas(key, direction, canvas.width, canvas.height, function(gx, gw, gh) {
+          gx.drawImage(source, 0, 0, gw, gh);
+          return true;
+        });
+        if (ghost) ctx.drawImage(ghost, 0, 0, canvas.width, canvas.height);
+      };
+      // ver1272: take the source from the paths that already hold it decoded — the committed live
+      // bitmap first (no decode at all, and it is the very canvas the visible layer draws, so the
+      // ghost cannot disagree with it), then the content-addressed preview-image cache. Only art
+      // neither path knows pays for an <img> decode, and that decode now feeds the shared cache too.
+      // Before this the onion path used neither and built a fresh Image per ghost per rebuild.
+      const live = layerLiveBitmapFor(ref);
+      const ready = live && live.width && live.height ? live : cachedLayerPreviewImage(contentKey);
+      if (ready) { blit(ready); return; }
+      const onionUrl = layerDrawingDisplayDataUrl(ref, drawing); // ver674: flush-then-read (erased strokes stayed in the onion ghost)
+      if (!onionUrl) return;
       const image = new Image();
       image.onload = function() {
-        if (canvas.dataset.onionDrawKey !== key) return;
-        const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-        let imageData = null;
-        try {
-          imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        } catch (error) {
-          return;
-        }
-        const data = imageData.data;
-        const tint = onionSkinTintColor(direction);
-        for (let i = 0; i < data.length; i += 4) {
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
-          const a = data[i + 3];
-          if (!a) continue;
-          const luma = r * 0.299 + g * 0.587 + b * 0.114;
-          const nearWhite = r > 244 && g > 244 && b > 244;
-          const ink = Math.max(0, Math.min(1, (255 - luma) / 180));
-          if (nearWhite || ink < 0.035) {
-            data[i + 3] = 0;
-            continue;
-          }
-          data[i] = tint.r;
-          data[i + 1] = tint.g;
-          data[i + 2] = tint.b;
-          data[i + 3] = Math.max(0, Math.min(255, Math.round(a * Math.max(0.35, ink))));
-        }
-        ctx.putImageData(imageData, 0, 0);
+        cacheLayerPreviewImage(contentKey, image);
+        blit(image);
       };
-      image.onerror = function() {
-        if (canvas.dataset.onionDrawKey !== key) return;
-        const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-      };
+      image.onerror = function() { blit(null); };
       image.src = onionUrl; // ver674: the flushed url (matches the key computed above)
     }
 
@@ -63166,11 +63217,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const frame = gengaCurrentFrame();
       gengaSoloBypass = true;
       gengaDougaFillForce = false; // ver1111: unchanged behaviour, now stated — a still export is final art, not a timing check
-      gengaClearOnionCache();
+      onionClearGhostCache();
       const comp = gengaCompositeFrame(frame, 0, true);
       gengaSoloBypass = false;
       gengaDougaFillForce = null;
-      gengaClearOnionCache();
+      onionClearGhostCache();
       const canvas = document.createElement('canvas');
       canvas.width = pw; canvas.height = ph;
       const ctx = canvas.getContext('2d');
@@ -63296,7 +63347,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         stopGengaPlayback();
         gengaSoloBypass = true; // ver1168: mirror the video export — every visible layer, solo-view bypassed
         gengaDougaFillForce = !!(document.getElementById('gengaExportDougaFill') && document.getElementById('gengaExportDougaFill').checked);
-        gengaClearOnionCache();
+        onionClearGhostCache();
         const dimsG = gengaExportOutputDims();
         if (dimsG) rememberGengaExportOutput(dimsG.w, dimsG.h);
         const loopChk = document.getElementById('gengaExportGifLoop');
@@ -63306,7 +63357,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }).catch(function(e) {
           if (status) status.textContent = 'GIF書き出しに失敗: ' + (e && e.message ? e.message : e);
           runBtn.disabled = false; runBtn.textContent = origG;
-        }).finally(function() { gengaSoloBypass = false; gengaDougaFillForce = null; gengaClearOnionCache(); });
+        }).finally(function() { gengaSoloBypass = false; gengaDougaFillForce = null; onionClearGhostCache(); });
         return;
       }
       if (kind === 'sheet') {
@@ -63330,7 +63381,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       stopGengaPlayback();
       gengaSoloBypass = true;
       gengaDougaFillForce = !!(document.getElementById('gengaExportDougaFill') && document.getElementById('gengaExportDougaFill').checked); // ver1110
-      gengaClearOnionCache();
+      onionClearGhostCache();
       // ver700: the 出力解像度 chosen in THIS dialog drives the export (fixes the disconnect where
       // gengaExportVideoFast defaulted to the camera-crop px and ignored gt.output) and is remembered.
       const dims = gengaExportOutputDims();
@@ -63341,7 +63392,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }).catch(function(e) {
         if (status) status.textContent = '映像書き出しに失敗: ' + (e && e.message ? e.message : e);
         runBtn.disabled = false; runBtn.textContent = orig;
-      }).finally(function() { gengaSoloBypass = false; gengaDougaFillForce = null; gengaClearOnionCache(); }); // ver1110: hand the view back its own toggle
+      }).finally(function() { gengaSoloBypass = false; gengaDougaFillForce = null; onionClearGhostCache(); }); // ver1110: hand the view back its own toggle
     }
     // ---- レイヤー画像一括出力 (batch per-cell × per-instance image export) ----------------------------------
     // Writes one paper-size image per CELL × per drawn INSTANCE, named 「ラベル+番号」 (A3 / BG1) so #preview
@@ -67830,7 +67881,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.gengaSoloView = !state.gengaSoloView;
       const b = document.getElementById('gengaSoloViewBtn');
       if (b) { b.classList.toggle('active', !!state.gengaSoloView); b.setAttribute('aria-pressed', state.gengaSoloView ? 'true' : 'false'); }
-      gengaClearOnionCache();
+      onionClearGhostCache();
       drawGengaPreview();
     }
     // drag-scrub: pointerdown on the ruler / lane background / playhead handle → jump + follow the pointer.
@@ -67951,7 +68002,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         h.classList.toggle('selected', hid === state.gengaSelectedLayerId || set.has(hid));
       });
       gengaSelectAudioLane(null); // row focus moved to a layer → the audio-lane selection ends (mirror behavior)
-      if (changed && state.gengaSoloView) { gengaClearOnionCache(); drawGengaPreview(); } // solo view follows the current layer
+      if (changed && state.gengaSoloView) { onionClearGhostCache(); drawGengaPreview(); } // solo view follows the current layer
     }
     // audio LANE selection (mirror of layer selection): picking a clip selects its lane; clicking an empty
     // audio cell selects that lane. Recording / ＋import land on the selected lane.
@@ -70323,15 +70374,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return cv;
     }
-    // PER-LAYER tinted-onion cache (layerId|frame|tint → single-layer canvas). Onion is per-layer in genga: each
-    // layer with its bulb on ghosts ITS OWN neighbor koma. The cache survives stroking AND playhead scrubbing
-    // (revisited frames are hits, not re-renders — the onion-on scrub slowdown). Cleared in refresh() (every
-    // command/undo/redo) so edited frames re-render.
-    const gengaOnionCanvasCache = new Map();
+    // ver1272: the tinted-onion cache itself moved to the shared kernel (onionGhostCache, by the tint
+    // constants) — genga and conte now hit the same map with the same law. Onion is per-layer in genga:
+    // each layer with its bulb on ghosts ITS OWN neighbor koma. The cache survives stroking AND playhead
+    // scrubbing (revisited frames are hits, not re-renders — the onion-on scrub slowdown), and is swept by
+    // onionClearGhostCache() on every genga command/undo/redo.
     // NOTE: the douga caches (env/pair/align) are keyed by drawing REF = immutable content — an edit mints a
     // NEW ref, undo restores the old one, so they stay valid across commands and must NOT be cleared here.
     // Clearing them made every stroke re-run the 4-radius closing cascade for all visible douga drawings (slow).
-    function gengaClearOnionCache() { gengaOnionCanvasCache.clear(); }
     // ---- 動画（in-between）auto-fill: on a ・-marked cell the preview shows an interpolated SILHOUETTE between
     // the previous and next drawings — each drawing becomes a solid envelope (non-white=ink, closing cascade),
     // its outer contour is resampled to 256 arc-length points, and the in-between is a POINT-WISE lerp of the
@@ -71243,29 +71293,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // resolution) — the frame it happens to sit on is irrelevant. Frame-keying stored a byte-identical
       // canvas for every exposure that reuses one drawing, which is the normal case in animation: a
       // cycle (1,2,3,1,2,3) held one ghost per occurrence, and two layers referencing the same art
-      // shared nothing. Resolution stays in the key so zooming IN can build a sharper ghost instead of
-      // silently reusing a softer one.
-      const key = (dr.ref || dr.dataUrl.slice(-40)) + '|' + tint + '|' + size.w;
-      const hit = gengaOnionCanvasCache.get(key);
-      if (hit !== undefined) { gengaOnionCanvasCache.delete(key); gengaOnionCanvasCache.set(key, hit); return hit; } // LRU touch
-      let t = null;
-      {
-        const sx = size.w / pw, sy = size.h / ph;
+      // shared nothing. Resolution stays in the key (onionGhostCanvas appends it) so zooming IN can
+      // build a sharper ghost instead of silently reusing a softer one.
+      return onionGhostCanvas(dr.ref || dr.dataUrl.slice(-40), tint, size.w, size.h, function(cx, cw, ch) {
         // the drawing places itself in PAPER coordinates (trimmed bitmaps carry their own x/y), so the
         // scale goes on the context and gengaDrawDrawingInto keeps speaking paper units.
-        const base = document.createElement('canvas'); base.width = size.w; base.height = size.h;
-        const bx = base.getContext('2d');
-        bx.setTransform(sx, 0, 0, sy, 0, 0);
-        gengaDrawDrawingInto(bx, dr, pw, ph, drawGengaPreview);
-        bx.setTransform(1, 0, 0, 1, 0, 0);
-        t = document.createElement('canvas'); t.width = size.w; t.height = size.h;
-        const tx = t.getContext('2d');
-        tx.drawImage(base, 0, 0);
-        tx.globalCompositeOperation = 'source-atop';
-        tx.globalAlpha = 0.6; tx.fillStyle = tint; tx.fillRect(0, 0, size.w, size.h);
-      }
-      budgetedMapSet(gengaOnionCanvasCache, key, t, 48, 'onion');
-      return t;
+        cx.setTransform(cw / pw, 0, 0, ch / ph, 0, 0);
+        const painted = gengaDrawDrawingInto(cx, dr, pw, ph, drawGengaPreview);
+        cx.setTransform(1, 0, 0, 1, 0, 0);
+        return painted; // false = still decoding; onReady re-renders, and nothing blank gets cached
+      });
     }
     function gengaDrawLayerOnion(ctx, layer, frame, ox, oy, dw, dh, opacity, tint) {
       const t = gengaLayerOnionCanvas(layer, frame, tint, dw, dh); if (!t) return;
@@ -73920,7 +73957,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const id = String(l && l.id || '');
         if (byId.has(id)) replaceObjectContentsInPlace(l, byId.get(id)); // keep the identity gt.layers holds
       });
-      gengaClearOnionCache();                 // tinted onion frames cache pixels that just changed
+      onionClearGhostCache();                 // tinted onion frames cache pixels that just changed
       gengaReliftSelectionAfterHistory();     // a pristine floating selection's base/patch cache is now stale
       const layerIds = Array.from(byId.keys());
       const tagOverlay = layerIds.some(function(id) {
@@ -77981,7 +78018,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ============================================================================================
     function refresh(options) {
       options = options || {};
-      gengaClearOnionCache(); // project may have changed (command/undo/redo) → tinted onion frames are stale
+      // ver1272: the sweep is GENGA's invalidation contract — its ghosts are keyed by drawing ref, so a
+      // stale entry is only possible through the paths that reuse one (import / paper resize / solo).
+      // Conte's share of the same map is keyed by layerDrawingContentKey, the content key the never-swept
+      // layerPreviewImageCache already trusts, so an edit mints its own new key; sweeping it here would
+      // just re-run the tint loop for every unchanged neighbour ghost after every stroke.
+      if (state.project && state.project.kind === 'genga') onionClearGhostCache();
       // genga has its OWN render path — the conte stage/timing/source/memo renderers are not used at all here.
       if (state.project && state.project.kind === 'genga') {
         if (!options.skipStage && !(options.gengaRenderPlan && options.gengaRenderPlan.scope === 'none')) {
