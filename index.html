@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1272</title>
+  <title>MoArt ver1273</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8701,7 +8701,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1272</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1273</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14685,7 +14685,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1272';
+    const APP_DISPLAY_VERSION = '1273';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -38888,6 +38888,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       budgetedMapSet(onionGhostCache, key, cv, 48, 'onion');
       return cv;
     }
+    // ver1273: ONE iteration for both modes — which distance bars are on, in what ORDER, at what
+    // OPACITY, in which TINT. What a "neighbour" IS stays per-mode and cannot be shared (genga counts
+    // a layer's exposure instances, conte counts timeline slots); everything downstream of that list
+    // was identical and had been kept in step by comment alone ("genga draw-order parity").
+    //   neighbours = { prev: [...], next: [...] } from the mode's own enumerator. Index k is the
+    //   DISTANCE, so bar k always means "k+1 away" — a missing neighbour must be a null HOLE in the
+    //   list, never a gap closed by shifting, or the bars stop meaning what their numbers say.
+    // Farthest first inside a direction, so the nearest ghost paints on top.
+    function onionForEachGhost(settings, neighbours, callback) {
+      const master = clampNumber(settings && settings.gengaMaster, 0, 100, 100) / 100;
+      [['previous', settings && settings.gengaPrev, neighbours && neighbours.prev, ONION_TINT_PREV],
+       ['next', settings && settings.gengaNext, neighbours && neighbours.next, ONION_TINT_NEXT]].forEach(function(group) {
+        const bars = group[1] || [], items = group[2] || [];
+        for (let k = Math.min(bars.length, items.length) - 1; k >= 0; k -= 1) {
+          const cfg = bars[k], item = items[k];
+          // `== null` on purpose: genga's item is a frame NUMBER and a falsy test would drop frame 0
+          if (!cfg || !cfg.on || item === null || item === undefined) continue;
+          callback({ item: item, opacity: (Number(cfg.op) || 0) * master / 100, tint: group[3], direction: group[0], k: k });
+        }
+      });
+    }
 
     function drawOnionSkinLayerCanvas(canvas) {
       const ref = canvas && canvas.dataset ? String(canvas.dataset.layerDrawingRef || '') : '';
@@ -39223,32 +39244,29 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const src = ref ? layerDrawingDisplayDataUrl(ref, drawing) : ''; // ver674: flush-then-read gate (a live-only drawing must still get its ghost)
       if (!ref || !src) return '';
       const classes = ['video-onion-skin-layer', direction];
-      return '<canvas class="' + classes.join(' ') + '" data-layer-drawing-ref="' + escapeAttr(ref) + '" data-conte-layer-id="' + escapeAttr(layer.id || '') + '" data-onion-direction="' + escapeAttr(direction) + '" style="--onion-opacity:' + clampNumber(opacity, 0, 100, 45) / 100 + ';' + layerDrawingBitmapGeometryStyle(drawing) + '"></canvas>';
+      // ver1273: opacity arrives as a FRACTION from onionForEachGhost (which already folded in 全体).
+      // ★clampFloat, NOT clampNumber — clampNumber rounds to an integer and turned 0.45 into 0, i.e. an
+      // invisible ghost. That is the exact ver655 trap, caught here by reading --onion-opacity off the
+      // element (the canvas PIXELS were still bit-perfect, so a raster check alone would have missed it).
+      return '<canvas class="' + classes.join(' ') + '" data-layer-drawing-ref="' + escapeAttr(ref) + '" data-conte-layer-id="' + escapeAttr(layer.id || '') + '" data-onion-direction="' + escapeAttr(direction) + '" style="--onion-opacity:' + clampFloat(opacity, 0, 1, 0.45) + ';' + layerDrawingBitmapGeometryStyle(drawing) + '"></canvas>';
     }
 
-    // shared iteration for the html + cache-key builders: every ON bar whose neighbor slot has a cut,
-    // farthest first inside a direction so the nearest ghost paints on top (genga draw-order parity).
+    // conte's adapter onto onionForEachGhost: turn the neighbour SLOTS into the kernel's item list.
+    // A cutless slot (a marker, a gap) becomes an explicit null so it costs a distance step without
+    // ghosting anything — that is what makes bar k mean "k+1 slots away" rather than "the k-th slot
+    // that happens to have content".
     function onionSkinForEachGhostSlot(project, slot, callback) {
-      const settings = onionSkinSettings(project);
       const nb = onionSkinNeighborSlots(project, slot, 5);
-      [['previous', settings.gengaPrev, nb.prev], ['next', settings.gengaNext, nb.next]].forEach(function(group) {
-        const bars = group[1] || [], slotList = group[2] || [];
-        for (let k = Math.min(bars.length, slotList.length) - 1; k >= 0; k -= 1) {
-          const cfg = bars[k], nSlot = slotList[k];
-          if (!cfg || !cfg.on || !nSlot || !nSlot.cut) continue;
-          callback(group[0], k, cfg, nSlot);
-        }
-      });
+      const withCut = function(list) { return (list || []).map(function(s) { return s && s.cut ? s : null; }); };
+      onionForEachGhost(onionSkinSettings(project), { prev: withCut(nb.prev), next: withCut(nb.next) }, callback);
     }
 
     function onionSkinPreviewHtml(project, slot) {
-      const settings = onionSkinSettings(project);
       if (!state.videoEditMode || !onionSkinEnabled(project) || !slot || !slot.cut) return '';
-      const master = clampNumber(settings.gengaMaster, 0, 100, 100) / 100;
       const parts = [];
-      onionSkinForEachGhostSlot(project, slot, function(direction, k, cfg, nSlot) {
-        onionSkinEntriesForSlot(project, nSlot).forEach(function(entry) {
-          parts.push(onionSkinLayerHtml(entry, direction, (Number(cfg.op) || 0) * master));
+      onionSkinForEachGhostSlot(project, slot, function(ghost) {
+        onionSkinEntriesForSlot(project, ghost.item).forEach(function(entry) {
+          parts.push(onionSkinLayerHtml(entry, ghost.direction, ghost.opacity));
         });
       });
       return parts.join('');
@@ -39257,9 +39275,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function onionSkinPreviewKeyForSlot(project, slot) {
       if (!state.videoEditMode || !onionSkinEnabled(project) || !slot || !slot.cut) return 'onion-off';
       const keys = [onionSkinSettingsKey(project), slot.cut.id || ''];
-      onionSkinForEachGhostSlot(project, slot, function(direction, k, cfg, nSlot) {
-        keys.push(direction + k + ':' + (nSlot.cut.id || ''));
-        onionSkinEntriesForSlot(project, nSlot).forEach(function(entry) {
+      onionSkinForEachGhostSlot(project, slot, function(ghost) {
+        keys.push(ghost.direction + ghost.k + ':' + (ghost.item.cut.id || ''));
+        onionSkinEntriesForSlot(project, ghost.item).forEach(function(entry) {
           const layer = entry && entry.layer || null;
           const drawing = layer && layer.drawingRef ? getLayerDrawingData(project, layer.drawingRef) : null;
           keys.push([
@@ -71449,21 +71467,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // prev = green, next = orange. Draw bottom-to-top so ghosts stack like the layers.
       const onion = state.onionSkin;
       const gPrev = (onion && onion.gengaPrev) || [], gNext = (onion && onion.gengaNext) || [];
-      const gMaster = clampNumber(onion && onion.gengaMaster, 0, 100, 100) / 100;
       const anyPrev = gPrev.some(function(x) { return x && x.on; }), anyNext = gNext.some(function(x) { return x && x.on; });
       if (onionShow && onion && (anyPrev || anyNext)) {
         const oLayers = (gt.layers || []);
         for (let li = oLayers.length - 1; li >= 0; li--) {
           const oLayer = oLayers[li];
           if (!oLayer.onion || oLayer.visible === false || gengaSoloHides(oLayer)) continue;
-          const fr = gengaOnionInstanceFrames(oLayer, frame, 5);
-          // farthest first so the nearest drawing sits on top (more readable)
-          for (let k = Math.min(5, fr.prev.length) - 1; k >= 0; k--) {
-            const cfg = gPrev[k]; if (cfg && cfg.on) gengaDrawLayerOnion(ctx, oLayer, fr.prev[k], ox, oy, dw, dh, (cfg.op / 100) * gMaster, ONION_TINT_PREV); // ver951: shared tint const (conte parity)
-          }
-          for (let k = Math.min(5, fr.next.length) - 1; k >= 0; k--) {
-            const cfg = gNext[k]; if (cfg && cfg.on) gengaDrawLayerOnion(ctx, oLayer, fr.next[k], ox, oy, dw, dh, (cfg.op / 100) * gMaster, ONION_TINT_NEXT); // ver951: shared tint const (conte parity)
-          }
+          // ver1273: order, opacity (incl. 全体) and tint all come from the shared kernel — this loop
+          // used to restate them next to conte's copy, kept in step by a comment (ver951's "conte parity")
+          onionForEachGhost(onion, gengaOnionInstanceFrames(oLayer, frame, 5), function(ghost) {
+            gengaDrawLayerOnion(ctx, oLayer, ghost.item, ox, oy, dw, dh, ghost.opacity, ghost.tint);
+          });
         }
       }
       // pad only as far as the viewport can actually SHOW around the paper — keeps the composite canvas small
