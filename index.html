@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1296</title>
+  <title>MoArt ver1297</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -6090,6 +6090,9 @@
     }
 
     .conte-layer-bar .conte-trim-handle:hover { background: #dce8fa; }
+    /* ver1297: BG 레이어는 normalizeBgLayerToOwnerSpan 이 panelSpan 을 그룹 길이로 강제하므로
+       길이를 손볼 수가 없다 — 동작하지 않는 그립을 보여주지 않는다. */
+    .conte-layer-bar.bg-layer .conte-trim-handle { display: none; }
 
     .conte-layer-bar .conte-trim-handle::before,
     .conte-layer-bar .conte-trim-handle::after {
@@ -8689,7 +8692,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1296</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1297</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14656,7 +14659,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1296';
+    const APP_DISPLAY_VERSION = '1297';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -32349,6 +32352,102 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return plan;
     }
 
+    // ══ ver1297: 레인 재배치 커널 — 원화 핸들의 잠식/리플을 패널 축 위에서 ═══════════════════
+    // 원화는 gengaHeadDragLayout 이 "드래그 델타 → 레인 전체의 새 배치"를 한 번에 돌려주고,
+    // 미리보기와 커밋이 그 하나를 공유한다 — 둘이 어긋나는 일이 원리적으로 불가능해진다.
+    // 그 모양을 그대로 가져오되, 축이 프레임이 아니라 패널 인덱스이고 owner 그룹 경계 안에 갇힌다.
+    //   • 머리(좌상단) ← : 머리가 왼쪽으로 자라며 앞 코마를 잠식한다(다 먹으면 그 코마는 사라짐)
+    //   • 머리(좌상단) → : 머리를 깎고, 비운 칸은 바로 앞의 **붙어 있는** 코마가 먹는다
+    //   • 꼬리(우하단)   : 늢이고 줄이며 뒤 코마들이 리플로 따라온다.
+    //     밀 곳이 없으면(그룹 끝) — 사용자 결정 — **리플 이동만 불발**하고 코마를 지우지는 않는다.
+    // BG 레이어는 panelSpan 이 그룹 길이로 강제되므로(normalizeBgLayerToOwnerSpan) 여기 오지 않는다.
+    function conteLaneKomaPlan(project, found, slots, edge, wantStart, wantEnd) {
+      if (!project || !found || !found.layer || !found.ownerCut) return null;
+      if (found.layer.layerRole === 'bg') return null;
+      const bounds = conteLayerOwnerSlotBounds(slots, found.ownerCut.id);
+      if (bounds.start < 0 || bounds.end < bounds.start) return null;
+      const lineKey = conteLayerLanePreferredKey(found.layer);
+      if (!lineKey) return null;
+      const layers = Array.isArray(found.ownerCut.conteLayers) ? found.ownerCut.conteLayers : [];
+      const lane = layers
+        .filter(function(one) { return one && one.id && one.layerRole !== 'bg' && conteLayerLanePreferredKey(one) === lineKey; })
+        .map(function(one) {
+          const r = layerSlotIndexRange(project, one, found.ownerCut);
+          return { id: String(one.id), start: r.startIndex, end: r.endIndex };
+        })
+        .sort(function(a, b) { return a.start - b.start; });
+      const selfId = String(found.layer.id);
+      const selfIdx = lane.findIndex(function(k) { return k.id === selfId; });
+      if (selfIdx < 0) return null;
+      const ranges = new Map();
+      lane.forEach(function(k) { ranges.set(k.id, { start: k.start, end: k.end, gone: false }); });
+      const self = ranges.get(selfId);
+
+      if (edge === 'left') {
+        const S = clampNumber(wantStart, bounds.start, self.end, self.start);
+        if (S < self.start) {
+          for (let i = selfIdx - 1; i >= 0; i -= 1) {
+            const e = ranges.get(lane[i].id);
+            if (e.end < S) break;              // 닿지 않는다 — 여기서 멈춰도 된다(정렬돼 있음)
+            if (e.start >= S) { e.gone = true; continue; }  // 통째로 잠식됨
+            e.end = S - 1;                     // 꼬리만 긎힌다
+          }
+        } else if (S > self.start) {
+          const prev = selfIdx > 0 ? ranges.get(lane[selfIdx - 1].id) : null;
+          if (prev && prev.end === self.start - 1) prev.end = S - 1; // 붙어 있는 앞 코마가 오른쪽으로 먹는다
+        }
+        self.start = S;
+        return { ok: true, ranges: ranges };
+      }
+
+      const Eend = clampNumber(wantEnd, self.start, bounds.end, self.end);
+      const delta = Eend - self.end;
+      if (delta !== 0) {
+        for (let i = selfIdx + 1; i < lane.length; i += 1) {
+          const k = ranges.get(lane[i].id);
+          const ns = k.start + delta, ne = k.end + delta;
+          if (ne > bounds.end || ns < bounds.start) return { ok: false, ranges: null }; // 밀 곳이 없다 → 불발
+          k.start = ns; k.end = ne;
+        }
+      }
+      self.end = Eend;
+      return { ok: true, ranges: ranges };
+    }
+
+    // 미리보기: 커널이 낸 배치를 그대로 DOM 에 입힌다(커밋과 같은 수치).
+    function applyConteLaneKomaPlanPreview(root, plan, slots, totalFrames) {
+      if (!plan || !plan.ok || !plan.ranges) return;
+      plan.ranges.forEach(function(r, id) {
+        const el = root && root.querySelector
+          ? root.querySelector('.conte-layer-bar[data-conte-layer-id="' + cssEscapeValue(id) + '"]')
+          : null;
+        if (!el) return;
+        el.style.opacity = r.gone ? '0.25' : '';
+        applyLayerPreviewToSlotRange(el, slots, r.start, r.end, totalFrames);
+      });
+    }
+    function clearConteLaneKomaPlanPreview(root) {
+      if (!root || !root.querySelectorAll) return;
+      root.querySelectorAll('.conte-layer-bar').forEach(function(el) { el.style.opacity = ''; });
+    }
+    // 커밋: 같은 배치를 모델에 쓴다. resizeConteLayerToPanel 이 쓰는 세 필드와 동일한 규약.
+    function writeConteLaneKomaPlan(project, ownerCutId, plan, slots) {
+      if (!plan || !plan.ok || !plan.ranges) return;
+      const ownerIndex = cutIndexById(project, ownerCutId);
+      const goneIds = [];
+      plan.ranges.forEach(function(r, id) {
+        if (r.gone) { goneIds.push(id); return; }
+        const found = findConteLayerById(project, id);
+        if (!found || !found.layer) return;
+        const startCut = slots[r.start] && slots[r.start].cut;
+        if (!startCut) return;
+        found.layer.startPanelCutId = startCut.id;
+        found.layer.panelStart = Math.max(0, cutIndexById(project, startCut.id) - ownerIndex);
+        found.layer.panelSpan = Math.max(1, r.end - r.start + 1);
+      });
+      if (goneIds.length) removeConteLayersByIds(project, goneIds);
+    }
+
     function refreshConteLayerPanelCopyGhostGroup(root, layerIds, fallbackLayerEl, ghosts, slots, indices, totalFrames, baseLane) {
       ghosts = clearConteLayerDragGhosts(ghosts);
       indices.forEach(function(slotIndex) {
@@ -32423,6 +32522,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let latestEnd = startEndIndex;
         let latestVisualIndex = startVisualIndex;
         let pointerMoved = false;
+        let lanePreviewActive = false; // ver1297: 레인 미리보기를 켠 적이 있으면 취소 때 모델로 되돌려야 한다
         let dragGhostGroup = []; // ver750 (fix_design P4): the old singular dragGhost alias (= group[0]) deleted — the group cleanup already covered its node
         let dragGhosts = [];
         let rowDragGhost = null;
@@ -32477,7 +32577,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               dragGhosts = refreshConteLayerPanelCopyGhostGroup(root, operationLayerIds, layerEl, dragGhosts, slots, plan.copyIndices, totalFrames, startVisualIndex);
             } else {
               dragGhosts = clearConteLayerDragGhosts(dragGhosts);
-              applyLayerPreviewToSlotRange(layerEl, slots, plan.originalStart, plan.originalEnd, totalFrames);
+              // ver1297: 그룹 **안쪽** 은 원화식 잠식/리플. 밖으로 끌면(위 가지) 기존 복제 그대로.
+              const lanePlan = conteLaneKomaPlan(state.project, found, slots, edge, latestStart, latestEnd);
+              if (lanePlan && lanePlan.ok) {
+                clearConteLaneKomaPlanPreview(root);
+                applyConteLaneKomaPlanPreview(root, lanePlan, slots, totalFrames);
+                lanePreviewActive = true;
+              } else {
+                applyLayerPreviewToSlotRange(layerEl, slots, plan.originalStart, plan.originalEnd, totalFrames);
+              }
             }
           } else {
             dragGhosts = clearConteLayerDragGhosts(dragGhosts);
@@ -32509,7 +32617,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // Resize / Duplicate / Paste / Reorder), so an iPad gesture Safari took over used to land as a real
           // edit at whatever the last preview position was. teardown restores the visuals — that is the revert,
           // and it is now a separate callback rather than a return statement in the middle of the commit path.
-          onCancel: teardown,
+          // ver1297: teardown 은 끌던 그 바의 --left/--width 만 되돌린다. 레인 미리보기는 같은 레인의
+          // 다른 코마들도 옮겨 놓고 잠식 대상에 opacity 를 걸므로, 취소 때는 모델에서 다시 그려야 한다.
+          onCancel: function() {
+            teardown();
+            if (!lanePreviewActive) return;
+            lanePreviewActive = false;
+            clearConteLaneKomaPlanPreview(root);
+            refresh({ skipSource: true });
+          },
           onCommit: function(upEvent) {
           teardown();
           if (latestStart === startSlotIndex && latestEnd === startEndIndex) {
@@ -32551,6 +32667,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             } else {
               const edgeSlot = slots[edge === 'right' ? latestEnd : latestStart];
               const targetCutId = edgeSlot && edgeSlot.cut ? edgeSlot.cut.id : '';
+              // ver1297: 미리보기와 똑같은 커널을 다시 돌려 그 결과를 그대로 기록한다.
+              // 불발(ok=false, 그룹 끝에서 리플할 곳이 없음)이면 아무것도 바꾸지 않는다.
+              const commitLanePlan = conteLaneKomaPlan(state.project, found, slots, edge, latestStart, latestEnd);
+              if (commitLanePlan && !commitLanePlan.ok) { clearConteLaneKomaPlanPreview(root); refresh({ skipSource: true }); return; }
+              if (commitLanePlan) {
+                clearConteLaneKomaPlanPreview(root);
+                runConteLayerCutPatchCommand('Resize conte layer koma', conteLayerPatchOwnerCutIds(state.project, operationLayerIds, [targetCutId]), function(project) {
+                  writeConteLaneKomaPlan(project, found.ownerCut.id, commitLanePlan, slots);
+                });
+                return;
+              }
               runConteLayerCutPatchCommand('Resize conte layer panel span', conteLayerPatchOwnerCutIds(state.project, operationLayerIds, [targetCutId]), function(project) {
                 operationLayerIds.forEach(function(operationLayerId) {
                   resizeConteLayerToPanel(project, operationLayerId, edge, targetCutId);
