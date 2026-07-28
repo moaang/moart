@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1282</title>
+  <title>MoArt ver1283</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8700,7 +8700,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1282</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1283</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14684,7 +14684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1282';
+    const APP_DISPLAY_VERSION = '1283';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -17673,6 +17673,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       teardownProjectFloatingWindows();
       options = options || {};
       const historyViewport = options.historyTimelineViewport || null;
+      // ver1283: ★프로젝트를 교체하면 이전 프로젝트에 매인 transient(선택 스텐실·변형 박스·스탬프·
+      // 진행 중 제스처)는 전부 무효다. resetProjectTransientRuntime은 "새 프로젝트 만들기" 경로에만
+      // 걸려 있었고, 실제로 프로젝트를 갈아끼우는 정본 경로인 여기에는 없었다 — 그래서 고정슬롯에서
+      // 콘티↔원화를 오가면 선택이 그대로 따라가 새 프로젝트의 레이어와 매칭되지 않는 잔상으로 남고,
+      // 해제조차 옛 ref를 대상으로 돌아 화면에서 지워지지 않았다(사용자 보고: "잔상처럼 영구하게 남음").
+      // 기본값이 리셋이고, 같은 프로젝트 안에서의 시간 이동(undo/redo)만 sameProject로 opt-out한다 —
+      // 새 호출부가 생겨도 잊어서 위험해지는 쪽이 아니라 안전한 쪽이 기본이 되도록.
+      if (!options.sameProject) resetProjectTransientRuntime();
       state.project = normalizeProjectSnapshot(project);
       invalidateProjectDataCaches();
       // 묶음 C: project 교체 시 audio cache 무효화
@@ -18914,12 +18922,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const memoPages = snapshotMemoPages();
       pushOther(command);
       restoreProject(payload, memoPages, {
+        sameProject: true, // ver1283: 히스토리는 같은 프로젝트의 시간 이동 — 선택을 씻으면 ver738 규칙 위반
         historyTimelineViewport: historyViewport,
         refreshOptions: command.gengaRenderPlan ? { gengaRenderPlan: command.gengaRenderPlan } : null
       });
       gengaReliftSelectionAfterHistory(); // ver738: keep a genga selection's pixel cache in sync with the restored drawing
     }
-    function undo() { applyHistoryCommand('undo'); }
+    // ver1283: ★미확정 변형이 화면에 떠 있는 동안의 Ctrl+Z는 **그 변형을 취소**한다. 히스토리로
+    // 내려가지 않는다 — 미확정 변형은 애초에 히스토리에 없으므로(ver1281) 내려가 봐야 그 앞 항목,
+    // 즉 사용자가 방금 만든 라쏘 선택이 취소된다. 사용자 보고가 정확히 그 상태였다: "위치는 제대로
+    // 리셋되는데 라쏘 선택 영역은 안 돌아가고, 기즈모 박스만 이동·회전·크기가 먹은 채 잔상으로 방치".
+    // 프리뷰를 버리면 그림은 원위치, quad를 baseQuad로 되돌리면 기즈모도 원위치 — 둘이 어긋날 수 없다.
+    // ①(툴 전환 뒤의 Ctrl+Z가 선택을 취소하고 좌표는 남기는 TVPaint 동작)과 충돌하지 않는다: 그때는
+    // 툴 전환이 이미 프리뷰를 버려서 여기 조건이 거짓이고, 그대로 히스토리로 내려간다.
+    function cancelPendingPaintTransform() {
+      const box = state.paintTransformBox;
+      if (!state.paintTransformPreview || !box) return false;
+      if (!paintTransformUiRefValid(box.drawingRef)) return false;
+      const ref = String(box.drawingRef || '');
+      state.paintTransformPreview = null;
+      if (Array.isArray(box.baseQuad) && box.baseQuad.length === 4) {
+        box.quad = box.baseQuad.map(function(p) { return [Number(p[0]) || 0, Number(p[1]) || 0]; });
+      }
+      redrawVisibleLayerCanvasesForRef(ref);
+      refreshPaintEditOverlays(ref);
+      updatePaintUI();
+      return true;
+    }
+    function undo() {
+      if (cancelPendingPaintTransform()) return; // ver1283
+      applyHistoryCommand('undo');
+    }
     function redo() { applyHistoryCommand('redo'); }
 
     function primaryUndoShouldUsePaintHistory(kind) {
@@ -52613,18 +52646,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 있었으므로 비용 증가 0.
       // 스케일/회전/퍼스펙티브 드래그는 매 프레임 마스크를 워프하고 외곽선을 다시 훑어야 해서 실측 없이
       // 넣을 비용이 아니다. 그 경우엔 변형 quad 박스가 이미 보이므로 종전대로 앤츠는 숨긴다.
-      // ver1280: 선택 마퀴만 자가검증에서 빠져 있었다 — 변형 박스/프리뷰는 paintTransformUiRefValid로
-      // 걸러 그리는데(아래) 선택은 ref를 안 봐서, 다른 컷·다른 레이어로 가도 점선이 그대로 떠 있었다.
-      // 그런데 실제 클립(paintStrokeClipForOp)은 ref가 일치할 때만 걸리므로, 점선은 "여기 그리면 이 안에만
-      // 들어간다"고 거짓말을 하고 있었던 셈. 타깃을 못 구하는 순간(로드 직후 등)에는 종전대로 그린다 —
-      // 깜빡임을 만들지 않으면서 거짓말만 없앤다.
-      const overlayTarget = currentPaintTransformLayerTarget();
-      const selectionIsForCurrentTarget = !overlayTarget
-        || !selection
-        || String(overlayTarget.drawingRef || '') === String(selection.drawingRef || '');
-      const previewOwnsSelection = !!(transformPreview && selection
-        && String(transformPreview.drawingRef || '') === String(selection.drawingRef || ''));
-      let overlaySelection = (previewOwnsSelection || !selectionIsForCurrentTarget) ? null : selection;
+      // ver1283: ver1280은 "다른 레이어에서는 점선이 거짓말을 한다"며 마퀴를 숨겼는데, 고쳐야 했던 것은
+      // 점선이 아니라 **클립이 레이어에 종속돼 있던 것**이었다(paintSelectionForDrawingRef 참조). 선택이
+      // 전역 스텐실이 된 지금은 어느 레이어에서 그려도 그 안에만 들어가므로 점선은 참말이고, 숨기면
+      // 오히려 사용자 보고("레이어·프레임 옮기면 선택이 전혀 안 남음")가 된다. 게이트를 걷어낸다.
+      const previewOwnsSelection = !!(transformPreview && transformPreview.source
+        && transformPreview.source.selection && selection);
+      let overlaySelection = previewOwnsSelection ? null : selection;
       if (previewOwnsSelection && paintTransformIsPureMove(transformPreview)) {
         overlaySelection = {
           maskCanvas: selection.maskCanvas,
@@ -52683,7 +52711,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function paintSelectionPathsForMode(ref, mode, points) {
-      const current = state.paintSelection && state.paintSelection.drawingRef === ref ? state.paintSelection : null;
+      const current = state.paintSelection || null; // ver1283: 전역 스텐실 — paths도 레이어에 매이지 않는다
       const existing = current && Array.isArray(current.paths) ? current.paths.slice() : [];
       const nextPoints = normalizePaintLassoPoints(points);
       if (!nextPoints.length) return existing;
@@ -52749,11 +52777,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return a.maskCanvas === b.maskCanvas &&
         paintSelectionBitmapX(a) === paintSelectionBitmapX(b) &&
         paintSelectionBitmapY(a) === paintSelectionBitmapY(b) &&
-        !!a.inverted === !!b.inverted &&
-        String(a.drawingRef || '') === String(b.drawingRef || '');
+        !!a.inverted === !!b.inverted; // ver1283: drawingRef는 캐시라 동일성 판정에서 뺀다(바뀌었다고 다른 선택이 아니다)
     }
     function applyPaintSelectionSnapshot(snap) {
-      const prevRef = state.paintSelection && String(state.paintSelection.drawingRef || '') || '';
+      const prevRef = currentPaintSelectionRef(); // ver1283: 옛 소속이 아니라 눈앞의 레이어
       state.paintSelection = snap ? Object.assign({}, snap) : null;
       // ver1282: ★ver1281의 ①("툴을 바꿔도 변형 좌표는 남는다")이 실기에서 안 먹던 진짜 이유가 여기였다.
       // 사용자 재현 순서는 [드래그 → 툴 전환 → Ctrl+Z → 변형 툴 복귀 → Enter]인데, 툴 전환은 ver1281이
@@ -52763,7 +52790,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 픽셀 프리뷰는 계속 버린다 — source 패치가 옛 선택으로 잘린 것이라 새 선택과 모순되고, 화면상
       // "그림은 원위치"가 TVPaint의 관측 결과이기도 하다. 좌표(box)만 남기면 Enter가 그때 소스를 다시 뜬다.
       state.paintTransformPreview = null;
-      const nextRef = state.paintSelection && String(state.paintSelection.drawingRef || '') || '';
+      const nextRef = currentPaintSelectionRef(); // ver1283
       if (prevRef) { redrawVisibleLayerCanvasesForRef(prevRef); refreshPaintEditOverlays(prevRef); }
       if (nextRef && nextRef !== prevRef) { redrawVisibleLayerCanvasesForRef(nextRef); refreshPaintEditOverlays(nextRef); }
       updatePaintUI();
@@ -52780,7 +52807,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const nextMode = mode; // ver740: mode is always state.paintSelectionMode from the sole call site, always 'replace'/'add'/'sub'
       const maskX = Math.round(Number(options.bitmapX) || 0);
       const maskY = Math.round(Number(options.bitmapY) || 0);
-      const existingSelection = state.paintSelection && state.paintSelection.drawingRef === ref && state.paintSelection.maskCanvas && nextMode !== 'replace'
+      const existingSelection = state.paintSelection && state.paintSelection.maskCanvas && nextMode !== 'replace' // ver1283: 전역 스텐실 — 어느 레이어에서 더해도 같은 선택에 합쳐진다
         ? state.paintSelection
         : null;
       const existingX = paintSelectionBitmapX(existingSelection);
@@ -52848,8 +52875,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!selection || !selection.maskCanvas) return;
       const mask = invertedMaskCanvas(selection.maskCanvas, { canvas: createReadbackCanvas(), fallbackW: CONTE_PAPER_WIDTH, fallbackH: CONTE_PAPER_HEIGHT });
       const bounds = paintSelectionBounds(mask);
+      const invertRef = currentPaintSelectionRef(); // ver1283
       state.paintSelection = bounds ? {
-        drawingRef: selection.drawingRef,
+        drawingRef: invertRef,
         maskCanvas: mask,
         bitmapX: paintSelectionBitmapX(selection),
         bitmapY: paintSelectionBitmapY(selection),
@@ -52861,14 +52889,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       state.paintTransformBox = null;
       state.paintTransformPreview = null;
       pushPaintSelectionCommand('Invert selection', selectionUndoBefore, snapshotPaintSelection());
-      redrawVisibleLayerCanvasesForRef(selection.drawingRef);
-      refreshPaintEditOverlays(selection.drawingRef);
+      redrawVisibleLayerCanvasesForRef(invertRef);
+      refreshPaintEditOverlays(invertRef);
       updatePaintUI();
     }
 
     function clearPaintSelection() {
       const selectionUndoBefore = snapshotPaintSelection();
-      const ref = state.paintSelection && state.paintSelection.drawingRef || '';
+      const ref = currentPaintSelectionRef(); // ver1283: 눈앞의 레이어를 다시 그려야 점선이 실제로 지워진다
       state.paintSelection = null;
       state.paintTransformBox = null;
       state.paintTransformPreview = null;
@@ -52880,7 +52908,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     function clearPaintEditStateForDrawing(drawingRef) {
       const ref = String(drawingRef || '');
-      if (state.paintSelection && String(state.paintSelection.drawingRef || '') === ref) state.paintSelection = null;
+      // ver1283: 선택은 더 이상 여기서 죽지 않는다 — 그림을 비운 것과 스텐실을 해제한 것은 다른 조작이고,
+      // 전역 스텐실은 어느 레이어의 픽셀이 사라지든 그 자리에 유효하다. 픽셀에서 파생된 것만 버린다.
       if (state.paintLassoPreview && String(state.paintLassoPreview.drawingRef || '') === ref) state.paintLassoPreview = null;
       if (state.paintTransformBox && String(state.paintTransformBox.drawingRef || '') === ref) state.paintTransformBox = null;
       if (state.paintTransformPreview && String(state.paintTransformPreview.drawingRef || '') === ref) state.paintTransformPreview = null;
@@ -53309,18 +53338,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     function activeRasterSelectionTarget() {
       const selection = state.paintSelection;
-      if (!selection || !selection.drawingRef || !selection.maskCanvas || !selection.bounds) return null;
+      if (!selection || !selection.maskCanvas || !selection.bounds) return null;
       if (!state.videoEditMode) return null; // ver634: selection ops are video-only (no paper layer access)
+      // ver1283: 대상은 **지금 선택된 레이어**다. 전에는 선택이 태어난 레이어를 대상으로 삼아, 레이어를
+      // 옮긴 뒤의 선택 조작(1px 이동 등)이 눈앞이 아닌 옛 레이어에 적용되고 있었다.
       const found = findConteLayerById(state.project, state.selectedConteLayerId);
-      const layerId = found && found.layer && found.layer.drawingRef === selection.drawingRef ? found.layer.id : '';
+      const ref = found && found.layer ? String(found.layer.drawingRef || '') : '';
+      if (!ref) return null;
+      selection.drawingRef = ref;
       setActiveLayerCanvasTargets({
         cutId: currentPicturePanelId(),
-        drawingRef: selection.drawingRef,
-        layerId: layerId
+        drawingRef: ref,
+        layerId: found.layer.id
       });
       const canvas = firstActiveLayerCanvas();
       if (!canvas) return null;
-      const drawing = getLayerDrawingData(state.project, selection.drawingRef);
+      const drawing = getLayerDrawingData(state.project, ref);
       const rect = prepareLayerCanvasForBitmapEdit(canvas, drawing);
       const op = {
         canvas: canvas,
@@ -53335,7 +53368,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         selection: selection,
         canvas: canvas,
         drawing: drawing,
-        drawingRef: selection.drawingRef,
+        drawingRef: ref,
         layerCanvasOffsetX: -Math.round(Number(op.bitmapX) || 0),
         layerCanvasOffsetY: -Math.round(Number(op.bitmapY) || 0),
         bitmapX: Math.round(Number(op.bitmapX) || 0),
@@ -53371,10 +53404,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return null;
     }
 
+    // ver1283: ★선택은 레이어의 소유물이 아니라 **용지에 놓인 전역 스텐실**이다(TVPaint 모델). 콘티의
+    // 레이어 캔버스는 모두 같은 용지 좌표계를 쓰고 선택의 bitmapX/Y도 용지 좌표라(레이어 오프셋은 사용처
+    // 에서 따로 더한다) 레이어가 달라도 같은 자리를 가리킨다 — 종속시킬 근거가 애초에 없었다.
+    // 종속의 대가가 사용자 보고 그대로였다: 레이어·프레임·패널을 옮기는 순간 선택이 통째로 사라졌다.
+    // drawingRef는 이제 "현재 붙어 있는 대상"의 캐시일 뿐이고, 갱신은 이 한 지점이 소유한다.
     function paintSelectionForDrawingRef(drawingRef) {
-      const ref = String(drawingRef || '');
       const selection = state.paintSelection;
-      return selection && String(selection.drawingRef || '') === ref && selection.maskCanvas && selection.bounds ? selection : null;
+      if (!selection || !selection.maskCanvas || !selection.bounds) return null;
+      const ref = String(drawingRef || '');
+      if (ref && String(selection.drawingRef || '') !== ref) selection.drawingRef = ref;
+      return selection;
+    }
+    // 선택을 다시 그려야 할 때 대상이 되는 레이어 = 지금 편집 중인 레이어. 선택이 기억하는 옛 ref가
+    // 아니다(그걸 쓰면 레이어를 옮긴 뒤의 해제가 엉뚱한 캔버스를 지우러 가서 화면에 잔상이 남는다).
+    function currentPaintSelectionRef() {
+      const target = currentPaintTransformLayerTarget();
+      if (target && target.drawingRef) return String(target.drawingRef);
+      return state.paintSelection && String(state.paintSelection.drawingRef || '') || '';
     }
 
     function paintSelectionLayerBounds(selection) {
@@ -54337,7 +54384,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const result = paintTransformResultCanvas(preview);
       if (!result || !result.canvas || !result.bounds) return false;
       const selectionBefore = snapshotPaintSelection(); // ver1279: 그림과 같은 undo 스텝에 실을 값
-      if (preview.source.selection && state.paintSelection && String(state.paintSelection.drawingRef || '') === ref) {
+      if (preview.source.selection && state.paintSelection) { // ver1283: 전역 스텐실 — 소속 비교 불필요
         state.paintSelection = paintSelectionAfterTransform(preview); // ver1278: 선택이 그림을 따라간다
       }
       state.paintTransformPreview = null;
