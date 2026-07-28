@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1277</title>
+  <title>MoArt ver1278</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8700,7 +8700,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1277</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1278</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14684,7 +14684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1277';
+    const APP_DISPLAY_VERSION = '1278';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -54177,6 +54177,68 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
+    // ver1278: a committed transform MOVES THE SELECTION WITH THE CONTENT. TVPaint's own name for this
+    // mode is "Move Selection Content" — "transform your selection and its contents at the same time" —
+    // i.e. the selection is an operand of the transform, not something the commit throws away. Conte used
+    // to null it here, so lasso → move → Enter left the art somewhere new and nothing selected.
+    // The mask is warped through the SAME kernel the content went through, so the two cannot disagree:
+    //   • pure move   → integer translate (exact, and the case that was reported)
+    //   • scale/rotate→ the quad is a parallelogram, so bilinear over the extended uv rect IS that affine map
+    //   • perspective → the same bilinear mesh the content itself uses (consistent by construction)
+    // ★The patch frame hugs the INK (ver711), which is normally smaller than the lasso, so the mask's rect is
+    // expressed in the patch's unit space and the quad is extended to those uv values before warping —
+    // without that the selection would come back cropped to the ink box instead of keeping its own shape.
+    function paintSelectionAfterTransform(preview) {
+      const selection = preview && preview.source && preview.source.selection;
+      if (!selection || !selection.maskCanvas) return null;
+      const offsetX = Math.round(Number(preview.layerCanvasOffsetX) || 0);
+      const offsetY = Math.round(Number(preview.layerCanvasOffsetY) || 0);
+      const mask = selection.maskCanvas;
+      const maskX = paintSelectionBitmapX(selection) + offsetX;   // mask rect in WORK-canvas space
+      const maskY = paintSelectionBitmapY(selection) + offsetY;
+      // ★The output is sized to where the MASK lands, never to the layer's result bounds. Those hug the ink
+      // (base ink ∪ moved patch), so sizing to them cropped the lasso's slack away — measured 103×83 → 79×78
+      // on a loop drawn deliberately wider than its ink.
+      const pureMove = paintTransformIsPureMove(preview);
+      let corners = null, dst = null;
+      if (pureMove) {
+        dst = { x: maskX + (preview.moveDx || 0), y: maskY + (preview.moveDy || 0), w: mask.width, h: mask.height };
+      } else {
+        const src = preview.source.sourceBounds;
+        const quad = paintTransformBoxQuadArray(preview.box);
+        if (!src || !(src.w > 0) || !(src.h > 0) || !Array.isArray(quad) || quad.length !== 4) return null;
+        const u0 = (maskX - src.x) / src.w, u1 = (maskX + mask.width - src.x) / src.w;
+        const v0 = (maskY - src.y) / src.h, v1 = (maskY + mask.height - src.y) / src.h;
+        const c = function(u, v) { const p = paintQuadBilinearPoint(quad, u, v); return [p.x, p.y]; };
+        corners = [c(u0, v0), c(u1, v0), c(u1, v1), c(u0, v1)]; // [TL,TR,BR,BL], the order the kernel reads
+        const xs = corners.map(function(p) { return p[0]; }), ys = corners.map(function(p) { return p[1]; });
+        const x0 = Math.min.apply(null, xs), y0 = Math.min.apply(null, ys);
+        dst = { x: x0, y: y0, w: Math.max.apply(null, xs) - x0, h: Math.max.apply(null, ys) - y0 };
+      }
+      const x = Math.floor(dst.x), y = Math.floor(dst.y);
+      const w = Math.max(1, Math.ceil(dst.x + dst.w) - x), h = Math.max(1, Math.ceil(dst.y + dst.h) - y);
+      const out = createReadbackCanvas();                          // read back once by paintSelectionBounds
+      out.width = w;
+      out.height = h;
+      const octx = out.getContext('2d');
+      octx.translate(-x, -y);
+      if (pureMove) octx.drawImage(mask, Math.round(dst.x), Math.round(dst.y));
+      else paintDrawPatchThroughQuad(octx, mask, mask.width, mask.height, corners, PAINT_TRANSFORM_MESH_N);
+      const bounds = paintSelectionBounds(out);
+      if (!bounds) return null; // warped clean off the surface — nothing left to select
+      return {
+        drawingRef: String(preview.drawingRef || ''),
+        maskCanvas: out,
+        bitmapX: x - offsetX,   // mask-local bounds above are read against this origin, as everywhere else
+        bitmapY: y - offsetY,
+        bounds: bounds,
+        // the lasso polygon does not survive a warp; the ants are drawn from the mask, exactly as after
+        // invertPaintSelection (which has always set both to null)
+        points: null,
+        paths: null,
+        inverted: !!selection.inverted
+      };
+    }
     function commitPaintTransformPreview() {
       const preview = state.paintTransformPreview;
       if (!preview || !preview.drawingRef || !preview.source) return false;
@@ -54186,7 +54248,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const result = paintTransformResultCanvas(preview);
       if (!result || !result.canvas || !result.bounds) return false;
       if (preview.source.selection && state.paintSelection && String(state.paintSelection.drawingRef || '') === ref) {
-        state.paintSelection = null;
+        state.paintSelection = paintSelectionAfterTransform(preview); // ver1278: follows the content
       }
       state.paintTransformPreview = null;
       state.paintTransformBox = null;
