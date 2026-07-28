@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1281</title>
+  <title>MoArt ver1282</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8700,7 +8700,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1281</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1282</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14684,7 +14684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1281';
+    const APP_DISPLAY_VERSION = '1282';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -51483,6 +51483,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // the whole point of the "전수 통일" rule.
     const MARQUEE_COLOR = '#1f66d1';        // selection / transform (blue)
     const MARQUEE_COLOR_PERSP = '#d06a1f';  // perspective transform (orange)
+// ver1282: 아직 안 구워진(미확정) 변형 박스. TVPaint가 확정 전 상태를 색으로 구분해 주는 것과 같은 역할이고,
+// ver1281 이후 좌표가 툴 전환·선택 취소를 넘어 살아남게 되면서 "지금 Enter를 누르면 뭔가 바뀐다"를 눈으로
+// 알 수 있어야 하는 상황이 실제로 생겼다. 파랑(변형)·주황(퍼스펙티브) 둘 다와 구분되는 빨강 하나로 통일.
+const MARQUEE_COLOR_PENDING = '#e02424';
     const MARQUEE_LINE_PX = 1.1;            // outline / dash thickness (screen px)
     const MARQUEE_DASH_ON = 4.6;            // dash length (screen px)
     const MARQUEE_DASH_OFF = 3.2;           // gap length (screen px)
@@ -52384,6 +52388,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }, true);
 
     // build the per-frame style for a given display scale (screen px per bitmap px)
+    // ver1282: 박스가 생성 시점의 항등 사각형(baseQuad)에서 벗어나 있으면 = Enter가 픽셀을 바꾼다 = 미확정.
+    // 프리뷰 존재 여부로 판정하지 않는 이유: ver1281 이후 툴을 갔다 오면 프리뷰는 없고 좌표만 남는데, 그
+    // 상태야말로 표시가 가장 필요한 순간이다. 확정하면 ensurePaintTransformBoxForTarget(force)가 새 잉크
+    // 바운즈로 박스를 다시 만들어 baseQuad === quad가 되므로 자동으로 확정색으로 돌아온다.
+    function paintTransformBoxIsPending(box) {
+      const q = box && box.quad, b = box && box.baseQuad;
+      if (!Array.isArray(q) || !Array.isArray(b) || q.length !== 4 || b.length !== 4) return false;
+      for (let i = 0; i < 4; i += 1) {
+        if (Math.abs((Number(q[i][0]) || 0) - (Number(b[i][0]) || 0)) > 0.5) return true;
+        if (Math.abs((Number(q[i][1]) || 0) - (Number(b[i][1]) || 0)) > 0.5) return true;
+      }
+      return false;
+    }
+    function paintTransformBoxColor(box) {
+      if (paintTransformBoxIsPending(box)) return MARQUEE_COLOR_PENDING;
+      return box && box.mode === 'perspective' ? MARQUEE_COLOR_PERSP : MARQUEE_COLOR;
+    }
     function paintMarqueeStyle(dispScale) {
       const s = dispScale > 0 ? dispScale : 1;
       const sp = function(px, floor) { return Math.max(floor || 0.35, px / s); }; // screen→bitmap
@@ -52462,7 +52483,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ctx.lineTo(corners[3].x, corners[3].y);
         ctx.closePath();
         return true;
-      }, { color: box.mode === 'perspective' ? MARQUEE_COLOR_PERSP : MARQUEE_COLOR, dash: st.dash, width: st.line });
+      }, { color: paintTransformBoxColor(box), dash: st.dash, width: st.line }); // ver1282: 미확정이면 빨강
       corners.forEach(function(point) { drawPaintOverlayHandle(ctx, point, null, st.handle, st.line); });
       if (box.mode === 'perspective') {
         // ver948: edge-midpoint handles — grab a whole edge and slide it (kernel 'edge' drag mode)
@@ -52734,7 +52755,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function applyPaintSelectionSnapshot(snap) {
       const prevRef = state.paintSelection && String(state.paintSelection.drawingRef || '') || '';
       state.paintSelection = snap ? Object.assign({}, snap) : null;
-      state.paintTransformBox = null;
+      // ver1282: ★ver1281의 ①("툴을 바꿔도 변형 좌표는 남는다")이 실기에서 안 먹던 진짜 이유가 여기였다.
+      // 사용자 재현 순서는 [드래그 → 툴 전환 → Ctrl+Z → 변형 툴 복귀 → Enter]인데, 툴 전환은 ver1281이
+      // 고쳤어도 그 다음 Ctrl+Z(=선택 취소)가 이 함수를 타면서 box를 통째로 날려, 복귀했을 때 좌표가 이미
+      // 없었다. TVPaint는 바로 이 지점을 "선택은 취소됐지만 이동 좌표값은 잔재해 있어서 엔터 누르면 바로
+      // 적용됨"으로 동작한다(사용자 실측). 그러니 선택 히스토리는 **선택만** 소유한다.
+      // 픽셀 프리뷰는 계속 버린다 — source 패치가 옛 선택으로 잘린 것이라 새 선택과 모순되고, 화면상
+      // "그림은 원위치"가 TVPaint의 관측 결과이기도 하다. 좌표(box)만 남기면 Enter가 그때 소스를 다시 뜬다.
       state.paintTransformPreview = null;
       const nextRef = state.paintSelection && String(state.paintSelection.drawingRef || '') || '';
       if (prevRef) { redrawVisibleLayerCanvasesForRef(prevRef); refreshPaintEditOverlays(prevRef); }
@@ -53517,6 +53544,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         refH: Math.max(1, Number(box.refH) || 1),
         quad: Array.isArray(box.quad) ? box.quad.map(function(q) {
           return [Number(q[0]) || 0, Number(q[1]) || 0];
+        }) : null,
+        baseQuad: Array.isArray(box.baseQuad) ? box.baseQuad.map(function(q) { // ver1282: 미확정 판정의 기준선
+          return [Number(q[0]) || 0, Number(q[1]) || 0];
         }) : null
       };
     }
@@ -53610,6 +53640,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         refW: Math.max(1, bounds.w), // ver948: original dims — the numeric settings' 100% scale reference
         refH: Math.max(1, bounds.h),
         quad: [
+          [bounds.x, bounds.y],
+          [bounds.x + bounds.w, bounds.y],
+          [bounds.x + bounds.w, bounds.y + bounds.h],
+          [bounds.x, bounds.y + bounds.h]
+        ],
+        // ver1282: 이 박스가 태어난 자리 = "아무것도 안 한 상태". 미확정 판정의 기준선이며, 드래그·숫자
+        // 입력·undo가 quad만 갈아끼우고 clone이 이 값을 실어 나르므로 별도 갱신 지점이 없다.
+        baseQuad: [
           [bounds.x, bounds.y],
           [bounds.x + bounds.w, bounds.y],
           [bounds.x + bounds.w, bounds.y + bounds.h],
