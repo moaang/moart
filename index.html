@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1283</title>
+  <title>MoArt ver1284</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8700,7 +8700,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1283</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1284</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14684,7 +14684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1283';
+    const APP_DISPLAY_VERSION = '1284';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -20120,19 +20120,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         try { cancelAnimationFrame(state.activeLayerCanvasRedrawRaf); } catch (error) {}
         state.activeLayerCanvasRedrawRaf = 0;
       }
-      state.paintPointerId = null;
-      state.paintCurrentStroke = null;
-      state.paintRasterOp = null;
+      paintAbortGestureSession(); // ver1284: 진행 중 제스처 — 툴 전환 커널과 같은 몸
       state.paintStamp = null;
       state.paintStampPreview = null;
       state.paintSelection = null;
       state.paintLassoPreview = null;
       state.paintTransformBox = null;
       state.paintTransformPreview = null;
-      state.paintCurrentLayerRect = null;
       state.cameraFrameDrag = null;
-      state.videoPaintPointerCanvasRect = null;
-      state.paintPointerCanvasRect = null;
       state.paintBitmapHistory = {};
       state.paintBitmapHistoryOrder = [];
       state.pendingLayerDrawingRefs = new Set();
@@ -52274,7 +52269,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         frame: state.gengaFrame, sel: state.gengaSelectedLayerId, tool: state.paintEditTool } };
       state.project = tlTutMakeProject();
       state.undoStack = []; state.redoStack = [];
-      state.paintEditTool = '';
+      resetProjectTransientRuntime(); // ver1284: 튜토리얼도 프로젝트 스왑 — 이전 프로젝트의 선택/박스를 데려가지 않는다
+      setActivePaintTool('');
       if (typeof invalidateVideoTimelineCache === 'function') invalidateVideoTimelineCache();
       if (miniContainer) tlTutMountStageMini(miniContainer); // reparent BEFORE the first render so it targets the mini
       tlTut.lessons = null; // ver1150: show the category picker first
@@ -52286,7 +52282,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!tlTut) return;
       const s = tlTut.saved; tlTut = null;
       state.project = s.project; state.undoStack = s.undo; state.redoStack = s.redo;
-      state.gengaFrame = s.frame; state.gengaSelectedLayerId = s.sel; state.paintEditTool = s.tool;
+      state.gengaFrame = s.frame; state.gengaSelectedLayerId = s.sel;
+      resetProjectTransientRuntime(); // ver1284: 복귀도 스왑
+      setActivePaintTool(s.tool || '');
       if (typeof invalidateVideoTimelineCache === 'function') invalidateVideoTimelineCache();
       tlTutRestoreStage(); // ver1144: put #gengaStage back in its home if the mini host had borrowed it
       tlTutHideCoach();
@@ -52653,13 +52651,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const previewOwnsSelection = !!(transformPreview && transformPreview.source
         && transformPreview.source.selection && selection);
       let overlaySelection = previewOwnsSelection ? null : selection;
-      if (previewOwnsSelection && paintTransformIsPureMove(transformPreview)) {
-        overlaySelection = {
-          maskCanvas: selection.maskCanvas,
-          bounds: selection.bounds,
-          bitmapX: paintSelectionBitmapX(selection) + Math.round(transformPreview.moveDx || 0),
-          bitmapY: paintSelectionBitmapY(selection) + Math.round(transformPreview.moveDy || 0)
-        };
+      if (previewOwnsSelection) {
+        if (paintTransformIsPureMove(transformPreview)) {
+          overlaySelection = {
+            maskCanvas: selection.maskCanvas,
+            bounds: selection.bounds,
+            bitmapX: paintSelectionBitmapX(selection) + Math.round(transformPreview.moveDx || 0),
+            bitmapY: paintSelectionBitmapY(selection) + Math.round(transformPreview.moveDy || 0)
+          };
+        } else if (!drawPaintTransformedSelectionOutline(ctx, transformPreview, MARQUEE_COLOR, marqueePx)) {
+          overlaySelection = selection; // ver1284: 매핑할 소스 정보가 없으면 원본이라도 보여 준다 — 숨기지 않는다
+        }
       }
       if (overlaySelection && overlaySelection.maskCanvas && overlaySelection.bounds) {
         ctx.save();
@@ -52720,35 +52722,78 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return existing;
     }
 
-    function drawPaintMaskOutline(ctx, maskCanvas, color, dotPx) {
-      if (!ctx || !maskCanvas) return;
-      const sz = Math.max(0.55, Number(dotPx) || 1.3); // ver649: screen-scale-aware thin selection edge
-      const maskCtx = maskCanvas.getContext('2d');
+    // ver1284: 마스크의 외곽 점을 **한 번만** 뽑아 캐시한다. 종전에는 앤츠를 그릴 때마다 마스크 전체를
+    // getImageData + 4이웃 스캔했다(용지 크기면 22만 픽셀/프레임). 마스크 캔버스는 만들어진 뒤 바뀌지
+    // 않는 객체라 WeakMap 캐시가 안전하고(마스크가 바뀌면 새 캔버스가 만들어진다), 무엇보다 이 점 배열이
+    // 있어야 "변형 중 앤츠"를 마스크 워프 없이 그릴 수 있다(워프는 실측 35.7ms/회 — 드래그에 못 쓴다).
+    // 대시 판정 ((x+y)%10)<6 은 원본 좌표 기준이라 뽑는 시점에 미리 걸러 둔다 — 변형돼도 같은 점이 찍힌다.
+    const paintMaskEdgeCache = new WeakMap();
+    function paintMaskEdgePoints(maskCanvas) {
+      if (!maskCanvas) return null;
+      const cached = paintMaskEdgeCache.get(maskCanvas);
+      if (cached) return cached;
       const width = maskCanvas.width;
       const height = maskCanvas.height;
       let data = null;
       try {
-        data = maskCtx.getImageData(0, 0, width, height).data;
+        data = maskCanvas.getContext('2d').getImageData(0, 0, width, height).data;
       } catch (error) {
-        return;
+        return null;
       }
-      function inside(x, y) {
+      const inside = function(x, y) {
         if (x < 0 || y < 0 || x >= width || y >= height) return false;
         return data[(y * width + x) * 4 + 3] > 0;
+      };
+      const points = [];
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          if (!inside(x, y)) continue;
+          if (inside(x - 1, y) && inside(x + 1, y) && inside(x, y - 1) && inside(x, y + 1)) continue; // 안쪽
+          if (((x + y) % 10) < 6) points.push(x, y);
+        }
       }
-      function edgeAt(x, y) {
-        return inside(x, y) && (!inside(x - 1, y) || !inside(x + 1, y) || !inside(x, y - 1) || !inside(x, y + 1));
-      }
+      paintMaskEdgeCache.set(maskCanvas, points);
+      return points;
+    }
+    function drawPaintMaskOutline(ctx, maskCanvas, color, dotPx) {
+      if (!ctx || !maskCanvas) return;
+      const points = paintMaskEdgePoints(maskCanvas);
+      if (!points) return;
+      const sz = Math.max(0.55, Number(dotPx) || 1.3); // ver649: screen-scale-aware thin selection edge
       // ver618: thin colored dashes with TRANSPARENT gaps (no white halo, no white counter-dash)
       ctx.save();
       ctx.fillStyle = color || MARQUEE_COLOR; // ver1071 (A6)
-      for (let y = 0; y < height; y += 1) {
-        for (let x = 0; x < width; x += 1) {
-          if (!edgeAt(x, y)) continue;
-          if (((x + y) % 10) < 6) ctx.fillRect(x, y, sz, sz);
-        }
+      for (let i = 0; i < points.length; i += 2) ctx.fillRect(points[i], points[i + 1], sz, sz);
+      ctx.restore();
+    }
+    // ver1284: 미확정 변형 중에도 선택 점선을 변형에 맞춰 보여 준다. 종전에는 순수 이동만 델타로 밀어
+    // 그리고 회전·크기·퍼스펙티브에서는 앤츠를 통째로 숨겼는데, 그러면 화면에 기즈모만 남아 사용자가
+    // "선택 점선을 한 번 버리고 기즈모가 선택인 것처럼 둔갑한다"고 읽게 된다(실제 보고이자 정확한 진단).
+    // 커밋(paintSelectionAfterTransform)과 **같은 uv 수학**을 쓰되 마스크가 아니라 캐시된 외곽 점만 옮기므로
+    // 비용은 점 개수에 비례한다. 그리는 좌표계는 오버레이 ctx = 용지 좌표라 work-canvas 오프셋을 되뺀다.
+    function drawPaintTransformedSelectionOutline(ctx, preview, color, dotPx) {
+      const selection = preview && preview.source && preview.source.selection;
+      const src = preview && preview.source && preview.source.sourceBounds;
+      if (!ctx || !selection || !selection.maskCanvas || !src || !(src.w > 0) || !(src.h > 0)) return false;
+      const quad = paintTransformBoxQuadArray(preview.box);
+      if (!Array.isArray(quad) || quad.length !== 4) return false;
+      const points = paintMaskEdgePoints(selection.maskCanvas);
+      if (!points || !points.length) return false;
+      const offsetX = Math.round(Number(preview.layerCanvasOffsetX) || 0);
+      const offsetY = Math.round(Number(preview.layerCanvasOffsetY) || 0);
+      const maskX = paintSelectionBitmapX(selection) + offsetX;
+      const maskY = paintSelectionBitmapY(selection) + offsetY;
+      const sz = Math.max(0.55, Number(dotPx) || 1.3);
+      ctx.save();
+      ctx.fillStyle = color || MARQUEE_COLOR;
+      for (let i = 0; i < points.length; i += 2) {
+        const u = (maskX + points[i] - src.x) / src.w;
+        const v = (maskY + points[i + 1] - src.y) / src.h;
+        const p = paintQuadBilinearPoint(quad, u, v);
+        ctx.fillRect(p.x - offsetX, p.y - offsetY, sz, sz);
       }
       ctx.restore();
+      return true;
     }
 
     function paintSelectionBitmapX(selection) {
@@ -56175,12 +56220,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       state.memoMode = nextEnabled;
       if (!paintInteractionActive()) {
         const transformRef = state.paintTransformPreview && state.paintTransformPreview.drawingRef || state.paintTransformBox && state.paintTransformBox.drawingRef || '';
-        state.paintPointerId = null;
-        state.paintCurrentStroke = null;
-        state.paintRasterOp = null;
-        state.paintCurrentLayerRect = null;
-        state.paintPointerCanvasRect = null;
-        state.videoPaintPointerCanvasRect = null;
+        paintAbortGestureSession(); // ver1284: 손복사돼 있던 6줄 — 툴 전환 커널과 같은 몸
         state.paintTransformPreview = null;
         state.paintTransformBox = null;
         state.paintSpacePanActive = false;
@@ -57835,74 +57875,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         function(lx, ly, px, py, w, h) { if (!sideDockZoneForRect(px, py, w, h)) maybeRedockPaintSettings(); saveEditorUiState(); });
     }
 
-    function selectPaintEditTool(tool) {
-      clearGengaGizmoCursor(); // ver1075 (B6): unconditional — switching TO camera must also drop the FX gizmo's cursor
-      if (state.project && state.project.kind === 'genga') {
-        if (gengaSel && String(tool || '') !== String(state.paintEditTool || '')) {
-          // tool switching NEVER applies a pending transform (Enter applies / Esc cancels): revert to the
-          // ORIGINAL selection region first, so hopping select↔transform↔perspective can't accumulate drift.
-          // ver751 (quad-only): the quad IS the whole transform now — reset = identity quad (bounds corners).
-          // ver766: …and switching never DESELECTS either. Leaving the selection tools used to call
-          // gengaCommitSelection(), which drops gengaSel — so select → transform → pen silently threw the
-          // selection away. Both reference tools disagree: the paint tool releases a selection only on an
-          // explicit Deselect (Ctrl+Shift+D), and the sheet tool keeps the selection's stencil live across tool
-          // changes until you clear it (K). The explicit exits already exist here — `d` (lassoSelectClear)
-          // and the LASSO SELECT window's Clear — so the implicit one was pure loss of the user's work.
-          gengaUnliftSelection(gengaSel);
-          // ver1201: and if it was the TOOL's own auto-selection (gengaSelectAll), leaving the transform tools
-          // releases it outright — ver766's keep-the-selection rule protects the user's lasso, not this.
-          // Switching 変形↔パース keeps the box, since both tools want it.
-          if (gengaSel.auto && tool !== 'transform' && tool !== 'perspective') { gengaSel = null; gengaSelDrag = null; }
-        }
-        if (gengaStamp && tool !== 'lasso-stamp') gengaExitStamp();
-        // ver1041: the camera tool and the layer-FX window are separate edit modes. The FX panel is a fixed
-        // ~216px box floating over the middle of the stage (z 240), so with it open its own body swallowed the
-        // presses meant for the camera frame's handles under it — the camera looked dead. Entering the camera
-        // tool closes it, the way entering it already resets the draw tool to the pen just below.
-        if (tool === 'camera' && state.gengaFxOpenId && typeof gengaCloseFxPanel === 'function') gengaCloseFxPanel();
-        // Entering transform/perspective should show the box immediately (parity with conte's auto box) —
-        // previously the layer was only lifted into gengaSel lazily, on the canvas's first pointerdown.
-        if (tool === 'transform' || tool === 'perspective') {
-          const gLayer = gengaSelectedLayer();
-          const sameSel = gengaSel && gLayer && String(gengaSel.layerId) === String(gLayer.id) && gengaSel.frame === gengaCurrentFrame();
-          if (gLayer && !gLayer.locked && !sameSel) gengaSelectAll(gLayer, gengaCurrentFrame());
-        }
-      }
-      const previousTool = state.paintEditTool;
-      const previousTransformRef = state.paintTransformPreview && state.paintTransformPreview.drawingRef || state.paintTransformBox && state.paintTransformBox.drawingRef || '';
-      state.paintEditTool = String(tool || '');
-      // ver677: draw tools and edit tools are mutually EXCLUSIVE selections — entering an edit tool
-      // (lasso/stamp/transform/perspective/camera) resets the draw tool to the neutral pen, so the eraser
-      // (or a shape) never stays highlighted/armed underneath. (The reverse direction already held: the
-      // pen/eraser/shape buttons all clear paintEditTool.) Closing an edit tool ('') leaves paintTool alone.
-      if (state.paintEditTool && state.paintTool !== 'pen') state.paintTool = 'pen';
-      state.paintEditToolWindowOpen = Boolean(state.paintEditTool && state.paintEditTool !== 'camera');
-      state.paintEyedropper = false;
-      state.cameraFrameDrag = null;
-      // ver1281 (TVPaint 실측): 툴을 바꾸면 그림은 원위치로 돌아가지만 **변형 좌표는 남는다**. 그래서
-      // 다시 변형 툴로 돌아와 Enter만 누르면 아까 잡아둔 이동/회전이 그대로 적용된다 — 사용자가 "꽤
-      // 편하다"고 지목한 동작이고, 콘티에는 이 개념 자체가 없었다(box까지 같이 버려서 좌표가 소실).
-      // 버리는 것은 픽셀 프리뷰뿐. box는 paintTransformUiRefValid가 툴을 검사하므로 변형 툴이 아닐 때는
-      // 그려지지도 않는다 — 남겨도 화면에 나타나지 않는다.
-      if (previousTool !== state.paintEditTool && state.paintTransformPreview) {
-        state.paintTransformPreview = null;
-      }
-      if (state.paintEditTool !== 'transform' && state.paintEditTool !== 'perspective') {
-        state.paintTransformPreview = null; // ver1281: box(좌표)는 남긴다 — 위 주석 참조
-      }
-      if (state.paintEditTool !== 'lasso-stamp') clearPaintStampPreview();
-      updatePaintUI();
-      if (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective') {
-        ensurePaintTransformBoxForCurrentTarget(false);
-      } else if (previousTransformRef) {
-        refreshPaintEditOverlays(previousTransformRef);
-      }
-      renderCameraFrameOverlay(document.getElementById('conteVideoStage'));
-      if (state.project && state.project.kind === 'genga') drawGengaPreview();
-      cameraFxWindowSync(); // ver921: inline section's visibility already follows updatePaintUI's inlineKey above — just refresh its displayed numbers
-      tfqWindowSync(); // ver948: same for the transform/perspective numeric rows
-    }
-
     function beginOnePxWindowDrag(event) { // ver838: shared body — see beginFloatingWinDrag
       beginFloatingWinDrag(event, 'onePxWindow', '[data-one-px-window-drag="true"]', '#onePxHeader',
         'onePxWindowX', 'onePxWindowY', applyOnePxWindowState);
@@ -59253,37 +59225,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
     }
 
-    // ver680: picking a DRAW tool (pen/eraser/shape) must tear down an armed EDIT tool exactly the way the
-    // edit-tool buttons do (selectPaintEditTool). Conte's transform box was already dropped by updatePaintUI's
-    // safety net, but GENGA's floating selection (gengaSel) was NOT — its marching-ants box kept drawing on
-    // every frame regardless of the active tool, so switching to pen left the selection box hanging ("다른
-    // 툴로 갔는데 선택박스가 안 없어짐", and re-entering popped the stale box). Route the teardown through the
-    // one canonical exit so conte (box + overlay) AND genga (reset+commit gengaSel + redraw) both clean up.
-    // Guarded so a plain pen↔eraser hop with nothing armed stays cheap.
-    function disarmPaintEditToolForDrawTool() {
-      const hasGengaSel = state.project && state.project.kind === 'genga' && typeof gengaSel !== 'undefined' && gengaSel;
-      if (state.paintEditTool || state.paintTransformBox || state.paintTransformPreview || hasGengaSel) selectPaintEditTool('');
-    }
-    // ver681 (P0, tool-state 재설계): the canonical teardown for the INLINE entry points that clear
-    // paintEditTool WITHOUT going through selectPaintEditTool — color-picker open, eyedropper on, tool-window
-    // close. Those paths used to leave the transform box (masked on CONTE only by the flimsy updatePaintUI
-    // safety net) and the GENGA floating selection hanging. Routing every such site through one shared exit
-    // is what lets the safety net be deleted: a tool leaving = its transient state torn down, always.
-    function disarmPaintEditToolState() {
-      if (state.project && state.project.kind === 'genga' && typeof gengaSel !== 'undefined' && gengaSel) {
-        // ver766: cancel any pending transform but KEEP the selection — opening the color picker or arming the
-        // eyedropper is not a Deselect (see selectPaintEditTool for the the reference tools precedent). Was
-        // gengaCommitSelection(), which dropped it.
-        gengaUnliftSelection(gengaSel);
-        drawGengaPreview();
-      }
-      if (state.project && state.project.kind === 'genga' && typeof gengaStamp !== 'undefined' && gengaStamp) gengaExitStamp();
-      const ref = (state.paintTransformPreview && state.paintTransformPreview.drawingRef) || (state.paintTransformBox && state.paintTransformBox.drawingRef) || '';
-      const had = !!(state.paintTransformBox || state.paintTransformPreview);
-      state.paintTransformBox = null;
-      state.paintTransformPreview = null;
-      if (had && ref) refreshPaintEditOverlays(ref);
-    }
     // ═══ ver685 (tool-state redesign P0-c): THE tool-switch choke point ═══════════════════════════
     // Reference pattern (tldraw setCurrentTool / Excalidraw setActiveTool / Literally Canvas
     // willBecomeInactive): ONE entry point owns every tool switch, so teardown of the outgoing tool is
@@ -59295,19 +59236,104 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // (P3 will rename the underlying memo* fields to paint*; this function is already the future name's
     // public surface, so call sites won't churn again.)
     const PAINT_DRAW_TOOL_IDS = ['pen', 'eraser', 'line', 'curve', 'rect', 'ellipse', 'lasso-fill', 'bucket'];
-    function setActivePaintTool(id) {
-      const next = String(id || '');
-      if (PAINT_DRAW_TOOL_IDS.indexOf(next) >= 0) {
-        disarmPaintEditToolForDrawTool(); // armed edit tool / lingering box (incl. the genga floating selection) tears down FIRST
-        state.paintTool = next;
-        state.paintEyedropper = false;
-        state.paintEditTool = '';
-        state.paintEditToolWindowOpen = false;
-        updatePaintUI();
-        return;
-      }
-      selectPaintEditTool(next); // edit tools ('lasso-select'|'lasso-stamp'|'transform'|'perspective'|'camera') + '' (close)
+    const PAINT_EDIT_TOOL_IDS = ['lasso-select', 'lasso-stamp', 'transform', 'perspective', 'camera'];
+    // ver1284: 툴을 떠날 때 반드시 사라져야 하는 것들. **누가 남겼는지 묻지 않는다** — 목적지 툴이 다르면
+    // 전부 버린다. 툴별 owns 테이블을 두면 "이 툴이 저 상태를 남길 수 있다"를 13×5칸 전부 맞게 유지해야
+    // 하고, 한 칸만 틀려도 조용히 새기 때문이다. 실제로 그렇게 새고 있었다(아래 실측).
+    // paintTransformBox는 목록에 없다 — 좌표는 툴 전환을 넘어 살아남는 게 TVPaint 규약(ver1281 ①).
+    const PAINT_TOOL_TRANSIENT_KEYS = ['paintLassoPreview', 'paintStamp', 'paintTransformPreview', 'cameraFrameDrag'];
+    // 진행 중인 포인터 제스처. 툴과 무관한 공통 세션이라 콘티·원화 양쪽이 같은 커널을 쓴다.
+    // (setMemoModeEnabled와 resetProjectTransientRuntime이 이 목록을 손복사해 갖고 있던 것을 하나로 합쳤다.)
+    function paintAbortGestureSession() {
+      state.paintPointerId = null;
+      state.paintCurrentStroke = null;
+      state.paintRasterOp = null;
+      state.paintCurrentLayerRect = null;
+      state.paintPointerCanvasRect = null;
+      state.videoPaintPointerCanvasRect = null;
     }
+    function paintDropToolTransients() {
+      PAINT_TOOL_TRANSIENT_KEYS.forEach(function(key) { state[key] = null; });
+      clearPaintStampPreview(); // 프리뷰는 오버레이 리프레시를 동반하므로 자기 함수로
+    }
+    // 원화 엔진의 툴 상태(gengaSel/gengaStamp/FX 패널)를 여닫는 훅. 종전에는 이 분기가 전환 함수 본문에
+    // kind === 'genga' 로 박혀 있어서, 콘티/원화의 "툴을 떠난다/들어간다" 규칙이 한 몸에 뒤엉켜 있었다.
+    function paintToolEngineExit(prevTool, nextTool) {
+      if (!(state.project && state.project.kind === 'genga')) return;
+      if (typeof gengaSel !== 'undefined' && gengaSel && String(nextTool || '') !== String(prevTool || '')) {
+        // 툴 전환은 미확정 변형을 절대 적용하지 않는다(Enter가 적용, Esc가 취소) — 원래 선택 영역으로
+        // 되돌려 select↔transform↔perspective 왕복이 드리프트를 쌓지 못하게 한다. ver751(quad-only)
+        // 기준 리셋 = 항등 quad. ver766: 그리고 전환은 선택을 해제하지도 않는다(참조 툴 두 곳 모두
+        // 명시적 Deselect에서만 놓는다). 명시적 출구는 이미 있다 — `d`와 LASSO SELECT 창의 Clear.
+        gengaUnliftSelection(gengaSel);
+        // ver1201: 단 그것이 툴이 스스로 만든 자동 선택(gengaSelectAll)이었다면 변형 툴을 떠날 때 놓아준다.
+        // ver766의 "선택을 지키는" 규칙은 사용자의 라쏘를 지키는 것이지 이걸 지키는 게 아니다.
+        if (gengaSel.auto && nextTool !== 'transform' && nextTool !== 'perspective') { gengaSel = null; gengaSelDrag = null; }
+      }
+      if (typeof gengaStamp !== 'undefined' && gengaStamp && nextTool !== 'lasso-stamp') gengaExitStamp();
+    }
+    function paintToolEngineEnter(nextTool) {
+      if (!(state.project && state.project.kind === 'genga')) return;
+      // ver1041: 카메라 툴과 레이어 FX 창은 별개 편집 모드다. FX 패널이 스테이지 한복판에 떠 있으면 그
+      // 몸통이 카메라 프레임 핸들로 갈 프레스를 삼켜 카메라가 죽은 것처럼 보인다 — 들어갈 때 닫는다.
+      if (nextTool === 'camera' && state.gengaFxOpenId && typeof gengaCloseFxPanel === 'function') gengaCloseFxPanel();
+      // 변형/퍼스펙티브에 들어가면 박스가 즉시 보여야 한다(콘티의 자동 박스와 파리티).
+      if (nextTool === 'transform' || nextTool === 'perspective') {
+        const gLayer = gengaSelectedLayer();
+        const sameSel = gengaSel && gLayer && String(gengaSel.layerId) === String(gLayer.id) && gengaSel.frame === gengaCurrentFrame();
+        if (gLayer && !gLayer.locked && !sameSel) gengaSelectAll(gLayer, gengaCurrentFrame());
+      }
+    }
+    // ═══ ver1284: 13개 툴 전부가 지나는 **유일한** 전환 커널 ═══════════════════════════════════
+    // 종전 구조는 draw 8개와 edit 5개가 서로 다른 몸을 타고, draw 경로는 전용 해제 함수를 거쳐 edit
+    // 경로로 재진입한 뒤 되돌아오는 이중 경로였다. 그 결과 정리 책임이 어디에도 온전히 없었고,
+    // **13×13 = 169개 조합 전부에서** paintLassoPreview·paintStamp·paintRasterOp·paintCurrentStroke·
+    // paintPointerId가 그대로 살아남았다(헤드리스 실측). 특히 paintStamp는 exitPaintStampMode가
+    // paintEditTool === 'lasso-stamp'를 검사하는데 전환이 이미 툴을 바꿔 놓은 뒤라 영원히 호출되지 않는
+    // 순서 버그였다. 이제 정리는 툴별 조건이 아니라 "툴이 바뀌었는가" 하나에만 달려 있다.
+    function setActivePaintTool(id, opts) {
+      opts = opts || {};
+      const next = String(id || '');
+      const isDraw = PAINT_DRAW_TOOL_IDS.indexOf(next) >= 0;
+      // 알려진 edit 툴이 아니면 ''(툴 닫기)로 떨어진다 — 오타난 id가 paintEditTool에 눌러앉아
+      // "아무 툴도 아닌데 창은 열려 있는" 상태를 만들지 못하게 하는 방어.
+      const nextEdit = (!isDraw && PAINT_EDIT_TOOL_IDS.indexOf(next) >= 0) ? next : '';
+      const prevEdit = String(state.paintEditTool || '');
+      const toolChanged = nextEdit !== prevEdit || (isDraw && next !== String(state.paintTool || ''));
+      const previousTransformRef = (state.paintTransformPreview && state.paintTransformPreview.drawingRef)
+        || (state.paintTransformBox && state.paintTransformBox.drawingRef) || '';
+      clearGengaGizmoCursor(); // ver1075 (B6): 무조건 — 카메라로 들어가는 전환도 FX 기즈모 커서를 놓아야 한다
+      paintToolEngineExit(prevEdit, nextEdit);
+      paintToolEngineEnter(nextEdit);
+      if (toolChanged) {
+        paintAbortGestureSession();
+        paintDropToolTransients();
+      }
+      if (isDraw) {
+        state.paintTool = next;
+        state.paintEditTool = '';
+      } else {
+        state.paintEditTool = nextEdit;
+        // ver677: draw 툴과 edit 툴은 상호 배타 — edit 툴에 들어가면 draw 툴은 중립 펜으로 되돌아가
+        // 지우개(또는 도형)가 밑에서 켜진 채 남지 않는다. edit 툴을 닫는 것('')은 draw 툴을 건드리지 않는다.
+        if (state.paintEditTool && state.paintTool !== 'pen') state.paintTool = 'pen';
+      }
+      state.paintEditToolWindowOpen = Boolean(state.paintEditTool && state.paintEditTool !== 'camera');
+      // 스포이드는 툴이 아니라 modifier다. 툴을 고르면 꺼지지만, 스포이드를 켜느라 툴을 닫는 경우만 예외.
+      if (!opts.keepEyedropper) state.paintEyedropper = false;
+      updatePaintUI();
+      if (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective') {
+        ensurePaintTransformBoxForCurrentTarget(false);
+      } else if (previousTransformRef) {
+        refreshPaintEditOverlays(previousTransformRef);
+      }
+      renderCameraFrameOverlay(document.getElementById('conteVideoStage'));
+      if (state.project && state.project.kind === 'genga') drawGengaPreview();
+      cameraFxWindowSync(); // ver921: 표시 숫자만 갱신 — 표시 여부는 위 updatePaintUI가 이미 정했다
+      tfqWindowSync(); // ver948: 변형/퍼스펙티브 숫자 행도 같이
+    }
+    // edit 툴 전용 이름이었던 것 — 이제 같은 커널의 별칭이다(호출부 유지).
+    function selectPaintEditTool(tool) { setActivePaintTool(tool); }
     // Thin aliases — the historical entry points now all funnel through the one choke point.
     // ver677: E shortcut is one-way (no implicit eraser→pen toggle); ver606: re-tapping the active shape
     // returns to the plain pen — both behaviors live at the CALL SITES (they pass '' / the resolved id).
@@ -60571,9 +60597,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       document.getElementById('paintEyedropperBtn').addEventListener('click', function() {
         state.paintEyedropper = !state.paintEyedropper;
         if (state.paintEyedropper) {
-          disarmPaintEditToolState(); // ver681: entering the eyedropper leaves the edit tool → tear down its box/selection
-          state.paintEditTool = '';
-          state.paintEditToolWindowOpen = false;
+          // ver1284: 스포이드를 켜는 것도 "편집 툴을 떠나는 것"이다. 종전에는 여기서 state를 직접 써서
+          // 초크포인트를 우회했고(그래서 전용 disarm 함수가 따로 필요했다), 커널이 하는 정리를 못 받았다.
+          setActivePaintTool('', { keepEyedropper: true });
           if (state.videoEditMode) updatePaintUI();
           else setMemoModeEnabled(true);
         } else {
