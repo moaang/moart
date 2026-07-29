@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1328</title>
+  <title>MoArt ver1329</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8838,7 +8838,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1328</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1329</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14794,7 +14794,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1328';
+    const APP_DISPLAY_VERSION = '1329';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -49155,6 +49155,46 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = n - 1; i >= 0; i -= 1) { acc += (out[i] - acc) * 0.4; out[i] = acc; }
       return out;
     }
+    // ver1328 ① / ver1329: uniform arc-length resampling of a pen's INPUT stream. Engine-neutral by
+    // construction — it takes the resampler state object, never a session, so it lives here with the other
+    // stroke kernels rather than inside either engine (it was born as `gengaArcResampleEmit` in the genga
+    // section; nothing about the math was ever genga's).
+    //
+    // The RENDER half has been arc-length since ver641 (paintTraceVariableWidthPath stamps dabs at 0.25×r);
+    // this is the INPUT half. Raw samples arrive at the pen's report rate (Apple Pencil 240Hz), so a slow
+    // stroke piles hundreds of near-duplicate points into the point list — every one re-walked by the
+    // whole-outline redraw each frame — while a fast stroke leaves width knees at sparse samples. This
+    // emits a point every `st.step` of TRAVELLED distance instead, with pressure AND tilt interpolated
+    // linearly between the two RAW samples bracketing each emitted point (경로 위 필압 보간): uniform
+    // density in, so paintSmoothStrokePressures and the radii slew see uniform spacing, and the list grows
+    // with stroke LENGTH, not stroke DURATION. `st.x/y/p/t` is always the last RAW sample; `st.carry` is
+    // the distance walked since the last EMIT. One gesture = one st.
+    //
+    // WHO USES IT: genga's outline pen. conte's outline pen deliberately does NOT, and that is not drift —
+    // conte strokes are PERSISTED VECTOR (stroke.points is saved and re-rendered), so resampling there
+    // rewrites saved data, and conte already gets the two benefits another way: shouldAppendPaintPoint
+    // drops near-duplicates on the way in, and paintTraceVariableWidthPath lerps width along every segment
+    // on the way out. Adopting it for conte is a data-format decision, not a kernel gap.
+    //
+    // NOT resampled in either engine, on purpose: pxStamp (2値化) — Bresenham is not associative
+    // (a→b→c ≠ a→c in pixels), so resampling would change committed pixels — and the pressure-ALPHA
+    // segment path, whose per-cap overlap darkening is coverage math that only a real flow model fixes.
+    function paintArcResampleEmit(st, x, y, p, tn) {
+      const out = [];
+      if (!st) { out.push({ x: x, y: y, p: p, t: tn }); return out; }
+      const dx = x - st.x, dy = y - st.y;
+      const L = Math.hypot(dx, dy);
+      if (L < 1e-9) return out;
+      let s = st.step - st.carry;
+      while (s <= L) {
+        const f = s / L;
+        out.push({ x: st.x + dx * f, y: st.y + dy * f, p: st.p + (p - st.p) * f, t: st.t + (tn - st.t) * f }); // ver1328 ③: tilt interpolates along the path exactly like pressure
+        s += st.step;
+      }
+      st.carry = st.carry + L - out.length * st.step;
+      st.x = x; st.y = y; st.p = p; st.t = tn;
+      return out;
+    }
     function paintVariableWidthRadii(pts, baseWidthPx, factorFor) {
       const n = pts.length;
       const radii = new Array(n);
@@ -50485,8 +50525,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.beginPath();
       ctx.moveTo(points[0].x * width - ox, points[0].y * height - oy);
       if (points.length === 1) {
-        const radius = Math.max(0.5, ctx.lineWidth * paintPressureWidthFactor(stroke, points[0].p) / 2);
-        if (stroke.pressureAlpha) ctx.globalAlpha = strokeOpacity * paintPressureAlphaFactor(stroke, points[0].p);
+        const radius = Math.max(0.5, ctx.lineWidth * paintPressureWidthFactor(stroke, points[0].p, points[0].t) / 2); // ver1329: tilt
+        if (stroke.pressureAlpha) ctx.globalAlpha = strokeOpacity * paintPressureAlphaFactor(stroke, points[0].p, points[0].t);
         ctx.arc(points[0].x * width - ox, points[0].y * height - oy, radius, 0, Math.PI * 2);
         if (stroke.tool === 'eraser') ctx.fill();
         else {
@@ -50496,8 +50536,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } else if (stroke.pressure && stroke.pressureSize && !stroke.pressureAlpha) {
         // ver621/ver641: pressure→size strokes = ONE variable-width dab-stamped shape, filled once
         // (kills the round-join blobs at direction changes — see paintTraceVariableWidthPath).
-        const ptsPx = points.map(function(pt) { return { x: pt.x * width - ox, y: pt.y * height - oy, p: pt.p }; });
-        const radii = paintVariableWidthRadii(ptsPx, ctx.lineWidth, function(p) { return paintPressureWidthFactor(stroke, p); });
+        const ptsPx = points.map(function(pt) { return { x: pt.x * width - ox, y: pt.y * height - oy, p: pt.p, t: pt.t }; }); // ver1329: .t must survive the px map or the radii kernel sees undefined
+        const radii = paintVariableWidthRadii(ptsPx, ctx.lineWidth, function(p, t) { return paintPressureWidthFactor(stroke, p, t); }); // ver1329: the callback used to be function(p) and silently DROPPED the tilt arg — conte got no tilt at all
         // A stroke with a resolvable tipId stamps that texture instead of the plain round dab. Live since
         // ver1239 wired tipId through the builders and the preview (the comment here still said it was dead
         // code); shared with genga since ver1247.
@@ -50507,8 +50547,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const baseWidth = ctx.lineWidth;
         for (let i = 1; i < points.length; i += 1) {
           const from = points[i - 1], to = points[i];
-          ctx.lineWidth = Math.max(0.5, baseWidth * paintPressureWidthFactor(stroke, to.p));
-          if (stroke.pressureAlpha) ctx.globalAlpha = strokeOpacity * paintPressureAlphaFactor(stroke, to.p);
+          ctx.lineWidth = Math.max(0.5, baseWidth * paintPressureWidthFactor(stroke, to.p, to.t)); // ver1329: tilt
+          if (stroke.pressureAlpha) ctx.globalAlpha = strokeOpacity * paintPressureAlphaFactor(stroke, to.p, to.t);
           ctx.beginPath();
           ctx.moveTo(from.x * width - ox, from.y * height - oy);
           ctx.lineTo(to.x * width - ox, to.y * height - oy);
@@ -50613,9 +50653,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!paintPixelStampMemo[key]) paintPixelStampMemo[key] = paintPixelStampRows(w);
       return paintPixelStampMemo[key];
     }
-    function paintPixelStampWidth(stroke, p) { // genga's integer segment widths (same rounding as gengaDrawMove)
+    function paintPixelStampWidth(stroke, p, t) { // genga's integer segment widths (same rounding as gengaDrawMove); ver1329: tilt rides here too — 2値化 keeps the RAW point STREAM (see the resampler note), which says nothing about width
       const baseW = Math.max(1, Math.round(Number(stroke.size) || 1));
-      return Math.max(1, Math.round(baseW * paintPressureWidthFactor(stroke, p)));
+      return Math.max(1, Math.round(baseW * paintPressureWidthFactor(stroke, p, t)));
     }
     function paintPixelStampStrokeInto(ctx, stroke, width, height, offsetX, offsetY) {
       const points = Array.isArray(stroke.points) ? stroke.points : [];
@@ -50632,8 +50672,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let lastX = 0, lastY = 0;
       for (let i = 0; i < points.length; i += 1) {
         const pt = points[i];
-        ctx.globalAlpha = strokeOpacity * (stroke.pressureAlpha ? paintPressureAlphaFactor(stroke, pt.p) : 1);
-        const stamp = paintPixelStampFor(paintPixelStampWidth(stroke, pt.p));
+        ctx.globalAlpha = strokeOpacity * paintPressureAlphaFactor(stroke, pt.p, pt.t); // ver1329: the pressureAlpha ternary is gone — the factor already returns 1 when pressureAlpha is off, and tilt must survive that case
+        const stamp = paintPixelStampFor(paintPixelStampWidth(stroke, pt.p, pt.t));
         const x = pt.x * width - ox, y = pt.y * height - oy;
         if (i === 0) paintPixelStampAt(ctx, stamp, x, y);
         else paintPixelLine(ctx, stamp, lastX, lastY, x, y);
@@ -50684,11 +50724,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.save();
       applyPaintStrokeStyle(ctx, stroke); // ver721: raw px, width/height are position-only now
       if (stroke.pressure) { // ver609: live pen segment — width/alpha follow the pen (opacity itself stays opaque until commit)
-        ctx.lineWidth = Math.max(0.5, ctx.lineWidth * paintPressureWidthFactor(stroke, toPoint.p));
-        if (stroke.pressureAlpha) ctx.globalAlpha = paintPressureAlphaFactor(stroke, toPoint.p);
+        ctx.lineWidth = Math.max(0.5, ctx.lineWidth * paintPressureWidthFactor(stroke, toPoint.p, toPoint.t)); // ver1329: tilt
+        if (stroke.pressureAlpha) ctx.globalAlpha = paintPressureAlphaFactor(stroke, toPoint.p, toPoint.t);
       }
       if (stroke.aa === false) { // ver943: hard edge stamps the FINAL pixels live (same renderer as commit — raster-consistency invariant)
-        const stamp = paintPixelStampFor(paintPixelStampWidth(stroke, toPoint.p));
+        const stamp = paintPixelStampFor(paintPixelStampWidth(stroke, toPoint.p, toPoint.t));
         ctx.fillStyle = stroke.color || '#111111';
         const hx = toPoint.x * width - ox;
         const hy = toPoint.y * height - oy;
@@ -72306,36 +72346,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       b.restore();
       gengaShapeComposite(sess);
     }
-    // ver1328 ①: uniform arc-length resampling of the outline pen's input stream (paper units). The
-    // RENDER half has been arc-length since ver641 (paintTraceVariableWidthPath stamps dabs at 0.25×r);
-    // this is the INPUT half: raw samples arrive at the pen's report rate (Apple Pencil 240Hz), so a slow
-    // stroke piles hundreds of near-duplicate points into sess.pts — every one re-walked by the
-    // whole-outline redraw each frame — while a fast stroke leaves width knees at sparse samples. This
-    // resampler emits points every `step` of TRAVELLED distance instead, with pressure interpolated
-    // linearly between the two RAW samples that bracket each emitted point (경로 위 필압 보간): uniform
-    // density in, so paintSmoothStrokePressures/slew see uniform spacing, and sess.pts growth is bounded
-    // by stroke LENGTH, not stroke DURATION. The anchor (st.x/y/p) is always the last RAW sample; carry
-    // is the distance walked since the last EMIT — both live on sess.arc, one gesture = one run.
-    // pxStamp (2値化) deliberately keeps the raw stream: Bresenham is not associative (a→b→c ≠ a→c in
-    // pixels), so resampling would change committed pixels. The alpha segment path keeps raw too — its
-    // per-segment cap overlap darkening is coverage math that only a real flow model fixes (documented
-    // in the code map, not silently half-fixed here).
-    function gengaArcResampleEmit(sess, x, y, p, tn) {
-      const st = sess.arc, out = [];
-      if (!st) { out.push({ x: x, y: y, p: p, t: tn }); return out; }
-      const dx = x - st.x, dy = y - st.y;
-      const L = Math.hypot(dx, dy);
-      if (L < 1e-9) return out;
-      let s = st.step - st.carry;
-      while (s <= L) {
-        const f = s / L;
-        out.push({ x: st.x + dx * f, y: st.y + dy * f, p: st.p + (p - st.p) * f, t: st.t + (tn - st.t) * f }); // ver1328 ③: tilt interpolates along the path exactly like pressure
-        s += st.step;
-      }
-      st.carry = st.carry + L - out.length * st.step;
-      st.x = x; st.y = y; st.p = p; st.t = tn;
-      return out;
-    }
     function gengaDrawMove(ev) {
       if (ev.pointerType === 'touch' && gengaPointers.has(ev.pointerId)) gengaPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
       if (gengaPinch) { if (gengaPointers.size >= 2) gengaPinchMove(); if (ev.cancelable) ev.preventDefault(); return; } // pinch owns it
@@ -72380,7 +72390,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const useTilt = penSess.smoothT;
         if (penSess.penOutline) { // ver621: outline mode just accumulates; ONE whole redraw after the loop
           // ver1328 ①: accumulate RESAMPLED points (uniform arc-length + interpolated pressure), not raw
-          const emitted = gengaArcResampleEmit(penSess, p.x, p.y, usePressure, useTilt);
+          const emitted = paintArcResampleEmit(penSess.arc, p.x, p.y, usePressure, useTilt);
           for (let ei = 0; ei < emitted.length; ei += 1) {
             const q = emitted[ei];
             penSess.pts.push(q);
