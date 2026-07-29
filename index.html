@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1323</title>
+  <title>MoArt ver1325</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -1167,6 +1167,19 @@
       line-height: 1.45;
       word-break: break-word;
     }
+
+    /* ver1325: environment status rows — latency-relevant platform facts, filled by renderVersionInfoEnv. */
+    .version-info-env-title {
+      margin-top: 4px;
+      padding-top: 10px;
+      border-top: 1px solid var(--sh-hairline, rgba(255, 255, 255, 0.12));
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 900;
+    }
+    .version-info-value.vi-ok { color: #8fce8f; }
+    .version-info-value.vi-warn { color: #e0b060; }
+    .version-info-value.vi-dim { color: var(--sh-text-muted, #9aa1a8); }
 
     /* ver789: license notice — deliberately plain boilerplate. Muted + small so it reads as standard
        legal chrome (individual users skip it); complete enough that an organization's review finds
@@ -8825,7 +8838,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1323</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1325</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -8836,6 +8849,8 @@
           <span id="versionInfoFileValue" class="version-info-value"></span>
         </div>
       </div>
+      <div class="version-info-env-title">Environment</div><!-- ver1325: rows built by renderVersionInfoEnv; English-only like the rest of this dialog (ver882) -->
+      <div id="versionInfoEnvList" class="version-info-list"></div>
       <div class="version-info-legal">Copyright (c) 2026 Moaang. All rights reserved.
 
 1. Grant to Individuals. Permission is granted, free of charge, to any individual natural person to install and use this software on devices under that person's own control, for that person's own work — including work performed for compensation and work delivered to a client or employer.
@@ -14775,7 +14790,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1323';
+    const APP_DISPLAY_VERSION = '1325';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -45066,6 +45081,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function writeProjectToIndexedDbSlot() {
       const id = ensureCurrentProjectId();
       // autosave keeps genga drawings as refs (light); the base64 is already in IndexedDB under 'gd:<ref>'
+      // — ver1324: "already" is now a promise the deferred encode must keep, so settle any stragglers first.
+      gengaFlushPendingDrawingEncodes();
       const payload = serializedProjectJson({ portable: false });
       const savedAt = new Date().toISOString();
       const title = String(state.project && state.project.title || '');
@@ -61874,6 +61891,75 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) { out.x = Math.round(Number(x)); out.y = Math.round(Number(y)); }
       return out;
     }
+    // ver1324 (perf F2): the stroke commit's PNG encode leaves the pointerup hot path (measured 5-100ms sync
+    // by paper size on the conte side before ver636; genga paid it on EVERY stroke/bucket/shape/transform
+    // commit). gengaPutDrawingCanvas registers the trimmed CANVAS under a fresh ref and returns {ref,w,h,x,y}
+    // immediately — the base64 is produced by an async canvas.toBlob (Chromium encodes off the main thread)
+    // and only then enters gengaDrawStore + IndexedDB ('gd:' row). Until it lands the ref resolves through
+    // gengaPendingDrawingEncode: gengaResolveDrawing hands consumers {canvas} instead of {dataUrl}, and the
+    // pixel consumers (gengaDrawDrawingInto, drawGengaLayerThumbs) draw that canvas directly — cheaper than
+    // an <img> decode anyway. The dopesheet koma thumb needs a URL string for its <img>, so its patch waits
+    // for the encode (gengaUpdateExpThumbDom skips a pending drawing; the settle re-patches). EVERY path
+    // that needs the string NOW must call gengaFlushPendingDrawingEncodes() first — the call sites are
+    // portable serialization (gengaInlineDrawings), the autosave slot write (writeProjectToIndexedDbSlot,
+    // whose "base64 is already in IndexedDB" premise this defers), the project-swap boundary
+    // (gengaPruneRuntimeStoresToProject), and every URL-keyed consumer entry: the export family
+    // (gengaPreloadExportImages / gengaBatchExportItems / gengaRenderCellInstanceBlob /
+    // gengaResolvePaperForExport / gengaCompositeArtInto / gengaTintedCelCanvas), the FX bake pair
+    // (gengaBakeExposureFx / gengaRasterizeFx), the paper-resize rebake (openGengaSettings apply), and the
+    // 診断 fix click. Pixel readers that stay on gengaDrawDrawingInto/thumbs instead take the canvas branch,
+    // and the presence guards that used to ask `dr.dataUrl` now ask `dr.dataUrl || dr.canvas` (composite,
+    // stroke seed, nearest-drawing, clear, instance-merge). A flush is a sync toDataURL per still-pending
+    // ref — normally zero to a few rapid strokes deep, a no-op when idle. meta.fullCanvas = the UNTRIMMED paper canvas; the settle parks it in
+    // gengaLastStrokeCanvas exactly as the old sync path did (that fallback draws at 0,0, so it must stay
+    // full-paper — a trimmed canvas there would shift the art to the origin during the decode race).
+    let gengaPendingDrawingEncode = new Map(); // ref → { canvas, layerId, frame, fullCanvas }
+    function gengaPutDrawingCanvas(canvas, w, h, x, y, meta) {
+      const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
+      const entry = { canvas: canvas, layerId: meta && meta.layerId, frame: meta && meta.frame, fullCanvas: meta && meta.fullCanvas };
+      gengaPendingDrawingEncode.set(ref, entry);
+      const finish = function(dataUrl) {
+        if (!gengaPendingDrawingEncode.has(ref)) return; // a flush already settled it synchronously
+        gengaPendingDrawingEncode.delete(ref);
+        gengaSettleDrawingEncode(ref, entry, dataUrl);
+      };
+      try {
+        canvas.toBlob(function(blob) {
+          if (!blob) { finish(canvas.toDataURL('image/png')); return; }
+          const rd = new FileReader();
+          rd.onload = function() { finish(String(rd.result || '')); };
+          rd.onerror = function() { finish(canvas.toDataURL('image/png')); };
+          rd.readAsDataURL(blob);
+        }, 'image/png');
+      } catch (e) { finish(canvas.toDataURL('image/png')); }
+      const out = { ref: ref, w: Math.max(1, Math.round(Number(w) || 1)), h: Math.max(1, Math.round(Number(h) || 1)) };
+      if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) { out.x = Math.round(Number(x)); out.y = Math.round(Number(y)); }
+      return out;
+    }
+    // the encode landed (async, or forced by a flush): store + persist + hand the decode-race fallback its
+    // key + patch the thumbs that were skipped while pending. Layer lookups self-guard, so a project swapped
+    // between commit and settle degrades to store/IDB writes only (the 'gd:' orphan GC covers a later undo).
+    function gengaSettleDrawingEncode(ref, entry, dataUrl) {
+      const url = String(dataUrl || '');
+      gengaDrawStore.set(ref, url);
+      try { putWorkspaceDbValue('gd:' + ref, url); } catch (e) {}
+      gengaLastStrokeCanvas = { dataUrl: url, canvas: entry.fullCanvas || entry.canvas };
+      gengaImageFor(url, drawGengaPreview); // start the decode now, off the stroke
+      if (entry.layerId != null && state.project && state.project.kind === 'genga') {
+        gengaUpdateExpThumbDom(entry.layerId, entry.frame);
+        drawGengaLayerThumbs([entry.layerId]);
+      }
+    }
+    function gengaFlushPendingDrawingEncodes() {
+      if (!gengaPendingDrawingEncode.size) return;
+      const entries = Array.from(gengaPendingDrawingEncode.entries());
+      gengaPendingDrawingEncode.clear();
+      entries.forEach(function(kv) {
+        let url = '';
+        try { url = kv[1].canvas.toDataURL('image/png'); } catch (e) { url = ''; }
+        gengaSettleDrawingEncode(kv[0], kv[1], url);
+      });
+    }
     // canonicalize a drawing object (legacy {dataUrl,w,h} or already {ref,w,h}) → {ref,w,h[,x,y]}; null-safe.
     function gengaIngestDrawing(d) {
       if (!d || typeof d !== 'object') return null;
@@ -61891,13 +61977,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!d) return null;
       const u = gengaDrawingUrl(d);
       if (u) { const out = { ref: d.ref, w: d.w, h: d.h, dataUrl: u }; if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; } return out; }
+      if (d.ref && gengaPendingDrawingEncode.has(d.ref)) { // ver1324: encode in flight — hand out the pixels
+        const out = { ref: d.ref, w: d.w, h: d.h, canvas: gengaPendingDrawingEncode.get(d.ref).canvas };
+        if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
+        return out;
+      }
       return (typeof d.dataUrl === 'string' && d.dataUrl) ? d : null;
     }
     // draw a resolved drawing onto a paper-res context with correct placement (trimmed 1:1 at x,y / legacy scaled
     // to paper). Falls back to the kept last-stroke canvas while its freshly-committed dataUrl is still decoding —
     // this is what stops the "line blinks out for a frame right after a fast stroke" flicker.
     function gengaDrawDrawingInto(ctx, dr, pw, ph, onReady) {
-      if (!dr || !dr.dataUrl) return false;
+      if (!dr) return false;
+      if (dr.canvas) { // ver1324: pending-encode drawing — draw the pixels directly (no decode round-trip)
+        if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) ctx.drawImage(dr.canvas, Math.round(dr.x), Math.round(dr.y));
+        else ctx.drawImage(dr.canvas, 0, 0, pw, ph);
+        return true;
+      }
+      if (!dr.dataUrl) return false;
       const img = gengaImageFor(dr.dataUrl, onReady);
       if (!img) {
         if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) { ctx.drawImage(gengaLastStrokeCanvas.canvas, 0, 0); return true; }
@@ -61926,10 +62023,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // crop a paper-res canvas to its ink bbox → {dataUrl,w,h,x,y} (integer offsets, 1:1 crop = zero drift), or
     // null when empty. Encoding only the ink region keeps per-stroke toDataURL + decoded memory small at large
     // paper sizes.
-    function gengaTrimCanvasToDrawing(cv, scanRect) {
+    function gengaTrimCanvasToDrawing(cv, scanRect, deferEncode) {
       const b = gengaCanvasInkBounds(cv, scanRect); if (!b) return null;
       const t = document.createElement('canvas'); t.width = b.w; t.height = b.h;
       t.getContext('2d').drawImage(cv, b.x, b.y, b.w, b.h, 0, 0, b.w, b.h);
+      if (deferEncode) return { canvas: t, w: b.w, h: b.h, x: b.x, y: b.y }; // ver1324 (F2): the stroke path encodes later; every non-session caller keeps the sync string
       return { dataUrl: t.toDataURL('image/png'), w: b.w, h: b.h, x: b.x, y: b.y };
     }
     // pull any {ref} drawings whose base64 isn't in memory yet from IndexedDB, then re-render (load/restore).
@@ -61948,6 +62046,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // inline {ref}→{dataUrl} (from the store) for PORTABLE serialization (file save / export). Operates on a clone.
     function gengaInlineDrawings(gt) {
       if (!gt) return;
+      gengaFlushPendingDrawingEncodes(); // ver1324: portable serialization needs every ref's string NOW
       const inl = function(d) { if (d && d.ref) { const u = gengaDrawStore.get(d.ref); if (u) { const out = { dataUrl: u, w: d.w, h: d.h }; if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; } return out; } } return d; };
       (gt.layers || []).forEach(function(l) {
         (l.exposures || []).forEach(function(e) { if (e.drawing) e.drawing = inl(e.drawing); });
@@ -62034,6 +62133,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // frequent, whereas the five existing call sites are rare project-load boundaries, so a cut-then-edit
     // session would have hit the blank-paste bug on nearly every trim.
     function gengaPruneRuntimeStoresToProject(project) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: settle before the sweep so pending refs are normal store rows (an orphan lands in the existing 'gd:' GC)
       const drawRefs = new Set();
       const audioRefs = new Set();
       gengaAddProjectRefs(project, drawRefs, audioRefs);
@@ -62592,6 +62692,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // webm) + genga audio mix. ver966: the whole encode spine is the shared runWebCodecsExport kernel (next to
     // exportConteVideoFast); only the camera-crop renderer, image preload and audio mixer live here. ----
     async function gengaPreloadExportImages(onStatus) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: export decodes by URL — settle stragglers first (no-op when idle)
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
       const urls = new Set();
       (gt.layers || []).forEach(function(l) {
@@ -63052,6 +63153,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Numbering: value present → instanceValue, else positional order (1-based over drawn instances of the cell).
     // Members = the VISIBLE layers to merge, bottom→top (blend order). Returns {items, warnings}.
     function gengaBatchExportItems(gt) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: hasArt below reads dataUrl
       const layers = (gt && gt.layers) || [];
       const tags = gengaLayerTags(gt); // {layerId → 'A'..'Z'} — non-bgbook, non-tagOff, bottom-up
       const items = [];
@@ -63149,6 +63251,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // are synchronous. opts: {whiteBg, format:'png'|'jpeg', quality, pw, ph, paper}. paper (optional) = the 用紙
     // frame composited at its stack side (bottom = under the cell, top = over the cell).
     async function gengaRenderCellInstanceBlob(item, opts) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: export decodes by URL
       const canvas = document.createElement('canvas');
       canvas.width = opts.pw; canvas.height = opts.ph;
       const ctx = canvas.getContext('2d');
@@ -63180,6 +63283,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // Resolve the visible 用紙 layer into a decoded {dr,blend,opacity,side} for batch compositing, or null.
     async function gengaResolvePaperForExport(gt) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: export decodes by URL
       const p = gengaPaperLayer(gt);
       if (!p || p.visible === false) return null;
       const exp = (p.exposures || [])[0];
@@ -63215,6 +63319,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // Composite the cut's visible art at one frame, so the frame is shown against what it actually crops.
     async function gengaCompositeArtInto(ctx, gt, frame, pw, ph) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: export decodes by URL
       const draws = [];
       ((gt && gt.layers) || []).slice().reverse().forEach(function(l) {   // layers[] is top-first → draw bottom-up
         if (!l || l.visible === false || gengaLayerIsPaper(l)) return;
@@ -63414,6 +63519,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // The cel's own art at one frame, recoloured. Genga drawings are line art, so the alpha mask IS the outline —
     // a source-in fill turns it into a clean coloured 輪郭線 without inventing an edge trace.
     async function gengaTintedCelCanvas(layer, frame, pw, ph, color) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: export decodes by URL
       const e = gengaExposureAt(layer, frame);
       const dr = e ? gengaExposureDrawing(layer, e) : null;
       if (!dr || !dr.dataUrl) return null;
@@ -67002,6 +67108,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (newPaperW !== oldPaperW || newPaperH !== oldPaperH) {
           if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = '再配置中…'; }
           const off = anchorOffset(); const offX = off.x, offY = off.y;
+          gengaFlushPendingDrawingEncodes(); // ver1324: the rebake below keys everything by dataUrl
           const uniq = new Map(); // dataUrl -> resolved drawing
           (gt.layers || []).forEach(function(l) {
             (l.exposures || []).forEach(function(e) { const d = gengaExposureDrawing(l, e); if (d && d.dataUrl) uniq.set(d.dataUrl, d); });
@@ -68524,6 +68631,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // render at identity and keep their keys, so 焼き込み can be run one effect at a time. Omitted = all three,
     // byte-identical to before (only('x') is true for every channel).
     function gengaBakeExposureFx(layer, exposure, fxFrame, tracks) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: the bake reads dr.dataUrl through the image cache
       const gt = state.project && state.project.gengaTimeline; if (!gt) return null;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       const dr = gengaExposureDrawing(layer, exposure); if (!dr || !dr.dataUrl) return null;
@@ -68553,6 +68661,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // own head-frame FX value. rangeMode 'selection' = exposures overlapping the timeline cell selection; 'all'.
     // ver1200: `tracks` (optional) restricts the run to those channels — the others keep their keys untouched.
     function gengaRasterizeFx(layerId, timeMode, rangeMode, tracks) {
+      gengaFlushPendingDrawingEncodes(); // ver1324: the per-exposure guard below reads dr.dataUrl
       const layer = gengaLayerById(layerId); if (!layer || layer.locked) return;
       const bakeTracks = Array.isArray(tracks) && tracks.length ? tracks : null;
       // ver1202: a STATIC fx is just as bakeable as a keyed one, so the guard asks "is there anything here".
@@ -70025,7 +70134,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           } else {
             dr = gengaExposureDrawing(l, e);
           }
-          if (dr && dr.dataUrl) {
+          if (dr && (dr.dataUrl || dr.canvas)) { // ver1324: pending-encode art is drawable art — without this a second layer's stroke hid the first layer's just-committed one for the encode window
             if (state.gengaSilDebug && !gengaSoloBypass) { // 診断: paint the computed silhouette UNDER this instance's lines
               const env = gengaDougaEnvDebugFor(l, e, pw, ph, drawGengaPreview);
               if (env && env !== 'pending') { target.globalAlpha = (l.opacity != null ? l.opacity : 1); target.drawImage(env, 0, 0, pw, ph); target.globalAlpha = 1; }
@@ -70822,6 +70931,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return e ? { layer: layer, e: e } : null;
     }
     function gengaSilFixClick(p) { // 診断: knock out (−, filled) / fill in (+, empty) — or REVERT a prior fix at that spot
+      gengaFlushPendingDrawingEncodes(); // ver1324: a deliberate click must not be dropped for an encode window
       const cur = gengaSilCurrentExposure(); if (!cur) return;
       const dr = gengaExposureDrawing(cur.layer, cur.e); if (!dr || !dr.dataUrl) return;
       const dw = Number(dr.w) || 1, dh = Number(dr.h) || 1;
@@ -71037,11 +71147,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaNearestDrawing(layer, frame) { // → resolved drawing OBJECT (placement-aware), not a bare url
       if (!layer || !Array.isArray(layer.exposures)) return null;
       const exact = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
-      if (exact && exact.dataUrl) return exact;
+      if (exact && (exact.dataUrl || exact.canvas)) return exact; // ver1324: pending-encode art counts
       let best = null, bestDist = Infinity;
       layer.exposures.forEach(function(e) {
         const dr = gengaExposureDrawing(layer, e);
-        if (dr && dr.dataUrl) {
+        if (dr && (dr.dataUrl || dr.canvas)) { // ver1324: pending-encode art counts
           const d = Math.min(Math.abs(e.startFrame - frame), Math.abs(e.startFrame + e.holdFrames - 1 - frame));
           if (d < bestDist) { bestDist = d; best = dr; }
         }
@@ -71061,19 +71171,29 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, cv.width, cv.height);
         if (!layer) return;
         const dr = gengaNearestDrawing(layer, frame);
-        if (dr && dr.dataUrl) {
-          const img = gengaImageFor(dr.dataUrl, drawGengaLayerThumbs);
-          if (img) {
-            const gtp = state.project.gengaTimeline, pw = Math.max(1, gtp.paper.w), ph = Math.max(1, gtp.paper.h);
-            if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) {
-              // trimmed: map the paper onto the thumb (same stretch semantics as before), placing the crop inside it
-              ctx.drawImage(img, dr.x / pw * cv.width, dr.y / ph * cv.height, dr.w / pw * cv.width, dr.h / ph * cv.height);
-            } else {
-              ctx.drawImage(img, 0, 0, cv.width, cv.height);
-            }
+        const thumbSrc = dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr.dataUrl, drawGengaLayerThumbs) : null)) : null; // ver1324: pending-encode drawings paint from their canvas, same placement law
+        if (thumbSrc) {
+          const gtp = state.project.gengaTimeline, pw = Math.max(1, gtp.paper.w), ph = Math.max(1, gtp.paper.h);
+          if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) {
+            // trimmed: map the paper onto the thumb (same stretch semantics as before), placing the crop inside it
+            ctx.drawImage(thumbSrc, dr.x / pw * cv.width, dr.y / ph * cv.height, dr.w / pw * cv.width, dr.h / ph * cv.height);
+          } else {
+            ctx.drawImage(thumbSrc, 0, 0, cv.width, cv.height);
           }
         }
       });
+    }
+    // ver1324: the preview's 2d context asks for DESYNCHRONIZED presentation — Chromium then presents this
+    // canvas outside the compositor's frame queue (Windows low-latency canvas), cutting 1-2 vsync periods
+    // of pen→screen latency on desktop. Safari ignores unknown getContext options (no error), so iPad is a
+    // no-op. The option only counts on the FIRST getContext of a canvas element; the stage rebuild recreates
+    // the element and renderGengaView's immediate drawGengaPreview lands here first, so a fresh canvas always
+    // gets the hint. Nothing reads pixels back from THIS canvas (the eyedropper samples the composite), so
+    // no willReadFrequently. NOTE: on Windows the low-latency path rides a DirectComposition overlay — if
+    // MPO is disabled at the OS level (the registry tweak in the project root), Chromium silently falls back
+    // to the normal queue; the hint is then inert, never harmful.
+    function gengaPreviewCtx(canvas) {
+      return canvas.getContext('2d', { desynchronized: true });
     }
     function drawGengaPreview(boxHint) {
       cameraFxWindowSync(); // keep the カメラ window numbers in sync with the genga camera-work frame (no-op if closed/scrubbing)
@@ -71093,7 +71213,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // per playback frame). clearRect below does the per-frame clear.
       if (canvas.width !== W) canvas.width = W;
       if (canvas.height !== H) canvas.height = H;
-      const ctx = canvas.getContext('2d'); if (!ctx) return;
+      const ctx = gengaPreviewCtx(canvas); if (!ctx) return; // ver1324: desynchronized (see gengaPreviewCtx)
       // ver1002: start from a known transform rather than relying on save/restore surviving this function's
       // several early returns, then apply the VIEW mirror once. Everything drawn below — onion skins, the
       // camera frame, the marquee, selection edges, quad handles, the rotate arm, stamps, the FX gizmo — rides
@@ -71225,6 +71345,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
       }
       if (composite) { const p = composite._pad || 0; ctx.drawImage(composite, ox - p * scale, oy - p * scale, composite.width * scale, composite.height * scale); }
+      // ver1324: 예측 꼬리 — 합성 위, 카메라/선택 오버레이 아래. 실제 잉크가 아니므로 어느 캔버스에도
+      // 커밋되지 않고, 다음 move가 교체하거나 세션 종료/90ms 타이머가 지운다(gengaUpdatePredictedTail).
+      // ctx에는 이미 뷰 미러/회전이 적용돼 있어 ox/oy/scale 매핑만으로 다른 오버레이와 같은 공간에 놓인다.
+      if (gengaDrawSession && gengaDrawSession.tail && gengaDrawSession.tail.pts && gengaDrawSession.tail.anchor
+          && frame === gengaDrawSession.frame) {
+        const tl = gengaDrawSession.tail;
+        ctx.save();
+        ctx.globalAlpha = tl.alpha;
+        ctx.strokeStyle = tl.color;
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.lineWidth = Math.max(1, tl.w * scale);
+        ctx.beginPath();
+        ctx.moveTo(ox + tl.anchor.x * scale, oy + tl.anchor.y * scale);
+        for (let ti = 0; ti < tl.pts.length; ti += 1) ctx.lineTo(ox + tl.pts[ti].x * scale, oy + tl.pts[ti].y * scale);
+        ctx.stroke();
+        ctx.restore();
+      }
       {
         const SC = function(px2, py2) { return { x: ox + px2 * scale, y: oy + py2 * scale }; };
         const bcam = gt.camera;                                  // BLACK = fixed output/composition frame
@@ -71579,8 +71716,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // press and its drag, and the ユビパラ edge test — and a mirror added to each of them separately is four
     // chances to get the sign wrong. One place instead. Pass a cached rect when you already measured one.
     function gengaClientToCanvasXY(clientX, clientY, rect) {
-      const canvas = document.getElementById('gengaPreviewCanvas');
-      const r = rect || (canvas && canvas.getBoundingClientRect());
+      // ver1324 정리: rect가 넘어오면(핫패스 전 호출부) 캔버스 조회 자체가 불필요했다 — 폴백에서만 찾는다.
+      const r = rect || (function() { const c = document.getElementById('gengaPreviewCanvas'); return c ? c.getBoundingClientRect() : null; })();
       if (!r) return null;
       const uz = uiReadScale() || 1;
       const w = r.width / uz, h = r.height / uz;
@@ -71790,7 +71927,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // can be re-keyed or re-committed in between (gengaCommitSelection alone does it), and a stale footprint
     // is exactly the silent-crop bug. null = the seed put no ink down, so the session's own ink is the union.
     function gengaDrawingSeedRect(dr, pw, ph) {
-      if (!dr || !dr.dataUrl) return null;
+      if (!dr || !(dr.dataUrl || dr.canvas)) return null; // ver1324: a pending-encode drawing is trimmed art too — omitting it from the union seed would let the scan window crop the prior ink (the exact ver1196 premise)
       // A trimmed drawing is placed 1:1 at x,y — and the decode-race fallback (gengaDrawDrawingInto paints
       // gengaLastStrokeCanvas at 0,0) is gated on the same dataUrl, whose ink bbox IS this rect, so both
       // seed paths land inside it.
@@ -72022,6 +72159,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure }] : null,
         scan: scanEligible ? gengaScanSeed(seedRect) : null // ver1196
       };
+      // ver1324 predicted tail: getPredictedEvents() 예측 샘플을 화면 전용 오버레이로 그려, 남는 파이프라인
+      // 지연(컴포지터 큐+vsync)을 체감에서 상쇄한다. 어떤 캔버스에도 커밋되지 않는다 — 다음 move가 교체하고,
+      // pointerup(세션 소멸)이 지우고, 펜이 공중에서 멈추면 90ms 타이머가 소거한다(gengaUpdatePredictedTail).
+      // 지우개/2値化(pxStamp)/behind/블렌드/透明度保護는 source-over 꼬리가 결과를 속이므로 제외 —
+      // 게이트는 토큰 이름이 아니라 합성 연산으로 판정해 모드 목록과 표류하지 않는다.
+      gengaDrawSession.tail = (!eraser && !pxStamp && !layer.alphaLock
+        && paintBrushModeCompositeOp(paintBrushModeVal()) === 'source-over')
+        ? { color: String(c.strokeStyle), alpha: penOpacity, w: startWidth, anchor: null, pts: null, timer: 0 }
+        : null;
       // ver1247: the SAME helper conte's three stroke builders call, so the rule "which strokes may be
       // textured" keeps exactly one statement. penOutlineMode is genga's name for conte's
       // pressure-size-without-alpha branch — the only branch the textured dab path renders in — and it
@@ -72091,6 +72237,30 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       b.restore();
       gengaShapeComposite(sess);
     }
+    // ver1324: 예측 꼬리 갱신 — ev.getPredictedEvents()의 브라우저 예측 샘플(Chromium=Windows Ink 예측,
+    // WebKit=Apple Pencil 예측)을 RAW 용지 좌표로 변환해 세션에 싣는다. FX 역변환(gengaPreviewPointerXY)이
+    // 아니라 RAW를 쓰는 이유: 꼬리는 표시 전용이고, 화면에서 펜 끝이 보이는 위치가 곧 RAW 용지 좌표다 —
+    // 커밋된 선은 역변환→합성시 FX 정변환을 왕복해 같은 화면점에 놓이므로 이음새가 맞는다. 펜이 공중에서
+    // 멈추면 move가 더 오지 않아 마지막 예측이 남는데, 90ms 무입력 타이머가 꼬리만 지우고 재드로우한다.
+    function gengaUpdatePredictedTail(sess, ev) {
+      const tl = sess.tail; if (!tl) return;
+      if (tl.timer) { clearTimeout(tl.timer); tl.timer = 0; }
+      let preds = null;
+      if (typeof ev.getPredictedEvents === 'function') { try { preds = ev.getPredictedEvents(); } catch (e) { preds = null; } }
+      if (!preds || !preds.length) { tl.pts = null; return; }
+      const anchor = gengaPreviewPointerXYRaw(ev);
+      if (!anchor) { tl.pts = null; return; }
+      const pts = [];
+      for (let i = 0; i < preds.length; i += 1) { const q = gengaPreviewPointerXYRaw(preds[i]); if (q) pts.push(q); }
+      tl.anchor = anchor;
+      tl.pts = pts.length ? pts : null;
+      if (tl.pts) {
+        tl.timer = setTimeout(function() {
+          tl.timer = 0;
+          if (gengaDrawSession === sess && tl.pts) { tl.pts = null; drawGengaPreview(); }
+        }, 90);
+      }
+    }
     function gengaDrawMove(ev) {
       if (ev.pointerType === 'touch' && gengaPointers.has(ev.pointerId)) gengaPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
       if (gengaPinch) { if (gengaPointers.size >= 2) gengaPinchMove(); if (ev.cancelable) ev.preventDefault(); return; } // pinch owns it
@@ -72143,6 +72313,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (penSess.penPressureAlpha && rawPressure != null) {
           segAlpha = paintPressureCurve(usePressure, 0.15, penSess.penGamma, penSess.penGain); // ver723: shared alpha curve
         }
+        if (penSess.tail) penSess.tail.w = segWidth; // ver1324: 꼬리 두께 = 마지막 실제 세그먼트의 두께
         // ver1196: BOTH ends of the segment, at the width this segment is stroked with — the previous point
         // was marked with its own (possibly narrower) width, and lineWidth is constant along a segment.
         gengaScanMark(penSess, penSess.lastX, penSess.lastY, segWidth / 2 + 1);
@@ -72166,6 +72337,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         drewAny = true;
       }
       if (!drewAny) return;
+      if (penSess.tail) gengaUpdatePredictedTail(penSess, ev); // ver1324: 재드로우 직전에 갱신 (아래 두 분기 모두)
       if (penSess.penOutline) {
         // ver622: rAF-batch — pen tablets deliver events faster than the display; one whole-outline
         // redraw + preview per FRAME, not per event (desktop lag/frame-drop fix).
@@ -72455,12 +72627,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // gengaLastStrokeCanvas stays keyed to the trimmed dataUrl, and the trimmed rect is still the exact ink
     // bbox, so the decode-race fallback keeps painting the same pixels in the same place.
     function gengaCommitCanvas(layerId, frame, cv, label, scanRect, selectionRider) {
-      const trimmed = gengaTrimCanvasToDrawing(cv, scanRect);
-      if (trimmed) {
-        gengaLastStrokeCanvas = { dataUrl: trimmed.dataUrl, canvas: cv };
-        gengaImageFor(trimmed.dataUrl, drawGengaPreview);
-      }
-      gengaCommitDrawing(layerId, frame, trimmed, label, selectionRider); // ver1314: 선택을 같은 undo 스텝에 태울 때만 전달
+      // ver1324 (F2): trim stays sync (bounded by the ver1196 union scan window), the PNG encode does not —
+      // gengaPutDrawingCanvas returns {ref,...} at once and settles store/IDB/thumbs/lastStroke async. The
+      // old sync gengaLastStrokeCanvas + gengaImageFor prefetch here MOVED into gengaSettleDrawingEncode
+      // (before the encode exists there is no dataUrl to key them by; the pending canvas covers display).
+      const trimmed = gengaTrimCanvasToDrawing(cv, scanRect, true);
+      const drawing = trimmed
+        ? gengaPutDrawingCanvas(trimmed.canvas, trimmed.w, trimmed.h, trimmed.x, trimmed.y, { layerId: layerId, frame: frame, fullCanvas: cv })
+        : null;
+      gengaCommitDrawing(layerId, frame, drawing, label, selectionRider); // ver1314: 선택을 같은 undo 스텝에 태울 때만 전달
     }
     // patch koma timeline thumbnail(s) in place (partial refresh path — no dopesheet rebuild).
     function gengaUpdateExpThumbDom(layerId, frame) {
@@ -72470,6 +72645,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // EVERY koma on the layer with the same instanceValue (gengaExposureDrawing resolves via the same key).
       // Patching only the drawn frame left every SIBLING koma showing its old thumbnail until a full
       // renderGengaView (reload) — the "only updates after refresh" symptom. Patch all komas sharing the key.
+      // ver1324: a pending-encode drawing has pixels but no URL string yet — the <img> patch would blank the
+      // thumb for the encode window. Skip; gengaSettleDrawingEncode re-calls this once the string exists.
+      const resolved = gengaExposureDrawing(layer, e);
+      if (resolved && resolved.canvas && !resolved.dataUrl) return;
       const key = gengaValueKey(e.instanceValue);
       const targets = (key === null) ? [e] : (layer.exposures || []).filter(function(x) { return gengaValueKey(x.instanceValue) === key; });
       targets.forEach(function(x) {
@@ -72497,7 +72676,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const cv = document.createElement('canvas'); cv.width = pw; cv.height = ph;
       const c = cv.getContext('2d');
       const dr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
-      const hasContent = (dr && dr.dataUrl) ? gengaDrawDrawingInto(c, dr, pw, ph, drawGengaPreview) : false; // placement-aware (trimmed/legacy)
+      const hasContent = (dr && (dr.dataUrl || dr.canvas)) ? gengaDrawDrawingInto(c, dr, pw, ph, drawGengaPreview) : false; // placement-aware (trimmed/legacy); ver1324: a pending-encode drawing MUST seed too — a blank seed here would erase the prior stroke at the next commit
       return { cv: cv, ctx: c, pw: pw, ph: ph, hasContent: hasContent };
     }
     function gengaWorkingCanvasFor(layer, frame) {
@@ -72642,7 +72821,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const exp = gengaExposureAt(layer, frame);
       if (!exp) { drawGengaPreview(); return true; } // no current koma → nothing to do
       const dr = gengaExposureDrawing(layer, exp);
-      if (dr && dr.dataUrl) {
+      if (dr && (dr.dataUrl || dr.canvas)) { // ver1324: pending-encode art has content — the else branch would take the koma with it
         gengaCommitDrawing(layer.id, frame, null, '原画クリア'); // has content → empty the drawing (keep the koma)
       } else {
         const expId = exp.id; // already empty → remove the koma
@@ -76045,7 +76224,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (layer && expNow && newKey !== null && newKey !== gengaValueKey(expNow.instanceValue)) {
         const mine = gengaExposureDrawing(layer, expNow);
         const theirs = gengaResolveDrawing(layer.sharedDrawings ? layer.sharedDrawings[newKey] : null);
-        if (mine && mine.dataUrl && theirs && theirs.dataUrl) {
+        if (mine && (mine.dataUrl || mine.canvas) && theirs && (theirs.dataUrl || theirs.canvas)) { // ver1324: pending-encode art joins the conflict — skipping the dialog would silently discard one side
           showGengaMergeChoice(anchorEl, function(choice) {
             if (choice === null) { settled(false); return; }
             commit(choice);
@@ -80221,6 +80400,84 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ## SECTION: INIT / BOOTSTRAP .................. event wiring, startup, perf HUD
 
+    // ver1325: environment status list — the latency-relevant platform facts a page can actually observe,
+    // shown in the Version Info dialog (English-only there by design, ver882). What CANNOT be observed is
+    // said out loud instead of omitted: Windows Ink routing and MPO are OS-side; their closest observable
+    // proxies are the pen-pressure probe (pressure arriving = the pen pipeline delivers) and the
+    // desynchronized attribute (Chromium ACCEPTED the low-latency canvas request — with MPO disabled the
+    // OS silently ignores it, which is why that row says accepted, not active).
+    let envPenPointerSeen = false, envPenPressureSeen = false;
+    (function() {
+      if (typeof PointerEvent === 'undefined') return;
+      const probe = function(ev) {
+        if (ev.pointerType !== 'pen') return;
+        envPenPointerSeen = true;
+        if (ev.pressure > 0 && ev.pressure < 1) {
+          envPenPressureSeen = true;
+          document.removeEventListener('pointermove', probe, true);
+          document.removeEventListener('pointerdown', probe, true);
+        }
+      };
+      document.addEventListener('pointermove', probe, { capture: true, passive: true });
+      document.addEventListener('pointerdown', probe, { capture: true, passive: true });
+    })();
+    let envRefreshHz = 0; // measured on first dialog open (25 rAF samples, median delta)
+    function envMeasureRefreshHz(done) {
+      const ts = [];
+      const step = function(t) {
+        ts.push(t);
+        if (ts.length < 25) { requestAnimationFrame(step); return; }
+        const ds = [];
+        for (let i = 1; i < ts.length; i += 1) ds.push(ts[i] - ts[i - 1]);
+        ds.sort(function(a, b) { return a - b; });
+        envRefreshHz = Math.max(1, Math.round(1000 / (ds[Math.floor(ds.length / 2)] || 16.7)));
+        done();
+      };
+      requestAnimationFrame(step);
+    }
+    function envGpuInfo() {
+      try {
+        const gl = document.createElement('canvas').getContext('webgl');
+        if (!gl) return { renderer: 'WebGL unavailable', hw: false };
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const r = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : (String(gl.getParameter(gl.RENDERER)) || 'masked');
+        return { renderer: r, hw: !/swiftshader|software|llvmpipe/i.test(r) };
+      } catch (e) { return { renderer: 'probe failed', hw: false }; }
+    }
+    function envDesyncAccepted() {
+      try {
+        const live = document.getElementById('gengaPreviewCanvas');
+        const ctx = live ? gengaPreviewCtx(live) : document.createElement('canvas').getContext('2d', { desynchronized: true });
+        const a = ctx && ctx.getContextAttributes ? ctx.getContextAttributes() : null;
+        return !!(a && a.desynchronized);
+      } catch (e) { return false; }
+    }
+    function renderVersionInfoEnv() {
+      const list = document.getElementById('versionInfoEnvList'); if (!list) return;
+      const gpu = envGpuInfo();
+      const desync = envDesyncAccepted();
+      const filterOk = (typeof CANVAS_FILTER_SUPPORTED !== 'undefined' && CANVAS_FILTER_SUPPORTED);
+      const pe = (typeof PointerEvent !== 'undefined') ? PointerEvent.prototype : null;
+      const rows = [];
+      const add = function(label, value, cls) {
+        rows.push('<div class="version-info-row"><span class="version-info-label">' + label + '</span><span class="version-info-value' + (cls ? ' ' + cls : '') + '">' + value + '</span></div>');
+      };
+      add('GPU', gpu.renderer, gpu.hw ? '' : 'vi-warn');
+      add('HW accel', gpu.hw ? 'on' : 'OFF — the browser is software-rendering; re-enable hardware acceleration in the browser settings', gpu.hw ? 'vi-ok' : 'vi-warn');
+      add('Low-latency', desync ? 'canvas desynchronized: accepted' : 'not available here (iPad WebKit has its own fast path)', desync ? 'vi-ok' : 'vi-dim');
+      add('GPU blur', filterOk ? 'ctx.filter: yes' : 'ctx.filter: no — FX blurs use the slower JS fallback', filterOk ? 'vi-ok' : 'vi-warn');
+      add('Display', (envRefreshHz ? '~' + envRefreshHz + ' Hz' : 'measuring…') + ' · pixel ratio ' + (window.devicePixelRatio || 1));
+      add('Pointer API', pe ? ((('getCoalescedEvents' in pe) ? 'coalesced: yes' : 'coalesced: no') + ' · ' + (('getPredictedEvents' in pe) ? 'predicted: yes' : 'predicted: no')) : 'PointerEvent unavailable');
+      add('Pen pressure', envPenPressureSeen ? 'observed — the pen pipeline delivers' : (envPenPointerSeen ? 'pen seen, no pressure yet — draw one stroke, then reopen' : 'no pen input observed yet'), envPenPressureSeen ? 'vi-ok' : 'vi-dim');
+      add('OS-side', 'Windows Ink routing and MPO cannot be read from a page — the tablet driver panel / OS settings own them', 'vi-dim');
+      list.innerHTML = rows.join('');
+      if (!envRefreshHz) {
+        envMeasureRefreshHz(function() {
+          const dlg = document.getElementById('versionInfoDialog');
+          if (dlg && dlg.open) renderVersionInfoEnv();
+        });
+      }
+    }
     function renderVersionInfoDialog() {
       const appValue = document.getElementById('versionInfoAppValue');
       const versionValue = document.getElementById('versionInfoVersionValue');
@@ -80235,6 +80492,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         brandTitle.setAttribute('title', 'Version Info');
         brandTitle.setAttribute('aria-label', APP_NAME + ' version info');
       }
+      renderVersionInfoEnv(); // ver1325: environment status rows
     }
 
     function openVersionInfoDialog() {
@@ -80961,7 +81219,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ring.push({ t: Math.round(ev.timeStamp), type: ev.type, pt: ev.pointerType, id: ev.pointerId,
           tgt: String((t && (t.id || t.className || t.tagName)) || ''), nc: ev.cancelable === false });
         if (ring.length > 10) ring.shift();
-        if ((ev.type === 'pointerdown' || ev.type === 'pointermove') && typeof ev.clientX === 'number') {
+        if (el && (ev.type === 'pointerdown' || ev.type === 'pointermove') && typeof ev.clientX === 'number') { // ver1324: gBCR 샘플은 HUD가 보일 때만 — 드로잉 핫패스의 pointermove당 레이아웃 읽기 제거
           // ver662: pick the VISIBLE canvas (the hidden one is 0x0 in the other mode); prefer the pointer's own target
           let cv = (t && t.tagName === 'CANVAS') ? t : null;
           let r = cv ? cv.getBoundingClientRect() : null;
@@ -80971,7 +81229,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         if (ev.type !== 'pointermove') persist(); // down/up/cancel/lost-capture are the interesting edges
       }
+      let rafOn = false; // ver1324 (perf audit F3): the frame-gap watcher runs ONLY while #perf is showing
       function rafTick(ts) {
+        if (!rafOn) { lastRaf = 0; return; } // uninstalled mid-flight → stop rescheduling
         if (lastRaf && ts - lastRaf > maxGap) {
           maxGap = ts - lastRaf; gapAt = ts;
           if (maxGap > 250) persist(); // a real freeze is worth persisting even with no pointer event nearby
@@ -80979,9 +81239,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         lastRaf = ts;
         requestAnimationFrame(rafTick);
       }
-      // recording is unconditional from boot (no #perf needed to CAPTURE, only to VIEW)
+      // ver1324: pointer-EDGE recording (down/up/cancel ring + counts + persist) stays unconditional from
+      // boot — that ring is what caught the ver581 pinch lockup post-hoc, and edges are rare. What moved
+      // behind #perf: the per-pointermove canvas getBoundingClientRect sample above (a layout read on the
+      // exact hot path ver973 scrubbed clean) and the permanent rAF frame-gap watcher (a main-thread wake
+      // per display frame, forever — perf audit F3). Freeze forensics via maxGap now need #perf active.
       EVENTS.forEach(function(t) { document.addEventListener(t, note, { capture: true, passive: true }); });
-      requestAnimationFrame(rafTick);
 
       function render() {
         // LIVE first (ver600): the HUD is pointer-events:none so it can't be scrolled on a phone — the
@@ -80998,11 +81261,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           'white-space:pre-wrap;pointer-events:none;border-radius:6px;';
         document.body.appendChild(el);
         intervalId = setInterval(render, 250);
+        rafOn = true; lastRaf = 0; requestAnimationFrame(rafTick); // ver1324: watcher lives with the HUD
       }
       function uninstall() {
         if (!el) return;
         clearInterval(intervalId);
         el.remove(); el = null;
+        rafOn = false; // ver1324: the pending rAF sees this and stops rescheduling
       }
       function sync() { if (location.hash.indexOf('perf') !== -1) install(); else uninstall(); }
       sync();
