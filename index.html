@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1346</title>
+  <title>MoArt ver1347</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8856,7 +8856,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1346</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1347</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14850,7 +14850,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1346';
+    const APP_DISPLAY_VERSION = '1347';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -50532,6 +50532,60 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         for (let s = 1; s <= steps; s += 1) {
           const t = s / steps;
           dab(a.x + dx * t, a.y + dy * t, ra + (rb - ra) * t, av[i] + (av[i + 1] - av[i]) * t);
+        }
+      }
+      // ── 2패스: 위치 보정 띠 ────────────────────────────────────────────────────────────────
+      // ver1347: 1패스(원형 dab)는 **덮개**만 보장한다 — 모양이 경로에서 r만큼 뻗으므로 장도 r을
+      // 덮어야 하고, 그래서 dab이 클 수밖에 없다. 그런데 dab 하나는 통째로 한 톤이라, 팁 브러시에서
+      // **모양은 팁인데 농도는 원**인 얼룩이 보인다(사용자 보고 + 스크린샷). 알파가 호(arc) 위치의
+      // 함수인데 원으로 칠하니 당연한 결과다.
+      // 그래서 경로에 수직인 띠로 한 번 더 덮어 **위치를 바로잡는다**. ver1345에서 띠를 폐기했던
+      // 이유는 가산 합성이 겹침을 더해 검게 태웠기 때문인데, 지금은 불투명 캔버스라 겹침이 **치환**
+      // 이다 — 띠가 접히든 교차하든 안전하다. 그래서 마이터도 넉넉히(≈8r) 뽑을 수 있고, 띠가 못 덮는
+      // 극단적 커스프의 쐐기는 1패스가 이미 칠해둔 값이 남아 구멍이 되지 않는다.
+      const segN = n - 1;
+      if (segN >= 1) {
+        const stx = new Array(segN), sty = new Array(segN);
+        let lastOk = -1;
+        for (let i = 0; i < segN; i += 1) {
+          const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
+          const L = Math.hypot(dx, dy);
+          if (L < 1e-6) { stx[i] = lastOk >= 0 ? stx[lastOk] : 1; sty[i] = lastOk >= 0 ? sty[lastOk] : 0; continue; }
+          stx[i] = dx / L; sty[i] = dy / L; lastOk = i;
+        }
+        const ox = new Array(n), oy = new Array(n);
+        for (let i = 0; i < n; i += 1) {
+          const A = (i === 0) ? 0 : i - 1, B = (i === n - 1) ? segN - 1 : i;
+          const rr = radii[i] + PAINT_ALPHA_FIELD_MARGIN;
+          const aux = -sty[A], auy = stx[A];
+          let sx = aux + (-sty[B]), sy = auy + stx[B];
+          const L = Math.hypot(sx, sy);
+          if (L < 1e-6) { ox[i] = aux * rr; oy[i] = auy * rr; continue; } // 180° 되꺾임
+          sx /= L; sy /= L;
+          const k = rr / Math.max(0.12, sx * aux + sy * auy);
+          ox[i] = sx * k; oy[i] = sy * k;
+        }
+        for (let i = 0; i < segN; i += 1) {
+          const p0 = pts[i], p1 = pts[i + 1];
+          if (Math.hypot(p1.x - p0.x, p1.y - p0.y) < 1e-6) continue;
+          const r0 = radii[i] + PAINT_ALPHA_FIELD_MARGIN, r1 = radii[i + 1] + PAINT_ALPHA_FIELD_MARGIN;
+          // 양 끝만 진행방향으로 연장해 둥근 캡을 덮는다(그라데이션은 끝 값으로 클램프된다)
+          const e0 = (i === 0) ? r0 : 0, e1 = (i === segN - 1) ? r1 : 0;
+          const ax = p0.x - stx[0] * e0 - bx, ay = p0.y - sty[0] * e0 - by;
+          const cx = p1.x + stx[segN - 1] * e1 - bx, cy = p1.y + sty[segN - 1] * e1 - by;
+          const v0 = Math.max(0, Math.min(255, Math.round(av[i] * 255)));
+          const v1 = Math.max(0, Math.min(255, Math.round(av[i + 1] * 255)));
+          const g = fc.createLinearGradient(p0.x - bx, p0.y - by, p1.x - bx, p1.y - by);
+          g.addColorStop(0, 'rgb(' + v0 + ',' + v0 + ',' + v0 + ')');
+          g.addColorStop(1, 'rgb(' + v1 + ',' + v1 + ',' + v1 + ')');
+          fc.fillStyle = g;
+          fc.beginPath();
+          fc.moveTo(ax + ox[i], ay + oy[i]);
+          fc.lineTo(cx + ox[i + 1], cy + oy[i + 1]);
+          fc.lineTo(cx - ox[i + 1], cy - oy[i + 1]);
+          fc.lineTo(ax - ox[i], ay - oy[i]);
+          fc.closePath();
+          fc.fill();
         }
       }
       const mc = M.getContext('2d');
