@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1345</title>
+  <title>MoArt ver1346</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8856,7 +8856,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1345</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1346</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14850,7 +14850,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1345';
+    const APP_DISPLAY_VERSION = '1346';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -50373,12 +50373,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const w = Math.max(1, ctx.canvas.width), h = Math.max(1, ctx.canvas.height);
       const sc = paintGrainScratchFor(w, h);
       paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
+      let flatAlpha = 1;   // 장을 못 만든 경우의 물러섬(아래)
       if (alphaFor) {
         const field = paintStrokeAlphaField(pts, radii, alphaFor, w, h);
         if (field) {
           sc.ctx.globalCompositeOperation = 'destination-in';
-          sc.ctx.drawImage(field, 0, 0);
+          sc.ctx.drawImage(field.cv, field.x, field.y);
           sc.ctx.globalCompositeOperation = 'source-over';
+        } else {
+          // ver1346: 휘도→알파 필터가 없는 브라우저 — 획 **전체 평균 알파**로 물러선다.
+          // 경로에 따른 변화는 잃지만 아티팩트는 없다(조용히 필압을 무시하는 것보다 정직하다).
+          let sum = 0;
+          for (let i = 0; i < pts.length; i += 1) {
+            const raw = Number(alphaFor(pts[i].p, pts[i].t));
+            sum += Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
+          }
+          if (pts.length) flatAlpha = sum / pts.length;
         }
       }
       if (mask) {
@@ -50396,7 +50406,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         sc.ctx.globalCompositeOperation = 'source-over';
       }
+      const prevAlpha = ctx.globalAlpha;
+      if (flatAlpha !== 1) ctx.globalAlpha = prevAlpha * flatAlpha; // ver1346: 장이 없을 때의 물러섬
       ctx.drawImage(sc.cv, 0, 0);
+      ctx.globalAlpha = prevAlpha;
     }
     // 모양만 그리는 부분 — 그레인/알파 유무와 무관하게 하나의 서술을 유지한다(ver1337 이전의 본문 그대로).
     function paintFillVariableWidthShape(ctx, pts, radii, color, tip) {
@@ -50410,124 +50423,127 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.fillStyle = color || '#111111';
       ctx.fill();
     }
-    // ── ver1345: 筆圧→不透明度의 알파 장(場) ───────────────────────────────────────────────────
-    // 스트로크 모양과 같은 넓이를 덮되, 각 픽셀의 **알파**가 그 지점의 필압 알파인 캔버스. 이걸
-    // destination-in으로 한 번 곱하면 모양은 그대로 두고 진하기만 경로를 따라 변한다.
+    // ── ver1346: 筆圧→不透明度의 알파 장(場) ───────────────────────────────────────────────────
+    // 스트로크 모양과 같은 넓이를 덮되, 각 픽셀 값이 그 지점의 필압 알파인 캔버스. destination-in으로
+    // 한 번 곱하면 모양은 그대로 두고 진하기만 경로를 따라 변한다.
     //
-    // 왜 dab마다 globalAlpha를 바꾸지 않는가: 반투명 dab을 겹쳐 찍으면 겹친 횟수만큼 진해진다.
-    // dab 간격은 반지름의 0.25~0.3배라 모든 픽셀이 6~8겹으로 덮이므로, (a) 전체가 불투명에 가깝게
-    // 포화되어 필압이 사라지고 (b) 겹침 수가 바뀌는 자리 = 각 dab의 원 경계가 눈에 보인다.
-    // ver641이 "모든 dab을 한 path에 넣고 caller가 ONCE 채운다"를 못박아 둔 이유가 정확히 이것이다.
+    // ★ 이 함수는 세 번 다시 썼다. 실패한 두 판을 남겨둔다 — 셋 다 "겹침을 어떻게 합성할 것인가"라는
+    //   하나의 문제였고, 캔버스 합성 연산의 성질을 잘못 안 것이 매번 원인이었다.
     //
-    // 장을 만드는 법: 경로를 따라 **서로 겹치지 않는 사각형 띠**로 덮고, 각 조각을 그 구간의 시작·끝
-    // 알파를 잇는 선형 그라데이션으로 칠한다. 조각이 겹치지 않으므로 누적이 원천적으로 없고,
-    // 그라데이션이라 계단도 없다.
+    //  [1판] dab마다 globalAlpha를 바꿔 찍기 → **누적**. 간격이 반지름의 0.25배라 모든 픽셀이 6~8겹으로
+    //        덮여 알파가 포화되고 dab의 원 경계가 그대로 드러났다(사용자: "원형 팁모양이 다 노출").
+    //        ver641이 "모든 dab을 한 path에 넣고 caller가 ONCE 채운다"를 못박아 둔 이유가 이것이다.
+    //  [2판] 경로에 수직인 사각형 띠 + 가산 합성(`lighter`). 이음매는 완벽해졌지만(부분 커버리지가
+    //        c₁·a+c₂·a=a로 정확히 합쳐진다) **띠가 자기 자신과 겹치는 곳에서 알파가 더해져 검정으로
+    //        포화**됐다. 굵은 브러시는 점 간격(≈9px)보다 반지름(55px)이 훨씬 커서 조금만 꺾여도 띠가
+    //        접힌다 — 실측: 필압을 고정한 획인데 촘촘한 커스프에서 **95.8%가 포화**(정답 톤은 4.1%),
+    //        자기교차 고리에서 32.9% 포화. 사용자 스크린샷의 검은 쐐기가 정확히 이것이다.
+    //        (마이터로 폭 부족을 메우면 겹침이 더 심해지고, 이등분선만 쓰면 회전부에 구멍이 난다.
+    //         반지름 ≫ 세그먼트 길이인 상황에서 띠 분할은 원리적으로 조건이 나쁘다.)
     //
-    // ★ 두 가지 함정을 실측으로 먼저 밟고 고쳤다(같은 실수 반복 금지):
-    //  1) **destination-over는 max가 아니다.** "높은 알파부터 깔면 겹침이 max가 된다"고 가정했는데,
-    //     대상이 *부분* 투명하면 `dst + src·(1−dst)`라 여전히 누적된다. 완전 불투명/완전 투명일 때만
-    //     max처럼 보인다. → 조각을 애초에 안 겹치게 만들고, 혹시 겹쳐도 같은 도형으로 지우고 다시
-    //     칠해(치환) 누적 경로를 없앤다.
-    //  2) **원형 dab으로 장을 칠하면 반지름만큼 번진다.** dab은 자기 구간 밖으로 r만큼 뻗으므로 높은
-    //     알파가 이웃 구간을 덮어써서 그라데이션이 뭉개진다(측정: 시작부 잉크가 51이어야 하는데 188).
-    //     → 경로에 수직인 띠로 각 구간을 자기 영역에만 가둔다.
+    // [지금] **불투명 그레이스케일 캔버스**에 값을 담는다. 대상이 완전 불투명이면 `source-over`가
+    //        곧 **치환**이므로(겹쳐 그려도 100→100, 실측 확인) 누적이 원천적으로 불가능하고, 경계
+    //        픽셀은 이웃한 두 값의 색 혼합이라 이음매도 없다. 즉 [1판]의 누적과 [2판]의 겹침 포화가
+    //        **동시에** 사라진다. 기하에 의존하지 않으므로 아무리 꺾이고 교차해도 안전하다.
+    //        값이 RGB에 있으므로 마지막에 휘도→알파로 옮긴다(SVG feColorMatrix 1패스).
     //
-    // 정점의 법선은 앞뒤 이웃을 잇는 방향의 수직(=각의 이등분선)을 쓴다. 이웃한 두 조각이 이 선을
-    // 정확히 공유하므로 꺾이는 구간에서도 쐐기 구멍이나 겹침이 생기지 않는다.
-    const PAINT_ALPHA_FIELD_MARGIN = 2;
-    // ★ 이음매 함정(실측으로 두 번 밟았다): 조각끼리 변을 맞대면 그 경계 픽셀은 양쪽이 각각 일부만
-    // 덮는다(안티에일리어싱). 이때 `destination-out`으로 지우고 다시 칠하는 "치환"은 **부분 커버리지
-    // 에서 성립하지 않는다** — 커버리지 c로 지우면 dst·(1−c)만 남고 다시 c·a를 얹으므로 합이 a에
-    // 못 미친다(c=0.6, a=0.93 → 0.72. 실측된 함몰값 185/255=0.72와 정확히 일치). 조각을 겹쳐도
-    // 같은 이유로 함몰은 위치만 옮겨갈 뿐 사라지지 않았다(정점마다 1px 줄이 41개).
-    //   → 해법은 겹치지 않게 맞대고 **가산 합성**(`lighter`)으로 칠하는 것. 알파가 더해지므로 경계
-    //     픽셀은 c₁·a + c₂·a = a가 되어 이음매가 원리적으로 0이 된다(c₁+c₂=1, 조각이 타일링하므로).
-    //     안쪽으로 심하게 꺾여 조각이 실제로 겹치는 드문 구간에서만 값이 더해져 1로 클램프된다.
-    let paintAlphaFieldScratch = null;
+    // 캔버스는 스트로크의 바운딩 박스 크기만 쓴다 — 필터 비용이 용지 전체가 아니라 획 넓이에 비례한다.
+    // destination-in에 부분 이미지를 쓰면 그 바깥이 지워지지만, 바깥에는 이 획의 모양이 없으므로 무해하다.
+    const PAINT_ALPHA_FIELD_MARGIN = 3;
+    let paintAlphaFieldScratch = null;   // 값(불투명 회색)
+    let paintAlphaMaskScratch = null;    // 알파로 옮긴 마스크
+    let paintLumFilterCss = null;        // '' = 이 브라우저는 지원하지 않음
+    function paintLumToAlphaFilter() {
+      if (paintLumFilterCss != null) return paintLumFilterCss;
+      paintLumFilterCss = '';
+      try {
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(NS, 'svg');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none';
+        const f = document.createElementNS(NS, 'filter');
+        f.id = 'paintLumToAlpha';
+        f.setAttribute('color-interpolation-filters', 'sRGB');
+        const m = document.createElementNS(NS, 'feColorMatrix');
+        m.setAttribute('type', 'matrix');
+        m.setAttribute('values', '0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  1 0 0 0 0'); // alpha := R
+        f.appendChild(m);
+        svg.appendChild(f);
+        document.body.appendChild(svg);
+        const probe = document.createElement('canvas').getContext('2d');
+        probe.filter = 'url(#paintLumToAlpha)';
+        if (probe.filter === 'url(#paintLumToAlpha)') paintLumFilterCss = 'url(#paintLumToAlpha)';
+      } catch (e) { paintLumFilterCss = ''; }
+      return paintLumFilterCss;
+    }
+    // 반환: { cv, x, y } — destination-in으로 그 좌표에 얹는다. null이면 장을 만들지 못한 것이고,
+    // 호출부가 **획 전체 평균 알파**로 물러선다(경로에 따른 변화는 잃지만 아티팩트는 없다).
     function paintStrokeAlphaField(pts, radii, alphaFor, w, h) {
       const n = pts.length;
       if (!n) return null;
+      const filter = paintLumToAlphaFilter();
+      if (!filter) return null;
       const av = new Array(n);
       for (let i = 0; i < n; i += 1) {
         const raw = Number(alphaFor(pts[i].p, pts[i].t));
         av[i] = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
       }
-      let R = 0;
-      for (let i = 0; i < n; i += 1) if (radii[i] > R) R = radii[i];
-      R += PAINT_ALPHA_FIELD_MARGIN;   // 모양 전체를 확실히 덮는 폭(장이 모양보다 좁으면 가장자리가 잘린다)
-      if (!paintAlphaFieldScratch) paintAlphaFieldScratch = document.createElement('canvas');
-      const cv = paintAlphaFieldScratch;
-      if (cv.width !== w) cv.width = w;
-      if (cv.height !== h) cv.height = h;
-      const ctx = cv.getContext('2d');
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.globalAlpha = 1;
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = '#000';                    // 색은 무의미하다 — destination-in이 읽는 건 알파뿐
-      if (n === 1) {
-        ctx.globalAlpha = av[0];
-        ctx.beginPath();
-        ctx.arc(pts[0].x, pts[0].y, R, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalAlpha = 1;
-        return cv;
-      }
-      const m = n - 1;                                  // 세그먼트 개수
-      const stx = new Array(m), sty = new Array(m);
-      let lastGood = -1;
-      for (let i = 0; i < m; i += 1) {
-        const dx = pts[i + 1].x - pts[i].x, dy = pts[i + 1].y - pts[i].y;
-        const L = Math.hypot(dx, dy);
-        if (L < 1e-6) {                                 // 길이 0 — 직전 방향을 잇는다(퇴화 조각 방지)
-          stx[i] = (lastGood >= 0) ? stx[lastGood] : 1;
-          sty[i] = (lastGood >= 0) ? sty[lastGood] : 0;
-          continue;
-        }
-        stx[i] = dx / L; sty[i] = dy / L; lastGood = i;
-      }
-      // 정점별 **마이터 오프셋**. 이웃한 두 조각이 이 점을 정확히 공유하므로 겹치지도 벌어지지도
-      // 않으면서, 모서리가 바깥으로 밀려난 만큼 회전 구간에서 모양(=반지름 R짜리 원들의 합집합)이
-      // 실제로 덮는 영역까지 포함한다. 단순 수직 법선을 썼을 때는 바깥 쐐기가 비어 스트로크에
-      // 구멍이 났다(실측: 곡선+되꺾임에서 1.43%).
-      const ox = new Array(n), oy = new Array(n);
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (let i = 0; i < n; i += 1) {
-        const A = (i === 0) ? 0 : i - 1;                // 앞 세그먼트
-        const B = (i === n - 1) ? m - 1 : i;            // 뒤 세그먼트
-        const aux = -sty[A], auy = stx[A];
-        let sx = aux + (-sty[B]), sy = auy + stx[B];
-        const L = Math.hypot(sx, sy);
-        if (L < 1e-6) { ox[i] = aux * R; oy[i] = auy * R; continue; }  // 180° 되꺾임
-        sx /= L; sy /= L;
-        const cosHalf = sx * aux + sy * auy;
-        ox[i] = sx * (R / Math.max(0.2, cosHalf));      // 0.2 = 마이터 길이 5R 상한(뾰족한 각에서 폭주 방지)
-        oy[i] = sy * (R / Math.max(0.2, cosHalf));
+        const r = radii[i] + PAINT_ALPHA_FIELD_MARGIN;
+        if (pts[i].x - r < minX) minX = pts[i].x - r;
+        if (pts[i].y - r < minY) minY = pts[i].y - r;
+        if (pts[i].x + r > maxX) maxX = pts[i].x + r;
+        if (pts[i].y + r > maxY) maxY = pts[i].y + r;
       }
-      // 가산 합성 — 위 ★ 주석 참고. 조각들은 변을 정확히 공유하며 타일링하므로 경계 픽셀의 부분
-      // 커버리지가 정확히 합쳐진다. 색은 검정이라 RGB는 0을 유지하고 알파만 쌓인다.
-      ctx.globalCompositeOperation = 'lighter';
-      for (let i = 0; i < m; i += 1) {
-        const p0 = pts[i], p1 = pts[i + 1];
-        if (Math.hypot(p1.x - p0.x, p1.y - p0.y) < 1e-6) continue; // 길이 0 → 그라데이션이 정의되지 않는다
-        // 양 끝 조각만 진행방향으로 R 연장해 둥근 캡을 덮는다(그라데이션은 끝 색으로 클램프된다).
-        // 중간 조각은 연장하지 않는다 — 겹치면 가산이 과대평가가 되기 때문.
-        const ex = (i === 0) ? stx[0] * R : 0, ey = (i === 0) ? sty[0] * R : 0;
-        const fx = (i === m - 1) ? stx[m - 1] * R : 0, fy = (i === m - 1) ? sty[m - 1] * R : 0;
-        const ax = p0.x - ex, ay = p0.y - ey, bx = p1.x + fx, by = p1.y + fy;
-        const g = ctx.createLinearGradient(p0.x, p0.y, p1.x, p1.y);
-        g.addColorStop(0, 'rgba(0,0,0,' + av[i].toFixed(4) + ')');
-        g.addColorStop(1, 'rgba(0,0,0,' + av[i + 1].toFixed(4) + ')');
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.moveTo(ax + ox[i], ay + oy[i]);
-        ctx.lineTo(bx + ox[i + 1], by + oy[i + 1]);
-        ctx.lineTo(bx - ox[i + 1], by - oy[i + 1]);
-        ctx.lineTo(ax - ox[i], ay - oy[i]);
-        ctx.closePath();
-        ctx.fill();
+      const bx = Math.max(0, Math.floor(minX)), by = Math.max(0, Math.floor(minY));
+      const bw = Math.min(w, Math.ceil(maxX)) - bx, bh = Math.min(h, Math.ceil(maxY)) - by;
+      if (!(bw > 0 && bh > 0)) return null;
+      if (!paintAlphaFieldScratch) paintAlphaFieldScratch = document.createElement('canvas');
+      if (!paintAlphaMaskScratch) paintAlphaMaskScratch = document.createElement('canvas');
+      const F = paintAlphaFieldScratch, M = paintAlphaMaskScratch;
+      if (F.width !== bw) F.width = bw;
+      if (F.height !== bh) F.height = bh;
+      if (M.width !== bw) M.width = bw;
+      if (M.height !== bh) M.height = bh;
+      const fc = F.getContext('2d');
+      fc.setTransform(1, 0, 0, 1, 0, 0);
+      fc.globalAlpha = 1;
+      fc.globalCompositeOperation = 'source-over';
+      fc.fillStyle = '#000';
+      fc.fillRect(0, 0, bw, bh);   // 불투명 검정 = 값 0. 여기서부터 모든 그리기가 '치환'이 된다.
+      const dab = function(x, y, r, a) {
+        const v = Math.max(0, Math.min(255, Math.round(a * 255)));
+        fc.fillStyle = 'rgb(' + v + ',' + v + ',' + v + ')';
+        fc.beginPath();
+        fc.arc(x - bx, y - by, Math.max(0.3, r + PAINT_ALPHA_FIELD_MARGIN), 0, Math.PI * 2);
+        fc.fill();
+      };
+      dab(pts[0].x, pts[0].y, radii[0], av[0]);
+      for (let i = 0; i < n - 1; i += 1) {
+        const a = pts[i], b = pts[i + 1], ra = radii[i], rb = radii[i + 1];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const len = Math.hypot(dx, dy);
+        const rr = Math.min(ra, rb);
+        // 간격 상한 2·√(4r+4) = 반지름 r+3짜리 원들이 폭 r짜리 띠를 빈틈없이 덮는 최대 간격.
+        // 그 안에서 r/2를 쓰되 1.5px 아래로는 안 내려간다(가는 브러시에서 dab 수가 폭주하지 않게).
+        const spacing = Math.max(1.5, Math.min(rr * 0.5, 2 * Math.sqrt(4 * rr + 4)));
+        const steps = Math.max(1, Math.ceil(len / spacing));
+        for (let s = 1; s <= steps; s += 1) {
+          const t = s / steps;
+          dab(a.x + dx * t, a.y + dy * t, ra + (rb - ra) * t, av[i] + (av[i + 1] - av[i]) * t);
+        }
       }
-      ctx.globalCompositeOperation = 'source-over';
-      return cv;
+      const mc = M.getContext('2d');
+      mc.setTransform(1, 0, 0, 1, 0, 0);
+      mc.globalAlpha = 1;
+      mc.globalCompositeOperation = 'source-over';
+      mc.filter = 'none';
+      mc.clearRect(0, 0, bw, bh);
+      mc.filter = filter;          // 휘도 → 알파: RGB에 담아 온 값을 알파 채널로 옮긴다
+      mc.drawImage(F, 0, 0);
+      mc.filter = 'none';
+      return { cv: M, x: bx, y: by };
     }
     // ── ver621: lasso smoothing — the raw pointer polyline reads angular. All lasso paths (previews,
     // masks, fills — conte AND genga, so the committed region always matches the preview) route
