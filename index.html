@@ -49256,6 +49256,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!tx && !ty) return null; // 완전 수직이면 방위가 정의되지 않는다 — 0으로 위장하지 않는다
       return ((Math.atan2(ty, tx) * 180 / Math.PI) % 360 + 360) % 360;
     }
+    // ver1345: 각도는 0/360에서 되감기므로 **선형 보간을 쓰면 안 된다**. 350°와 10°는 20° 떨어져
+    // 있는데 `a0 + (a1-a0)*t`는 그 사이를 340° 반대로 돌아 t=0.5에서 180°(정반대)를 내놓는다 —
+    // 방위 추종 팁이 한 바퀴 휙 돌아버린다. 항상 짧은 쪽 호를 따라간다.
+    function paintLerpAngleDeg(a0, a1, t) {
+      const d = (((a1 - a0) % 360) + 540) % 360 - 180;   // -180..180 (짧은 쪽 부호 있는 차이)
+      return (((a0 + d * t) % 360) + 360) % 360;
+    }
     // ver1335: 팁 렌더 옵션을 읽는 단 하나의 자리. conte 스트로크 레코드와 genga 세션이 같은 필드
     // 이름을 쓰므로 양쪽이 이 함수 하나를 통과한다 — 필드가 늘어도 커널 시그니처가 다시 넓어지지 않고,
     // 두 엔진이 표류할 수 없다(ver1329에서 배운 것). 팁이 없으면 null → 호출부는 옛 원형 dab 경로.
@@ -49445,20 +49452,35 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // NOT resampled in either engine, on purpose: pxStamp (2値化) — Bresenham is not associative
     // (a→b→c ≠ a→c in pixels), so resampling would change committed pixels — and the pressure-ALPHA
     // segment path, whose per-cap overlap darkening is coverage math that only a real flow model fixes.
-    function paintArcResampleEmit(st, x, y, p, tn) {
+    // ver1345: 여섯 번째 인자 az = 펜 방위(도) 또는 null. 이게 없어서 **原画에서 방위 추종 팁이
+    // 완전히 죽어 있었다** — conte는 paintAttachPressure가 점에 `a`를 실어주는데 genga는 이
+    // 리샘플러를 거치므로 방출된 점에 `a`가 아예 없었고, paintStampTexturedPath의 방위 분기가
+    // 항상 회전 0으로 지나갔다(엔진 편측 기능). 방위는 각도라 짧은 쪽 호로 보간한다.
+    function paintArcResampleEmit(st, x, y, p, tn, az) {
       const out = [];
-      if (!st) { out.push({ x: x, y: y, p: p, t: tn }); return out; }
+      if (!st) {
+        const seed = { x: x, y: y, p: p, t: tn };
+        if (az != null) seed.a = az;
+        out.push(seed);
+        return out;
+      }
       const dx = x - st.x, dy = y - st.y;
       const L = Math.hypot(dx, dy);
       if (L < 1e-9) return out;
+      // 한쪽만 방위를 보고했으면 있는 쪽 값을 그대로 쓴다(기기가 수직 근처에서 간헐적으로 null을 준다)
+      const a0 = (st.a == null) ? az : st.a;
+      const a1 = (az == null) ? st.a : az;
       let s = st.step - st.carry;
       while (s <= L) {
         const f = s / L;
-        out.push({ x: st.x + dx * f, y: st.y + dy * f, p: st.p + (p - st.p) * f, t: st.t + (tn - st.t) * f }); // ver1328 ③: tilt interpolates along the path exactly like pressure
+        const q = { x: st.x + dx * f, y: st.y + dy * f, p: st.p + (p - st.p) * f, t: st.t + (tn - st.t) * f }; // ver1328 ③: tilt interpolates along the path exactly like pressure
+        if (a0 != null && a1 != null) q.a = paintLerpAngleDeg(a0, a1, f);
+        out.push(q);
         s += st.step;
       }
       st.carry = st.carry + L - out.length * st.step;
       st.x = x; st.y = y; st.p = p; st.t = tn;
+      if (az != null) st.a = az;
       return out;
     }
     function paintVariableWidthRadii(pts, baseWidthPx, factorFor) {
@@ -50306,7 +50328,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         while (s <= len) {
           const t = s / len;
           let rad = baseRad + dirRad;
-          if (az0 != null) rad += (az0 + (az1 - az0) * t) * Math.PI / 180;
+          // ver1345: 짧은 쪽 호로 보간(옛 선형식 `az0+(az1-az0)*t`는 0/360 되감기에서 팁을 한 바퀴
+          // 반대로 돌렸다 — conte에도 있던 버그).
+          if (az0 != null) rad += paintLerpAngleDeg(az0, az1, t) * Math.PI / 180;
           // ver1345: 필압/틸트는 여기서 더 이상 보간하지 않는다 — dab의 크기는 radii가 이미 담고 있고
           // (paintVariableWidthRadii가 점마다 필압·틸트를 반영해 만든다), 알파는 이 함수 밖의
           // paintStrokeAlphaField 마스크가 담당한다. 이 루프에 남은 일은 위치와 회전뿐이다.
@@ -51382,7 +51406,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // paintVariableWidthRadii가 상수 반지름을 내주므로 균일폭 dab 사슬 = 옛 세그먼트 렌더와 같은 그림.
         // ver621/ver641: pressure→size strokes = ONE variable-width dab-stamped shape, filled once
         // (kills the round-join blobs at direction changes — see paintTraceVariableWidthPath).
-        const ptsPx = points.map(function(pt) { return { x: pt.x * width - ox, y: pt.y * height - oy, p: pt.p, t: pt.t }; }); // ver1329: .t must survive the px map or the radii kernel sees undefined
+        // ver1329: .t must survive the px map or the radii kernel sees undefined.
+        // ver1345: **.a too** — 방위(azimuth)는 ver1335에 추가됐는데 이 map에 빠져 있었다. 그래서
+        // paintAttachPressure가 점에 실어준 방위가 여기서 통째로 버려졌고, 方位 추종 팁은 conte에서도
+        // (genga와 마찬가지로) 처음부터 아무 일도 하지 않았다. ver1329가 .t로 겪은 사고와 같은 자리,
+        // 같은 원인 — 점에 필드를 추가하는 사람은 이 map을 반드시 같이 고쳐야 한다.
+        const ptsPx = points.map(function(pt) { return { x: pt.x * width - ox, y: pt.y * height - oy, p: pt.p, t: pt.t, a: pt.a }; });
         const radii = paintVariableWidthRadii(ptsPx, ctx.lineWidth, function(p, t) { return paintPressureWidthFactor(stroke, p, t); }); // ver1329: the callback used to be function(p) and silently DROPPED the tilt arg — conte got no tilt at all
         // A stroke with a resolvable tipId stamps that texture instead of the plain round dab. Live since
         // ver1239 wired tipId through the builders and the preview (the comment here still said it was dead
@@ -73275,6 +73304,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // out at ~0.11) a 0.5 fallback is 5-10x fatter than the rest of the stroke — exactly a start blob.
       // Trust the literal reported value (0 included); only a true non-number (NaN/undefined) falls back.
       const downPressure = (ev.pointerType === 'pen' && typeof ev.pressure === 'number' && ev.pressure >= 0) ? Math.min(1, ev.pressure) : 0.5;
+      // ver1345: 기울기·방위의 pointerdown 값. 방위는 실제로 쓸 때만 읽는다 — 팁이 등록돼 있고
+      // 追従이 '方位'일 때. (팁은 아래 paintAttachTip이 세션에 심지만 그건 이 리터럴 다음이라,
+      // conte 빌더들과 마찬가지로 스토어를 직접 본다.)
+      const downTilt = paintSampleTiltNorm(ev);
+      const wantAzimuth = paintArmedTipActive() && paintTipRotateVal() === 'azimuth';
+      const downAzimuth = wantAzimuth ? paintSampleAzimuthDeg(ev) : null;
       let startWidth = c.lineWidth;
       if (penPressureSizeOnNow) startWidth = Math.max(1, Math.round(c.lineWidth * gengaPressureFactor(downPressure)));
       startWidth = Math.max(1, Math.round(startWidth * paintTiltWidthFactor({ tiltSizePct: paintTiltSizeVal() }, paintSampleTiltNorm(ev)))); // ver1328 ③: the start dot tilts too (no session yet — read the slot directly)
@@ -73298,17 +73333,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaDrawSession = {
         layerId: layer.id, frame: frame, canvas: cv, ctx: c, lastX: p.x, lastY: p.y, pxStamp: pxStamp, // ver943: outline mode now implies !pxStamp, no nulling needed
         penBaseWidth: c.lineWidth,
-        penPressureSize: penPressureSizeOnNow,
-        penPressureAlpha: penPressure && paintPressureAlphaOn(),
-        // ★ver1342: 공용 커널이 읽는 **정본 이름**을 세션에도 싣는다. 여기가 이번 세션에서 세 번째로
-        // 같은 사고가 난 지점이다: genga 세션은 pen* 방언(penPressureAlpha/penGamma/penGain)을 쓰고
-        // conte 스트로크는 pressure* 정본을 쓰는데, 공용 커널(paintPressureAlphaFactor,
-        // paintTipOptionsFrom)은 정본만 읽는다 → 原画에서는 필압 알파가 **영원히 꺼진 값**이었고,
-        // ver1340의 검증이 conte 형태 레코드를 쓴 탓에 통과했다(사용자 보고: "여전히 적용 안 됨").
-        // 어댑터 함수를 만들지 않고 세션에 정본 이름을 싣는 이유: 어댑터는 **다음 커널이 그것을 쓸 것을
-        // 기억해야** 하므로 같은 함정이 계속 재발한다. 정본을 실어두면 어떤 공용 커널이든 그냥 동작한다.
-        // 두 벌이 어긋날 창이 없다 — pointerdown에서 함께 한 번만 정해지고 제스처 내내 불변이다
-        // (conte도 같은 규약). pen* 쪽은 gengaDrawMove의 세그먼트 루프가 아직 쓰므로 남긴다.
+        // ★ver1342: 공용 커널이 읽는 **정본 이름**을 세션에 싣는다. 여기가 그 세션에서 세 번째로
+        // 같은 사고가 난 지점이었다: genga 세션은 pen* 방언을 쓰고 conte 스트로크는 pressure* 정본을
+        // 쓰는데, 공용 커널(paintPressureAlphaFactor, paintTipOptionsFrom)은 정본만 읽는다 →
+        // 原画에서는 필압 알파가 **영원히 꺼진 값**이었고, ver1340의 검증이 conte 형태 레코드를 쓴
+        // 탓에 통과했다(사용자 보고: "여전히 적용 안 됨"). 어댑터를 만들지 않고 정본을 싣는 이유:
+        // 어댑터는 **다음 커널이 그것을 쓸 것을 기억해야** 하므로 같은 함정이 계속 재발한다.
+        // ★ver1345: 방언을 **완전히 제거**했다. ver1342는 정본을 나란히 싣기만 하고 pen* 쪽을
+        // 남겨서 한 세션에 어휘가 3벌(pen* / 정본 / pressureFactor 클로저) 공존했고, 그 상태가
+        // 이번 판의 굵기 누출(ver1345 ①)을 낳았다 — 세그먼트 루프만 pen*을 읽고 아웃라인 경로는
+        // 제3의 pressureFactor를 읽는 식이었다. 지금은 세션이 정본 한 벌만 들고, 두 경로가 같은
+        // 필드를 읽는다. gengaPressureFactor가 클로저로 잡던 penMinS/penGamma/penGain은
+        // pressureMin/pressureGamma/pressureGain과 **같은 값**이라 치환은 수학적 항등이다.
         pressure: penPressure,
         pressureSize: penPressureSizeOnNow,
         pressureAlpha: penPressure && paintPressureAlphaOn(),
@@ -73317,12 +73353,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         pressureGain: penGain,
         smoothState: { x: p.x, y: p.y }, pxStampCache: {}, smoothP: downPressure, // ver750 (fix_design P4): shared paintStabilizePoint kernel state (was inline smoothX/Y EMA copy)
         stabScale: gengaPreviewXform ? 1 / Math.max(1e-6, gengaPreviewXform.scale) : 0, // ver1328 ②: paper px per screen px — the rope radius is a screen-space feel
-        pressureFactor: gengaPressureFactor,
-        penGamma: penGamma, // ver623: alpha curve shares the shape gamma
-        penGain: penGain,   // ver626: alpha curve shares the gain too
         penOutline: penOutlineMode,
-        pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure }] : null,
-        arc: penOutlineMode ? { x: p.x, y: p.y, p: downPressure, t: 0, carry: 0, step: Math.max(1, Math.min(5, c.lineWidth * 0.35)) } : null, // ver1328 ①: resampler state — step scales with brush width, clamped so thin pens stay dense and fat pens stay cheap
+        azOn: wantAzimuth, // ver1345: 방위를 실제로 쓸 때만 샘플링한다(팁이 있고 追従=方位일 때)
+        // ver1345: 첫 점도 t/a를 싣는다 — 전에는 `{x,y,p}`뿐이라 arc 상태(t:0)와 어긋났고,
+        // paintVariableWidthRadii가 pts[0].t를 undefined로 읽어 첫 점만 기울기가 빠졌다.
+        pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth }] : null,
+        arc: penOutlineMode ? { x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth, carry: 0, step: Math.max(1, Math.min(5, c.lineWidth * 0.35)) } : null, // ver1328 ①: resampler state — step scales with brush width, clamped so thin pens stay dense and fat pens stay cheap
         tiltSizePct: paintTiltSizeVal(), tiltAlphaPct: paintTiltAlphaVal(), smoothT: null, // ver1328 ③: captured per stroke like the pressure shape fields
         scan: scanEligible ? gengaScanSeed(seedRect) : null // ver1196
       };
@@ -73449,9 +73485,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (penSess.smoothT == null) penSess.smoothT = tiltRaw;
         else penSess.smoothT += (tiltRaw - penSess.smoothT) * 0.35;
         const useTilt = penSess.smoothT;
+        const useAz = penSess.azOn ? paintSampleAzimuthDeg(sample) : null; // ver1345: 방위(方位 추종 팁 전용)
         if (penSess.penOutline) { // ver621: outline mode just accumulates; ONE whole redraw after the loop
           // ver1328 ①: accumulate RESAMPLED points (uniform arc-length + interpolated pressure), not raw
-          const emitted = paintArcResampleEmit(penSess.arc, p.x, p.y, usePressure, useTilt);
+          const emitted = paintArcResampleEmit(penSess.arc, p.x, p.y, usePressure, useTilt, useAz);
           for (let ei = 0; ei < emitted.length; ei += 1) {
             const q = emitted[ei];
             penSess.pts.push(q);
@@ -73463,14 +73500,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver1328 ②: the rope holds the point STILL inside its dead zone — a zero-length segment with a
         // round cap still stamps a dot per event (and with alpha it darkens), so a standstill draws nothing.
         if (Math.hypot(p.x - penSess.lastX, p.y - penSess.lastY) < 0.05) continue;
+        // ver1345: pen* 방언과 pressureFactor 클로저를 걷어내고 세션의 **정본 필드**를 읽는다.
+        // 값은 동일하다(pressureMin/Gamma/Gain = 클로저가 잡던 penMinS/penGamma/penGain). 커널 함수
+        // (paintPressureWidthFactor/AlphaFactor)를 그대로 쓰지 않는 이유는 저 둘이 틸트를 내부에서
+        // 곱하는데 여기서는 아래 줄이 따로 곱하기 때문 — 이중 적용을 피하려고 곡선만 공유한다.
+        // `rawPressure != null` 게이트는 유지: 이 샘플이 필압을 안 실어 왔으면 굵기/알파를 건드리지
+        // 않는다(Windows Ink가 첫 샘플에 0을 주는 사례 — ver625).
         let segWidth = penSess.penBaseWidth || target.lineWidth; // ver609: pen pressure → per-segment width
-        if (penSess.penPressureSize && rawPressure != null) {
-          segWidth = Math.max(1, Math.round(segWidth * penSess.pressureFactor(usePressure))); // ver721: pressureFactor always set
+        if (penSess.pressureSize && rawPressure != null) {
+          segWidth = Math.max(1, Math.round(segWidth * paintPressureCurve(usePressure, penSess.pressureMin, penSess.pressureGamma, penSess.pressureGain)));
         }
         segWidth = Math.max(1, Math.round(segWidth * paintTiltWidthFactor(penSess, useTilt))); // ver1328 ③ (×1 at 0%)
         let segAlpha = 1;
-        if (penSess.penPressureAlpha && rawPressure != null) {
-          segAlpha = paintPressureCurve(usePressure, 0.15, penSess.penGamma, penSess.penGain); // ver723: shared alpha curve
+        if (penSess.pressureAlpha && rawPressure != null) {
+          segAlpha = paintPressureCurve(usePressure, 0.15, penSess.pressureGamma, penSess.pressureGain); // ver723: shared alpha curve
         }
         segAlpha *= paintTiltAlphaMul(penSess, useTilt); // ver1328 ③ (×1 at 0%)
         // ver1196: BOTH ends of the segment, at the width this segment is stroked with — the previous point
