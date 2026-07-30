@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1352</title>
+  <title>MoArt ver1353</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8856,7 +8856,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1352</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1353</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -14850,7 +14850,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: CONSTANTS + SHORTCUT ACTION DEFS
     // APP: CONSTANTS
     const APP_NAME = 'MoArt';
-    const APP_DISPLAY_VERSION = '1352';
+    const APP_DISPLAY_VERSION = '1353';
     const PROJECT_FORMAT_VERSION = 2;
     const ROWS_PER_PAGE = 5;
     const EMPTY_SLOT_COUNT = 5;
@@ -50477,6 +50477,148 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } catch (e) { paintLumFilterCss = ''; }
       return paintLumFilterCss;
     }
+    // ── ver1353: 최근접점 격자 장(場) ────────────────────────────────────────────────────────
+    // 리서치가 확정한 정답(Blender GP: 픽셀마다 "경로 위 최근접점"의 값 — saturate(t) 클램프)을
+    // 도형 래스터화로 흉내내는 시도는 세 번 전부 실패했다(수직 띠·마이터 띠·butt 캡슐 — 반지름이
+    // 세그먼트 길이보다 크면 조각이 부챗살로 갈라진다, ver1352 코드맵). 그래서 흉내를 그만두고
+    // **그 계산을 그대로 한다**: CPU에서, 저해상도 격자로.
+    //   - 장 A(p) = a(최근접 호 위치)는 경로를 따라 매끄러운 함수라 셀 크기(≈반지름/6)로 샘플링해도
+    //     잃는 것이 없고, 쌍선형 확대가 셀 사이를 메운다. 오차 상한 = 셀 크기이지 반지름이 아니다.
+    //   - 원판이라는 개념 자체가 없으므로 **원형 아티팩트가 원리적으로 생길 수 없다** — 등고선은
+    //     경로에 수직으로 서고, 자기교차에서는 두 구간의 중간선(보로노이 경계)에서 한 셀 폭으로 갈린다.
+    //   - 셀 수는 면적 예산(≈2.5만)으로 묶고, 경로는 셀 간격으로 솎는다(둘 다 실측으로 잡은 병목).
+    //     경로에서 먼 빈 셀은 전수 스캔하지 않고 체임퍼 2패스가 이웃 값을 복사한다 — 그 셀들은
+    //     모양 밖이라 마스크로 잘려나가고, 복사는 쌍선형 확대가 경계 바깥을 읽어도 안전하게 만든다.
+    //   - 후보 조회는 CSR(타입드 배열) + "3×3 후보 목록을 버킷이 바뀔 때만 재구성"으로 줄였다.
+    //     행 순회에서 이웃 셀들은 거의 항상 같은 버킷에 있으므로 재구성은 ~10셀에 1번이다.
+    let paintAlphaGridCanvas = null;
+    let paintAlphaGridImage = null;
+    function paintAlphaFieldGridFill(fc, pts, av, radii, bx, by, bw, bh) {
+      const n = pts.length;
+      if (n < 2) return false;
+      let maxR = 0;
+      for (let i = 0; i < n; i += 1) if (radii[i] > maxR) maxR = radii[i];
+      const reach = maxR + PAINT_ALPHA_FIELD_MARGIN;
+      // 셀 크기 = max(반지름/6, √(면적/25000)). 두 번째 항이 **작업량 상한** — 셀 수를 약 2.5만으로
+      // 묶어서 중간 반지름이 "예산 바로 밑의 거대 격자"에 빠지는 것을 막는다(실측 100ms → 수 ms).
+      // 오차는 셀 크기만큼뿐이고, 면적 항은 ≤7.4px(전장 캔버스)라 항상 보이지 않는 크기다.
+      const cell = Math.max(2, Math.min(24, Math.max(reach / 6, Math.sqrt((bw * bh) / 25000))));
+      const gw = Math.ceil(bw / cell), gh = Math.ceil(bh / cell);
+      if (gw < 1 || gh < 1 || gw * gh > 90000) return false;
+      // 경로를 셀 간격으로 솎는다 — 장은 셀 해상도로만 샘플되므로 더 촘촘한 점은 후보 수만 불린다.
+      // 값 보간 오차·보로노이 경계 흔들림 모두 셀 크기 이하라 화질 손실이 없다.
+      const dxp = [], dyp = [], davL = [];
+      dxp.push(pts[0].x - bx); dyp.push(pts[0].y - by); davL.push(av[0]);
+      let acc = 0;
+      for (let i = 1; i < n; i += 1) {
+        acc += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+        if (acc >= cell || i === n - 1) {
+          dxp.push(pts[i].x - bx); dyp.push(pts[i].y - by); davL.push(av[i]);
+          acc = 0;
+        }
+      }
+      const dn = dxp.length;
+      if (dn < 2) return false;
+      const m = dn - 1;
+      const sx = new Float64Array(m), sy = new Float64Array(m);
+      const sdx = new Float64Array(m), sdy = new Float64Array(m);
+      const sl2 = new Float64Array(m), sa0 = new Float64Array(m), sda = new Float64Array(m);
+      for (let i = 0; i < m; i += 1) {
+        sx[i] = dxp[i]; sy[i] = dyp[i];
+        sdx[i] = dxp[i + 1] - dxp[i]; sdy[i] = dyp[i + 1] - dyp[i];
+        sl2[i] = sdx[i] * sdx[i] + sdy[i] * sdy[i];
+        sa0[i] = davL[i]; sda[i] = davL[i + 1] - davL[i];
+      }
+      // 공간 해시(CSR). 버킷 한 변 B ≥ "정확해야 하는 셀"의 최대 경로 거리(reach + 셀 몇 개)면
+      // 3×3 이웃으로 충분하다. 더 먼 셀은 못 찾아도 된다 — 체임퍼가 채우고 마스크가 자른다.
+      const B = Math.ceil(reach + 3 * cell);
+      const hw = Math.ceil(bw / B) + 1, hh = Math.ceil(bh / B) + 1;
+      const nb = hw * hh;
+      const cnt = new Int32Array(nb + 1);
+      const bi0 = new Int32Array(m), bi1 = new Int32Array(m), bj0 = new Int32Array(m), bj1 = new Int32Array(m);
+      for (let i = 0; i < m; i += 1) {
+        const ex = sx[i] + sdx[i], ey = sy[i] + sdy[i];
+        bi0[i] = Math.max(0, Math.floor(Math.min(sx[i], ex) / B));
+        bi1[i] = Math.min(hw - 1, Math.floor(Math.max(sx[i], ex) / B));
+        bj0[i] = Math.max(0, Math.floor(Math.min(sy[i], ey) / B));
+        bj1[i] = Math.min(hh - 1, Math.floor(Math.max(sy[i], ey) / B));
+        for (let hy = bj0[i]; hy <= bj1[i]; hy += 1) for (let hx = bi0[i]; hx <= bi1[i]; hx += 1) cnt[hy * hw + hx + 1] += 1;
+      }
+      for (let k = 0; k < nb; k += 1) cnt[k + 1] += cnt[k];
+      const items = new Int32Array(cnt[nb]);
+      const cursor = cnt.slice(0, nb);
+      for (let i = 0; i < m; i += 1) {
+        for (let hy = bj0[i]; hy <= bj1[i]; hy += 1) for (let hx = bi0[i]; hx <= bi1[i]; hx += 1) {
+          const key = hy * hw + hx;
+          items[cursor[key]] = i; cursor[key] += 1;
+        }
+      }
+      if (!paintAlphaGridCanvas) paintAlphaGridCanvas = document.createElement('canvas');
+      const gc = paintAlphaGridCanvas;
+      if (gc.width !== gw) gc.width = gw;
+      if (gc.height !== gh) gc.height = gh;
+      const gctx = gc.getContext('2d');
+      if (!paintAlphaGridImage || paintAlphaGridImage.width !== gw || paintAlphaGridImage.height !== gh) {
+        paintAlphaGridImage = gctx.createImageData(gw, gh);
+      }
+      const px8 = paintAlphaGridImage.data;
+      const nCells = gw * gh;
+      const gval = new Float32Array(nCells);
+      const gfil = new Uint8Array(nCells);
+      const cand = new Int32Array(items.length || 1);
+      let candN = 0, candKey = -1;
+      let oc = 0;
+      for (let gy = 0; gy < gh; gy += 1) {
+        const py = (gy + 0.5) * cell;                       // 셀 중심에서 샘플링(확대 시 텍셀 중심과 일치)
+        const hyC = Math.max(0, Math.min(hh - 1, Math.floor(py / B)));
+        for (let gx = 0; gx < gw; gx += 1, oc += 1) {
+          const px = (gx + 0.5) * cell;
+          const hxC = Math.max(0, Math.min(hw - 1, Math.floor(px / B)));
+          const key = hyC * hw + hxC;
+          if (key !== candKey) {                            // 버킷이 바뀔 때만 3×3 후보 목록 재구성
+            candKey = key; candN = 0;
+            for (let hy = Math.max(0, hyC - 1); hy <= Math.min(hh - 1, hyC + 1); hy += 1) {
+              for (let hx = Math.max(0, hxC - 1); hx <= Math.min(hw - 1, hxC + 1); hx += 1) {
+                const k2 = hy * hw + hx;
+                for (let q = cnt[k2]; q < cnt[k2 + 1]; q += 1) { cand[candN] = items[q]; candN += 1; }
+              }
+            }
+          }
+          let bestD = Infinity, bestV = 0;
+          for (let ci = 0; ci < candN; ci += 1) {
+            const i = cand[ci];
+            const rx = px - sx[i], ry = py - sy[i];
+            let t = sl2[i] > 0 ? (rx * sdx[i] + ry * sdy[i]) / sl2[i] : 0;
+            if (t < 0) t = 0; else if (t > 1) t = 1;        // = Blender GP의 saturate(t)
+            const qx = rx - t * sdx[i], qy = ry - t * sdy[i];
+            const d = qx * qx + qy * qy;
+            if (d < bestD) { bestD = d; bestV = sa0[i] + sda[i] * t; }
+          }
+          if (bestD !== Infinity) { gval[oc] = bestV; gfil[oc] = 1; }
+        }
+      }
+      // 체임퍼 2패스: 빈 셀에 이웃 값 전파(→↓ 후 ←↑). 경로 리본은 격자를 가로지르므로 전부 채워진다.
+      for (let gy = 0; gy < gh; gy += 1) for (let gx = 0; gx < gw; gx += 1) {
+        const o2 = gy * gw + gx;
+        if (gfil[o2]) continue;
+        if (gx > 0 && gfil[o2 - 1]) { gval[o2] = gval[o2 - 1]; gfil[o2] = 1; }
+        else if (gy > 0 && gfil[o2 - gw]) { gval[o2] = gval[o2 - gw]; gfil[o2] = 1; }
+      }
+      for (let gy = gh - 1; gy >= 0; gy -= 1) for (let gx = gw - 1; gx >= 0; gx -= 1) {
+        const o2 = gy * gw + gx;
+        if (gfil[o2]) continue;
+        if (gx < gw - 1 && gfil[o2 + 1]) { gval[o2] = gval[o2 + 1]; gfil[o2] = 1; }
+        else if (gy < gh - 1 && gfil[o2 + gw]) { gval[o2] = gval[o2 + gw]; gfil[o2] = 1; }
+      }
+      for (let o2 = 0, o4 = 0; o2 < nCells; o2 += 1, o4 += 4) {
+        const v8 = Math.max(0, Math.min(255, Math.round(gval[o2] * 255)));
+        px8[o4] = v8; px8[o4 + 1] = v8; px8[o4 + 2] = v8; px8[o4 + 3] = 255;
+      }
+      gctx.putImageData(paintAlphaGridImage, 0, 0);
+      fc.imageSmoothingEnabled = true;                       // 쌍선형 확대가 셀 사이를 메운다
+      fc.drawImage(gc, 0, 0, gw, gh, 0, 0, gw * cell, gh * cell);
+      return true;
+    }
     // 반환: { cv, x, y } — destination-in으로 그 좌표에 얹는다. null이면 장을 만들지 못한 것이고,
     // 호출부가 **획 전체 평균 알파**로 물러선다(경로에 따른 변화는 잃지만 아티팩트는 없다).
     function paintStrokeAlphaField(pts, radii, alphaFor, w, h) {
@@ -50515,50 +50657,54 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       fc.globalCompositeOperation = 'source-over';
       fc.fillStyle = '#000';
       fc.fillRect(0, 0, bw, bh);   // 불투명 검정 = 값 0
-      // ver1348: dab을 **max**로 합친다. 불투명 캔버스에서 `lighten`은 채널별 max이고(알파는 양쪽 다
-      // 1이라 그대로), 이건 실제 페인트 엔진의 "buildup 끔"(Krita의 Wash, Procreate의 Uniform)과 같은
-      // 의미론이다 — 한 획 안에서 dab이 겹쳐도 진해지지 않는다.
-      // ver1347의 '치환'(source-over)은 **마지막 dab이 이긴다**라, dab 하나가 통째로 한 톤인 원형
-      // 얼룩을 만들었다(사용자 보고: 팁 브러시인데 농도가 원 모양). 그걸 띠로 덮어 고치려 했더니
-      // 이번엔 띠가 사각형으로 보였다(마이터를 크게 잡아 조각 하나가 이웃을 통째로 덮어씀).
-      // max는 기하 조각이 없으므로 **모양 있는 아티팩트가 원리적으로 생기지 않는다** — 값이 이웃
-      // dab들의 최댓값이라 연속이고, 경계도 조각도 없다. 남는 것은 반지름만큼의 완만한 팽창뿐이다.
-      fc.globalCompositeOperation = 'lighten';
-      // ver1349: dab에 **부드러운 테두리**를 준다. max 합성에서 결과는 dab들의 상위 포락선인데,
-      // 하드 디스크로 찍으면 그 포락선에 원 경계가 그대로 남는다 — 특히 획이 자기 자신과 교차해
-      // 알파가 크게 다른 두 구간이 겹치는 자리에서 인접 픽셀 농도 점프가 40%를 넘었다(실측).
-      // 상용 엔진 조사에서도 같은 진단이 나온다: 하드 엣지 브러시 + max = 합집합 = dab 원형 노출.
-      // 안쪽 `core`(=r+여백)까지는 값이 평평해서 **덮개는 그대로 보장**되고, 그 바깥 `soft` 구간에서만
-      // 0으로 떨어진다. 그 falloff 구간은 모양 밖이라 마스킹으로 잘려나가지만, 교차 지점에서는
-      // 상대 구간의 모양 안으로 들어가 **딱딱한 경계를 완만한 경사로 바꿔준다**.
-      // 그라데이션은 끝까지 완전 불투명이다 — 반투명이 섞이면 `lighten`이 정확한 max가 아니게 된다.
-      const dab = function(x, y, r, a) {
-        const v = Math.max(0, Math.min(255, Math.round(a * 255)));
-        const core = Math.max(0.3, r + PAINT_ALPHA_FIELD_MARGIN);
-        const outer = core + Math.max(1.5, core * PAINT_ALPHA_FIELD_SOFT);
-        const g = fc.createRadialGradient(x - bx, y - by, core, x - bx, y - by, outer);
-        g.addColorStop(0, 'rgb(' + v + ',' + v + ',' + v + ')');
-        g.addColorStop(1, 'rgb(0,0,0)');
-        fc.fillStyle = g;
-        fc.beginPath();
-        fc.arc(x - bx, y - by, outer, 0, Math.PI * 2);
-        fc.fill();
-      };
-      dab(pts[0].x, pts[0].y, radii[0], av[0]);
-      for (let i = 0; i < n - 1; i += 1) {
-        const a = pts[i], b = pts[i + 1], ra = radii[i], rb = radii[i + 1];
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const len = Math.hypot(dx, dy);
-        const rr = Math.min(ra, rb);
-        // 간격 = 덮개가 깨지지 않는 **최대**. 2·√(4r+4)는 반지름 r+3짜리 원들이 폭 r짜리 띠를
-        // 빈틈없이 덮는 한계다. ver1348: 이 패스는 **덮개 전용**이므로(값의 정확도는 아래 띠 패스가
-        // 책임진다) 한계까지 성기게 찍어 dab 수를 최소로 만든다 — 촘촘하게 찍어봐야 띠가 덮어쓸
-        // 값을 더 정성껏 계산하는 낭비고, 실측에서 그 낭비가 52ms를 만들었다.
-        const spacing = Math.max(1.5, Math.min(rr * 0.9, 2 * Math.sqrt(4 * rr + 4)));
-        const steps = Math.max(1, Math.ceil(len / spacing));
-        for (let s = 1; s <= steps; s += 1) {
-          const t = s / steps;
-          dab(a.x + dx * t, a.y + dy * t, ra + (rb - ra) * t, av[i] + (av[i + 1] - av[i]) * t);
+      // ver1353: 반지름이 크면(=팽창이 보일 조건) 최근접점 격자로 장을 만든다. 아래 디스크
+      // 경로는 격자가 셀 예산을 넘는 소반경 전용 폴백으로 남는다(위 헬퍼 주석 참고).
+      if (!paintAlphaFieldGridFill(fc, pts, av, radii, bx, by, bw, bh)) {
+        // ver1348: dab을 **max**로 합친다. 불투명 캔버스에서 `lighten`은 채널별 max이고(알파는 양쪽 다
+        // 1이라 그대로), 이건 실제 페인트 엔진의 "buildup 끔"(Krita의 Wash, Procreate의 Uniform)과 같은
+        // 의미론이다 — 한 획 안에서 dab이 겹쳐도 진해지지 않는다.
+        // ver1347의 '치환'(source-over)은 **마지막 dab이 이긴다**라, dab 하나가 통째로 한 톤인 원형
+        // 얼룩을 만들었다(사용자 보고: 팁 브러시인데 농도가 원 모양). 그걸 띠로 덮어 고치려 했더니
+        // 이번엔 띠가 사각형으로 보였다(마이터를 크게 잡아 조각 하나가 이웃을 통째로 덮어씀).
+        // max는 기하 조각이 없으므로 **모양 있는 아티팩트가 원리적으로 생기지 않는다** — 값이 이웃
+        // dab들의 최댓값이라 연속이고, 경계도 조각도 없다. 남는 것은 반지름만큼의 완만한 팽창뿐이다.
+        fc.globalCompositeOperation = 'lighten';
+        // ver1349: dab에 **부드러운 테두리**를 준다. max 합성에서 결과는 dab들의 상위 포락선인데,
+        // 하드 디스크로 찍으면 그 포락선에 원 경계가 그대로 남는다 — 특히 획이 자기 자신과 교차해
+        // 알파가 크게 다른 두 구간이 겹치는 자리에서 인접 픽셀 농도 점프가 40%를 넘었다(실측).
+        // 상용 엔진 조사에서도 같은 진단이 나온다: 하드 엣지 브러시 + max = 합집합 = dab 원형 노출.
+        // 안쪽 `core`(=r+여백)까지는 값이 평평해서 **덮개는 그대로 보장**되고, 그 바깥 `soft` 구간에서만
+        // 0으로 떨어진다. 그 falloff 구간은 모양 밖이라 마스킹으로 잘려나가지만, 교차 지점에서는
+        // 상대 구간의 모양 안으로 들어가 **딱딱한 경계를 완만한 경사로 바꿔준다**.
+        // 그라데이션은 끝까지 완전 불투명이다 — 반투명이 섞이면 `lighten`이 정확한 max가 아니게 된다.
+        const dab = function(x, y, r, a) {
+          const v = Math.max(0, Math.min(255, Math.round(a * 255)));
+          const core = Math.max(0.3, r + PAINT_ALPHA_FIELD_MARGIN);
+          const outer = core + Math.max(1.5, core * PAINT_ALPHA_FIELD_SOFT);
+          const g = fc.createRadialGradient(x - bx, y - by, core, x - bx, y - by, outer);
+          g.addColorStop(0, 'rgb(' + v + ',' + v + ',' + v + ')');
+          g.addColorStop(1, 'rgb(0,0,0)');
+          fc.fillStyle = g;
+          fc.beginPath();
+          fc.arc(x - bx, y - by, outer, 0, Math.PI * 2);
+          fc.fill();
+        };
+        dab(pts[0].x, pts[0].y, radii[0], av[0]);
+        for (let i = 0; i < n - 1; i += 1) {
+          const a = pts[i], b = pts[i + 1], ra = radii[i], rb = radii[i + 1];
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const len = Math.hypot(dx, dy);
+          const rr = Math.min(ra, rb);
+          // 간격 = 덮개가 깨지지 않는 **최대**. 2·√(4r+4)는 반지름 r+3짜리 원들이 폭 r짜리 띠를
+          // 빈틈없이 덮는 한계다. ver1348: 이 패스는 **덮개 전용**이므로(값의 정확도는 아래 띠 패스가
+          // 책임진다) 한계까지 성기게 찍어 dab 수를 최소로 만든다 — 촘촘하게 찍어봐야 띠가 덮어쓸
+          // 값을 더 정성껏 계산하는 낭비고, 실측에서 그 낭비가 52ms를 만들었다.
+          const spacing = Math.max(1.5, Math.min(rr * 0.9, 2 * Math.sqrt(4 * rr + 4)));
+          const steps = Math.max(1, Math.ceil(len / spacing));
+          for (let s = 1; s <= steps; s += 1) {
+            const t = s / steps;
+            dab(a.x + dx * t, a.y + dy * t, ra + (rb - ra) * t, av[i] + (av[i + 1] - av[i]) * t);
+          }
         }
       }
       const mc = M.getContext('2d');
