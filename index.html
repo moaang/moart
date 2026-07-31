@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1380</title>
+  <title>MoArt ver1381</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -4917,7 +4917,9 @@
     }
 
     .timeline-track.conte-camera-track {
-      height: 18px;
+      /* ver1381: 원화 카메라 레인(--genga-cam-lane-h: 22px)과 같은 높이. 18px 로는 키 사이 지시문
+         (PAN/T.U/T.B/回転)을 선 위에 얹을 자리가 없었다 — 높이를 맞추면 두 화면이 같은 그림이 된다. */
+      height: 22px;
       border-top-width: 0;
       border-bottom-width: 0;
       border-radius: 0;
@@ -8860,7 +8862,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1380</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1381</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -9742,6 +9744,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
        pointer-events:none throughout — the diamonds above are the interaction surface, unchanged. */
     .genga-cam-box { position: absolute; top: 1px; bottom: 1px; background: rgba(224,0,0,0.07); border-radius: 3px; pointer-events: none; z-index: 0; }
     .genga-cam-run { position: absolute; top: 0; bottom: 0; pointer-events: none; z-index: 1; color: var(--cam-red); }
+    /* ver1381: 콘티 레인은 좌표를 %로 쓴다 — 모양 규칙은 위 .genga-cam-run 이 그대로 갖고, 여기서는
+       쌓임 순서만 콘티 레인의 것(띠 0 < run 1 < 키 2)에 맞춘다. */
+    .conte-cam-run { z-index: 1; }
     .genga-cam-run::after { content: ''; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px solid rgba(224,0,0,0.55); }
     .genga-cam-run-t { position: absolute; left: 50%; transform: translateX(-50%); bottom: 50%; margin-bottom: 1px; font-size: 9px; font-weight: 700; line-height: 1; white-space: nowrap; letter-spacing: 0.02em; }
     /* audio track */
@@ -27977,6 +27982,69 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
+    // ver1381: **콘티 카메라 구간(run)도 원화와 같은 커널로 낸다.**
+    // 두 화면이 키를 다른 좌표계로 들고 있을 뿐이다 — 원화는 용지 좌표의 절대 사각형 {x,y,w,h,rotation},
+    // 콘티는 기준 카메라 틀에 대한 변환 {x,y,scale,rotation}(종횡비가 프로젝트 설정으로 고정이라 scale
+    // 하나면 w·h 가 따라 나오고, w·h 를 따로 저장하면 종횡비가 깨진 값을 담을 수 있게 된다).
+    // 정보량은 같으므로 여기서 사각형으로 바꿔 끼우면 분류(gengaCamPairInfo)·문구(gengaCamRunDirectiveText)·
+    // 라벨(cameraKeyframeLabel)을 **복제 없이** 그대로 쓴다.
+    function conteCamKeyAsRect(kf) {
+      const tf = normalizedCameraFrameTransform(kf);
+      const baseW = cameraCoordinateWidth(), baseH = cameraCoordinateHeight();
+      const w = baseW * tf.scale, h = baseH * tf.scale;
+      return { frame: Math.max(0, Math.round(Number(kf && kf.frame) || 0)),
+               x: baseW / 2 + tf.x - w / 2, y: baseH / 2 + tf.y - h / 2,
+               w: w, h: h, rotation: (Number(tf.rotation) || 0) * Math.PI / 180 };
+    }
+    // 한 컷의 키들을 run 으로 묶는다. 병합 규칙은 원화와 같다: 이웃한 두 구간이 둘 다 FIX 면 하나로 본다.
+    function conteCameraRunsForCut(project, cutId) {
+      const keys = cameraKeyframesForCut(project, cutId)
+        .map(conteCamKeyAsRect)
+        .sort(function(a, b) { return a.frame - b.frame; });
+      if (keys.length < 2) return [];
+      const camW = cameraCoordinateWidth();
+      const raw = [];
+      for (let i = 0; i < keys.length - 1; i += 1) {
+        const info = gengaCamPairInfo(keys[i], keys[i + 1], camW);
+        const last = raw[raw.length - 1];
+        if (last && gengaCamRunsMergeable(last.info, info)) last.endIdx = i + 1;
+        else raw.push({ startIdx: i, endIdx: i + 1, info: info });
+      }
+      let counter = 0, startLabel = cameraKeyframeLabel(0, keys[0].frame, null);
+      return raw.map(function(run) {
+        const a = keys[run.startIdx], b = keys[run.endIdx];
+        const endLabel = run.info.primary === 'FIX' ? startLabel : cameraKeyframeLabel(++counter, b.frame, null);
+        const out = { from: a.frame, to: b.frame, info: run.info,
+                      text: gengaCamRunDirectiveText(run.info, null, null),
+                      startLabel: startLabel, endLabel: endLabel };
+        startLabel = endLabel;
+        return out;
+      });
+    }
+    // 레인에 얹을 마크업. 클래스는 원화와 **같은 것**을 쓴다 — 모양이 갈릴 자리를 만들지 않는다.
+    function conteCameraRunsHtml(project, totalFrames) {
+      const total = Math.max(1, Math.round(Number(totalFrames) || 1));
+      const laneW = Math.max(1, Math.round(Number(state.timelineInnerWidth) || 1));
+      return cameraTimelineSlots(project).map(function(slot) {
+        const cut = slot && slot.cut;
+        if (!cut) return '';
+        const slotStart = Math.max(0, Math.round(Number(slot.startFrame) || 0));
+        return conteCameraRunsForCut(project, cut.id).map(function(run) {
+          const from = slotStart + run.from, to = slotStart + run.to;
+          const clip = olClipFrameRange(cut.id, from, to);
+          if (!clip) return '';
+          const left = framePercent(clip.startFrame, total);
+          const width = Math.max(0.02, framePercent(clip.endFrame - clip.startFrame, total));
+          const shortText = gengaCamSegmentDisplayText(run.startLabel, run.endLabel, run.text);
+          if (!shortText) return '';
+          const fits = camRunTextFitsWidth(shortText, width / 100 * laneW, 9, 1);
+          return '<div class="genga-cam-run conte-cam-run" style="left:' + left.toFixed(4) + '%;width:' + width.toFixed(4) + '%"'
+            + ' title="' + escapeAttr(run.startLabel + '→' + run.endLabel + ' ' + run.text) + '">'
+            + (fits ? '<span class="genga-cam-run-t">' + escapeHtml(shortText) + '</span>' : '')
+            + '</div>';
+        }).join('');
+      }).join('');
+    }
     function cameraKeyframeCutSegmentsHtml(project, totalFrames) {
       const keyframeCutIds = new Set(cameraKeyframesForProject(project).map(function(item) {
         return String(item && item.cutId || '');
@@ -28160,6 +28228,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         timelineCameraTrackLabelHtml() +
         '<div class="timeline-lane camera-timeline-lane">' +
           cameraKeyframeCutSegmentsHtml(state.project, totalFrames) +
+          conteCameraRunsHtml(state.project, totalFrames) + // ver1381: 키 사이에 무엇이 일어나는지 (원화와 같은 커널)
           cameraCutBoundariesHtml(totalFrames) +
           '<span class="camera-track-line"></span>' +
           // ver1312: 선택 띠는 이 행도 지난다 — 그래야 좌우 세로선이 CUT 부터 C1 까지 끊기지 않는다.
@@ -66509,16 +66578,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (a && a === b) return 'FIX';                                                      // matching ends = a held position
       return String(text == null ? '' : text);
     }
-    // ver1380: **간격이 좁으면 지시문을 내지 않는다.** 키 사이가 CAM_RUN_TEXT_MIN_FRAMES 이하면 글자가
-    // 들어갈 자리가 없어 겹쳐 읽히므로(사용자 지적: "간격 좁은데 표시 우겨넣음 보기 안 좋다"), 선만 남긴다.
-    // 구간 자체는 그대로 존재하므로 A→B 라벨과 존재영역은 유지된다 — 사라지는 것은 문자열뿐이다.
-    const CAM_RUN_TEXT_MIN_FRAMES = 2;
-    function camRunTextFitsGap(fromFrame, toFrame) {
-      const gap = Math.abs(Math.round(Number(toFrame) || 0) - Math.round(Number(fromFrame) || 0));
-      return gap > CAM_RUN_TEXT_MIN_FRAMES;
+    // ver1381: **글자가 실제로 들어가는지로 판정한다.** ver1380 은 "2프레임 이하면 감춘다"였는데, 그것은
+    // ver1375 에서 스냅 판정을 고치며 배운 실수를 되풀이한 것이다 — 같은 프레임 간격이 줌에 따라 화면에서
+    // 13px~133px 로 변하므로(그때 실측), 축소하면 넉넉하다 판정하고 겹쳐 찍고 확대하면 자리가 남는데 감춘다.
+    // 이제 **구간의 화면 폭**과 **그 문자열이 실제로 요구하는 폭**을 견준다. 글자 수와 글꼴 크기가 인자로
+    // 들어가므로 'PAN'(3자)과 '回転 T.B 8Fr→12Fr'(15자)가 자동으로 다른 폭을 요구하고, 임의의 숫자를
+    // 화면마다 다시 정할 필요가 없다.
+    // headroom: 화면마다 여유를 다르게 줄 수 있는 계수. 두 레인의 높이를 같게 맞춘 지금은 둘 다 1 이다.
+    const CAM_RUN_TEXT_CHAR_W = 0.62;   // 글꼴 크기 대비 한 글자의 대략 폭(9px 굵은 산세리프 실측 근사)
+    const CAM_RUN_TEXT_PAD_PX = 6;      // 선 위에 글자가 앉을 때 양옆으로 남겨야 하는 여백
+    function camRunTextFitsWidth(text, widthPx, fontPx, headroom) {
+      const label = String(text || '');
+      if (!label) return false;
+      const need = label.length * (Number(fontPx) || 9) * CAM_RUN_TEXT_CHAR_W + CAM_RUN_TEXT_PAD_PX;
+      return (Number(widthPx) || 0) >= need * (Number(headroom) || 1);
     }
-    function gengaCamRunDirectiveText(info, frStart, frEnd, fromFrame, toFrame) {
-      if (fromFrame != null && toFrame != null && !camRunTextFitsGap(fromFrame, toFrame)) return '';
+    function gengaCamRunDirectiveText(info, frStart, frEnd) {
       if (info.primary === 'FIX') return '';                                               // the payload stays empty; FIX is DISPLAYED by gengaCamSegmentDisplayText (matching labels), exactly as #sheet derives it
       // ver1207: 回転 comes FIRST (user) — 「回転 T.B」, not 「T.B 回転」. The lane and the sheet
       // column both read this one function, so they change together and cannot disagree.
@@ -66561,7 +66636,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const endLabel = run.info.primary === 'FIX' ? startLabel : label(++counter, b.frame);
         const frStart = gengaSheetCameraFr(a.w, camW), frEnd = gengaSheetCameraFr(b.w, camW);
         const out = { startIdx: run.startIdx, endIdx: run.endIdx, from: a.frame, to: b.frame, info: run.info,
-                      text: gengaCamRunDirectiveText(run.info, frStart, frEnd, a.frame, b.frame), startLabel: startLabel,
+                      text: gengaCamRunDirectiveText(run.info, frStart, frEnd), startLabel: startLabel,
                       endLabel: endLabel, frStart: frStart, frEnd: frEnd };
         startLabel = endLabel;
         return out;
@@ -79294,11 +79369,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // being skipped outright — that skip is why the printed sheet said FIX and this lane said nothing.
           const shortText = gengaCamSegmentDisplayText(run.startLabel, run.endLabel, gengaCamRunDirectiveText(run.info, null, null)); // null Fr → the kernel omits the Fr part
           if (!shortText) return;
+          // ver1381: 구간이 좁으면 선만 남기고 글자는 내지 않는다(폭으로 판정 — 위 camRunTextFitsWidth 주석).
+          const runFits = camRunTextFitsWidth(shortText, camAt(run.to) - camAt(run.from), 9, 1);
           // ver1230: no more run-a/run-b start/end labels here — the circle markers themselves now carry
           // A/B/C.. as real text (gengaCamKeyframeLabels), so a second small label at each run's ends was
           // a leftover duplicate from before that change, not a second piece of information.
           camWork += '<div class="genga-cam-run" style="left:' + camAt(run.from) + 'px;width:' + (camAt(run.to) - camAt(run.from)) + 'px" title="' + escapeAttr(run.startLabel + '→' + run.endLabel + ' ' + run.text) + '">' +
-            '<span class="genga-cam-run-t">' + escapeHtml(shortText) + '</span>' +
+            (runFits ? '<span class="genga-cam-run-t">' + escapeHtml(shortText) + '</span>' : '') +
           '</div>';
         });
         let camDiamonds = '';
