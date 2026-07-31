@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1381</title>
+  <title>MoArt ver1382</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8862,7 +8862,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1381</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1382</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -32675,17 +32675,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             latestEnd = startEndIndex;
             latestVisualIndex = conteLayerVisualIndexAtPointer(root, moveEvent, found.ownerCut);
           } else {
-            const targetIndex = videoSlotIndexAtTimelinePointer(root, moveEvent, totalFrames);
-            if (targetIndex < 0) return;
-            latestStart = clampNumber(
-              targetIndex - dragSlotAnchorOffset,
-              bodyDragMinStart,
-              bodyDragMaxStart,
-              startSlotIndex
-            );
-            latestEnd = Math.min(ownerBoundsForBodyDrag.end >= bodyDragMinStart ? ownerBoundsForBodyDrag.end : slots.length - 1, latestStart + startSpan - 1);
-            latestVisualIndex = startVisualIndex;
+            // ver1382: **몸통 하나로 두 축을 다 쓴다.** 판정은 잠금이 아니라 "지금 원래 줄에 있나"로 매 순간
+            // 정해진다 — 다른 줄로 넘어가면 행 이동, 원래 줄로 돌아오면 시간 이동이 다시 산다.
+            // 한 번 잠그는 방식보다 이쪽이 옳은 이유: 행 이동에는 애초에 좌우 판정이 없으므로 다른 줄에
+            // 있는 동안은 X 가 샐 곳이 없고, 되돌아왔을 때 드래그를 놓았다 다시 잡을 이유도 없다.
+            // 세로는 행 단위로만 값이 나오므로(conteLayerVisualIndexAtPointer) 중간값이 없다 = 실수 이동이 적다.
+            const rowAtPointer = conteLayerVisualIndexAtPointer(root, moveEvent, found.ownerCut);
+            const onOwnRow = !(rowAtPointer >= 0) || rowAtPointer === startVisualIndex;
+            if (onOwnRow) {
+              const targetIndex = videoSlotIndexAtTimelinePointer(root, moveEvent, totalFrames);
+              if (targetIndex < 0) return;
+              latestStart = clampNumber(
+                targetIndex - dragSlotAnchorOffset,
+                bodyDragMinStart,
+                bodyDragMaxStart,
+                startSlotIndex
+              );
+              latestEnd = Math.min(ownerBoundsForBodyDrag.end >= bodyDragMinStart ? ownerBoundsForBodyDrag.end : slots.length - 1, latestStart + startSpan - 1);
+              latestVisualIndex = startVisualIndex;
+            } else {
+              // 행 이동 중에는 시간을 건드리지 않는다 — 세로로 옮기려던 손이 가로로 흔들려도 길이·위치가 안 변한다.
+              latestStart = startSlotIndex;
+              latestEnd = startEndIndex;
+              latestVisualIndex = rowAtPointer;
+            }
           }
+          // ver1382: 이 드래그가 지금 행 이동인가. rowHandle 은 늘 참이고, 몸통은 다른 줄에 있을 때만 참이다.
+          const rowMoveNow = Boolean(rowHandle) || latestVisualIndex !== startVisualIndex;
           if (edgeHandle) {
             const edge = edgeHandle.dataset.conteLayerEdge || 'right';
             const plan = conteLayerEdgePanelPlan(slots, found.ownerCut.id, edge, startSlotIndex, startEndIndex, latestStart, latestEnd);
@@ -32705,12 +32721,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             dragGhosts = clearConteLayerDragGhosts(dragGhosts);
             if (!dragGhostGroup.length) dragGhostGroup = createConteLayerDragGhostGroup(root, operationLayerIds, layerEl);
             applyLayerPreviewToGhostGroup(dragGhostGroup, slots, latestStart, latestEnd, totalFrames);
-            if (rowHandle && dragGhostGroup.length) {
+            // ver1382: 몸통 드래그가 행 이동으로 넘어가면 원화와 같은 **줄 고스트**(갈 자리를 테두리로)를 켠다.
+            // 시간 이동으로 돌아오면 지워서, 지금 무엇을 하는 중인지가 화면에 항상 하나만 보이게 한다.
+            if (rowMoveNow && dragGhostGroup.length) {
               applyLayerTopPreviewToGhostGroup(dragGhostGroup, latestVisualIndex);
             }
-            if (rowHandle) {
+            if (rowMoveNow) {
               if (!rowDragGhost) rowDragGhost = createConteLayerRowDragGhost(root, slots, found.ownerCut.id, totalFrames, found.layer, latestVisualIndex);
               updateConteLayerRowDragGhost(rowDragGhost, latestVisualIndex);
+            } else if (rowDragGhost) {
+              if (rowDragGhost.parentNode) rowDragGhost.parentNode.removeChild(rowDragGhost);
+              rowDragGhost = null;
             }
           }
           if (edgeHandle) {
@@ -32743,7 +32764,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           onCommit: function(upEvent) {
           teardown();
           if (latestStart === startSlotIndex && latestEnd === startEndIndex) {
-            if (rowHandle && latestVisualIndex !== startVisualIndex) {
+            // ver1382: 행 이동의 커밋 조건도 손잡이가 아니라 **결과**로 본다 — 몸통으로 줄을 옮겼어도
+            // 그 결과가 "다른 줄"이면 같은 명령이 돌아야 한다. 종전에는 rowHandle 로만 갈려서, 몸통
+            // 드래그로 옮긴 줄은 미리보기까지 되고 놓으면 아무 일도 안 났을 것이다.
+            if (latestVisualIndex !== startVisualIndex) {
               runConteLayerCutPatchCommand('Reorder conte layer', conteLayerOwnerCutIdsForLayerIds(state.project, [layerId]), function(project) {
                 reorderConteLayerLineWithinOwner(project, layerId, latestVisualIndex);
               });
