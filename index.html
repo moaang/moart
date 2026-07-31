@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1374</title>
+  <title>MoArt ver1375</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8866,7 +8866,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1374</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1375</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -32818,17 +32818,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function panelOnlySelectionForMove(project, ids) {
       const indexById = new Map();
       project.cuts.forEach(function(cut, index) { indexById.set(cut.id, index); });
-      const picked = [];
+      const picked = new Set();
       const looseIds = new Set();
       ids.forEach(function(id) {
         const index = indexById.get(id);
         if (index == null) return;
-        picked.push(index);
-        // 머리든 연속 패널이든, 혼자 나가면 원래 있던 그룹에서 떨어져 나가는 것이라 loose 다.
-        looseIds.add(id);
+        // ver1375: **머리는 자기 컷을 떠날 수 없다.** 번호가 붙은 패널은 그 컷의 정체 그 자체라, 혼자 빠지면
+        // 뒤따르던 무번호 패널들이 위 컷에 흡수되면서 양쪽 길이가 재편된다 — 사용자가 본 "왼쪽 끝 패널을
+        // 왼쪽으로 옮기면 뭔가 다른 동작을 하는 것 같다"가 이것이다. 순서를 바꾸려던 사람에게 그건
+        // 이동이 아니라 컷 구조 변경이라, 머리를 잡으면 몸통이든 번호 탭이든 **컷 묶음**으로 간다.
+        // 그래서 단위는 이렇게 읽힌다: 번호 탭 = 컷 묶음 · 연속 패널 몸통 = 그 패널 · 머리 몸통 = 컷 묶음.
+        if (String(project.cuts[index].cutNo || '').trim()) {
+          picked.add(index);
+          for (let cursor = index + 1; cursor < project.cuts.length && !String(project.cuts[cursor].cutNo || '').trim(); cursor += 1) picked.add(cursor);
+          return;
+        }
+        picked.add(index);
+        looseIds.add(id); // 연속 패널이 혼자 나가면 원래 그룹에서 떨어져 나간다
       });
-      picked.sort(function(a, b) { return a - b; });
-      return { entryIds: picked.map(function(i) { return project.cuts[i].id; }), looseIds: looseIds };
+      const order = Array.from(picked).sort(function(a, b) { return a - b; });
+      return { entryIds: order.map(function(i) { return project.cuts[i].id; }), looseIds: looseIds };
     }
     function expandPanelSelectionForMove(project, ids) {
       const indexById = new Map();
@@ -32898,6 +32907,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
+    // ver1375: 경계에 붙는 거리(화면 픽셀). 손끝이 이 안에 들어와야 스냅한다 — 터치의 표준 히트 반경이
+    // 대략 이 정도이고, 마우스에서도 "가까이 가면 붙는다"가 눈으로 읽히는 폭이다.
+    const CONTE_PANEL_SNAP_PX = 24;
     function bindContePanelMoveDrag(root, slotEl) {
       slotEl.addEventListener('pointerdown', function(event) {
         if (event.button && event.button !== 0) return;
@@ -32975,13 +32987,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
             if (me.cancelable) me.preventDefault();
             const frame = timelineFrameAtPointer(root, me, totalFrames);
+            // ver1375: 판정을 **픽셀**로, 그리고 **임계값**을 둔다.
+            //  · 종전에는 거리를 프레임으로 쟀다. 같은 프레임 수라도 줌 배율에 따라 화면 거리가 몇 배씩
+            //    달라지므로, 확대하면 손이 조금만 움직여도 건너뛰고 축소하면 한참 끌어도 안 붙었다.
+            //  · 종전에는 **가장 가까운 경계로 무조건** 붙었다. 임계 밖이라는 개념이 없어 제자리에 있어도
+            //    어딘가로 스냅됐고, 그래서 "판정이 어색하다"가 됐다. 이제 가까이 갔을 때만 붙고,
+            //    아니면 가이드를 감춘다(그 상태로 놓으면 아무 일도 일어나지 않는다).
+            const pointerPx = timelineFrameToPixel(frame, totalFrames);
             let best = null;
             let bestDistance = Infinity;
             boundaries.forEach(function(b) {
-              const distance = Math.abs(b.frame - frame);
+              const distance = Math.abs(timelineFrameToPixel(b.frame, totalFrames) - pointerPx);
               if (distance < bestDistance) { bestDistance = distance; best = b; }
             });
-            boundary = best;
+            boundary = bestDistance <= CONTE_PANEL_SNAP_PX ? best : null;
             // ver1374 (B): 단위를 라벨에도 적는다 — 몇 장이 가는지 뿐 아니라 **왜** 그 장수인지가 보인다.
             if (boundary) updateConteDragGuide(root, boundary.frame, totalFrames,
               plan.entryIds.length + (groupMove ? '枚 移動（カット）' : '枚 移動'), true);
