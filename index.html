@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1382</title>
+  <title>MoArt ver1383</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -5898,7 +5898,9 @@
       min-width: 0;
       box-sizing: border-box;
       background: transparent;
-      cursor: cell;
+      /* ver1383: 빈 칸에서도 상하이동이 되므로 커서가 그것을 말한다 — 세로 화살표가 우선이고,
+         제자리에서 놓으면 종전대로 칸 선택이다. */
+      cursor: ns-resize;
       z-index: 4;
       /* ver1312: 빈 칸이 격자로 읽히게 하는 가로선. 세로선은 여기서 그리지 않는다 —
          .video-boundary 가 세로의 유일한 소유자이고, 여기서 border-right 를 또 그으면
@@ -8862,7 +8864,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1382</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1383</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -31826,6 +31828,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cellEl.dataset.timelineTotalFrames = String(totalFrames);
         if (cellEl.dataset.conteLayerTimelineBound === 'true') return;
         cellEl.dataset.conteLayerTimelineBound = 'true';
+        bindConteLayerRowOnlyDrag(root, cellEl); // ver1383: 빈 칸에서도 상하이동
         cellEl.addEventListener('pointerdown', function(event) {
           if (event.button && event.button !== 0) return;
           event.preventDefault();
@@ -31834,6 +31837,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cellEl.addEventListener('click', function(event) {
           event.preventDefault();
           event.stopPropagation();
+          if (trailingClickGuard.consume('conteLayerRow', cellEl.dataset.conteLayerId || '')) return; // ver1383: 끌고 놓은 뒤의 click 은 선택이 아니다
           selectConteLayerCellFromTimeline(
             root,
             cellEl.dataset.contePanelCutId || '',
@@ -32588,6 +32592,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
 
+    // ver1383: **레이어의 어느 부분을 잡아도 상하이동은 같다.** 빈 칸(.conte-layer-cell-hit)은 그동안
+    // pointerdown 을 막고 있어서 드래그가 시작조차 못 했다 — 같은 레이어인데 잡는 자리에 따라 되고 안 되는
+    // 것은 규칙이 아니라 우연이다. 여기에 붙이는 것은 **세로 전용**이다: 빈 칸은 그 레이어가 존재하지 않는
+    // 자리라 가로(시간) 이동은 뜻을 갖지 않고, 잘못 잡았을 때 길이가 변해 버리면 더 나쁘다.
+    // 줄이 안 바뀌면 아무 일도 하지 않는다 — 기존 click(칸 선택)이 그대로 산다.
+    function bindConteLayerRowOnlyDrag(root, cellEl) {
+      cellEl.addEventListener('pointerdown', function(event) {
+        if (event.button && event.button !== 0) return;
+        const layerId = cellEl.dataset.conteLayerId || '';
+        const found = layerId ? findConteLayerById(state.project, layerId) : null;
+        if (!found) return;
+        const range = layerSlotIndexRange(state.project, found.layer, found.ownerCut);
+        const slots = range.slots || [];
+        if (!slots.length) return;
+        const totalFrames = Math.max(1, Math.round(Number(cellEl.dataset.timelineTotalFrames) || 1));
+        const startVisualIndex = conteLayerVisualIndexAtPointer(root, event, found.ownerCut);
+        let latestVisualIndex = startVisualIndex;
+        let rowDragGhost = null;
+        const teardown = function() {
+          if (rowDragGhost && rowDragGhost.parentNode) rowDragGhost.parentNode.removeChild(rowDragGhost);
+          rowDragGhost = null;
+        };
+        beginDragStrand(event, {
+          on: 'document',
+          raf: true,
+          onMove: function(mv) {
+            const row = conteLayerVisualIndexAtPointer(root, mv, found.ownerCut);
+            latestVisualIndex = row >= 0 ? row : startVisualIndex;
+            if (latestVisualIndex !== startVisualIndex) {
+              if (!rowDragGhost) rowDragGhost = createConteLayerRowDragGhost(root, slots, found.ownerCut.id, totalFrames, found.layer, latestVisualIndex);
+              updateConteLayerRowDragGhost(rowDragGhost, latestVisualIndex);
+            } else {
+              teardown();
+            }
+          },
+          onCancel: teardown,
+          onCommit: function() {
+            teardown();
+            if (latestVisualIndex === startVisualIndex) return; // 제자리 = 클릭이므로 칸 선택에 맡긴다
+            trailingClickGuard.arm('conteLayerRow', layerId); // 끌었으면 뒤따르는 click 은 선택이 아니다
+            runConteLayerCutPatchCommand('Reorder conte layer', conteLayerOwnerCutIdsForLayerIds(state.project, [layerId]), function(project) {
+              reorderConteLayerLineWithinOwner(project, layerId, latestVisualIndex);
+            });
+          }
+        });
+      });
+    }
     function bindConteLayerPointerDrag(root, layerEl, totalFrames) {
       layerEl.addEventListener('pointerdown', function(event) {
         totalFrames = Math.max(1, Math.round(Number(layerEl && layerEl.dataset && layerEl.dataset.timelineTotalFrames) || Number(totalFrames) || 1));
