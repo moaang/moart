@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1373</title>
+  <title>MoArt ver1374</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8866,7 +8866,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1373</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1374</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -32810,6 +32810,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return -1;
     }
 
+    // ver1374: **손잡이가 단위를 정한다.** 컷 번호 탭을 끌면 컷 묶음(머리 + 뒤따르는 무번호 패널)이
+    // 통째로, 패널 몸통을 끌면 그 패널 하나만 움직인다. 종전에는 둘 다 expandPanelSelectionForMove 를
+    // 지나 **몸통을 끌어도 그룹 전체가 갔다** — 한 장을 옮기려던 사용자에게는 예고 없이 여러 장이 따라오는
+    // 셈이었다(실기 지적). 커널(movePicturePanels)은 이미 looseIds 로 "그룹에서 떨어져 나가는 패널"의
+    // 길이 이관을 처리하므로, 여기서 계획만 좁게 세우면 새 명령이 필요 없다.
+    function panelOnlySelectionForMove(project, ids) {
+      const indexById = new Map();
+      project.cuts.forEach(function(cut, index) { indexById.set(cut.id, index); });
+      const picked = [];
+      const looseIds = new Set();
+      ids.forEach(function(id) {
+        const index = indexById.get(id);
+        if (index == null) return;
+        picked.push(index);
+        // 머리든 연속 패널이든, 혼자 나가면 원래 있던 그룹에서 떨어져 나가는 것이라 loose 다.
+        looseIds.add(id);
+      });
+      picked.sort(function(a, b) { return a - b; });
+      return { entryIds: picked.map(function(i) { return project.cuts[i].id; }), looseIds: looseIds };
+    }
     function expandPanelSelectionForMove(project, ids) {
       const indexById = new Map();
       project.cuts.forEach(function(cut, index) { indexById.set(cut.id, index); });
@@ -32884,6 +32904,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (event.target && event.target.closest && event.target.closest('.conte-trim-handle, .conte-panel-boundary-handle')) return;
         const cutId = slotEl.dataset.videoSlotCutId || slotEl.dataset.contePanelCutId || '';
         if (!cutId) return;
+        // ver1374: 번호 탭 = 컷 묶음, 몸통 = 패널 하나.
+        const groupMove = slotEl.hasAttribute('data-conte-cut-tab');
         const totalFrames = Math.max(1, Math.round(Number(slotEl.dataset.timelineTotalFrames) || videoTimelineDisplayTotalFrames(state.project) || 1));
         const startX = event.clientX, startY = event.clientY;
         const pointerId = event.pointerId;
@@ -32902,7 +32924,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             selectPicturePanel(cutId, false, { render: 'timeline' }); // dragging an unselected panel makes it the selection
             ids = selectedPicturePanelIdArray(false);
           }
-          plan = expandPanelSelectionForMove(state.project, ids);
+          plan = groupMove ? expandPanelSelectionForMove(state.project, ids)
+                           : panelOnlySelectionForMove(state.project, ids);
           const movingSet = new Set(plan.entryIds);
           const slots = (buildVideoTimelineCached(state.project).slots || []).filter(function(slot) { return slot && slot.cut; });
           boundaries = [];
@@ -32911,13 +32934,30 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             boundaries.push({ frame: Math.round(Number(slot.startFrame) || 0), beforeCutId: slot.cut.id });
           });
           if (slots.length) boundaries.push({ frame: Math.round(Number(slots[slots.length - 1].endFrame) || totalFrames), beforeCutId: '' });
+          // ver1374 (A): 놓아도 순서가 그대로인 자리는 **후보에서 뺀다**. 종전에는 움직이는 블록 안쪽
+          // 경계만 걸렀기 때문에 블록의 바로 앞/뒤 경계가 남아 있었고, 그 위에서는 가이드가 멀쩡히 보이는데
+          // 놓으면 아래 무변화 가드에 걸려 아무 일도 안 났다 — "표시됐는데 안 먹는다"의 정체다.
+          // 판정식은 커밋 때 쓰는 것과 같은 것을 그대로 쓴다(두 곳이 갈리면 같은 사고가 되돌아온다).
+          (function() {
+            const order = state.project.cuts.map(function(cut) { return cut.id; });
+            const restIds = order.filter(function(id) { return !movingSet.has(id); });
+            boundaries = boundaries.filter(function(b) {
+              let ins = b.beforeCutId ? restIds.indexOf(b.beforeCutId) : restIds.length;
+              if (ins < 0) ins = restIds.length;
+              const next = restIds.slice(0, ins).concat(plan.entryIds, restIds.slice(ins));
+              return next.join('\n') !== order.join('\n');
+            });
+          })();
           // a block that does not START with a numbered head cannot land at the very top (no owner above)
           const firstEntry = state.project.cuts.find(function(cut) { return cut.id === plan.entryIds[0]; });
           if (!(firstEntry && String(firstEntry.cutNo || '').trim())) {
             const firstRemaining = slots.find(function(slot) { return !movingSet.has(slot.cut.id); });
             if (firstRemaining) boundaries = boundaries.filter(function(b) { return b.beforeCutId !== firstRemaining.cut.id; });
           }
-          root.querySelectorAll('.conte-panel-hit, .conte-panel-segment').forEach(function(el) {
+          // ver1374 (B): 끌리는 것이 무엇인지 **잡은 즉시** 보이게 한다. 종전에도 이 클래스는 붙었지만
+          // 번호 탭에는 안 붙어서, 컷 묶음을 끌 때 정작 머리(번호)가 표시에서 빠졌다. 몸통·번호 탭을
+          // 같은 목록으로 훑어 블록 전체가 한 덩어리로 보이게 한다.
+          root.querySelectorAll('.conte-panel-hit, .conte-panel-segment, [data-conte-cut-tab]').forEach(function(el) {
             const id = el.dataset.videoSlotCutId || el.dataset.contePanelCutId || '';
             if (movingSet.has(id)) el.classList.add('panel-move-source');
           });
@@ -32942,7 +32982,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               if (distance < bestDistance) { bestDistance = distance; best = b; }
             });
             boundary = best;
-            if (boundary) updateConteDragGuide(root, boundary.frame, totalFrames, plan.entryIds.length + '枚 移動', true);
+            // ver1374 (B): 단위를 라벨에도 적는다 — 몇 장이 가는지 뿐 아니라 **왜** 그 장수인지가 보인다.
+            if (boundary) updateConteDragGuide(root, boundary.frame, totalFrames,
+              plan.entryIds.length + (groupMove ? '枚 移動（カット）' : '枚 移動'), true);
             else hideConteDragGuide(root);
           },
           // cancel = drop the guide and the source highlight, commit nothing. This site always had a separate
