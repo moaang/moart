@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1376</title>
+  <title>MoArt ver1377</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8866,7 +8866,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1376</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1377</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -32859,6 +32859,43 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { entryIds: entryIds, looseIds: looseIds };
     }
 
+    // ver1377: **컷 번호는 패널이 아니라 그 자리(그룹)에 붙는다.**
+    // 머리 패널이 자기 그룹을 떠나면 그룹은 남는데 머리가 없어진다. 종전에는 번호가 패널을 따라가서,
+    // 머리를 왼쪽 틈으로 옮기면 **패널이 아니라 경계선이 움직였다** — 앞 컷의 패널이 옮긴 머리 뒤로
+    // 들어가며 소속이 바뀌고, 앞 컷이 2장에서 1장으로 줄어 "왼쪽 패널 둘이 하나로 합쳐진" 것처럼 보였다
+    // (실측: CUT1 2장→1장, CUT2 2장→3장). 연속 패널을 옮길 때는 이미 올바르게 동작했다
+    // (실측: CUT1 dur 48→72, CUT2 48→24) — 그쪽만 그룹 이동이 성립했던 것이다.
+    // 그래서 머리가 떠날 때 **번호와 그룹 길이를 남은 첫 패널에게 넘긴다.** 넘기고 나면 떠나는 패널은
+    // 번호 없는 한 장이 되므로, 아래 loose 처리가 연속 패널과 똑같이 맞아떨어진다.
+    function handOffCutNumberOnHeadLeave(project, entryIds) {
+      const movingSet = new Set(entryIds);
+      entryIds.forEach(function(id) {
+        const index = project.cuts.findIndex(function(cut) { return cut.id === id; });
+        if (index < 0) return;
+        const head = project.cuts[index];
+        if (!String(head.cutNo || '').trim()) return; // 연속 패널은 넘길 번호가 없다
+        const next = project.cuts[index + 1];
+        // 뒤에 남는 같은 그룹의 패널이 있어야 넘길 수 있다. 없으면(그룹이 머리 한 장뿐이면) 그룹째
+        // 움직이는 것이므로 번호를 그대로 들고 간다.
+        if (!next || String(next.cutNo || '').trim() || movingSet.has(next.id)) return;
+        // 떠나는 머리는 앞 컷의 패널이 된다 — 앞에 컷이 없으면 주인 없는 패널이 되어 버리므로 넘기지 않는다.
+        let ownerIndex = -1;
+        for (let k = index - 1; k >= 0; k -= 1) {
+          if (String(project.cuts[k].cutNo || '').trim()) { ownerIndex = k; break; }
+        }
+        if (ownerIndex < 0) return;
+        const frames = Math.max(0, Math.round(Number(head.pictureFrames) || 0));
+        const groupDuration = Math.max(0, Math.round(Number(head.durationFrames) || 0));
+        next.cutNo = head.cutNo;                                  // 번호는 자리에 남는다
+        next.durationFrames = Math.max(0, groupDuration - frames); // 그룹 길이에서 떠나는 장만큼 뺀다
+        next.durationFramesLocked = Boolean(head.durationFramesLocked); // 길이 고정도 그룹의 성질이라 함께 넘어간다
+        head.cutNo = '';
+        head.durationFrames = 0;
+        head.durationFramesLocked = false;
+        const owner = project.cuts[ownerIndex];
+        owner.durationFrames = Math.max(0, Math.round(Number(owner.durationFrames) || 0) + frames); // 잠시 앞 컷 소속이 된다
+      });
+    }
     function movePicturePanels(project, entryIds, looseIdList, insertBeforeCutId) {
       const movingSet = new Set(entryIds);
       const looseIds = new Set(looseIdList || []);
@@ -33035,6 +33072,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const looseIdList = Array.from(plan.looseIds);
           const beforeCutId = boundary.beforeCutId;
           runTimelineStructureCommand('Move picture panels', function(project) {
+            // ver1377: 번호 인계가 먼저다 — 그래야 떠나는 머리가 번호 없는 한 장이 되어,
+            // movePicturePanels 의 loose 처리(떠난 그룹은 줄고 새 그룹은 는다)가 그대로 맞는다.
+            if (!groupMove) handOffCutNumberOnHeadLeave(project, entryIds);
             if (movePicturePanels(project, entryIds, looseIdList, beforeCutId)) {
               relayoutProject(project);
               setCurrentPageToCut(project, entryIds[0]);
