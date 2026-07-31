@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1369</title>
+  <title>MoArt ver1370</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8866,7 +8866,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1369</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1370</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -50659,6 +50659,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         sc.ctx.fillStyle = color || '#111111';
         sc.ctx.fillRect(0, 0, w, h);
         sc.ctx.globalCompositeOperation = 'source-over';
+      } else if (alphaFor && s && s.inkMode && paintInkFieldToAlpha(sc, s, w, h, color)) {
+        // ver1370: 필터가 없는 브라우저(iOS/WebKit)도 **같은 잉크 장**을 쓴다 — 휘도→알파만 JS로 옮긴다.
+        // ver1369 의 물러섬은 안전하지만 획 전체가 한 농도가 됐다. 여기서는 농담이 그대로 살아 있고,
+        // 훑는 구역이 캔버스 전체가 아니라 세션이 쌓아 둔 s.box(획이 지나간 곳)라 비용이 획 크기에 붙는다.
+        // 성공하면 true 를 돌려주므로 이 분기가 성립하고, 실패하면(구역이 비었거나 픽셀을 못 읽으면)
+        // 아래 평균 알파 물러섬으로 그대로 흘러간다.
       } else if (alphaFor) {
         // ver1346: 휘도→알파 필터가 없는 브라우저 — 모양을 그리고 획 **전체 평균 알파**로 물러선다.
         // 경로에 따른 변화는 잃지만 아티팩트는 없다(조용히 필압을 무시하는 것보다 정직하다).
@@ -50705,6 +50711,59 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintTraceVariableWidthPath(ctx, pts, radii);
       ctx.fillStyle = color || '#111111';
       ctx.fill();
+    }
+    // ver1370: 휘도→알파를 **JS로** 옮긴다 — SVG 필터를 실제로는 걸지 않는 브라우저(iOS/WebKit)를 위한
+    // 같은 결과의 다른 길. 필터판과 픽셀 단위로 같은 일을 한다: alpha := R (장은 R=G=B=휘도인 불투명 회색).
+    // 캔버스 전체가 아니라 s.box — 세션이 dab 을 찍으며 쌓아 둔 **획이 지나간 범위**만 훑는다. 그래서
+    // 비용이 캔버스 크기가 아니라 그은 크기에 붙고, 라이브 미리보기에서도 감당할 만해진다.
+    // 실패하면 false 를 돌려주고 호출부가 ver1346 의 평균 알파 물러섬으로 간다.
+    let paintInkAlphaScratch = null, paintInkAlphaScratchCtx = null;
+    function paintInkFieldToAlpha(sc, s, w, h, color) {
+      const box = s && s.box;
+      if (!box) return false;
+      const x0 = Math.max(0, Math.floor(box.x0)), y0 = Math.max(0, Math.floor(box.y0));
+      const x1 = Math.min(w, Math.ceil(box.x1)), y1 = Math.min(h, Math.ceil(box.y1));
+      const bw = x1 - x0, bh = y1 - y0;
+      if (bw <= 0 || bh <= 0) return false;
+      try {
+        // ★ 전용 캔버스를 쓰는 이유는 `willReadFrequently` 하나다. GPU 뒤에 있는 캔버스에서 getImageData 는
+        //   파이프라인을 세우는 읽기라, 구역이 아무리 작아도 고정 비용이 붙는다 — 실측(1500×844, 260×104
+        //   구역): 기본 컨텍스트 **16.15ms/프레임**, 이 힌트를 주면 **1.61ms**. 10배다. 힌트를 공용
+        //   스크래치(paintGrainScratchFor)에 걸 수는 없다. 그쪽은 읽지 않고 합성만 하므로 CPU 쪽에 붙들면
+        //   오히려 손해다. 그래서 읽는 캔버스만 따로 둔다.
+        //   구역 제한도 힌트와 함께여야 값이 산다: 같은 조건에서 캔버스 전체는 7.92ms, 획 범위만은 1.61ms.
+        if (!paintInkAlphaScratch) {
+          paintInkAlphaScratch = document.createElement('canvas');
+          paintInkAlphaScratchCtx = paintInkAlphaScratch.getContext('2d', { willReadFrequently: true });
+        }
+        if (!paintInkAlphaScratchCtx) return false;
+        if (paintInkAlphaScratch.width !== bw) paintInkAlphaScratch.width = bw;
+        if (paintInkAlphaScratch.height !== bh) paintInkAlphaScratch.height = bh;
+        const rc = paintInkAlphaScratchCtx;
+        rc.setTransform(1, 0, 0, 1, 0, 0);
+        rc.globalAlpha = 1;
+        rc.filter = 'none';
+        rc.globalCompositeOperation = 'copy'; // 이전 내용 지우기와 복사를 한 번에
+        rc.drawImage(s.cv, x0, y0, bw, bh, 0, 0, bw, bh);
+        const img = rc.getImageData(0, 0, bw, bh);
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) d[i + 3] = d[i]; // alpha := R (필터의 feColorMatrix와 같은 식)
+        rc.putImageData(img, 0, 0);
+        rc.globalCompositeOperation = 'source-in';
+        rc.fillStyle = color || '#111111';
+        rc.fillRect(0, 0, bw, bh);
+        rc.globalCompositeOperation = 'source-over';
+        sc.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        sc.ctx.globalAlpha = 1;
+        sc.ctx.globalCompositeOperation = 'source-over';
+        sc.ctx.filter = 'none';
+        sc.ctx.drawImage(paintInkAlphaScratch, x0, y0); // 제자리에 얹는다
+        return true;
+      } catch (e) {
+        // getImageData 가 막히는 경우(오염된 캔버스 등) — 스크래치를 비우고 평균 알파 물러섬에 맡긴다
+        try { sc.ctx.globalCompositeOperation = 'source-over'; sc.ctx.clearRect(0, 0, w, h); } catch (e2) {}
+        return false;
+      }
     }
     // 휘도 → 알파. 잉크 장(paintStampInkField)은 값을 **불투명 회색**으로 들고 있다가(그래야 lighten이
     // 정확한 max다) 마지막에 이 필터로 알파 채널에 옮긴다. SVG feColorMatrix 1패스.
@@ -50810,6 +50869,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.walk = { seg: 0, carry: 0, dabIndex: 0, firstEmitted: false };
         s.av = [];
         s.done = 0;
+        s.box = null; // ver1370: 이 스트로크가 장에서 실제로 건드린 범위(휘도→알파를 JS로 옮길 때의 작업 구역)
         const c0 = s.cv.getContext('2d');
         c0.setTransform(1, 0, 0, 1, 0, 0);
         c0.globalAlpha = 1;
@@ -50830,7 +50890,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const raw = Number(opts.alphaFor(pts[i].p, pts[i].t));
           s.av[i] = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
         }
-        if (grew) paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, s.walk);
+        // ver1370: 찍은 범위를 세션에 누적한다. 증분 호출이라 한 번의 반환은 **그 프레임에 새로 찍은
+        // dab**의 범위뿐이므로, 스트로크 전체 범위는 여기서 합집합으로 쌓아야 한다. 휘도→알파를 JS로
+        // 옮겨야 하는 브라우저(iOS/WebKit)에서 훑을 구역이 이것 — 캔버스 전체가 아니라 획이 지나간 곳만.
+        if (grew) {
+          const b = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, s.walk);
+          if (b) {
+            s.box = s.box
+              ? { x0: Math.min(s.box.x0, b.x0), y0: Math.min(s.box.y0, b.y0),
+                  x1: Math.max(s.box.x1, b.x1), y1: Math.max(s.box.y1, b.y1) }
+              : b;
+          }
+        }
       } else if (grew) {
         paintStampTexturedPath(cx, pts, radii, paintTintedTip(tipImage, color), opts.tip, s.walk);
       }
