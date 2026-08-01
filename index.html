@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1397</title>
+  <title>MoArt ver1398</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8927,7 +8927,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1397</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1398</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -63447,14 +63447,30 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // cut drawn as a red rect+letter-label overlay — conte's own analogue of
     // gengaRenderCameraInstructionBlob/gengaDrawInstructionMarks (no dynamic canvas growth for
     // out-of-paper frames; conte's camera-work range is paper-bounded in practice, unlike genga's).
+    // Returns null (no file to write) when the cut has no real camera work — same gate conte's own
+    // paper renderer uses (cameraWorkPaperBounds is null unless cameraWorkKeyframesForPaper finds more
+    // than a single default/no-op position), mirroring genga's own gengaRenderCameraInstructionBlob
+    // ("if (!moving && rectsEqual(shown[0], std)) return null;"): a camera column with nothing to
+    // instruct isn't worth a _camera/ folder and an image that's just the plain artwork.
     async function conteRenderCameraInstructionCanvas(project, ownerCut, scale) {
-      scale = scale || 3;
+      // cameraWorkKeyframesForPaper is the "is there real camera work" gate (it returns [] for a lone
+      // default/no-op pose), the same one cameraWorkPaperBounds and the paper renderer use.
+      const keyframes = cameraWorkKeyframesForPaper(project, ownerCut);
+      if (!keyframes.length) return null;
+      scale = scale > 0 ? scale : 3; // conte paper units are small (561×396); render at 3× for a printable image
       const CAMERA_RED = '#e00000';
-      const w = Math.round(CONTE_PAPER_WIDTH * scale), h = Math.round(CONTE_PAPER_HEIGHT * scale);
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+      // Camera transforms are FRAME-origin; the layer bitmaps live in PAPER space. Shift into paper space
+      // once here so the growth kernel, the art and the overlay all share one coordinate system.
+      const toPaperRect = function(transform) {
+        const fr = cameraFrameTransformToFrameRect(transform); // rotation already radians
+        return { x: fr.x + CONTE_FRAME_X, y: fr.y + CONTE_FRAME_Y, w: fr.w, h: fr.h, rotation: fr.rotation };
+      };
+      const camRects = keyframes.map(toPaperRect);
+      const stdRect = { x: CONTE_FRAME_X, y: CONTE_FRAME_Y, w: CONTE_FRAME_W, h: CONTE_FRAME_H, rotation: 0 };
+      // Grows the canvas out to whichever sides the camera actually leaves the paper on (shared kernel).
+      const made = instrCanvasCoveringRects(camRects.concat([stdRect]), CONTE_PAPER_WIDTH, CONTE_PAPER_HEIGHT, scale);
+      const ctx = made.ctx;
+      // Everything below is in PAPER units — the kernel's transform handles scale + the grown origin.
       const entries = layerDrawingEntriesForCut(project, ownerCut.id);
       for (const entry of entries.slice().reverse()) {
         const drawing = getLayerDrawingData(project, entry.layer.drawingRef);
@@ -63462,31 +63478,35 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const rect = layerDrawingBitmapRect(drawing);
         try {
           const img = await loadImage(drawing.bitmapDataUrl);
-          ctx.drawImage(img, rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale);
+          ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h);
         } catch (e) { /* skip broken bitmap */ }
       }
+      // Line/'text sizes are in paper units but floored so they never fall under ~1 output px when the
+      // budget clamp shrinks a far-flung camera move (same intent as genga's lw/fs derivation).
+      const lw = Math.max(1.1, 1 / made.drawScale);
+      const fs = Math.max(13, 11 / made.drawScale);
       ctx.save();
-      ctx.strokeStyle = 'rgba(0,0,0,0.4)';
-      ctx.lineWidth = Math.max(1, scale * 0.5);
-      ctx.strokeRect(CONTE_FRAME_X * scale, CONTE_FRAME_Y * scale, CONTE_FRAME_W * scale, CONTE_FRAME_H * scale);
+      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+      ctx.lineWidth = lw;
+      ctx.strokeRect(stdRect.x, stdRect.y, stdRect.w, stdRect.h);
       ctx.restore();
-      cameraKeyframesForCut(project, ownerCut.id).forEach(function(kf, i) {
-        const r = kf.rect || {};
-        const pw = (Number(r.w) || 0) * scale, ph = (Number(r.h) || 0) * scale;
-        const px = (CONTE_FRAME_X + (Number(r.x) || 0)) * scale, py = (CONTE_FRAME_Y + (Number(r.y) || 0)) * scale;
+      ctx.font = outputFont(fs, '"Yu Gothic", "Meiryo", sans-serif', 'bold');
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.lineJoin = 'round';
+      camRects.forEach(function(rect, i) {
+        const corners = cameraRectCorners(rect);
         ctx.save();
-        ctx.translate(px + pw / 2, py + ph / 2);
-        ctx.rotate((Number(r.rotation) || 0) * Math.PI / 180);
-        ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = Math.max(1.5, scale * 0.6);
-        ctx.strokeRect(-pw / 2, -ph / 2, pw, ph);
+        ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = lw * 1.3;
+        ctx.beginPath();
+        corners.forEach(function(p, j) { if (j === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y); });
+        ctx.closePath(); ctx.stroke();
         ctx.restore();
         const label = cameraKeyframeLabel(i);
-        ctx.font = outputFont(Math.max(16, scale * 6), '"Yu Gothic", "Meiryo", sans-serif', 'bold');
-        ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-        ctx.lineWidth = 3; ctx.strokeStyle = '#fff'; ctx.strokeText(label, px + 6, py + Math.max(16, scale * 6));
-        ctx.fillStyle = CAMERA_RED; ctx.fillText(label, px + 6, py + Math.max(16, scale * 6));
+        const tx = corners[0].x + fs * 0.35, ty = corners[0].y + fs * 0.35;
+        ctx.lineWidth = fs * 0.28; ctx.strokeStyle = '#fff'; ctx.strokeText(label, tx, ty);
+        ctx.fillStyle = CAMERA_RED; ctx.fillText(label, tx, ty);
       });
-      return canvas;
+      return made.canvas;
     }
 
     // The #sheet-compatible payload (schema:'auto-sheet-current-settings') for one cut group: reuses
@@ -63534,20 +63554,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const sheetCanvas = await conteRasterizeSvgToCanvas(svg);
           const json = buildConteShootSheetSettingsJson(project, g.cut);
           const komas = await conteRenderKomaImages(project, g.cut);
+          // null = no real camera work on this cut (conteRenderCameraInstructionCanvas's own gate) —
+          // no _camera/ folder, no CAM file, nothing worth showing.
           const camCanvas = await conteRenderCameraInstructionCanvas(project, g.cut);
           if (dirHandle) {
             const sub = await dirHandle.getDirectoryHandle(base, { create: true });
             await writeFile(sub, base + '.png', await canvasToBlob(sheetCanvas, 'image/png'));
             await writeFile(sub, base + '.json', JSON.stringify(json, null, 2));
             for (const koma of komas) await writeFile(sub, koma.label + '.png', await canvasToBlob(koma.canvas, 'image/png'));
-            const camDir = await sub.getDirectoryHandle('_camera', { create: true });
-            await writeFile(camDir, base + '_CAM.png', await canvasToBlob(camCanvas, 'image/png'));
-            results.push({ cutNo: g.cutNo, base: base, written: true, komaCount: komas.length });
+            if (camCanvas) {
+              const camDir = await sub.getDirectoryHandle('_camera', { create: true });
+              await writeFile(camDir, base + '_CAM.png', await canvasToBlob(camCanvas, 'image/png'));
+            }
+            results.push({ cutNo: g.cutNo, base: base, written: true, komaCount: komas.length, hasCamera: !!camCanvas });
           } else {
             results.push({
               cutNo: g.cutNo, base: base, json: json,
               sheetPngDataUrl: sheetCanvas.toDataURL('image/png'),
-              camPngDataUrl: camCanvas.toDataURL('image/png'),
+              camPngDataUrl: camCanvas ? camCanvas.toDataURL('image/png') : null,
               komas: komas.map(function(k) { return { label: k.label, pngDataUrl: k.canvas.toDataURL('image/png') }; })
             });
           }
@@ -65951,6 +65975,41 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, h);
       return { canvas: canvas, ctx: ctx, fit: fit };
     }
+    // ver1397: THE canvas-growth kernel for every 撮影指示 image, genga and conte alike — extracted from
+    // gengaRenderCameraInstructionBlob (ver1030) so conte's コンテ撮 camera image grows the same way instead
+    // of clipping every frame that leaves the paper (it used to render at a flat paper-sized canvas, so a
+    // cut whose camera swings out bottom-left simply lost that half of the instruction).
+    //   • grow ONLY on the side a rect actually leaves the paper on, and only by what that side needs —
+    //     padding all four unconditionally moves the paper (and with it the printed frame + tap holes)
+    //     around inside the output.
+    //   • `scale` (default 1) is an extra output-resolution multiplier for callers whose paper units are
+    //     small: conte's paper is 561×396 drawing units, so it renders at scale 3. Coordinates handed to
+    //     the returned ctx stay in the CALLER'S OWN paper units either way.
+    // Returns gengaInstrCanvas's {canvas, ctx, fit} plus the {ox, oy} origin the ctx is already shifted by.
+    function instrCanvasCoveringRects(rects, pw, ph, scale) {
+      scale = scale > 0 ? scale : 1;
+      let l = 0, t = 0, r = pw, b = ph;
+      (rects || []).forEach(function(rect) {
+        if (!rect) return;
+        cameraRectCorners(rect).forEach(function(p) {
+          if (p.x < l) l = p.x; if (p.y < t) t = p.y;
+          if (p.x > r) r = p.x; if (p.y > b) b = p.y;
+        });
+      });
+      const pad = GENGA_CAM_IMG_PAD / scale; // a constant number of OUTPUT px on every caller's scale
+      const padL = l < 0 ? pad : 0, padT = t < 0 ? pad : 0;
+      const padR = r > pw ? pad : 0, padB = b > ph ? pad : 0;
+      const ox = Math.floor(l - padL), oy = Math.floor(t - padT);
+      const fullW = Math.ceil(r + padR) - ox, fullH = Math.ceil(b + padB) - oy;
+      const made = gengaInstrCanvas(fullW * scale, fullH * scale);
+      // gengaInstrCanvas already painted the white ground under its own (fit) transform; re-establish the
+      // transform with our scale folded in, then shift so caller coordinates stay in paper units.
+      made.ctx.setTransform(made.fit * scale, 0, 0, made.fit * scale, 0, 0);
+      made.ctx.translate(-ox, -oy);
+      made.ox = ox; made.oy = oy;
+      made.drawScale = made.fit * scale; // output px per caller paper unit
+      return made;
+    }
     // ver1394: 자동 전환(auto)의 **유일한** 기준. 「용지의 몇 배인가」로 재지 않는다 — 터지는 지점은 절대
     // 픽셀 수(브라우저 캔버스 한계)이지 용지와의 비율이 아니다. 실측하면 같은 상자라도 1754×1240 용지에서는
     // 용지의 128배가 예산의 11.6배지만, 4000×3000 용지에서 예산의 11.6배는 용지의 2.3배다 — 비율은 용지
@@ -66133,23 +66192,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
                            : [Object.assign({ frame: keys.length ? keys[0].frame : 1 }, keys.length ? { x: keys[0].x, y: keys[0].y, w: keys[0].w, h: keys[0].h, rotation: Number(keys[0].rotation) || 0 } : base)];
       if (!moving && gengaCamRectsEqual(shown[0], std)) return null;
 
-      // ver1030: grow ONLY on the side a frame actually leaves the paper on, and only by what that side needs.
-      // Padding all four sides unconditionally made every image bigger than the 用紙 even when nothing stuck out,
-      // which moves the paper — and with it the printed frame and the tap holes — around inside the output. A
-      // frame poking out top-right must extend the sheet up and right and leave the other two edges alone.
-      let l = 0, t = 0, r = pw, b = ph;
-      shown.concat([std]).forEach(function(rect) {
-        cameraRectCorners(rect).forEach(function(p) {
-          if (p.x < l) l = p.x; if (p.y < t) t = p.y;
-          if (p.x > r) r = p.x; if (p.y > b) b = p.y;
-        });
-      });
-      const padL = l < 0 ? GENGA_CAM_IMG_PAD : 0, padT = t < 0 ? GENGA_CAM_IMG_PAD : 0;
-      const padR = r > pw ? GENGA_CAM_IMG_PAD : 0, padB = b > ph ? GENGA_CAM_IMG_PAD : 0;
-      const ox = Math.floor(l - padL), oy = Math.floor(t - padT);
-      const made = gengaInstrCanvas(Math.ceil(r + padR) - ox, Math.ceil(b + padB) - oy); // ver1391: 한계를 넘으면 비율 유지로 줄인다
+      // ver1030 → ver1397: the grow-only-on-the-side-that-needs-it rule now lives in the shared
+      // instrCanvasCoveringRects kernel (conte's コンテ撮 camera image uses the same one). Same behaviour
+      // as before for genga: 1:1 scale, same GENGA_CAM_IMG_PAD, same gengaInstrCanvas budget clamp, ctx
+      // already translated to the grown origin.
+      const made = instrCanvasCoveringRects(shown.concat([std]), pw, ph);
       const canvas = made.canvas, ctx = made.ctx, instrFit = made.fit;
-      ctx.translate(-ox, -oy);
       await gengaCompositeArtInto(ctx, gt, shown[0].frame || 1, pw, ph);
       const paper = opts.paper && opts.paper.dr && opts.paper.dr.dataUrl ? opts.paper : null;
       if (paper) {
