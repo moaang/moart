@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1398</title>
+  <title>MoArt ver1399</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8927,7 +8927,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1398</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1399</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -63454,23 +63454,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // instruct isn't worth a _camera/ folder and an image that's just the plain artwork.
     async function conteRenderCameraInstructionCanvas(project, ownerCut, scale) {
       // cameraWorkKeyframesForPaper is the "is there real camera work" gate (it returns [] for a lone
-      // default/no-op pose), the same one cameraWorkPaperBounds and the paper renderer use.
+      // default/no-op pose) — conte's equivalent of genga's `if (!moving && rectsEqual(shown[0], std))`.
       const keyframes = cameraWorkKeyframesForPaper(project, ownerCut);
       if (!keyframes.length) return null;
-      scale = scale > 0 ? scale : 3; // conte paper units are small (561×396); render at 3× for a printable image
-      const CAMERA_RED = '#e00000';
-      // Camera transforms are FRAME-origin; the layer bitmaps live in PAPER space. Shift into paper space
-      // once here so the growth kernel, the art and the overlay all share one coordinate system.
-      const toPaperRect = function(transform) {
+      scale = scale > 0 ? scale : 3;
+      // ver1398: everything below works in OUTPUT PIXELS (conte paper unit × scale), NOT paper units, so
+      // every number genga's own 撮影指示 image uses transfers 1:1 — its scale/lw/fs derivation is written
+      // against a paper whose units ARE output pixels. Getting this wrong is what put the key labels
+      // inside the frame instead of above it.
+      const pw = Math.round(CONTE_PAPER_WIDTH * scale), ph = Math.round(CONTE_PAPER_HEIGHT * scale);
+      // Camera transforms are FRAME-origin; layer bitmaps are PAPER-space. Shift + scale in one step.
+      const toRect = function(transform, frame) {
         const fr = cameraFrameTransformToFrameRect(transform); // rotation already radians
-        return { x: fr.x + CONTE_FRAME_X, y: fr.y + CONTE_FRAME_Y, w: fr.w, h: fr.h, rotation: fr.rotation };
+        return {
+          frame: frame,
+          x: (fr.x + CONTE_FRAME_X) * scale, y: (fr.y + CONTE_FRAME_Y) * scale,
+          w: fr.w * scale, h: fr.h * scale, rotation: fr.rotation
+        };
       };
-      const camRects = keyframes.map(toPaperRect);
-      const stdRect = { x: CONTE_FRAME_X, y: CONTE_FRAME_Y, w: CONTE_FRAME_W, h: CONTE_FRAME_H, rotation: 0 };
-      // Grows the canvas out to whichever sides the camera actually leaves the paper on (shared kernel).
-      const made = instrCanvasCoveringRects(camRects.concat([stdRect]), CONTE_PAPER_WIDTH, CONTE_PAPER_HEIGHT, scale);
-      const ctx = made.ctx;
-      // Everything below is in PAPER units — the kernel's transform handles scale + the grown origin.
+      const shown = keyframes.map(function(k) { return toRect(k, Math.max(1, Math.round(Number(k.frame) || 0) + 1)); });
+      const std = { x: CONTE_FRAME_X * scale, y: CONTE_FRAME_Y * scale, w: CONTE_FRAME_W * scale, h: CONTE_FRAME_H * scale, rotation: 0 };
+      const made = instrCanvasCoveringRects(shown.concat([std]), pw, ph);
+      const ctx = made.ctx, instrFit = made.fit;
       const entries = layerDrawingEntriesForCut(project, ownerCut.id);
       for (const entry of entries.slice().reverse()) {
         const drawing = getLayerDrawingData(project, entry.layer.drawingRef);
@@ -63478,33 +63483,58 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const rect = layerDrawingBitmapRect(drawing);
         try {
           const img = await loadImage(drawing.bitmapDataUrl);
-          ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h);
+          ctx.drawImage(img, rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale);
         } catch (e) { /* skip broken bitmap */ }
       }
-      // Line/'text sizes are in paper units but floored so they never fall under ~1 output px when the
-      // budget clamp shrinks a far-flung camera move (same intent as genga's lw/fs derivation).
-      const lw = Math.max(1.1, 1 / made.drawScale);
-      const fs = Math.max(13, 11 / made.drawScale);
-      ctx.save();
-      ctx.strokeStyle = 'rgba(0,0,0,0.55)';
-      ctx.lineWidth = lw;
-      ctx.strokeRect(stdRect.x, stdRect.y, stdRect.w, stdRect.h);
-      ctx.restore();
-      ctx.font = outputFont(fs, '"Yu Gothic", "Meiryo", sans-serif', 'bold');
-      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-      ctx.lineJoin = 'round';
-      camRects.forEach(function(rect, i) {
-        const corners = cameraRectCorners(rect);
+      // ---- from here down: gengaRenderCameraInstructionBlob's own numbers, verbatim ----
+      const uiScale = Math.max(1, Math.min(pw, ph) / 900) / instrFit;
+      const lw = Math.max(1, uiScale), fs = Math.max(16, 18 * uiScale);
+      ctx.font = '700 ' + Math.round(fs) + 'px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
+      ctx.textBaseline = 'bottom';
+      // The standard frame gets satsuma's × (small red crosses ON its own corners) only when it is NOT
+      // one of the frames actually being shot — same rule, same colours, same sizes as genga.
+      if (!shown.some(function(r) { return gengaCamRectsEqual(r, std); })) {
+        const c = cameraRectCorners(std);
+        gengaCamStrokePoly(ctx, c, '#111111', Math.max(1, lw * 0.6));
+        const k = Math.max(6, 7 * uiScale);
         ctx.save();
-        ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = lw * 1.3;
-        ctx.beginPath();
-        corners.forEach(function(p, j) { if (j === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y); });
-        ctx.closePath(); ctx.stroke();
+        ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = Math.max(2, lw * 0.8); ctx.lineCap = 'round';
+        c.forEach(function(p) {
+          ctx.beginPath();
+          ctx.moveTo(p.x - k, p.y - k); ctx.lineTo(p.x + k, p.y + k);
+          ctx.moveTo(p.x + k, p.y - k); ctx.lineTo(p.x - k, p.y + k);
+          ctx.stroke();
+        });
         ctx.restore();
-        const label = cameraKeyframeLabel(i);
-        const tx = corners[0].x + fs * 0.35, ty = corners[0].y + fs * 0.35;
-        ctx.lineWidth = fs * 0.28; ctx.strokeStyle = '#fff'; ctx.strokeText(label, tx, ty);
-        ctx.fillStyle = CAMERA_RED; ctx.fillText(label, tx, ty);
+      }
+      // Trajectory + key quads + labels all come from THE shared kernel (gengaDrawInstructionMarks) —
+      // hand-rolling the quad/label here is exactly what drifted. cornersAt interpolates with conte's own
+      // cameraTransformFromKeyframes, the same resolver the conte preview/video export use; keys are
+      // exact, so an in-between sample never contradicts one.
+      const shownCorners = new Map();
+      shown.forEach(function(r) { shownCorners.set(r.frame, cameraRectCorners(r)); });
+      const cornersAt = function(f) {
+        if (shownCorners.has(f)) return shownCorners.get(f);
+        const tr = cameraTransformFromKeyframes(keyframes, f - 1); // conte keyframe frames are 0-based
+        return tr ? cameraRectCorners(toRect(tr, f)) : null;
+      };
+      const moving = shown.length >= 2;
+      // Corner trajectories only for a pure move (no rotation/scale change) — genga's own §D rule.
+      const camWEps = Math.max(0.5, std.w * 0.004);
+      const camPureMove = !shown.some(function(r) {
+        return Math.abs((Number(r.rotation) || 0) - (Number(shown[0].rotation) || 0)) > 0.3
+            || Math.abs((Number(r.w) || 0) - (Number(shown[0].w) || 0)) > camWEps;
+      });
+      gengaDrawInstructionMarks(ctx, {
+        frames: moving ? cameraTrajectoryFrames(shown.map(function(k) { return k.frame; })).frames : [],
+        cornersAt: cornersAt,
+        keys: shown.map(function(r, i) {
+          const fr = gengaSheetCameraFr(r.w, std.w);
+          const label = moving ? String.fromCharCode(0x24B6 + Math.min(25, i)) : '';
+          const text = (label ? label + ' ' : '') + (fr != null ? fr + 'Fr' : '');
+          return { frame: r.frame, tag: moving ? text : ('フレームこちらで' + (fr != null ? '  ' + fr + 'Fr' : '')), note: '' };
+        }),
+        scale: uiScale, lw: lw, ticks: false, corners: camPureMove, noteFont: ''
       });
       return made.canvas;
     }
