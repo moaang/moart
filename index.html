@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1431</title>
+  <title>MoArt ver1432</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8863,7 +8863,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1431</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1432</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -15873,8 +15873,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       videoPaintPointerCanvasRect: null,
       paintBitmapHistory: {},
       paintBitmapHistoryOrder: [],
-      pendingLayerDrawingRefs: new Set(),
-      paintCompositeDirty: false,
       paintLayerPreviewCache: {},
       paperFrameImport: null,
       paperFrameImportDrag: null,
@@ -17399,8 +17397,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return;
         }
         const drawing = normalizeLayerDrawingData(fastClone(drawings[key]));
-        drawing.undo = [];
-        drawing.redo = [];
         drawing.strokes = [];
         // ver636: attach the CURRENT committed pixels by reference (immutable snapshot canvas) so undo
         // restores from the canvas — synchronous, no decode. Non-enumerable so it never reaches
@@ -20865,8 +20861,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try { gengaResetEngineTransients(); } catch (error) {}
       state.paintBitmapHistory = {};
       state.paintBitmapHistoryOrder = [];
-      state.pendingLayerDrawingRefs = new Set();
-      state.paintCompositeDirty = false;
       state.paintLayerPreviewCache = {};
       state.layerDrawingDataUrlCache = {};
       state.videoPreloadedLayerImages = {};
@@ -22670,7 +22664,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function blankLayerDrawingData() {
       // P1 (unification §2.2, user decision): a FRESH drawing starts covering the whole paper.
       // ver693 (P4b-β): bitmap space is paper-origin — the paper is simply [0,0,561,396].
-      return { bitmapDataUrl: '', bitmapStorage: null, bitmapX: 0, bitmapY: 0, bitmapWidth: CONTE_PAPER_WIDTH, bitmapHeight: CONTE_PAPER_HEIGHT, undo: [], redo: [], version: 0 };
+      return { bitmapDataUrl: '', bitmapStorage: null, bitmapX: 0, bitmapY: 0, bitmapWidth: CONTE_PAPER_WIDTH, bitmapHeight: CONTE_PAPER_HEIGHT, version: 0 };
     }
 
     function normalizeLayerDrawingBitmapStorage(storage) {
@@ -22710,8 +22704,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       drawing.bitmapY = Math.round(Number(drawing.bitmapY) || 0);
       drawing.bitmapWidth = Math.max(1, Math.round(Number(drawing.bitmapWidth) || CONTE_PAPER_WIDTH));
       drawing.bitmapHeight = Math.max(1, Math.round(Number(drawing.bitmapHeight) || CONTE_PAPER_HEIGHT));
-      drawing.undo = Array.isArray(drawing.undo) ? drawing.undo : [];
-      drawing.redo = Array.isArray(drawing.redo) ? drawing.redo : [];
       drawing.strokes = [];
       drawing.version = Math.max(0, Math.round(Number(drawing.version) || 0));
       return drawing;
@@ -22742,8 +22734,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!target) return null;
       const drawings = ensureLayerDrawings(project);
       const source = getLayerDrawingData(project, sourceRef);
+      // ver1432: 픽셀 정본 쌍 — 원본이 dirty(커밋 후 지연 인코드 전)면 dataUrl 은 옛 픽셀이다.
+      // flush 한 뒤 복제해야 사본이 지금 그림을 갖는다. 사본 ref 의 live 도 여기서 결정한다(=없음).
+      if (source) flushLayerLiveBitmapDataUrl(String(sourceRef || ''), source);
       drawings[target] = source ? fastClone(source) : blankLayerDrawingData();
       drawings[target] = normalizeLayerDrawingData(drawings[target]);
+      clearLayerLiveBitmap(target);
       touchLayerDrawing(drawings[target]);
       return drawings[target];
     }
@@ -24236,7 +24232,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function invalidateLayerDrawingPastePreview(drawingRef) {
       const ref = String(drawingRef || '');
       if (!ref) return;
-      clearLayerDrawingCompositionPending(ref);
       clearLayerDrawingDataUrlCacheForRef(ref);
       const stageEl = document.getElementById('conteVideoStage');
       if (stageEl) stageEl.dataset.previewKey = '';
@@ -36910,7 +36905,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const layer = entries[i] && entries[i].layer;
           if (!layer || !layer.drawingRef) continue;
           const drawing = getLayerDrawingData(state.project, layer.drawingRef);
-          if (!drawing || !drawing.bitmapDataUrl) continue;   // no pixels -> the compositor skips it too
+          if (!drawing || !layerDrawingDisplayDataUrl(layer.drawingRef, drawing)) continue;   // ver1432: flush-then-read(ver674) — 이후의 키·프리로드가 같은 최신 상태를 본다
           const key = videoLayerBitmapPreloadKey(layer.drawingRef, drawing);
           sigParts.push(key);
           let img = state.videoPreloadedLayerImages ? state.videoPreloadedLayerImages[key] : null;
@@ -36933,7 +36928,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               const gLayer = entry && entry.layer;
               if (!gLayer || !gLayer.drawingRef) return;
               const gDrawing = getLayerDrawingData(state.project, gLayer.drawingRef);
-              if (!gDrawing || !gDrawing.bitmapDataUrl) return;
+              if (!gDrawing || !layerDrawingDisplayDataUrl(gLayer.drawingRef, gDrawing)) return; // ver1432: flush-then-read(ver674)
               const gKey = videoLayerBitmapPreloadKey(gLayer.drawingRef, gDrawing);
               sigParts.push('g' + ghost.direction + ghost.k + ':' + gKey);
               let gImg = state.videoPreloadedLayerImages ? state.videoPreloadedLayerImages[gKey] : null;
@@ -45125,9 +45120,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!drawing) return;
         drawing.bitmapDataUrl = '';
         drawing.bitmapStorage = null;
-        drawing.undo = [];
         drawing.strokes = [];
-        drawing.redo = [];
+        // ver1432: 픽셀 정본 쌍 — dataUrl 을 비우면 live 캔버스도 함께 비운다. 페인터는 live 를
+        // 우선하므로(ver636), 이게 빠지면 지운 그림이 계속 보인다.
+        clearLayerLiveBitmap(ref);
         clearPaintEditStateForDrawing(ref);
         touchLayerDrawing(drawing);
         clearLayerDrawingDataUrlCacheForRef(ref);
@@ -47063,8 +47059,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (copy.layerDrawings && typeof copy.layerDrawings === 'object') {
         Object.keys(copy.layerDrawings).forEach(function(ref) {
           const drawing = normalizeLayerDrawingData(copy.layerDrawings[ref]);
-          drawing.undo = [];
-          drawing.redo = [];
           drawing.strokes = [];
           if (drawing.bitmapStorage && drawing.bitmapStorage.fileName) {
             drawing.bitmapDataUrl = '';
@@ -47424,7 +47418,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const ref = refs[i];
           if (/^drawing-conte-layer-/i.test(ref) && !usedRefs.has(ref)) { delete copy.layerDrawings[ref]; continue; } // used assets only: drop orphan layer drawings
           const d = normalizeLayerDrawingData(copy.layerDrawings[ref]);
-          d.undo = []; d.redo = []; d.strokes = [];
+          d.strokes = [];
           const live = state.project.layerDrawings ? state.project.layerDrawings[ref] : null;
           const url = live ? String(live.bitmapDataUrl || '') : '';
           if (url) {
@@ -48190,27 +48184,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return String(Math.max(1, Math.round(Number(pageNo) || state.project.currentPage || 1)));
     }
 
-    function pendingLayerDrawingRefSet() {
-      if (!(state.pendingLayerDrawingRefs instanceof Set)) {
-        state.pendingLayerDrawingRefs = new Set(Array.isArray(state.pendingLayerDrawingRefs) ? state.pendingLayerDrawingRefs : []);
-      }
-      return state.pendingLayerDrawingRefs;
-    }
-
-
-    function refreshPaintCompositeDirtyFlag() {
-      state.paintCompositeDirty = Boolean(pendingLayerDrawingRefSet().size);
-      return state.paintCompositeDirty;
-    }
-
-
-    function clearLayerDrawingCompositionPending(drawingRef) {
-      const ref = String(drawingRef || '');
-      if (!ref) return;
-      pendingLayerDrawingRefSet().delete(ref);
-      refreshPaintCompositeDirtyFlag();
-    }
-
     function invalidateVideoPreviewRenderCache() {
       const stage = document.getElementById('conteVideoStage');
       if (!stage) return;
@@ -48243,28 +48216,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // content-addressed cache). Structural changes (layer add/remove/visibility) invalidate through
       // their own paths (refreshConteLayerVisibilityPreview, cut-patch history).
       if (ref && onionSkinEnabled(state.project)) invalidateVideoPreviewRenderCache();
-    }
-
-    function flushDeferredPaintComposition(options) {
-      options = options || {};
-      const pendingRefs = Array.from(pendingLayerDrawingRefSet());
-      if (!pendingRefs.length && !state.paintCompositeDirty) return false;
-      cancelScheduledMemoCanvasRedraw();
-      pendingRefs.forEach(function(ref) {
-        const drawing = getLayerDrawingData(state.project, ref);
-        touchLayerDrawing(drawing);
-        clearLayerDrawingDataUrlCacheForRef(ref);
-      });
-      pendingLayerDrawingRefSet().clear();
-      state.paintCompositeDirty = false;
-      normalizeLayerDrawings(state.project);
-      if (options.render !== false) {
-        guardedRender('stage', renderStageView);
-        guardedRender('timing', renderTimingDashboard);
-        guardedRender('inspector', renderInspector);
-        if (!state.videoEditMode || conteYoushiWindowIsOpen()) guardedRender('memo', redrawMemoCanvas); // ver1288
-      }
-      return true;
     }
 
     function getMemoPageData(pageNo) {
@@ -52103,21 +52054,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return;
       }
       if (thumbnail) thumbnail.classList.remove('empty');
-      if (!drawing.bitmapDataUrl) {
-        canvas.dataset.layerThumbnailDrawnKey = '';
-        return;
-      }
-      const image = new Image();
-      image.onload = function() {
-        if (!canvas.isConnected || layerDrawingThumbnailKey(canvas, canvas.dataset.layerDrawingRef || '') !== key) return;
-        const iw = Math.max(1, image.naturalWidth || image.width || 1);
-        const ih = Math.max(1, image.naturalHeight || image.height || 1);
-        const sourceCanvas = createReadbackCanvas();
-        sourceCanvas.width = iw;
-        sourceCanvas.height = ih;
-        const sourceCtx = sourceCanvas.getContext('2d');
-        sourceCtx.clearRect(0, 0, iw, ih);
-        sourceCtx.drawImage(image, 0, 0, iw, ih);
+      // ver1432: 표시는 live 캔버스 우선 — 커밋 직후의 dataUrl 은 지연 인코드(ver636) 전의 옛
+      // 픽셀이라, 이걸 읽던 탓에 썸네일만 한 박자 늦었다(재생바를 옮겨 재렌더가 오면 그제야
+      // 맞아 보였다 — 사용자 목격담의 정체). 그리기 본체를 소스 중립으로 빼고, live 는 디코드
+      // 없이 동기로 그린다. dataUrl 은 live 가 없을 때만 읽는다(그때는 최신이다).
+      const paintFromSource = function(sourceCanvas, iw, ih) {
         // ver956 P4④: joined into the alphaInkBoundsScan kernel (minAlpha 9 = the old alpha>8 cut,
         // suppressNearWhite = the old opaque-paper skip). ok:false → null → full-image crop, as before.
         const inkScan = alphaInkBoundsScan(sourceCanvas, { minAlpha: 9, suppressNearWhite: true });
@@ -52165,6 +52106,28 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cacheTimelineLayerThumbnail(canvas, key);
         clearTimelineLayerThumbnailBackground(canvas);
       };
+      const live = layerLiveBitmapFor(ref);
+      if (live && live.width && live.height) {
+        paintFromSource(live, live.width, live.height);
+        return;
+      }
+      if (!drawing.bitmapDataUrl) {
+        canvas.dataset.layerThumbnailDrawnKey = '';
+        return;
+      }
+      const image = new Image();
+      image.onload = function() {
+        if (!canvas.isConnected || layerDrawingThumbnailKey(canvas, canvas.dataset.layerDrawingRef || '') !== key) return;
+        const iw = Math.max(1, image.naturalWidth || image.width || 1);
+        const ih = Math.max(1, image.naturalHeight || image.height || 1);
+        const sourceCanvas = createReadbackCanvas();
+        sourceCanvas.width = iw;
+        sourceCanvas.height = ih;
+        const sourceCtx = sourceCanvas.getContext('2d');
+        sourceCtx.clearRect(0, 0, iw, ih);
+        sourceCtx.drawImage(image, 0, 0, iw, ih);
+        paintFromSource(sourceCanvas, iw, ih);
+      };
       image.onerror = function() {
         canvas.dataset.layerThumbnailDrawnKey = '';
       };
@@ -52185,12 +52148,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       document.querySelectorAll('.video-preview-layer-image[data-layer-drawing-ref]').forEach(function(image) {
         if (String(image.dataset.layerDrawingRef || '') !== ref) return;
         const drawing = getLayerDrawingData(state.project, ref);
-        if (!drawing || !drawing.bitmapDataUrl) {
+        const url = drawing ? layerDrawingDisplayDataUrl(ref, drawing) : ''; // ver1432: <img> 는 문자열만 먹는다 — flush-then-read(ver674)
+        if (!url) {
           image.removeAttribute('src');
           return;
         }
         applyLayerImageBitmapGeometry(image, drawing);
-        if (image.getAttribute('src') !== drawing.bitmapDataUrl) image.src = drawing.bitmapDataUrl;
+        if (image.getAttribute('src') !== url) image.src = url;
       });
       if (options.skipThumbnails !== true) {
         document.querySelectorAll('.conte-layer-thumbnail-canvas[data-layer-drawing-ref]').forEach(function(canvas) {
@@ -53238,18 +53202,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return traceSmoothedLassoPath(ctx, pts, true);
     }
 
-    function layerDrawingUndoStack(drawing) {
-      if (!drawing) return [];
-      drawing.undo = Array.isArray(drawing.undo) ? drawing.undo : [];
-      return drawing.undo;
-    }
-
-    function layerDrawingRedoStack(drawing) {
-      if (!drawing) return [];
-      drawing.redo = Array.isArray(drawing.redo) ? drawing.redo : [];
-      return drawing.redo;
-    }
-
     function normalizeLayerDrawingSnapshot(value) {
       if (value && typeof value === 'object') {
         return {
@@ -53273,18 +53225,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function layerDrawingSnapshot(drawing) {
       return normalizeLayerDrawingSnapshot(drawing || {});
-    }
-
-    function applyLayerDrawingSnapshot(drawing, snapshot) {
-      if (!drawing) return;
-      const next = normalizeLayerDrawingSnapshot(snapshot);
-      drawing.bitmapDataUrl = next.bitmapDataUrl;
-      drawing.bitmapStorage = next.bitmapStorage;
-      drawing.bitmapX = next.bitmapX;
-      drawing.bitmapY = next.bitmapY;
-      drawing.bitmapWidth = next.bitmapWidth;
-      drawing.bitmapHeight = next.bitmapHeight;
-      drawing.strokes = [];
     }
 
     function createReadbackCanvas() {
@@ -58292,8 +58232,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const selectedRef = selectedLayer && selectedLayer.layer ? String(selectedLayer.layer.drawingRef || '') : '';
       const hasPrimaryUndo = state.undoStack.length > 0;
       const hasPrimaryRedo = state.redoStack.length > 0;
-      if (undoBtn) undoBtn.disabled = hasPrimaryUndo ? false : (selectedDrawing ? !layerDrawingGlobalHistoryAvailable('undo', selectedRef) && layerDrawingUndoStack(selectedDrawing).length === 0 : page.strokes.length === 0);
-      if (redoBtn) redoBtn.disabled = hasPrimaryRedo ? false : (selectedDrawing ? !layerDrawingGlobalHistoryAvailable('redo', selectedRef) && layerDrawingRedoStack(selectedDrawing).length === 0 : page.redo.length === 0);
+      if (undoBtn) undoBtn.disabled = hasPrimaryUndo ? false : (selectedDrawing ? !layerDrawingGlobalHistoryAvailable('undo', selectedRef) : page.strokes.length === 0);
+      if (redoBtn) redoBtn.disabled = hasPrimaryRedo ? false : (selectedDrawing ? !layerDrawingGlobalHistoryAvailable('redo', selectedRef) : page.redo.length === 0);
       if (clearBtn) clearBtn.disabled = !selectedLayer;
     }
 
@@ -58302,8 +58242,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const selectedDrawing = selectedLayer && selectedLayer.layer ? getLayerDrawingData(state.project, selectedLayer.layer.drawingRef) : null;
       if (selectedDrawing) {
         const ref = selectedLayer && selectedLayer.layer ? String(selectedLayer.layer.drawingRef || '') : '';
-        if (layerDrawingGlobalHistoryAvailable(kind, ref)) return true;
-        return kind === 'redo' ? layerDrawingRedoStack(selectedDrawing).length > 0 : layerDrawingUndoStack(selectedDrawing).length > 0;
+        return layerDrawingGlobalHistoryAvailable(kind, ref); // ver1432: 로컬 스택 제거 — 전역 히스토리가 전부다
       }
       const page = getMemoPageData(state.project.currentPage);
       return kind === 'redo' ? page.redo.length > 0 : page.strokes.length > 0;
@@ -58312,7 +58251,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function refreshPaintLayerHistoryChange(drawingRef, stroke, historyKey) {
       const ref = String(drawingRef || '');
       if (!ref) return;
-      clearLayerDrawingCompositionPending(ref);
       clearLayerDrawingDataUrlCacheForRef(ref);
       const restored = stroke && historyKey ? applyPaintBitmapHistory(stroke, historyKey) : false;
       if (!restored) redrawVisibleLayerCanvasesForRef(ref);
@@ -58322,23 +58260,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintUndo() {
       const selectedLayer = findConteLayerById(state.project, state.selectedConteLayerId);
       if (selectedLayer && selectedLayer.layer && selectedLayer.layer.drawingRef) {
-        if (layerDrawingGlobalHistoryAvailable('undo', selectedLayer.layer.drawingRef)) {
-          undo();
-          return;
-        }
-        const drawing = getLayerDrawingData(state.project, selectedLayer.layer.drawingRef);
-        // ver760: this local was named `undo`, shadowing the global undo() that the branch above calls —
-        // a temporal-dead-zone landmine: whenever global drawing history WAS available, `undo()` threw
-        // "Cannot access 'undo' before initialization" instead of undoing. Pre-existing (not the rename);
-        // surfaced by exercising that branch headless.
-        const undoStack = layerDrawingUndoStack(drawing);
-        if (!undoStack.length) return;
-        layerDrawingRedoStack(drawing).push(layerDrawingSnapshot(drawing));
-        applyLayerDrawingSnapshot(drawing, undoStack.pop());
-        clearPaintEditStateForDrawing(selectedLayer.layer.drawingRef);
-        touchLayerDrawing(drawing);
-        refreshPaintLayerHistoryChange(selectedLayer.layer.drawingRef, null, '');
-        scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+        // ver1432: 그림 히스토리는 전역 스택 하나다. 그림별 로컬 undo/redo 스택은 채우는 곳이 자신
+        // (undo↔redo 맞교환)뿐이라 영원히 비어 도달 불가였고, 그 분기는 필드만 갈아끼워 live 캔버스
+        // (픽셀 정본)를 방치하는 잠재 결함이기도 했다 — 기계째 제거(경위는 changelog ver1432).
+        if (layerDrawingGlobalHistoryAvailable('undo', selectedLayer.layer.drawingRef)) undo();
         return;
       }
       const page = getMemoPageData(state.project.currentPage);
@@ -58353,19 +58278,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintRedo() {
       const selectedLayer = findConteLayerById(state.project, state.selectedConteLayerId);
       if (selectedLayer && selectedLayer.layer && selectedLayer.layer.drawingRef) {
-        if (layerDrawingGlobalHistoryAvailable('redo', selectedLayer.layer.drawingRef)) {
-          redo();
-          return;
-        }
-        const drawing = getLayerDrawingData(state.project, selectedLayer.layer.drawingRef);
-        const redoStack = layerDrawingRedoStack(drawing); // ver760: was `redo` — same TDZ shadow as paintUndo
-        if (!redoStack.length) return;
-        layerDrawingUndoStack(drawing).push(layerDrawingSnapshot(drawing));
-        applyLayerDrawingSnapshot(drawing, redoStack.pop());
-        clearPaintEditStateForDrawing(selectedLayer.layer.drawingRef);
-        touchLayerDrawing(drawing);
-        refreshPaintLayerHistoryChange(selectedLayer.layer.drawingRef, null, '');
-        scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+        if (layerDrawingGlobalHistoryAvailable('redo', selectedLayer.layer.drawingRef)) redo(); // ver1432: 위 paintUndo 와 같은 정리
         return;
       }
       const page = getMemoPageData(state.project.currentPage);
@@ -58393,8 +58306,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         clearActiveLayerCanvasTargets();
         if (transformRef) refreshPaintEditOverlays(transformRef);
         updatePaintSpacePanCursorClass();
-        if (pendingLayerDrawingRefSet().size) flushDeferredPaintComposition({ render: true });
-        else refreshPaintCompositeDirtyFlag();
       }
       updatePaintUI();
     }
@@ -62730,7 +62641,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             for (let gi = 0; gi < ghosts.length; gi += 1) {
               const g = ghosts[gi];
               const gDrawing = getLayerDrawingData(project, g.ref);
-              const gSrc = gDrawing && gDrawing.bitmapDataUrl;
+              const gSrc = gDrawing ? layerDrawingDisplayDataUrl(g.ref, gDrawing) : ''; // ver1432: flush-then-read(ver674)
               if (!gSrc) continue;
               const gImg = opts.cache ? opts.cache.get(g.ref) : await loadImageForExport(gSrc);
               if (!gImg) continue;
@@ -62754,7 +62665,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             const layer = entries[i] && entries[i].layer;
             if (!layer) continue;
             const drawing = getLayerDrawingData(project, layer.drawingRef);
-            const src = drawing && drawing.bitmapDataUrl;
+            const src = drawing ? layerDrawingDisplayDataUrl(layer.drawingRef, drawing) : ''; // ver1432: flush-then-read(ver674)
             if (!src) continue;
             const rect = layerDrawingBitmapRect(drawing);
             const img = opts.cache ? opts.cache.get(layer.drawingRef) : await loadImageForExport(src);
@@ -62838,7 +62749,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let missing = 0;
       for (let i = 0; i < refs.length; i += 1) {
         const drawing = getLayerDrawingData(project, refs[i]);
-        const src = drawing && drawing.bitmapDataUrl;
+        const src = drawing ? layerDrawingDisplayDataUrl(refs[i], drawing) : ''; // ver1432: flush-then-read(ver674)
         if (!src) {
           // A drawing referenced by a stored file but still without pixels after hydration = a genuine
           // export gap; surface it (rather than silently dropping the layer) so it's diagnosable.
@@ -63325,7 +63236,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         state.videoExportCancel = false;
         setExportDialogBusy(true, t('export.video.status.retryPreparing'));
-        await flushDeferredPaintComposition({ render: false });
         const r = await writeCutExportGroups(retry.dirHandle, retry.groups, retry.opts, function(msg) { setExportDialogBusy(true, msg); });
         state.lastCutExportRetry = r.failedGroups.length ? { dirHandle: retry.dirHandle, groups: r.failedGroups, opts: retry.opts } : null;
         updateExportRetryButtonVisibility();
@@ -63496,8 +63406,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const items = [];
       for (const entry of entries.slice().reverse()) {           // → paint bottom-up
         const drawing = getLayerDrawingData(project, entry.layer.drawingRef);
-        if (!drawing || !drawing.bitmapDataUrl) continue;
-        const image = await loadImage(drawing.bitmapDataUrl);
+        const artUrl = drawing ? layerDrawingDisplayDataUrl(entry.layer.drawingRef, drawing) : ''; // ver1432: flush-then-read(ver674)
+        if (!artUrl) continue;
+        const image = await loadImage(artUrl);
         const box = mapRect(layerDrawingBitmapRect(drawing));
         items.push({
           layer: entry.layer,
@@ -63527,10 +63438,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         canvas.width = w; canvas.height = h;
         const ctx = canvas.getContext('2d');
         ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
-        if (drawing.bitmapDataUrl) {
+        const komaUrl = layerDrawingDisplayDataUrl(l.drawingRef, drawing); // ver1432: flush-then-read(ver674)
+        if (komaUrl) {
           const rect = layerDrawingBitmapRect(drawing);
           try {
-            const img = await loadImage(drawing.bitmapDataUrl);
+            const img = await loadImage(komaUrl);
             ctx.drawImage(img, rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale);
           } catch (e) {
             // Still emit the frame-outline-only image (one koma missing must not lose the other 5),
@@ -63756,7 +63668,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!await ensureWorkspacePermission(retry.dirHandle, true)) { alert(t('export.video.err.retryPermission')); return; }
         state.videoExportCancel = false;
         setExportDialogBusy(true, t('export.video.status.retryPreparing'));
-        await flushDeferredPaintComposition({ render: false });
         const r = await writeCtExportGroups(state.project, retry.groups, retry.dirHandle, function(msg) { setExportDialogBusy(true, msg); });
         state.lastCtExportRetry = r.failedGroups.length ? { dirHandle: retry.dirHandle, groups: r.failedGroups } : null;
         updateExportRetryButtonVisibility();
@@ -63843,8 +63754,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           };
           rememberConteExportOutput(dims); // ver705: remember this resolution for next time (per project)
           setExportDialogBusy(true, t('export.video.status.videoPreparing'));
-          await flushDeferredPaintComposition({ render: false });
-          const result = await runConteExportVideo(opts, function(msg) { setExportDialogBusy(true, msg); });
+            const result = await runConteExportVideo(opts, function(msg) { setExportDialogBusy(true, msg); });
           setExportDialogBusy(false, (result.canceled ? t('export.video.status.canceledPartialSave') : (t('export.video.status.videoDone') + (result.fast ? t('export.video.status.fastSuffix') : t('export.video.status.realtimeSuffix')))) + ' ' + (result.format || '') + ' ' + Math.round(result.blobSize / 1024) + 'KB / ' + result.frames + 'f' + (result.fallbackReason ? '  ' + t('export.video.status.fastUnavailablePrefix') + result.fallbackReason : ''));
         } catch (error) {
           setExportDialogBusy(false, t('export.video.err.videoFailedPrefix') + (error && error.message ? error.message : error));
@@ -63870,8 +63780,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           state.videoExportCancel = false;
           rememberConteExportOutput(conteExportOutputDims()); // ver705: same remembered resolution as 映像（全体）
           setExportDialogBusy(true, t('export.video.status.cutBatchPreparing'));
-          await flushDeferredPaintComposition({ render: false });
-          const r = await runConteExportCutsBatch(dir, function(msg) { setExportDialogBusy(true, msg); });
+            const r = await runConteExportCutsBatch(dir, function(msg) { setExportDialogBusy(true, msg); });
           const tail = r.failures.length ? ('  ' + t('export.video.status.failuresTailPrefix') + r.failures.length + t('export.video.unit.items') + ': ' + r.failures.slice(0, 3).join(' / ')) : '';
           setExportDialogBusy(false, (r.canceled ? t('export.video.status.cutBatchCanceledShort') : t('export.video.status.cutBatchDone')) + ' ' + r.written + '/' + r.total + ' ' + t('export.video.unit.films') + tail);
         } catch (error) {
@@ -63899,8 +63808,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         try {
           state.videoExportCancel = false;
           setExportDialogBusy(true, t('export.video.status.cutBatchPreparing'));
-          await flushDeferredPaintComposition({ render: false });
-          const r = await runConteExportCtBatch(ctDir, function(msg) { setExportDialogBusy(true, msg); });
+            const r = await runConteExportCtBatch(ctDir, function(msg) { setExportDialogBusy(true, msg); });
           const tail = r.failures.length ? ('  ' + t('export.video.status.failuresTailPrefix') + r.failures.length + t('export.video.unit.items') + ': ' + r.failures.slice(0, 3).join(' / ')) : '';
           setExportDialogBusy(false, (r.canceled ? t('export.video.status.cutBatchCanceledShort') : t('export.video.status.cutBatchDone')) + ' ' + r.written + '/' + r.total + tail);
         } catch (error) {
@@ -63938,7 +63846,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     async function exportProjectPagesToDirectory(directoryHandle, mode, onStatus) {
       const pages = exportPageNumbers();
       const projectName = safeFileName(state.project.projectId || 'conte_project');
-      flushDeferredPaintComposition({ render: false });
       if (mode === 'pdf') {
         const pdfPages = [];
         for (let index = 0; index < pages.length; index += 1) {
