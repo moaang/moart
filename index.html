@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1449</title>
+  <title>MoArt ver1450</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1449</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1450</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -80003,7 +80003,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       d.targetLayerId = gengaCrossLayerMoveAllowed(d.layerId, tgtId) ? String(tgtId) : null;
       let dy = 0;
       const tgtLane = d.targetLayerId ? gengaLaneEl(d.targetLayerId) : null;
-      if (srcLane && tgtLane) dy = Math.round(tgtLane.getBoundingClientRect().top - srcLane.getBoundingClientRect().top);
+      // ver1450: 여기 있던 것은 성능 문제가 아니라 **좌표 문제**였다(실측: 이 함수 1회 0.025ms, 예산의
+      // 2% — 고칠 이유가 없다). 진짜 결함은 gBCR **차**를 그대로 `translateY(...px)` 에 넣은 것이다.
+      // Chromium 에서 gBCR 은 CSS zoom 이 곱해진 값이고(uiGbcrIncludesZoom) translate 의 px 는 요소의
+      // **로컬** px 다 — UI 배율 125% 면 코마가 1.25배 멀리 튄다. 코드맵의 「KNOWN v1 LIMIT」(px 델타
+      // 상호작용이 배율≠100% 에서 비례해 어긋난다)에 정확히 해당하는 자리다.
+      // localRect() 는 이 파일이 이미 32곳에서 쓰는 정규화 커널 — 두 rect 를 로컬 px 로 맞춰 뺀다.
+      if (srcLane && tgtLane) dy = Math.round(localRect(tgtLane).top - localRect(srcLane).top);
       document.querySelectorAll('#gengaStage .genga-lane.genga-drop-target').forEach(function(el) { el.classList.remove('genga-drop-target'); });
       if (tgtLane) tgtLane.classList.add('genga-drop-target');
       const ty = dy ? ('translateY(' + dy + 'px)') : '';
@@ -82095,7 +82101,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       document.addEventListener('pointerup', gaugePointerUp, true);
       document.addEventListener('pointercancel', gaugePointerUp, true); // ver749 (fix_design 2-2): OS gesture steal used to strand the drag (display stuck off-data)
     }, true);
-    function gaugePointerMove(e) { if (!gengaGaugeDrag) return; e.preventDefault(); const v = gaugeValAt(gengaGaugeDrag.g, e, gengaGaugeDrag.rect); gaugeSetP(gengaGaugeDrag.g, v); gaugeDispatch(gengaGaugeDrag.g, v, 'move'); }
+    // ver1450: 게이지의 'move' 디스패치를 프레임당 1회로 접는다. 분기에 따라 1회가 매우 비싸다 —
+    // 실측(원화 레이어 8): `genga-zoom` 은 이벤트마다 renderGengaView() = **6.9ms**, 1000Hz 마우스의
+    // 16이벤트/프레임이면 **110ms = 60fps 예산의 662%** 로 드래그 내내 UI 가 잠긴다. `genga-op` 도
+    // 프리뷰+썸네일로 1.7ms/프레임(10%).
+    // gaugeSetP 는 계속 동기다 — dataset.value 미러링이 싸고, pointercancel 이 「마지막 적용값」으로
+    // 끝내는 ver749 계약이 그 값에 걸려 있다. 미루는 것은 **무거운 반영**뿐이다.
+    let gengaGaugeMoveRaf = 0;
+    let gengaGaugeMovePending = null;
+    function gaugeScheduleMoveDispatch(g, v) {
+      gengaGaugeMovePending = { g: g, v: v };
+      if (gengaGaugeMoveRaf) return;
+      gengaGaugeMoveRaf = requestAnimationFrame(function() {
+        gengaGaugeMoveRaf = 0;
+        const pend = gengaGaugeMovePending;
+        gengaGaugeMovePending = null;
+        // 드래그가 이미 끝났으면 버린다 — 'end' 뒤에 옛 'move' 가 착지하면 ver972 가 겪은
+        // 「undo 가 다 안 되돌려짐」 계열의 사고가 된다.
+        if (pend && gengaGaugeDrag) gaugeDispatch(pend.g, pend.v, 'move');
+      });
+    }
+    function gaugeCancelPendingMoveDispatch() {
+      if (gengaGaugeMoveRaf) { cancelAnimationFrame(gengaGaugeMoveRaf); gengaGaugeMoveRaf = 0; }
+      gengaGaugeMovePending = null;
+    }
+    function gaugePointerMove(e) { if (!gengaGaugeDrag) return; e.preventDefault(); const v = gaugeValAt(gengaGaugeDrag.g, e, gengaGaugeDrag.rect); gaugeSetP(gengaGaugeDrag.g, v); gaugeScheduleMoveDispatch(gengaGaugeDrag.g, v); }
     function gaugePointerUp(e) {
       document.removeEventListener('pointermove', gaugePointerMove, true);
       document.removeEventListener('pointerup', gaugePointerUp, true);
@@ -82106,6 +82136,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // APPLIED value (gaugeSetP mirrors every move into dataset.value), not at the event point.
       const v = e.type === 'pointercancel' ? Number(g.dataset.value) : gaugeValAt(g, e, gengaGaugeDrag.rect);
       gengaGaugeDrag.canceled = (e.type === 'pointercancel'); // ver965: af-* branches keep ver753 no-commit-on-cancel; genga-* branches ignore this (ver749 commit-at-last-applied stands)
+      gaugeCancelPendingMoveDispatch(); // ver1450: 대기 중인 'move' 가 'end' 뒤에 착지하지 않게
       gaugeSetP(g, v); gaugeDispatch(g, v, 'end'); gengaGaugeDrag = null;
     }
     // ver612: native ranges (.gg-range) share the gauge canon — JS keeps --p (fill fraction) in sync
