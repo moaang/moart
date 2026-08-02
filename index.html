@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1443</title>
+  <title>MoArt ver1444</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1443</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1444</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -76702,7 +76702,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ver747: gengaPanDrag/gengaPanKeyActive retired — pan now shares state.paintSpacePanDrag/paintSpacePanActive
     // with conte (see startPaintViewportPanDrag / spacePanEligible / gengaDrawStart).
-    let gengaStamp = null;   // captured stamp { patch<canvas cropped>, w, h, work<paper canvas>, workLayer, workFrame } — click to rubber-stamp copies
+    let gengaStamp = null;   // captured stamp { patch<canvas cropped>, w, h, work<paper canvas>, workKey } — click to rubber-stamp copies
+                             // ver1444: workKey = layer@frame#drawingRef — 그 자리의 픽셀이 바뀌면 키가 달라져 work 를 다시 쌓는다
     let gengaStampPt = null; // { x, y } paper-coord preview point following the cursor in stamp mode
     // ver771: { layerId, frame, pointerId, last, pts[] } while a stamp gesture is down. 탭이든 궤적이든 이
     // 세션이 커밋 1회를 소유한다(= 제스처당 undo 1스텝). janitor 등록 필수 — ver581 클래스.
@@ -77479,21 +77480,37 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const patch = document.createElement('canvas'); patch.width = w; patch.height = h;
       patch.getContext('2d').drawImage(full, minx, miny, w, h, 0, 0, w, h);
       const work = document.createElement('canvas'); work.width = pw; work.height = ph; work.getContext('2d').drawImage(wk.cv, 0, 0);
-      gengaStamp = { patch: patch, w: w, h: h, work: work, workLayer: String(layer.id), workFrame: frame,
+      gengaStamp = { patch: patch, w: w, h: h, work: work, workKey: gengaStampWorkKey(layer, frame),
         originX: minx + w / 2, originY: miny + h / 2 }; // original lasso center — 'stamp in place' target (conte parity)
       gengaStampPt = null; // no persistent ghost (a seeded ghost over the just-cut hole looked like a leftover on iPad); tap places, drag positions
       state.timelineStatus = t('status.genga.stamp.captured');
       drawGengaPreview();
       return true;
     }
+    // ver1444: work 캐시의 키에 **무엇으로 만들었는지**(그 코마의 그림 ref)를 넣는다.
+    // 종전 키는 (레이어, 프레임) 뿐이었다. 그런데 work 는 「그 코마의 현재 픽셀 + 지금까지 찍은 도장」의
+    // 사본이므로 같은 자리의 **픽셀이 바뀌면 낡는다** — 그 갱신은 커밋 말고도 여러 경로에서 일어난다
+    // (undo/redo · 코마 클리어 · 1px 이동). 옛 코드는 그 경우들을 안 봐서, 스탬프를 찍고 Ctrl+Z 로
+    // 되돌린 뒤 다시 찍으면 **되돌렸던 도장이 되살아났다**(사용자 재현 확인). 클리어·1px 이동도 같다.
+    // 원화의 그림은 **ref 단위 불변**이고 커밋마다 새 ref 를 발급한다(ver1433) — 그래서 ref 하나면
+    // 「그 자리의 픽셀이 그때 그것인가」를 정확히 말한다. undo 는 옛 ref 로, 클리어는 ref 없음으로,
+    // 1px 이동은 새 ref 로 간다. 전부 키가 달라져 자동으로 다시 쌓는다.
+    // 호출부마다 무효화를 기억시키는 대신 **캐시가 스스로 낡음을 안다** — ver1428 이 콘티 프리뷰
+    // 캔버스에서 쓴 처방과 같은 몸이다.
+    function gengaStampWorkKey(layer, frame) {
+      const exp = layer ? gengaExposureAt(layer, frame) : null;
+      const dr = exp ? gengaExposureDrawing(layer, exp) : null;
+      return String(layer && layer.id) + '@' + frame + '#' + String((dr && dr.ref) || '');
+    }
     // ver771: work 캔버스에 도장을 찍기만 한다(커밋 없음). 커밋 소유자는 호출자.
     function gengaStampPaintInto(layer, frame, x, y) {
       if (!gengaStamp) return;
-      if (gengaStamp.workLayer !== String(layer.id) || gengaStamp.workFrame !== frame) {
+      const workKey = gengaStampWorkKey(layer, frame);
+      if (gengaStamp.workKey !== workKey) {
         const wk = gengaWorkingCanvasFor(layer, frame);
         const work = document.createElement('canvas'); work.width = wk.pw; work.height = wk.ph;
         if (wk.hasContent) work.getContext('2d').drawImage(wk.cv, 0, 0);
-        gengaStamp.work = work; gengaStamp.workLayer = String(layer.id); gengaStamp.workFrame = frame;
+        gengaStamp.work = work; gengaStamp.workKey = workKey;
       }
       gengaStamp.work.getContext('2d').drawImage(gengaStamp.patch, Math.round(x - gengaStamp.w / 2), Math.round(y - gengaStamp.h / 2));
     }
@@ -77505,10 +77522,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       drawGengaPreview(); drawGengaLayerThumbs();
     }
     // ver771: 드래그 중 이미 찍은 것들을 버린다(커밋 전). work는 무효화해 다음 제스처가 데이터에서 다시 쌓게 한다
-    // — 안 지우면 workLayer/workFrame이 그대로라 다음 탭이 버려진 도장들까지 커밋해 버린다.
+    // — 안 지우면 workKey 가 그대로라 다음 탭이 버려진 도장들까지 커밋해 버린다.
     function gengaDiscardStampDrag() {
       gengaStampDrag = null;
-      if (gengaStamp) { gengaStamp.work = null; gengaStamp.workLayer = null; gengaStamp.workFrame = -1; }
+      if (gengaStamp) { gengaStamp.work = null; gengaStamp.workKey = ''; }
     }
     function gengaStampPointerMove(ev) {
       const d = gengaStampDrag;
