@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1440</title>
+  <title>MoArt ver1442</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1440</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1442</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -54774,9 +54774,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 대시 패턴으로 쪼갠다. 그 비용은 점 수에 비례하고, 점은 1스크린px 이동당 하나씩 쌓인다
         // (ver1438 참고: 그 상한을 고폴링 마우스만 채워서 장치별로 체감이 갈렸다).
         // 색은 지어내지 않는다 — 이 앱이 이미 「미확정」에 쓰는 MARQUEE_COLOR_PENDING(ver1282)이다.
-        strokePaintOverlayPath(ctx, function() {
-          return paintOverlayPath(ctx, lasso.points, CONTE_PAPER_WIDTH, CONTE_PAPER_HEIGHT, Boolean(lasso.closed));
-        }, { color: MARQUEE_COLOR_PENDING, width: Math.max(0.55, mstyle.line), dash: [] });
+        // ver1442: 그리는 중도 같은 커널 — 1 device px, 안티 0. (ver1439 는 실선으로만 바꿨고 두께·안티는
+        // 패스 스트로크 그대로였다.) 점은 정규화 좌표라 오버레이(용지) 좌표로 옮겨서 넘긴다.
+        drawCrispMarqueePolyline(ctx, lasso.points.map(function(pt) {
+          return paintOverlayPoint(pt, CONTE_PAPER_WIDTH, CONTE_PAPER_HEIGHT);
+        }), MARQUEE_COLOR_PENDING, false, Boolean(lasso.closed));
       }
       const stampPreview = state.paintStampPreview;
       if (stampPreview) drawPaintStampPreviewOverlay(ctx, stampPreview, mstyle);
@@ -54904,35 +54906,59 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     //      (고DPI 에서 0.5 CSS px)라 1px 보다 얇다. Canvas2D 는 패스 안티를 못 끄지만 이 방법은 애초에
     //      안티가 생길 여지를 안 만든다.
     // mapPoint(x, y) → 오버레이 좌표. 생략하면 마스크 좌표를 그대로 쓴다.
-    function drawMarqueeContourDots(ctx, maskCanvas, color, mapPoint) {
-      const contours = paintMaskContours(maskCanvas);
-      if (!contours || !contours.length) return false;
+    // ver1442: **마퀴를 그리는 단 하나의 자리.** 콘티/원화 × 확정선택/그리는중 × 라쏘선택/라쏘스탬프가
+    // 전부 여기로 들어온다. 종전에는 콘티와 원화가 `(x + y) % 10` 대각 줄무늬를 **각자 복사**해 갖고
+    // 있었고(ver1440 이 콘티만 고쳐서 그 사실이 드러났다), 그리는 중의 선은 패스 스트로크라 안티가 걸렸다.
+    //
+    // 두 가지를 지킨다:
+    //  · **1 device px, 정수 좌표** — 안티에일리어싱이 생길 여지를 안 만든다(Canvas2D 는 패스 안티를 못 끈다).
+    //  · **세그먼트를 1px 간격으로 채운다** — ver1440 은 윤곽 「점마다」 하나씩 찍었는데, 확대하면 점 사이가
+    //    1px 보다 벌어져 대시가 이어지지 않고 **점**으로 보였다(사용자 지적). 화면 거리로 걸으면 배율과
+    //    무관하게 대시가 이어진다.
+    // pts = ctx 의 현재 좌표계 기준 {x,y} 배열. dash=false 면 실선(그리는 중).
+    function drawCrispMarqueePolyline(ctx, pts, color, dash, closed) {
+      if (!ctx || !pts || pts.length < 2) return false;
       const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
+      const toX = m ? function(x, y) { return m.a * x + m.c * y + m.e; } : function(x) { return x; };
+      const toY = m ? function(x, y) { return m.b * x + m.d * y + m.f; } : function(x, y) { return y; };
       const period = MARQUEE_DASH_ON + MARQUEE_DASH_OFF;
       ctx.save();
       ctx.fillStyle = color || MARQUEE_COLOR;
       if (m) ctx.setTransform(1, 0, 0, 1, 0, 0);
-      for (let c = 0; c < contours.length; c += 1) {
-        const path = contours[c];
-        let phase = 0;
-        let prevX = 0, prevY = 0, hasPrev = false;
-        for (let i = 0; i < path.length; i += 2) {
-          const src = mapPoint ? mapPoint(path[i], path[i + 1]) : null;
-          const lx = src ? src.x : path[i];
-          const ly = src ? src.y : path[i + 1];
-          const sx = m ? (m.a * lx + m.c * ly + m.e) : lx;
-          const sy = m ? (m.b * lx + m.d * ly + m.f) : ly;
-          if (hasPrev) {
-            const dx = sx - prevX, dy = sy - prevY;
-            phase += Math.sqrt(dx * dx + dy * dy);
+      let phase = 0;
+      const last = closed ? pts.length : pts.length - 1;
+      for (let i = 0; i < last; i += 1) {
+        const a = pts[i], b = pts[(i + 1) % pts.length];
+        const ax = toX(a.x, a.y), ay = toY(a.x, a.y);
+        const bx = toX(b.x, b.y), by = toY(b.x, b.y);
+        const dx = bx - ax, dy = by - ay;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        const steps = Math.max(1, Math.ceil(len));
+        for (let k = 0; k < steps; k += 1) {
+          const t = k / steps;
+          if (!dash || (phase % period) < MARQUEE_DASH_ON) {
+            ctx.fillRect(Math.round(ax + dx * t), Math.round(ay + dy * t), 1, 1);
           }
-          prevX = sx; prevY = sy; hasPrev = true;
-          if ((phase % period) >= MARQUEE_DASH_ON) continue;
-          ctx.fillRect(Math.round(sx), Math.round(sy), 1, 1);
+          phase += len / steps;
         }
       }
       ctx.restore();
       return true;
+    }
+
+    function drawMarqueeContourDots(ctx, maskCanvas, color, mapPoint) {
+      const contours = paintMaskContours(maskCanvas);
+      if (!contours || !contours.length) return false;
+      let drew = false;
+      for (let c = 0; c < contours.length; c += 1) {
+        const path = contours[c];
+        const pts = [];
+        for (let i = 0; i < path.length; i += 2) {
+          pts.push(mapPoint ? mapPoint(path[i], path[i + 1]) : { x: path[i], y: path[i + 1] });
+        }
+        if (drawCrispMarqueePolyline(ctx, pts, color, true, true)) drew = true;
+      }
+      return drew;
     }
     // ver618: thin colored dashes with TRANSPARENT gaps (no white halo, no white counter-dash)
     // ver1440: 두께 인자(dotPx)가 사라졌다 — 점은 언제나 1 device px 다(공용 커널 주석 참고).
@@ -64733,7 +64759,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // the encode landed (async, or forced by a flush): store + persist + hand the decode-race fallback its
     // key + patch the thumbs that were skipped while pending. Layer lookups self-guard, so a project swapped
-    // between commit and settle degrades to store/IDB writes only (the 'gd:' orphan GC covers a later undo).
+    // between commit and settle degrades to store/IDB writes only.
+    // ver1441 정정: 여기 있던 「그 고아는 기존 'gd:' GC 가 거둔다」는 **사실이 아니다** —
+    // 'gd:' 행을 지우는 코드는 파일 전체에 0곳이다(deleteWorkspaceDbValue 호출부 전수 확인:
+    // 프로젝트 페이로드·버전·오디오·'bt:' 뿐). 즉 획 하나가 영구 IndexedDB 행 하나다.
+    // 그 GC 는 **아직 없다** — 만들 때는 gengaLayerClipboard 가 ref 수집에서 빠져 있는 것부터 메울 것
+    // (gengaAddClipboardRefs). 지금은 GC 가 없어서 그 구멍이 안 터지고 있을 뿐이다.
     function gengaSettleDrawingEncode(ref, entry, dataUrl) {
       const url = String(dataUrl || '');
       gengaDrawStore.set(ref, url);
@@ -64931,7 +64962,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // frequent, whereas the five existing call sites are rare project-load boundaries, so a cut-then-edit
     // session would have hit the blank-paste bug on nearly every trim.
     function gengaPruneRuntimeStoresToProject(project) {
-      gengaFlushPendingDrawingEncodes(); // ver1324: settle before the sweep so pending refs are normal store rows (an orphan lands in the existing 'gd:' GC)
+      gengaFlushPendingDrawingEncodes(); // ver1324: settle before the sweep so pending refs are normal store rows
+      // (ver1441 정정: 여기 있던 「고아는 기존 'gd:' GC 로 간다」도 사실이 아니다 — 위 주석 참고.)
       const drawRefs = new Set();
       const audioRefs = new Set();
       gengaAddProjectRefs(project, drawRefs, audioRefs);
@@ -69613,9 +69645,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1431: 노출 하나를 만드는 자리가 다섯 군데에서 같은 리터럴을 따로 적고 있었다(새 프로젝트의 첫
     // 레이어 · 시트 임포트의 BG/BOOK · 用紙 · 그리고 이번에 채우는 레이어 추가 둘). 한 벌로 부른다.
     // 기본값은 새 프로젝트가 이미 쓰던 그것 — 1프레임째, 번호 없음, 그림 없음.
+    // ver1441: 노출 id 한 벌. 똑같은 식이 **열두 곳**에 복사돼 있었다(ver1431 이 「다섯 곳을 모았다」고
+    // 적었는데, 그건 **기본 노출 객체**를 만드는 다섯 곳이었고 id 식은 그 밖에도 널려 있었다 — 그 주석의
+    // 범위를 여기 정정해 둔다). 대부분의 호출부는 startFrame 이 제각각이라 newGengaExposure 를 그대로
+    // 못 쓴다 — 공유되는 것은 **id 형식**이고, 그러니 그것만 커널로 뺀다.
+    function newGengaExposureId() {
+      return 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    }
     function newGengaExposure(holdFrames) {
       return {
-        id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+        id: newGengaExposureId(),
         startFrame: 1,
         holdFrames: Math.max(1, Math.round(Number(holdFrames) || 1)),
         instanceValue: null,
@@ -69628,7 +69667,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       exp = exp && typeof exp === 'object' ? exp : {};
       const hold = Math.max(1, Math.round(Number(exp.holdFrames) || 1));
       return {
-        id: typeof exp.id === 'string' && exp.id ? exp.id : ('genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)),
+        id: typeof exp.id === 'string' && exp.id ? exp.id : (newGengaExposureId()),
         startFrame: Math.max(1, Math.round(Number(exp.startFrame) || 1)),
         holdFrames: hold,
         instanceValue: (exp.instanceValue === undefined || exp.instanceValue === '') ? null : exp.instanceValue,
@@ -71024,7 +71063,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       clone.exposures = (clone.exposures || []).map(function(e) {
         return Object.assign({}, e, {
-          id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          id: newGengaExposureId(),
           serifuId: (e.serifuId && serifuIdMap[e.serifuId]) ? serifuIdMap[e.serifuId] : ''
         });
       });
@@ -71173,7 +71212,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
         const baked = anyContent ? gengaTrimCanvasToDrawing(cv) : null;
         exposures.push({
-          id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8) + '-' + i,
+          id: newGengaExposureId() + '-' + i,
           startFrame: segStart, holdFrames: segEnd - segStart, instanceValue: null, dougaOffsets: [],
           drawing: baked ? gengaIngestDrawing(baked) : null
         });
@@ -75234,19 +75273,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver619 revert: open polyline while dragging (artifact demo never closePath's during drag —
       // close+fill happens in one step at release), for both lasso-select and 投げ縄塗りつぶし.
       if (gengaLasso && gengaLasso.pts.length > 1) {
-        gengaOverlayStroke(ctx, function() { // ver621: smoothed open marquee
-          const sp = gengaLasso.pts.map(function(pt) { return S(pt[0], pt[1]); });
-          ctx.beginPath();
-          traceSmoothedLassoPath(ctx, sp, false);
-        }, MARQUEE_COLOR_PENDING, []); // ver1439: 그리는 중은 실선 빨강 (콘티와 같은 규칙)
+        // ver1442: 콘티와 **같은 커널** — 실선 빨강 1 device px, 안티 0. 라쏘선택·라쏘스탬프 공통이다
+        // (gengaLasso 는 둘 다 쓰는 세션이다: stamp 플래그만 다르다).
+        drawCrispMarqueePolyline(ctx, gengaLasso.pts.map(function(pt) { return S(pt[0], pt[1]); }),
+          MARQUEE_COLOR_PENDING, false, false);
       }
       if (gengaDrawSession && gengaDrawSession.shape === 'lasso-fill' && gengaDrawSession.shapeMoved && gengaDrawSession.shapeLassoPts.length > 1) {
         const lfPts = gengaDrawSession.shapeLassoPts;
-        gengaOverlayStroke(ctx, function() { // ver621: smoothed open marquee
-          const sp = lfPts.map(function(pt) { return S(pt.x, pt.y); });
-          ctx.beginPath();
-          traceSmoothedLassoPath(ctx, sp, false);
-        }, MARQUEE_COLOR_PENDING, []); // ver1439: 그리는 중은 실선 빨강 (콘티와 같은 규칙)
+        drawCrispMarqueePolyline(ctx, lfPts.map(function(pt) { return S(pt.x, pt.y); }),
+          MARQUEE_COLOR_PENDING, false, false); // ver1442: 위와 같은 커널
       }
       // ver1313: **선택(스텐실)은 전역이고, 떠 있는 픽셀만 자기 레이어·프레임 것이다** — 콘티가
       // ver1283 에 세운 그 모델(전역 스텐실)로 통일한다. 종전에는 마퀴까지 frame 에 묶여 있어서,
@@ -76390,7 +76425,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // the full-command mutate, so undo restores creation + extension as one step.
           const ci = gengaCurrentInstanceIndex(layer, frame);
           if (ci.idx >= 0) ci.sorted[ci.idx].holdFrames = frame - ci.sorted[ci.idx].startFrame;
-          e = { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), startFrame: frame, holdFrames: 1, instanceValue: null, drawing: null };
+          e = { id: newGengaExposureId(), startFrame: frame, holdFrames: 1, instanceValue: null, drawing: null };
           layer.exposures.push(e);
         }
         gengaSetExposureDrawing(layer, e, drawing);
@@ -76922,10 +76957,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 픽셀이 제자리이므로 점선도 제자리여야 한다. 다른 프레임은 그 경우가 아니다 — 프레임 이동은
       // 리프트를 풀지 않으므로(ver1313: 이동은 커밋이 아니다) 여기서는 mapped 가 참이 된다.
       const mapped = gengaSelLifted(sel) && !gengaSelIsPristine(sel);
+      // ver1442: 여기 있던 `(x + y) % 10` 대각 줄무늬는 **콘티가 갖고 있던 것과 같은 코드**였다 — 한쪽만
+      // (ver1440) 고쳐서 두 엔진의 마퀴가 갈렸고, 그 사실이 사용자 눈에 먼저 띄었다. 이제 같은 커널을 쓴다.
+      // sel.edge 는 순서 없는 점 집합이므로 마스크에서 **순서 있는 윤곽**을 다시 얻는다(같은 캐시를 쓴다).
+      const contours = sel.mask ? paintMaskContours(sel.mask) : null;
+      if (contours && contours.length) {
+        for (let c = 0; c < contours.length; c += 1) {
+          const path = contours[c];
+          const pts = [];
+          for (let i = 0; i < path.length; i += 2) {
+            const mp = mapped ? gengaSelMapPoint(sel, path[i], path[i + 1]) : { x: path[i], y: path[i + 1] };
+            pts.push(S(mp.x, mp.y));
+          }
+          drawCrispMarqueePolyline(ctx, pts, MARQUEE_COLOR, true, true);
+        }
+        return;
+      }
+      // 폴백: 마스크가 없으면 옛 점 집합이라도 보여 준다(숨기지 않는다).
       ctx.save();
       ctx.fillStyle = MARQUEE_COLOR;
-      const d = MARQUEE_LINE_PX, hd = d / 2; // ver651: unified thin marching-ants dot (matches conte mask outline)
-      for (let i = 0; i < edge.length; i++) { const e = edge[i]; if (((e[0] + e[1]) % 10) >= 6) continue; const m = mapped ? gengaSelMapPoint(sel, e[0], e[1]) : { x: e[0], y: e[1] }, s = S(m.x, m.y); ctx.fillRect(s.x - hd, s.y - hd, d, d); }
+      for (let i = 0; i < edge.length; i++) {
+        const e = edge[i];
+        const m = mapped ? gengaSelMapPoint(sel, e[0], e[1]) : { x: e[0], y: e[1] };
+        const sp = S(m.x, m.y);
+        ctx.fillRect(Math.round(sp.x), Math.round(sp.y), 1, 1);
+      }
       ctx.restore();
     }
     // bake the floating selection back into the layer drawing.
@@ -77231,7 +77287,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           g.layers.push({
             id: newId, name: 'Import ' + (n + 1), color: gengaLayerColor(n),
             opacity: 1, visible: true, locked: false, onion: false, sharedDrawings: {},
-            exposures: drawings.map(function(d, i) { return { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8) + i, startFrame: i + 1, holdFrames: 1, instanceValue: null, drawing: d }; })
+            exposures: drawings.map(function(d, i) { return { id: newGengaExposureId() + i, startFrame: i + 1, holdFrames: 1, instanceValue: null, drawing: d }; })
           });
         });
         if (newId) { selectGengaLayer(newId); gengaCenterLayerIntoView(newId); } // ver994: an imported layer lands at the bottom, usually off-screen
@@ -78966,7 +79022,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const xS = x.startFrame, xE = x.startFrame + Math.max(1, x.holdFrames) - 1;
         if (xE < s || xS > e) { out.push(x); return; }                                    // fully outside the cut
         if (xS < s) out.push(Object.assign({}, x, { holdFrames: s - xS }));               // left remainder (keeps id)
-        if (xE > e) out.push(Object.assign({}, x, { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), startFrame: e + 1, holdFrames: xE - e })); // right remainder
+        if (xE > e) out.push(Object.assign({}, x, { id: newGengaExposureId(), startFrame: e + 1, holdFrames: xE - e })); // right remainder
       });
       return out;
     }
@@ -79020,7 +79076,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         L.exposures.forEach(function(e) { if (e.startFrame >= atFrame) e.startFrame += clip.span; }); // make room
         clip.komas.forEach(function(k) {
-          const exp = { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), startFrame: atFrame + k.rel, holdFrames: Math.max(1, k.holdFrames), instanceValue: (k.instanceValue != null ? k.instanceValue : null), drawing: k.drawing ? gengaIngestDrawing(k.drawing) : null };
+          const exp = { id: newGengaExposureId(), startFrame: atFrame + k.rel, holdFrames: Math.max(1, k.holdFrames), instanceValue: (k.instanceValue != null ? k.instanceValue : null), drawing: k.drawing ? gengaIngestDrawing(k.drawing) : null };
           L.exposures.push(exp);
           const key = gengaValueKey(exp.instanceValue);
           if (key !== null && exp.drawing) { if (!L.sharedDrawings) L.sharedDrawings = {}; if (!L.sharedDrawings[key]) L.sharedDrawings[key] = gengaIngestDrawing(k.drawing); }
@@ -79568,7 +79624,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); }); if (!L) return;
         const s = (L.exposures || []).slice().sort(function(a, b) { return a.startFrame - b.startFrame; }); if (!s.length) return;
         const first = s[0].startFrame, last = s[s.length - 1].startFrame + s[s.length - 1].holdFrames - 1, span = last - first + 1;
-        const mkEmpty = function(sf) { return { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), startFrame: sf, holdFrames: 1, instanceValue: null, drawing: null }; };
+        const mkEmpty = function(sf) { return { id: newGengaExposureId(), startFrame: sf, holdFrames: 1, instanceValue: null, drawing: null }; };
         if (mode === 'empty') { // 1-frame empty komas appended outside the region (head side limited by frame 1)
           if (side === 'tail') { for (let i = 1; i <= n; i++) L.exposures.push(mkEmpty(last + i)); }
           else { const room = Math.min(n, first - 1); for (let i = 1; i <= room; i++) L.exposures.push(mkEmpty(first - i)); }
@@ -79881,7 +79937,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         moving.forEach(function(e) {
           const dr = gengaExposureDrawing(src, e);
           const ns = Math.max(1, e.startFrame + delta);
-          const nx = { id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          const nx = { id: newGengaExposureId(),
             startFrame: ns, holdFrames: Math.max(1, e.holdFrames), instanceValue: null, drawing: null,
             dougaOffsets: Array.isArray(e.dougaOffsets) ? e.dougaOffsets.slice() : [], serifuId: '', silFix: [] };
           tgt.exposures = gengaEatRange(tgt.exposures, ns, ns + Math.max(1, nx.holdFrames) - 1);
@@ -80090,7 +80146,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // which is the un-drawn in-between the picker offers as a first-class choice.
         const shared = (key !== null && L.sharedDrawings) ? L.sharedDrawings[key] : null;
         L.exposures.push(normalizeGengaExposure({
-          id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          id: newGengaExposureId(),
           startFrame: frame, holdFrames: 1, instanceValue: (key === null ? null : value),
           drawing: shared ? null : null // shared art is resolved through sharedDrawings by value, never copied here
         }));
@@ -80112,12 +80168,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return true;
       }
       const cur = exp ? gengaValueKey(exp.instanceValue) : null;
+      // ver1441: 목록을 만들기 전에 인코드 대기분을 실체화한다. 이 창은 사람이 눌러 여는 자리라
+      // 비용이 문제되지 않고(ver674 의 flush-then-read 와 같은 판단), 같은 파일의 gengaBatchExportItems
+      // 가 이미 같은 이유로 같은 일을 한다.
+      gengaFlushPendingDrawingEncodes();
       const cands = gengaInstanceValueCandidates(layer);
       const shared = layer.sharedDrawings || {};
       // ver1016: a VERTICAL list, not a thumbnail grid — the the paint tool shape, and the one that stays legible
       // when a layer has forty numbers. Each row is one thin line: a small preview, the value, and a 白紙 tag
       // when that value has no art yet. Scanning a column of numbers beats hunting a grid of near-identical
       // thumbnails, which is what the first cut was.
+      // ver1441: 「그림이 있나」의 판정은 **한 벌**이다 — gengaInstanceValueCandidates 가 이미
+      // c.hasArt 로 계산해 실어 보내는데, 여기서 art.dataUrl 로 **다시** 판정하고 있었다. 두 판정은
+      // 인코드 대기 중인 그림에서 갈렸다(candidates 는 gengaResolveDrawing 이라 대기 픽셀도 그림으로
+      // 치고, 이쪽은 dataUrl 만 봤다) → **그림이 있는 번호가 「白紙」로 표시**됐다. 그 태그는 사용자의
+      // 선택을 좌우하는 라벨이라 단순 깜빡임이 아니다. 이제 계산한 쪽의 답만 쓴다.
       const rows = cands.map(function(c) {
         const art = gengaResolveDrawing(shared[gengaValueKey(c.value)]);
         const thumb = (art && art.dataUrl)
@@ -80126,7 +80191,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return '<button type="button" class="genga-cellpick-item' + (gengaValueKey(c.value) === cur ? ' current' : '') +
                '" data-value="' + escapeAttr(c.value) + '">' + thumb +
                '<span class="genga-cellpick-label">' + escapeHtml(c.value) + '</span>' +
-               (art && art.dataUrl ? '' : '<span class="genga-cellpick-tag">' + escapeHtml(t('genga.cellPicker.blank')) + '</span>') +
+               (c.hasArt ? '' : '<span class="genga-cellpick-tag">' + escapeHtml(t('genga.cellPicker.blank')) + '</span>') +
                '</button>';
       }).join('');
       let picked = null; // latched before the close so onClose stays free of side effects (the popover is a
@@ -80221,7 +80286,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!L) return;
         L.exposures = L.exposures || [];
         L.exposures.push({
-          id: 'genga-exp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          id: newGengaExposureId(),
           startFrame: f, holdFrames: 1, drawing: null, instanceValue: null, serifuId: '',
           dougaOffsets: [], silFix: []
         });
