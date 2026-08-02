@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1432</title>
+  <title>MoArt ver1433</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8863,7 +8863,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1432</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1433</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -13744,6 +13744,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           en: function(n) { return 'Paper resize: ' + n + ' image(s) could not be loaded, so the operation was aborted. Please try again.'; },
         },
         'msg.genga.repeat.noSourceDrawing': { ja: 'リピートの前に繰り返す絵がありません。', ko: '반복하기 전에 반복할 그림이 없습니다.', en: 'There is no drawing before this point to repeat.' },
+        'msg.genga.merge.coldMiss': {
+          ja: function(n) { return 'レイヤー合体: 画像未ロードで ' + n + ' コマを処理できず中止しました。もう一度実行してください。'; },
+          ko: function(n) { return '레이어 합체: 이미지 미로드로 ' + n + '코마를 처리하지 못해 중단했습니다. 다시 실행해주세요.'; },
+          en: function(n) { return 'Merge layers: ' + n + ' frame(s) could not be processed because the image was not loaded, so the operation was aborted. Please try again.'; },
+        },
         'msg.genga.fx.rasterizeColdMiss': {
           ja: function(n) { return 'FXラスタライズ: 画像未ロードで ' + n + ' コマを処理できませんでした。もう一度実行してください。'; },
           ko: function(n) { return 'FX 래스터라이즈: 이미지 미로드로 ' + n + '코마를 처리하지 못했습니다. 다시 실행해주세요.'; },
@@ -70918,8 +70923,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // points = the union of every layer's own exposure start/end frames, so each output segment has a
     // constant set of contributing (layer, exposure) pairs — mirrors the sheet tool's own documented (if imperfect)
     // "replicate the instance structure" approach rather than collapsing to one giant flat frame range.
+    // ver1433: 반환이 exposures 배열에서 { exposures, coldMisses } 로 바뀌었다. 호출부가 **합체를 시작하기
+    // 전에** 미스를 알아야 하기 때문이다 — 아래 gengaMergeLayersFromSelection 이 원본 레이어를 지운다.
     function gengaMergeCompositeExposures(gt, layers) {
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
+      let coldMisses = 0;
       // draw order = each layer's OWN stack position, bottom (largest index) first so the topmost paints last
       const ordered = layers.slice().sort(function(a, b) { return gt.layers.indexOf(b) - gt.layers.indexOf(a); });
       const cuts = new Set([1]);
@@ -70942,10 +70950,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const e = gengaExposureAt(l, segStart);
           if (!e) return;
           const dr = gengaExposureDrawing(l, e);
-          if (!dr || !dr.dataUrl) return;
+          // ver1433: 인코드 대기 중인 그림(dr.canvas, ver1324)은 dataUrl 이 아직 없다 — 옛 조건은 그걸
+          // 「내용 없음」으로 보고 버렸다. ver1430 의 커널로 판정을 맞춘다(gengaDrawDrawingInto 는 대기
+          // 픽셀을 디코드 없이 바로 그린다).
+          if (!gengaDrawingHasArt(dr)) return;
           ctx.globalCompositeOperation = l.blend || 'source-over';
           ctx.globalAlpha = (l.opacity != null ? l.opacity : 1);
+          // ver1433: 여기서 false 는 「그림이 없다」가 아니라 **이미지 캐시가 차갑다**는 뜻이다(위에서
+          // 내용 있음을 이미 확인했다). gengaImageFor 는 첫 요청에 항상 null 을 주고 디코드를 시작하므로
+          // 재실행하면 성공한다 — ver748 이 FXラスタライズ에서 세운 규칙과 같은 몸이다. 세어서 올린다.
           if (gengaDrawDrawingInto(ctx, dr, pw, ph, null)) anyContent = true;
+          else coldMisses += 1;
           ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
         });
         const baked = anyContent ? gengaTrimCanvasToDrawing(cv) : null;
@@ -70955,7 +70970,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           drawing: baked ? gengaIngestDrawing(baked) : null
         });
       }
-      return exposures;
+      return { exposures: exposures, coldMisses: coldMisses };
     }
     function gengaMergeLayersFromSelection() {
       if (!state.project || state.project.kind !== 'genga' || !state.project.gengaTimeline) return;
@@ -70968,7 +70983,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // Heavy synchronous compositing done OUTSIDE runCommand (same reasoning as gengaRasterizeFx's own
       // pre-bake step) — reads the live project directly since runCommand's mutator receives that same object.
       const shape = gengaMergeResultShape(gt, validation);
-      const exposures = gengaMergeCompositeExposures(gt, validation.layers);
+      // ver1433: 이 함수는 아래 runCommand 에서 **원본 레이어들을 지운다**. 그런데 합성이 이미지 캐시가
+      // 차가운 코마를 조용히 건너뛰고 있었다 — 코마 여러 개짜리 레이어를 합치면 화면에 그려진 적 없는
+      // 코마가 대부분이라(디코드 캐시는 그려진 것만 담는다) 상당수가 빈 채로 남고, 원본은 지워졌다.
+      // undo 로 되돌아가긴 하지만 **사용자에게 아무 신호가 없었다.** ver748(FXラスタライズ)·ver750(用紙
+      // 리사이즈)이 각각 같은 병을 「전부-아니면-전무 + 알림」으로 고쳤고, 합체만 그 수정을 못 받았다.
+      const composite = gengaMergeCompositeExposures(gt, validation.layers);
+      if (composite.coldMisses) { alert(t('msg.genga.merge.coldMiss', composite.coldMisses)); return; }
+      const exposures = composite.exposures;
       const mergedId = 'genga-layer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
       runCommand('レイヤー合体', function(p) {
         const pgt = p.gengaTimeline; if (!pgt) return;
