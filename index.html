@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1450</title>
+  <title>MoArt ver1451</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1450</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1451</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -52822,9 +52822,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
+    // ver1451: 선택 클립용 스크래치 버퍼 — **제스처당 한 장**. op 에 매달아 두므로 커밋과 함께 죽는다
+    // (전역 캐시가 아니다 = 붙잡아 두는 메모리 없음). ensurePaintRasterOpBounds 가 확장 레이어에서
+    // op.canvas 를 **제스처 도중에 키우므로** 크기를 매번 대조한다 — 안 하면 옛 크기 버퍼로 잘린 프리뷰가
+    // 나온다. 크기 대입은 그 자체로 캔버스를 초기화하니 그때는 clearRect 가 필요 없지만, 상태 복구
+    // (변환·합성모드·알파)는 어느 경로든 해야 한다: 재사용 캔버스는 앞 회차의 컨텍스트 상태를 물고 있다.
+    function paintShapePreviewClipBuffer(op) {
+      const w = op.canvas.width, h = op.canvas.height;
+      let buf = op.previewClipBuf;
+      if (!buf) { buf = document.createElement('canvas'); op.previewClipBuf = buf; }
+      const ctx = buf.getContext('2d');
+      if (buf.width !== w || buf.height !== h) { buf.width = w; buf.height = h; }
+      else { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; ctx.clearRect(0, 0, w, h); }
+      return buf;
+    }
+
     // ver606: live shape preview — restore the pre-gesture snapshot, then render the CURRENT whole shape
     // on top (WYSIWYG incl. blend modes; drawPaintStroke applies the real composite op for full-path renders).
     // Only op.canvas is previewed; peer canvases (if any) catch up at commit.
+    // ver1451 정정: 그 WYSIWYG 은 **클립 없는 분기에만** 해당한다. 선택영역이 있으면 아래 clip 분기가
+    // 버퍼에 그린 뒤 `drawImage(buf)` 로 얹는데 그것은 source-over · alpha 1 이다 — 合成モード와
+    // 不透明度가 프리뷰에서 빠진다. 커밋(paintRecompositeStrokeForMode)과 원화(gengaShapeComposite)는
+    // 둘 다 공용 커널 paintCompositeBufferOnto 로 gco/alpha 를 적용하므로, **선택영역 안에서 乗算 등의
+    // 도형을 그리면 손 떼는 순간 농도·색이 튄다**(ver943 이 세운 「라이브 픽셀 = 커밋 픽셀」 불변식
+    // 위반). 이번 판에서 안 고친 이유: 합성 계약을 바꾸는 일이라 다섯 합성모드 × 선택 유무의 픽셀
+    // 회귀 증명이 따로 필요하다 — 근거와 착수 조건은 changelog ver1451.
     function paintShapePreviewRedraw(op) {
       if (!op || !op.modeBaseCanvas || !op.canvas || !op.stroke) return;
       const ctx = op.canvas.getContext('2d');
@@ -52850,10 +52872,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // 재계산되는 가짜 성장이라(점 수가 줄기도 함) 세션이 프레임마다 리셋만 반복한다.
           : function(target) { drawPaintStroke(target, op.stroke, CONTE_PAPER_WIDTH, CONTE_PAPER_HEIGHT, op.bitmapX, op.bitmapY, op.shapeKind ? null : op); };
         if (clip) {
-          const buf = document.createElement('canvas');
-          buf.width = op.canvas.width; buf.height = op.canvas.height;
-          renderStrokeInto(buf.getContext('2d'));
+          // ver1451: 종전에는 **재그리기마다 용지 크기 캔버스를 새로 할당**했다. 선택영역이 켜져 있으면
+          // 이 분기가 포인터 이동마다 도는데(드래그 한 번에 수십~수백 장), 실측에서 재그리기 1회가
+          // 선택 없음 0.017ms → 선택 있음 0.597ms 로 **35배**가 됐고 9회 중 1회가 458ms 로 튀었다(GC).
+          // 원화의 형제는 처음부터 옳았다 — gengaDrawStart 가 세션당 shapeBuf 한 장을 잡고
+          // gengaShapeDragMove/gengaPenOutlineRedraw 가 그것을 clearRect 로 씻어 다시 쓴다. 같은 설계를
+          // 콘티에도 준다(0.597 → 0.260ms, 2.3배 · 분산도 55~85ms → 27~33ms 로 붙는다).
+          const buf = paintShapePreviewClipBuffer(op);
           const bc = buf.getContext('2d');
+          renderStrokeInto(bc);
           bc.globalCompositeOperation = 'destination-in';
           bc.drawImage(clip.canvas, clip.x, clip.y);
           bc.globalCompositeOperation = 'source-over';
@@ -52904,7 +52931,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         op.stroke.points = paintShapeLocalPoints(op.shapeKind, op.shapeAnchor, localRawPoint, op.pixelW, op.pixelH,
           { shift: Boolean(event && event.shiftKey), alt: Boolean(event && event.altKey) });
       }
-      paintShapePreviewRedraw(op);
+      // ver1451: 프리뷰는 프레임당 1회. **점 계산은 위에서 동기로 끝났고** 커밋
+      // (paintBakeShapeStroke → paintRecompositeStrokeForMode)은 프리뷰 픽셀이 아니라 op.stroke 에서
+      // 다시 그리므로, 미루는 것은 화면뿐이고 확정 도형은 언제나 마지막 포인터 위치 그대로다.
+      // 늦게 도착한 프레임은 스케줄러가 state.paintRasterOp 동일성으로 버리고, 커밋이 modeBaseCanvas 를
+      // null 로 만들어 커널 머리에서 한 번 더 막힌다.
+      // 실측(561×396 레이어, 마우스 16이벤트/프레임): 선택영역이 켜져 있을 때 9.75ms/프레임(예산 58%)
+      // → 1.35ms(8%), 7.2배. 선택이 없으면 원래 0.27ms 라 눈에 띄는 이득은 선택 쪽이다.
+      schedulePaintRasterPreviewRedraw(op);
     }
 
     // ver607: bucket fill on a conte layer target (paper picture layer OR video layer) — an instant op,
@@ -58199,7 +58233,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (op.type === 'draw' && op.shapeKind && state.paintCurrentStroke) { // ver606 (+curve bend ver608)
         if (op.shapeKind === 'curve' && op.curveChord) {
           op.stroke.points = paintCurveLocalPoints(op.curveChord.a, op.curveChord.b, rawPoint, op.pixelW, op.pixelH);
-          paintShapePreviewRedraw(op);
+          schedulePaintRasterPreviewRedraw(op); // ver1451: 굽히기도 같은 계약 (위 도형 드래그와 한 벌)
           return;
         }
         paintShapeRasterDragUpdate(op, rawPoint, event);
