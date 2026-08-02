@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1437</title>
+  <title>MoArt ver1438</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1437</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1438</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -52887,7 +52887,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           points: op.stroke.points.map(function(p) { return { x: Number(p.x) || 0, y: Number(p.y) || 0 }; }),
           closed: false
         };
-        refreshPaintEditOverlays(op.drawingRef);
+        schedulePaintEditOverlaysRedraw(op.drawingRef); // ver1438: 프레임당 1회
       } else {
         op.stroke.points = paintShapeLocalPoints(op.shapeKind, op.shapeAnchor, localRawPoint, op.pixelW, op.pixelH,
           { shift: Boolean(event && event.shiftKey), alt: Boolean(event && event.altKey) });
@@ -53539,7 +53539,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const btn = document.getElementById('selectionLauncherClear');
       if (btn) btn.title = t('tool.sel.clear.title') + shortcutHint('lassoSelectClear');
     }
+    // ver1438: 라쏘 마퀴도 **프레임당 1회**. ver622 가 스트로크 프리뷰에 세운 바로 그 계약인데
+    // (「펜 태블릿이 디스플레이보다 빨리 이벤트를 준다」) 라쏘 경로만 그 스윕에서 빠져 pointermove
+    // 마다 동기로 다시 그리고 있었다. 그 1회가 싸지 않다 — 폴리곤 전체 순회 3회(복사·투영·트레이스),
+    // 뷰포트 전체 clearRect, gBCR 2회. 게다가 점은 「1스크린px 이동당 1개」로 쌓이므로 폴리곤 길이 n 은
+    // **드래그 속도**가 정하고, 그 상한을 고폴링 마우스(1000Hz)만 채운다 — 펜(133~266Hz)은 못 채운다.
+    // 그래서 같은 코드가 장치에 따라 갈렸다(사용자 제보: 「펜은 안 무거운데 마우스는 엄청 무겁다」).
+    // 코드에 pointerType 분기는 없다 — 전수 확인. 차이는 유량이 만드는 점 밀도뿐이다.
+    let paintOverlayRedrawRaf = 0;
+    let paintOverlayRedrawRef = '';
+    function schedulePaintEditOverlaysRedraw(drawingRef) {
+      paintOverlayRedrawRef = String(drawingRef || '');
+      if (paintOverlayRedrawRaf) return;
+      paintOverlayRedrawRaf = requestAnimationFrame(function() {
+        paintOverlayRedrawRaf = 0;
+        refreshPaintEditOverlays(paintOverlayRedrawRef);
+      });
+    }
     function refreshPaintEditOverlays(drawingRef) {
+      // 직접 호출이 대기 중인 프레임을 **흡수한다** — pointerup·툴 전환·프로젝트 스왑 어디서 들어와도
+      // 뒤늦은 한 프레임이 겹쳐 그려지지 않는다(호출부마다 취소를 기억할 필요가 없다).
+      if (paintOverlayRedrawRaf) { cancelAnimationFrame(paintOverlayRedrawRaf); paintOverlayRedrawRaf = 0; }
       const refFilter = String(drawingRef || '');
       // ver682: only a CONTEXT-VALID preview hides its base canvas — an orphaned preview must not leave the
       // real layer pixels invisible (self-validating rule, same gate as the overlay draw).
@@ -57780,7 +57800,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             points: op.points.map(function(point) { return { x: Number(point.x) || 0, y: Number(point.y) || 0 }; }),
             closed: false
           };
-          refreshPaintEditOverlays(op.drawingRef);
+          schedulePaintEditOverlaysRedraw(op.drawingRef); // ver1438: 프레임당 1회
         }
         return;
       }
@@ -58128,7 +58148,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             points: op.points.map(function(item) { return { x: Number(item.x) || 0, y: Number(item.y) || 0 }; }),
             closed: false
           };
-          refreshPaintEditOverlays(op.drawingRef);
+          schedulePaintEditOverlaysRedraw(op.drawingRef); // ver1438: 프레임당 1회
         }
         return;
       }
@@ -74850,7 +74870,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaPreviewCtx(canvas) {
       return canvas.getContext('2d', { desynchronized: true });
     }
+    // ver1438: 원화 라쏘의 짝. 이쪽은 pointermove 마다 프리뷰를 **통째로 재합성**하고 있었고
+    // (리타깃·온이온·합성·오버레이 전부), 게다가 점 솎아내기가 아예 없어 샘플이 오는 족족 쌓였다.
+    // 같은 파일에 rAF 선례가 둘 있다(ver622 penOutline, ver1043 카메라 드래그) — 그 모양을 따른다.
+    let gengaPreviewRedrawRaf = 0;
+    function scheduleGengaPreviewRedraw() {
+      if (gengaPreviewRedrawRaf) return;
+      gengaPreviewRedrawRaf = requestAnimationFrame(function() {
+        gengaPreviewRedrawRaf = 0;
+        drawGengaPreview();
+      });
+    }
     function drawGengaPreview(boxHint) {
+      if (gengaPreviewRedrawRaf) { cancelAnimationFrame(gengaPreviewRedrawRaf); gengaPreviewRedrawRaf = 0; } // ver1438: 직접 호출이 대기분을 흡수
       syncSelectionLauncher(); // ver1437: 원화의 선택은 이 렌더가 소유한다
       cameraFxWindowSync(); // keep the カメラ window numbers in sync with the genga camera-work frame (no-op if closed/scrubbing)
       tfqWindowSync(); // ver948: transform/perspective numeric rows follow the genga selection quad
@@ -78544,7 +78576,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           pushed = true;
         }
         if (!pushed) return;
-        drawGengaPreview(); ev.preventDefault();
+        scheduleGengaPreviewRedraw(); ev.preventDefault(); // ver1438: 프레임당 1회
       }
     }
     function gengaSelectPointerEnd(ev) {
