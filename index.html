@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1439</title>
+  <title>MoArt ver1440</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1439</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1440</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -54733,7 +54733,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       else ctx.setTransform(scaleX, 0, 0, scaleY, fbx - fx0 * scaleX, fby - fy0 * scaleY);
       const dispScale = fRect.width / flw; // display(visual) px per layer px → constant screen-size marquee/handles
       const mstyle = paintMarqueeStyle(dispScale);
-      const marqueePx = mstyle.line;
       const rawPreview = state.paintTransformPreview;
       const transformPreview = rawPreview && paintTransformUiRefValid(rawPreview.drawingRef) ? rawPreview : null;
       const selection = state.paintSelection;
@@ -54758,14 +54757,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             bitmapX: paintSelectionBitmapX(selection) + Math.round(transformPreview.moveDx || 0),
             bitmapY: paintSelectionBitmapY(selection) + Math.round(transformPreview.moveDy || 0)
           };
-        } else if (!drawPaintTransformedSelectionOutline(ctx, transformPreview, MARQUEE_COLOR, marqueePx)) {
+        } else if (!drawPaintTransformedSelectionOutline(ctx, transformPreview, MARQUEE_COLOR)) {
           overlaySelection = selection; // ver1284: 매핑할 소스 정보가 없으면 원본이라도 보여 준다 — 숨기지 않는다
         }
       }
       if (overlaySelection && overlaySelection.maskCanvas && overlaySelection.bounds) {
         ctx.save();
         ctx.translate(Math.round(Number(overlaySelection.bitmapX) || 0), Math.round(Number(overlaySelection.bitmapY) || 0));
-        drawPaintMaskOutline(ctx, overlaySelection.maskCanvas, MARQUEE_COLOR, marqueePx);
+        drawPaintMaskOutline(ctx, overlaySelection.maskCanvas, MARQUEE_COLOR);
         ctx.restore();
       }
       const lasso = state.paintLassoPreview;
@@ -54834,7 +54833,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 있어야 "변형 중 앤츠"를 마스크 워프 없이 그릴 수 있다(워프는 실측 35.7ms/회 — 드래그에 못 쓴다).
     // 대시 판정 ((x+y)%10)<6 은 원본 좌표 기준이라 뽑는 시점에 미리 걸러 둔다 — 변형돼도 같은 점이 찍힌다.
     const paintMaskEdgeCache = new WeakMap();
-    function paintMaskEdgePoints(maskCanvas) {
+    // ver1440: 경계 픽셀을 **순서 있는 윤곽**으로 잇는다.
+    // 종전에는 경계 픽셀을 순서 없이 모아 두고 `(x + y) % 10 < 6` 이라는 **대각 줄무늬**로 솎아 냈다.
+    // 그 줄무늬는 윤곽이 아니라 좌표계에 고정돼 있어서, 윤곽이 45°에 가까우면 통째로 켜지거나 통째로
+    // 꺼진다 — 「같은 선인데 위쪽은 이어지고 왼쪽 아래는 뚝뚝 끊긴다」(사용자 스크린샷)의 정체다.
+    // 순서가 있으면 대시를 **윤곽 길이**로 넣을 수 있고, 그게 marching ants 의 정의다.
+    // 잇는 방법은 탐욕 걷기(미방문 8이웃 중 첫 번째). 자기 접촉 도형에서 한 번 건너뛸 수 있지만 그
+    // 실패는 「대시 위상이 한 번 리셋된다」로 끝난다 — Moore 추적의 무한 루프 위험을 사지 않는다.
+    // 매 걸음 한 픽셀을 used 로 찍고 미방문으로만 이동하므로 종료는 구조적으로 보장된다.
+    const PAINT_MASK_NB8 = [1, 0, 1, 1, 0, 1, -1, 1, -1, 0, -1, -1, 0, -1, 1, -1];
+    function paintMaskContours(maskCanvas) {
       if (!maskCanvas) return null;
       const cached = paintMaskEdgeCache.get(maskCanvas);
       if (cached) return cached;
@@ -54850,56 +54858,111 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (x < 0 || y < 0 || x >= width || y >= height) return false;
         return data[(y * width + x) * 4 + 3] > 0;
       };
-      const points = [];
+      const edge = new Uint8Array(width * height);
+      const seeds = [];
       for (let y = 0; y < height; y += 1) {
         for (let x = 0; x < width; x += 1) {
           if (!inside(x, y)) continue;
           if (inside(x - 1, y) && inside(x + 1, y) && inside(x, y - 1) && inside(x, y + 1)) continue; // 안쪽
-          if (((x + y) % 10) < 6) points.push(x, y);
+          edge[y * width + x] = 1;
+          seeds.push(y * width + x);
         }
       }
-      paintMaskEdgeCache.set(maskCanvas, points);
-      return points;
+      const used = new Uint8Array(width * height);
+      const contours = [];
+      for (let s = 0; s < seeds.length; s += 1) {
+        if (used[seeds[s]]) continue;
+        const path = [];
+        let cur = seeds[s];
+        while (cur >= 0) {
+          used[cur] = 1;
+          const cx = cur % width;
+          const cy = (cur - cx) / width;
+          path.push(cx, cy);
+          let next = -1;
+          for (let k = 0; k < 16; k += 2) {
+            const nx = cx + PAINT_MASK_NB8[k];
+            const ny = cy + PAINT_MASK_NB8[k + 1];
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const ni = ny * width + nx;
+            if (edge[ni] && !used[ni]) { next = ni; break; }
+          }
+          cur = next;
+        }
+        if (path.length >= 4) contours.push(path);
+      }
+      paintMaskEdgeCache.set(maskCanvas, contours);
+      return contours;
     }
-    function drawPaintMaskOutline(ctx, maskCanvas, color, dotPx) {
-      if (!ctx || !maskCanvas) return;
-      const points = paintMaskEdgePoints(maskCanvas);
-      if (!points) return;
-      const sz = Math.max(0.55, Number(dotPx) || 1.3); // ver649: screen-scale-aware thin selection edge
-      // ver618: thin colored dashes with TRANSPARENT gaps (no white halo, no white counter-dash)
+
+    // ver1440: 마퀴 점 찍기의 **한 벌**. 두 소비자가 같은 몸을 쓴다 — 그대로 그리기와 변형 quad 로
+    // 휘어 그리기. 둘 다 (a) 대시를 **화면 거리**로 재고 (b) 점을 **디바이스 픽셀 격자에 정수로** 찍는다.
+    //  (a) 화면 거리로 재야 확대/축소와 무관하게 간격이 일정하고, 퍼스펙티브로 휘어도 균일하다
+    //      (휜 뒤의 화면 좌표로 재기 때문이다 — 마스크 좌표로 쟀으면 원근에서 다시 갈렸을 것이다).
+    //  (b) 레이어 좌표로 찍으면 변환이 소수점을 만들어 캔버스가 안티에일리어싱으로 번지게 한다 —
+    //      그게 「펜으로 그은 느낌」의 정체였다. 정수 디바이스 픽셀은 번지지 않고, 두께도 1 device px
+    //      (고DPI 에서 0.5 CSS px)라 1px 보다 얇다. Canvas2D 는 패스 안티를 못 끄지만 이 방법은 애초에
+    //      안티가 생길 여지를 안 만든다.
+    // mapPoint(x, y) → 오버레이 좌표. 생략하면 마스크 좌표를 그대로 쓴다.
+    function drawMarqueeContourDots(ctx, maskCanvas, color, mapPoint) {
+      const contours = paintMaskContours(maskCanvas);
+      if (!contours || !contours.length) return false;
+      const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
+      const period = MARQUEE_DASH_ON + MARQUEE_DASH_OFF;
       ctx.save();
-      ctx.fillStyle = color || MARQUEE_COLOR; // ver1071 (A6)
-      for (let i = 0; i < points.length; i += 2) ctx.fillRect(points[i], points[i + 1], sz, sz);
+      ctx.fillStyle = color || MARQUEE_COLOR;
+      if (m) ctx.setTransform(1, 0, 0, 1, 0, 0);
+      for (let c = 0; c < contours.length; c += 1) {
+        const path = contours[c];
+        let phase = 0;
+        let prevX = 0, prevY = 0, hasPrev = false;
+        for (let i = 0; i < path.length; i += 2) {
+          const src = mapPoint ? mapPoint(path[i], path[i + 1]) : null;
+          const lx = src ? src.x : path[i];
+          const ly = src ? src.y : path[i + 1];
+          const sx = m ? (m.a * lx + m.c * ly + m.e) : lx;
+          const sy = m ? (m.b * lx + m.d * ly + m.f) : ly;
+          if (hasPrev) {
+            const dx = sx - prevX, dy = sy - prevY;
+            phase += Math.sqrt(dx * dx + dy * dy);
+          }
+          prevX = sx; prevY = sy; hasPrev = true;
+          if ((phase % period) >= MARQUEE_DASH_ON) continue;
+          ctx.fillRect(Math.round(sx), Math.round(sy), 1, 1);
+        }
+      }
       ctx.restore();
+      return true;
+    }
+    // ver618: thin colored dashes with TRANSPARENT gaps (no white halo, no white counter-dash)
+    // ver1440: 두께 인자(dotPx)가 사라졌다 — 점은 언제나 1 device px 다(공용 커널 주석 참고).
+    function drawPaintMaskOutline(ctx, maskCanvas, color) {
+      if (!ctx || !maskCanvas) return;
+      drawMarqueeContourDots(ctx, maskCanvas, color, null);
     }
     // ver1284: 미확정 변형 중에도 선택 점선을 변형에 맞춰 보여 준다. 종전에는 순수 이동만 델타로 밀어
     // 그리고 회전·크기·퍼스펙티브에서는 앤츠를 통째로 숨겼는데, 그러면 화면에 기즈모만 남아 사용자가
     // "선택 점선을 한 번 버리고 기즈모가 선택인 것처럼 둔갑한다"고 읽게 된다(실제 보고이자 정확한 진단).
     // 커밋(paintSelectionAfterTransform)과 **같은 uv 수학**을 쓰되 마스크가 아니라 캐시된 외곽 점만 옮기므로
     // 비용은 점 개수에 비례한다. 그리는 좌표계는 오버레이 ctx = 용지 좌표라 work-canvas 오프셋을 되뺀다.
-    function drawPaintTransformedSelectionOutline(ctx, preview, color, dotPx) {
+    function drawPaintTransformedSelectionOutline(ctx, preview, color) {
       const selection = preview && preview.source && preview.source.selection;
       const src = preview && preview.source && preview.source.sourceBounds;
       if (!ctx || !selection || !selection.maskCanvas || !src || !(src.w > 0) || !(src.h > 0)) return false;
       const quad = paintTransformBoxQuadArray(preview.box);
       if (!Array.isArray(quad) || quad.length !== 4) return false;
-      const points = paintMaskEdgePoints(selection.maskCanvas);
-      if (!points || !points.length) return false;
       const offsetX = Math.round(Number(preview.layerCanvasOffsetX) || 0);
       const offsetY = Math.round(Number(preview.layerCanvasOffsetY) || 0);
       const maskX = paintSelectionBitmapX(selection) + offsetX;
       const maskY = paintSelectionBitmapY(selection) + offsetY;
-      const sz = Math.max(0.55, Number(dotPx) || 1.3);
-      ctx.save();
-      ctx.fillStyle = color || MARQUEE_COLOR;
-      for (let i = 0; i < points.length; i += 2) {
-        const u = (maskX + points[i] - src.x) / src.w;
-        const v = (maskY + points[i + 1] - src.y) / src.h;
+      // ver1440: 점 찍기·대시·크리스프는 공용 커널이 하고, 여기는 **uv → quad 매핑만** 넘긴다.
+      // 커널이 대시를 「휜 뒤의 화면 거리」로 재므로 원근에서도 간격이 균일하다.
+      return drawMarqueeContourDots(ctx, selection.maskCanvas, color, function(mx, my) {
+        const u = (maskX + mx - src.x) / src.w;
+        const v = (maskY + my - src.y) / src.h;
         const p = paintQuadBilinearPoint(quad, u, v);
-        ctx.fillRect(p.x - offsetX, p.y - offsetY, sz, sz);
-      }
-      ctx.restore();
-      return true;
+        return { x: p.x - offsetX, y: p.y - offsetY };
+      });
     }
 
     function paintSelectionBitmapX(selection) {
