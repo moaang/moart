@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1447</title>
+  <title>MoArt ver1448</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8887,7 +8887,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1447</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1448</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -64785,7 +64785,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaSettleDrawingEncode(ref, entry, dataUrl) {
       const url = String(dataUrl || '');
       gengaDrawStore.set(ref, url);
-      try { putWorkspaceDbValue('gd:' + ref, url); } catch (e) {}
+      // ver1448: putWorkspaceDbValue 는 async 라 이 try/catch 가 **rejection 을 못 잡는다**(쿼터 초과 ·
+      // 트랜잭션 abort 가 unhandled rejection 으로 새고, base64 는 디스크에 안 들어간다 → 다음 세션에
+      // 빈 코마). 조용히 새지 않게 붙잡아 기록한다.
+      try {
+        const put = putWorkspaceDbValue('gd:' + ref, url);
+        if (put && typeof put.catch === 'function') put.catch(function(err) {
+          console.error('[gengaEncode] IndexedDB write failed for gd:' + ref + ' - this drawing will not survive a reload', err);
+        });
+      } catch (e) { console.error('[gengaEncode] IndexedDB write threw for gd:' + ref, e); }
       gengaLastStrokeCanvas = { dataUrl: url, canvas: entry.fullCanvas || entry.canvas };
       gengaImageFor(url, drawGengaPreview); // start the decode now, off the stroke
       if (entry.layerId != null && state.project && state.project.kind === 'genga') {
@@ -64793,14 +64801,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         drawGengaLayerThumbs([entry.layerId]);
       }
     }
+    // ver1448: **인코드에 실패하면 그 결과를 정본에 쓰지 않는다.** 종전에는 toDataURL 이 실패하면 빈
+    // 문자열을 그대로 settle 로 넘겼고, settle 은 그것을 store 와 IndexedDB 양쪽에 적었다 —
+    // gengaDrawingUrl 은 '' 를 「그림 없음」으로 읽으므로 **그 획이 메모리와 디스크에서 영구히 사라졌고
+    // 로그도 없었다.** 콘티의 형제(flushLayerLiveBitmapDataUrl)는 같은 상황에서 dirty 를 유지하고
+    // console.error 를 남긴다 — 그 계약을 그대로 옮긴다.
+    // 실패분을 pending 에 되돌려 두면 **픽셀이 캔버스로 살아 있고**(gengaResolveDrawing 이 대기분을
+    // 그림으로 친다) 다음 flush 가 다시 시도한다. 빈 문자열을 쓰는 것보다 언제나 낫다.
+    // 시도 상한은 콘티와 같은 상수 — 영구 실패(타락한 캔버스/OOM)에 무한 재시도하지 않는다.
     function gengaFlushPendingDrawingEncodes() {
       if (!gengaPendingDrawingEncode.size) return;
       const entries = Array.from(gengaPendingDrawingEncode.entries());
       gengaPendingDrawingEncode.clear();
       entries.forEach(function(kv) {
+        const ref = kv[0], entry = kv[1];
         let url = '';
-        try { url = kv[1].canvas.toDataURL('image/png'); } catch (e) { url = ''; }
-        gengaSettleDrawingEncode(kv[0], kv[1], url);
+        try { url = entry.canvas.toDataURL('image/png'); } catch (e) {
+          entry.encodeFailures = (entry.encodeFailures || 0) + 1;
+          console.error('[gengaEncode] toDataURL failed (attempt ' + entry.encodeFailures + '/' +
+            LAYER_BITMAP_FLUSH_MAX_ATTEMPTS + ') for ' + ref +
+            ' - keeping the pixels pending instead of storing an empty drawing', e);
+          if (entry.encodeFailures < LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) gengaPendingDrawingEncode.set(ref, entry);
+          else console.error('[gengaEncode] giving up on ' + ref + ' - the drawing stays unsaved');
+          return;
+        }
+        gengaSettleDrawingEncode(ref, entry, url);
       });
     }
     // canonicalize a drawing object (legacy {dataUrl,w,h} or already {ref,w,h}) → {ref,w,h[,x,y]}; null-safe.
@@ -64886,7 +64911,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       if (!refs.size) return;
       let loaded = 0;
-      for (const ref of refs) { try { const v = await getWorkspaceDbValue('gd:' + ref); if (v) { gengaDrawStore.set(ref, String(v)); loaded++; } } catch (e) {} }
+      let missing = 0;
+      for (const ref of refs) {
+        try {
+          const v = await getWorkspaceDbValue('gd:' + ref);
+          if (v) { gengaDrawStore.set(ref, String(v)); loaded++; }
+          else missing += 1; // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
+        } catch (e) { missing += 1; console.error('[gengaHydrate] read failed for gd:' + ref, e); }
+      }
+      // ver1448: 종전에는 loaded 만 세고 결측은 조용히 지나갔다 — 사용자는 **원인 불명의 빈 코마**를 본다.
+      // 형제인 gengaPreloadExportImages 는 같은 상황을 이미 카운트+경고한다(ver853).
+      if (missing) console.error('[gengaHydrate] ' + missing + ' of ' + refs.size + ' drawing(s) had no stored data - those komas will appear blank');
       if (loaded && state.project && state.project.kind === 'genga') { drawGengaPreview(); drawGengaLayerThumbs(); }
     }
     // inline {ref}→{dataUrl} (from the store) for PORTABLE serialization (file save / export). Operates on a clone.
@@ -66260,13 +66295,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return { plan: plan, warnings: warnings };
     }
     // Await decode of a specific dataUrl into gengaImageCache so gengaDrawDrawingInto can draw it synchronously.
+    // ver1448: 디코드 **실패를 성공과 구분한다.** 종전에는 `img.onerror = res` 라 실패가 성공과 똑같이
+    // 떨어졌고, 뒤이어 gengaDrawDrawingInto 가 false 를 돌려주면 compositeDrawItems 의 빈 catch 가 그것을
+    // 삼켰다 — **그 레이어가 빠진 파일이 조용히 저장됐다.** 영상 export 는 ver853 이 같은 병을 고쳐
+    // 실패를 세고 콘솔·상태줄에 낸다; 일괄 이미지 계열만 그 수정을 못 받았다.
+    // 이번 판은 **기록과 반환값**까지 한다(조용한 실패 금지). 「몇 장 빠졌으니 중단」의 사용자 알림은
+    // 호출부마다 판단이 달라 별건으로 남긴다 — 근거는 changelog ver1448.
     function gengaDecodeIntoCache(dataUrl) {
       return new Promise(function(res) {
-        if (!dataUrl) { res(); return; }
+        if (!dataUrl) { res(false); return; }
         const cached = gengaImageCache.get(dataUrl);
-        if (cached && cached.complete) { res(); return; }
+        if (cached && cached.complete) { res(Boolean(cached.naturalWidth)); return; }
         const img = new Image();
-        img.onload = res; img.onerror = res;
+        img.onload = function() { res(true); };
+        img.onerror = function() {
+          console.error('[gengaDecode] image decode failed - anything composited from it will be missing this layer');
+          res(false);
+        };
         img.src = dataUrl;
         gengaImageCache.set(dataUrl, img);
       });
@@ -72008,6 +72053,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       img = new Image();
       if (onReady) img.addEventListener('load', function() { onReady(); }, { once: true });
+      // ver1448: onerror 배선이 아예 없었다. 깨진 base64 는 complete=true / naturalWidth=0 이 되고, 그
+      // 상태의 이미지를 drawImage 하면 사양상 **조용히 아무것도 안 그린다** — 그런데
+      // gengaDrawDrawingInto 는 「그렸다(true)」를 돌려준다. 그 결과 빈 고스트가 오니온 캐시에 박힌다.
+      // 최소한 말은 하게 한다(gengaDrawnBounds 는 이미 !naturalWidth 를 검사한다 — 누군가는 알고 있었다).
+      img.addEventListener('error', function() {
+        console.error('[gengaImage] decode failed - draws from this ref will silently produce nothing');
+      }, { once: true });
       retrimBudgetedMapOnDecode(gengaImageCache, img, dataUrl, GENGA_IMAGE_CACHE_MAX, 'image');
       img.src = dataUrl;
       budgetedMapSet(gengaImageCache, dataUrl, img, GENGA_IMAGE_CACHE_MAX, 'image'); // ver1055: LRU by BYTES (item cap is the backstop)
