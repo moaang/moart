@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1461</title>
+  <title>MoArt ver1462</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -46443,25 +46443,39 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { keys: keys, drawRefs: drawRefs, audioRefs: audioRefs, unknown: unknown, payloadCount: payloadKeys.length };
     }
 
+    // ver1462: **「이 행이 아직 쓰이는가」의 판정은 여기 한 곳이다.**
+    // ver1456~1460 을 여러 판에 걸쳐 쌓는 동안 같은 두 줄이 **세 곳**으로 늘어 있었다: 조사의 무참조
+    // 목록 · 조사의 사용 중 개수 · 자동 sweep 의 무참조 목록. 셋이 갈리면 **화면이 보여 준 목록과
+    // 정리가 지우는 목록이 달라진다** — 그림을 지우는 기능에서 그건 그대로 사고다.
+    // 접두사 길이(slice(3))도 여기 한 번만 있다: 'gd:'/'ga:' 가 바뀌면 고칠 자리가 하나다.
+    // 한 번 순회로 둘 다 낸다(종전에는 조사가 같은 목록을 두 번 훑었다).
+    function storagePartitionRows(live) {
+      const unused = [];
+      let kept = 0;
+      (live && live.keys || []).forEach(function(k) {
+        const b = storageKeyBucket(k);
+        let referenced;
+        if (b === 'gd') referenced = live.drawRefs.has(k.slice(3));
+        else if (b === 'ga') referenced = live.audioRefs.has(k.slice(3));
+        else return; // 그림·음성 행이 아니면 이 판정의 대상이 아니다(프로젝트 payload·버전·팁 등)
+        if (referenced) kept += 1; else unused.push(k);
+      });
+      return { unused: unused, kept: kept };
+    }
+
     // 무사용 조사. 바이트는 **무참조 행만** 읽어서 잰다 — IndexedDB 에 레코드 크기 API 가 없고,
     // 전부 읽으면 base64 수백 MB 가 메모리에 올라온다.
+    // ver1460: **사용 중인 행 수도 낸다.** 「미사용 3178건」만 보여 주면 그것이 정상인지(원화는 커밋마다
+    // 새 ref 라 고아가 대부분인 게 정상이다) root 수집이 통째로 실패한 것인지 사용자가 구별할 수 없다.
     async function storageUnreferencedScan(onProgress) {
       const live = await storageLiveRefsScan(onProgress);
-      const unused = [];
-      live.keys.forEach(function(k) {
-        const b = storageKeyBucket(k);
-        if (b === 'gd' && !live.drawRefs.has(k.slice(3))) unused.push(k);
-        else if (b === 'ga' && !live.audioRefs.has(k.slice(3))) unused.push(k);
-      });
-      // ver1460: **사용 중인 행 수도 센다.** 「미사용 3178건」만 보여 주면 그것이 정상인지
-      // (원화는 커밋마다 새 ref 라 고아가 대부분인 게 정상이다) 아니면 root 수집이 통째로 실패한
-      // 것인지 사용자가 구별할 수 없다. 둘 다 보여 주면 스스로 검산할 수 있다.
-      let kept = 0;
-      live.keys.forEach(function(k) {
-        const b = storageKeyBucket(k);
-        if (b === 'gd' && live.drawRefs.has(k.slice(3))) kept += 1;
-        else if (b === 'ga' && live.audioRefs.has(k.slice(3))) kept += 1;
-      });
+      // ver1462: **모르면 목록을 만들지 않는다.** 호출부가 unknown 을 먼저 보지만(runStorageUnreferencedScan
+      // 이 정리 버튼을 안 연다), 「함수가 위험한 목록을 돌려주지 않는 것」이 한 겹 더 안전하다 —
+      // 누가 이 반환값을 그대로 삭제에 쓰는 순간이 사고다. 덤으로 무참조 행 바이트 측정도 건너뛴다.
+      if (live.unknown) return { keys: [], count: 0, bytes: 0, unknown: live.unknown, kept: 0 };
+      const part = storagePartitionRows(live);
+      const unused = part.unused;
+      const kept = part.kept;
       let bytes = 0;
       for (let i = 0; i < unused.length; i += 1) {
         try { const v = await getWorkspaceDbValue(unused[i]); bytes += v ? String(v).length : 0; }
@@ -46497,12 +46511,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           console.warn('[storage] sweep skipped — ' + live.unknown + ' saved payload(s) unreadable; refusing to delete on a guess');
           return { blocked: live.unknown, deleted: 0, pending: 0 };
         }
-        const unused = [];
-        live.keys.forEach(function(k) {
-          const b = storageKeyBucket(k);
-          if (b === 'gd' && !live.drawRefs.has(k.slice(3))) unused.push(k);
-          else if (b === 'ga' && !live.audioRefs.has(k.slice(3))) unused.push(k);
-        });
+        const unused = storagePartitionRows(live).unused; // ver1462: 조사와 **같은 판정**
         let prev = {};
         try { prev = (await getWorkspaceDbValue(STORAGE_SWEEP_STREAK_KEY)) || {}; } catch (error) { prev = {}; }
         if (!prev || typeof prev !== 'object') prev = {};
@@ -64253,17 +64262,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // Renders one cut group's コンテ撮 sheet into a detached (never attached to the DOM) SVG — draws
     // through the exact same kernel genga's live panel uses, so nothing here can be "a different format".
-    function conteRenderTimesheetSvg(project, ownerCut) {
+    function conteRenderTimesheetSvg(project, ownerCut, pageIndex) {
       const layout = conteCutGroupLocalLayout(project, ownerCut);
       const gt = conteCutGroupToGengaTimeline(project, ownerCut, layout);
       const parts = projectNameParts(project);
+      const page = Math.max(0, Math.round(Number(pageIndex) || 0));
       const svg = document.createElementNS(GENGA_TS_NS, 'svg');
       renderTimesheetKernel(svg, gt, {
         nameParts: { work: parts.work, ep: parts.ep, cut: String(ownerCut.cutNo || '') },
-        title: project.title, currentFrame: 1, syncPlayhead: false, applyZoom: false,
+        title: project.title, currentFrame: page * timesheetPageFramesFor(gt) + 1, syncPlayhead: false, applyZoom: false,
         dialogueManual: conteBuildDialogManual(project, ownerCut, layout)
       });
       return svg;
+    }
+    // Shared kernel: how many コンテ撮 sheet pages this cut group needs — must be known *before* the export
+    // loop calls conteRenderTimesheetSvg once per page. Fixes cuts ≥144 (or ≥72 once >10 cels) frames
+    // silently losing everything past page 0 — writeCtExportGroups used to render only pageIndex 0.
+    function conteCutGroupTimesheetPageCount(project, ownerCut) {
+      const layout = conteCutGroupLocalLayout(project, ownerCut);
+      const gt = conteCutGroupToGengaTimeline(project, ownerCut, layout);
+      return Math.max(1, Math.ceil(gt.totalFrames / timesheetPageFramesFor(gt)));
     }
 
     async function conteRasterizeSvgToCanvas(svgEl, scale) {
@@ -64481,8 +64499,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (onStatus) onStatus('C' + g.cutNo + ' (' + (i + 1) + '/' + groups.length + ')');
         const base = [parts.work, parts.ep, g.cutNo, 'CT'].filter(Boolean).join('_');
         try {
-          const svg = conteRenderTimesheetSvg(project, g.cut);
-          const sheetCanvas = await conteRasterizeSvgToCanvas(svg);
+          // ver: a cut can span more than one printed timesheet page (conteCutGroupTimesheetPageCount) —
+          // render+write one PNG per page, or the tail of any cut ≥144(or 72) frames silently vanished.
+          const pageCount = conteCutGroupTimesheetPageCount(project, g.cut);
+          const sheetCanvases = [];
+          for (let p = 0; p < pageCount; p += 1) {
+            sheetCanvases.push(await conteRasterizeSvgToCanvas(conteRenderTimesheetSvg(project, g.cut, p)));
+          }
           const json = buildConteShootSheetSettingsJson(project, g.cut);
           const komas = await conteRenderKomaImages(project, g.cut);
           // null = no real camera work on this cut (conteRenderCameraInstructionCanvas's own gate) —
@@ -64490,18 +64513,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const camCanvas = await conteRenderCameraInstructionCanvas(project, g.cut);
           if (dirHandle) {
             const sub = await dirHandle.getDirectoryHandle(base, { create: true });
-            await writeFile(sub, base + '.png', await canvasToBlob(sheetCanvas, 'image/png'));
+            for (let p = 0; p < sheetCanvases.length; p += 1) {
+              const sheetName = p === 0 ? (base + '.png') : (base + '_' + (p + 1) + '.png');
+              await writeFile(sub, sheetName, await canvasToBlob(sheetCanvases[p], 'image/png'));
+            }
             await writeFile(sub, base + '.json', JSON.stringify(json, null, 2));
             for (const koma of komas) await writeFile(sub, koma.label + '.png', await canvasToBlob(koma.canvas, 'image/png'));
             if (camCanvas) {
               const camDir = await sub.getDirectoryHandle('_camera', { create: true });
               await writeFile(camDir, base + '_CAM.png', await canvasToBlob(camCanvas, 'image/png'));
             }
-            results.push({ cutNo: g.cutNo, base: base, written: true, komaCount: komas.length, hasCamera: !!camCanvas });
+            results.push({ cutNo: g.cutNo, base: base, written: true, pageCount: sheetCanvases.length, komaCount: komas.length, hasCamera: !!camCanvas });
           } else {
             results.push({
               cutNo: g.cutNo, base: base, json: json,
-              sheetPngDataUrl: sheetCanvas.toDataURL('image/png'),
+              sheetPngDataUrls: sheetCanvases.map(function(c) { return c.toDataURL('image/png'); }),
               camPngDataUrl: camCanvas ? camCanvas.toDataURL('image/png') : null,
               komas: komas.map(function(k) { return { label: k.label, pngDataUrl: k.canvas.toDataURL('image/png') }; })
             });
@@ -69498,6 +69524,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         currentFrame: gengaCurrentFrame(), syncPlayhead: true, applyZoom: true
       });
     }
+    // Shared kernel: how many frames fit on one printed timesheet page for this `gt` (Auto Sheet paper —
+    // 144 frames/6s when ≤ 10 cels fit two blocks side by side, 72 frames/3s once cels force one wide block).
+    // Both the live panel's page math (inside renderTimesheetKernel) and conte's コンテ撮 batch export (which
+    // must know the page count *before* rendering, to loop and write one file per page) call this — a single
+    // formula, so the two can never disagree about how many pages a cut needs.
+    function timesheetPageFramesFor(gt) {
+      const nCel = gengaSheetRowLabels(gt).order.length;
+      return nCel > 10 ? 72 : 144;
+    }
     // Shared kernel: draws one gengaTimeline-shaped `gt` onto `svg` (the 72-row Auto-Sheet-style exposure
     // sheet — cel-token columns, Dialog header, camera lanes). Used by both genga's live panel (gt =
     // state.project.gengaTimeline, meta from state.project) and conte's コンテ撮 export (gt = a per-cut-group
@@ -69515,8 +69550,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // rest stay empty but ruled/labelled (A,B,C…). More than 8 cels just widens the count to fit them.
       const nCol = Math.max(8, nCel);
       const colLabel = function(i) { return i < nCel ? (labels.byId[cels[i].id] || '') : (i < 26 ? String.fromCharCode(65 + i) : 'A' + String.fromCharCode(39 + i)); };
-      const single = nCel > 10;                               // >10 cels → one wide block, else two side by side
-      const pageFrames = single ? 72 : 144;
+      const pageFrames = timesheetPageFramesFor(gt);           // single source of truth — conte's export loop calls the same helper
+      const single = pageFrames === 72;                        // >10 cels → one wide block, else two side by side
       const totalPages = Math.max(1, Math.ceil(total / pageFrames));
       const page = Math.max(0, Math.min(totalPages - 1, Math.floor((Math.max(1, Math.round(Number(meta.currentFrame) || 1)) - 1) / pageFrames)));
       const PAGE_W = 1753, PAGE_H = 2480, TOP = 450, NAMEH = 44, BODYH = 1912, ROWH = BODYH / 72;
