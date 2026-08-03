@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1457</title>
+  <title>MoArt ver1458</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8909,7 +8909,7 @@
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Version</span>
-          <span id="versionInfoVersionValue" class="version-info-value">ver1457</span>
+          <span id="versionInfoVersionValue" class="version-info-value">ver1458</span>
         </div>
         <div class="version-info-row">
           <span class="version-info-label">Schema</span>
@@ -21258,6 +21258,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // switchToProjectTab 은 쓰지 않는다 — 그건 먼저 **현재 프로젝트를 스냅샷**하는데, 방금 닫기로 버린
       // 것을 도로 저장하게 된다(사용자는 이미 폐기를 골랐다). 스냅샷 없는 안쪽 호출만 쓴다.
       if (nextId) await restoreIndexedDbProjectById(nextId);
+      // ver1458: 닫기는 **폐기**다(위 주석) — 저장 안 된 편집분의 그림은 여기서 무참조가 된다.
+      // 닫은 프로젝트 자체는 슬롯 payload 가 남아 있으므로 그 그림은 계속 root 다.
+      scheduleStorageSweep('close-slot');
     }
     // ver1261: backup chips are their own control, not a restyled tab — pill silhouette, kind DOT (not the
     // square badge), mid-air alignment. Click = switch (auto-pins if a slot is free, ver1260); DRAG onto the
@@ -46113,6 +46116,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!id || (state.project && state.project.projectId === id)) return;
       await snapshotCurrentProjectForTabSwitch();
       await restoreIndexedDbProjectById(id);
+      scheduleStorageSweep('tab-switch'); // ver1458: 방금 떠난 프로젝트도 슬롯 payload 에 있으므로 그 그림은 root 다
     }
 
     function applyRestoredIndexedDbProject(payload) {
@@ -46367,6 +46371,68 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (onProgress) onProgress(live.payloadCount + i + 1, live.payloadCount + unused.length);
       }
       return { keys: unused, count: unused.length, bytes: bytes, unknown: live.unknown };
+    }
+
+    // ── ver1458: 무참조 정리 ────────────────────────────────────────────────────────────────────
+    // 획 하나가 영구 IndexedDB 행 하나였다('gd:' 를 지우는 코드가 0곳이었다 — ver1441 이 확인). 이제
+    // 지운다. **사용자 그림을 지우는 코드**이므로 안전장치가 먼저다.
+    //
+    // 결정(2026-08-03, 사용자): ① 유예 = **저장 성공 3회 연속 무참조**여야 삭제. 시계에 안 기댄다
+    // (기기 시각이 바뀌어도 안 틀린다) — 카운터 하나면 된다. ② 시점 = **명시적 저장·프로젝트 닫기·
+    // 탭 전환**뿐. 자동저장에서는 안 돈다: 한 번 도는 데 저장된 payload 를 전부 파싱해야 해서
+    // (슬롯 8 + 프로젝트마다 버전 5) 자동저장마다 감당할 무게가 아니다.
+    //
+    // **모르면 아무것도 안 한다.** storageLiveRefsScan 의 unknown 은 「참조가 없다」가 아니라
+    // 「읽지 못해서 모른다」다(깨진 payload·빈 행). 하나라도 있으면 카운트조차 올리지 않는다 —
+    // 올리면 세 번 뒤에 삭제로 이어진다. 이 한 줄이 이 기능의 전체 안전 마진이다.
+    const STORAGE_SWEEP_STREAK_KEY = 'gcMissStreak'; // { '<row key>': 연속 무참조 횟수 }
+    const STORAGE_SWEEP_STREAK_LIMIT = 3;
+    let storageSweepRunning = false;
+
+    async function storageSweepUnreferenced() {
+      if (!indexedDbAutosaveAvailable() || storageSweepRunning) return null;
+      storageSweepRunning = true;
+      try {
+        const live = await storageLiveRefsScan(null);
+        if (live.unknown) {
+          // 조용한 실패 금지 — 정리가 왜 안 돌았는지 남긴다. 사용자에게는 저장공간 패널이 같은 말을 한다.
+          console.warn('[storage] sweep skipped — ' + live.unknown + ' saved payload(s) unreadable; refusing to delete on a guess');
+          return { blocked: live.unknown, deleted: 0, pending: 0 };
+        }
+        const unused = [];
+        live.keys.forEach(function(k) {
+          const b = storageKeyBucket(k);
+          if (b === 'gd' && !live.drawRefs.has(k.slice(3))) unused.push(k);
+          else if (b === 'ga' && !live.audioRefs.has(k.slice(3))) unused.push(k);
+        });
+        let prev = {};
+        try { prev = (await getWorkspaceDbValue(STORAGE_SWEEP_STREAK_KEY)) || {}; } catch (error) { prev = {}; }
+        if (!prev || typeof prev !== 'object') prev = {};
+        // 이번에 무참조인 것만 세어 넘긴다 — 참조가 되살아난 행은 **맵에서 사라져 카운트가 리셋된다**
+        // (레이어 붙여넣기·undo 로 다시 쓰이는 그림이 실제로 이 경로를 탄다).
+        const next = {};
+        unused.forEach(function(k) { next[k] = (Number(prev[k]) || 0) + 1; });
+        const deleted = [];
+        const keys = Object.keys(next);
+        for (let i = 0; i < keys.length; i += 1) {
+          if (next[keys[i]] < STORAGE_SWEEP_STREAK_LIMIT) continue;
+          try { await deleteWorkspaceDbValue(keys[i]); deleted.push(keys[i]); delete next[keys[i]]; }
+          catch (error) { console.error('[storage] delete failed for ' + keys[i], error); }
+        }
+        try { await putWorkspaceDbValue(STORAGE_SWEEP_STREAK_KEY, next); }
+        catch (error) { console.error('[storage] streak write failed — 다음 판이 처음부터 센다', error); }
+        if (deleted.length) console.info('[storage] swept ' + deleted.length + ' unreferenced row(s)');
+        return { blocked: 0, deleted: deleted.length, pending: Object.keys(next).length };
+      } finally {
+        storageSweepRunning = false;
+      }
+    }
+
+    // 진입점은 셋뿐이다(위 ②). writeProjectToIndexedDbSlot 에 걸면 **자동저장까지** 걸리므로 거기가 아니다.
+    function scheduleStorageSweep(reason) {
+      storageSweepUnreferenced()
+        .then(function(res) { if (res) console.debug('[storage] sweep(' + reason + ')', res); })
+        .catch(function(error) { console.error('[storage] sweep(' + reason + ') failed', error); });
     }
 
     function storageUsageRow(label, value) {
@@ -47946,6 +48012,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // inline). The durable copy is that file; the IndexedDB autosave is just an evictable convenience cache.
         if (saveIsShareZipExport()) {
           await exportConteFolderZip();
+          scheduleStorageSweep('save-zip'); // ver1458
           return true;
         }
         if (!state.workspaceHandle) {
@@ -47960,7 +48027,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           state.project.settings.indexedDbAutosaveEnabled = false;
           if (state.indexedDbAutosaveTimer) { clearTimeout(state.indexedDbAutosaveTimer); state.indexedDbAutosaveTimer = 0; }
         }
-        return await saveProjectToWorkspace();
+        const saved = await saveProjectToWorkspace();
+        if (saved) scheduleStorageSweep('save'); // ver1458: **진짜 저장된 뒤에만** (사용자 결정)
+        return saved;
       } catch (error) {
         alert('JSON save failed: ' + (error && error.message ? error.message : error));
         return false;
