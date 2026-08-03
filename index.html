@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1473</title>
+  <title>MoArt ver1474</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -55202,7 +55202,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return;
       }
       try { flushIndexedDbAutosave(); } catch(e){}      // persist the user's work before we swap it out
-      tlTut = { idx:0, solved:false, mini: !!miniContainer, saved:{
+      const drawKeysAtStart = new Set(gengaDrawStore.keys()); // ver1474
+      tlTut = { idx:0, solved:false, mini: !!miniContainer, drawKeysAtStart: drawKeysAtStart, saved:{
         project: state.project, undo: state.undoStack, redo: state.redoStack,
         frame: state.gengaFrame, sel: state.gengaSelectedLayerId, tool: state.paintEditTool } };
       state.project = tlTutMakeProject();
@@ -55218,6 +55219,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     function tlTutExit(){
       if (!tlTut) return;
+      // ver1474: 연습 중에 생긴 그림은 메모리에서도 거둔다. 디스크 쪽은 애초에 안 썼고
+      // (gengaDrawingShouldPersist), 여기는 그 짝이다 — 진입 뒤에 **새로 생긴 것만** 지운다.
+      const started = tlTut.drawKeysAtStart;
+      if (started) {
+        const drop = [];
+        gengaDrawStore.forEach(function(_v, k) { if (!started.has(k)) drop.push(k); });
+        drop.forEach(function(k) { gengaDrawStore.delete(k); });
+      }
       const s = tlTut.saved; tlTut = null;
       state.project = s.project; state.undoStack = s.undo; state.redoStack = s.redo;
       state.gengaFrame = s.frame; state.gengaSelectedLayerId = s.sel;
@@ -65664,13 +65673,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // therefore light. Serialization inlines refs for portable files (default) and strips to refs for autosave.
     let gengaDrawStore = new Map();
     let gengaDrawRefSeq = 0;
+    // ver1474: 도장(タイムライン練習)에서 그린 그림은 **디스크에 쓰지 않는다.**
+    // 도장은 연습용 프로젝트를 만들고(tlTutMakeProject) 끝나면 사용자 프로젝트로 통째로 되돌린다 —
+    // 그래서 프로젝트 payload 는 `indexedDbAutosaveEnabled=false` 로 이미 막혀 있었다. 그런데 그림은
+    // **그 게이트를 지나지 않는 별도 경로**라(획 하나가 곧 `gd:` 행 하나) 연습에서 그은 획이 전부
+    // 영구 행으로 남았다. 실측(1280×874 스테이지, 가이드북 밖 도장): 그리기 가능, `gd:` 쓰기 발생.
+    // 무참조 GC(ver1458)가 나중에 회수하기는 하지만, 애초에 안 만드는 것이 근본이다 —
+    // 되돌릴 프로젝트의 그림을 디스크에 적을 이유가 없다.
+    // `tlTut` 하나만 본다: autosave 설정으로 판정하면 「사용자가 자동저장을 꺼 둔 진짜 프로젝트」의
+    // 그림까지 안 써져 리로드에서 사라진다 — 그것은 이 판이 고치려는 것과 정반대의 사고다.
+    function gengaDrawingShouldPersist() { return !tlTut; }
     function gengaDrawingUrl(d) { return d ? (d.ref ? (gengaDrawStore.get(d.ref) || null) : (typeof d.dataUrl === 'string' ? (d.dataUrl || null) : null)) : null; }
     // x,y (integer paper px, optional) = TRIMMED-bitmap placement: the bitmap is the ink's bbox crop and is drawn
     // 1:1 at (x,y) on the paper. Objects WITHOUT finite x/y are legacy full-paper bitmaps (drawn scaled to paper).
     function gengaPutDrawingData(dataUrl, w, h, x, y) {
       const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
       gengaDrawStore.set(ref, String(dataUrl || ''));
-      try { putWorkspaceDbValue('gd:' + ref, String(dataUrl || '')); } catch (e) {}
+      if (gengaDrawingShouldPersist()) { // ver1474
+        try { putWorkspaceDbValue('gd:' + ref, String(dataUrl || '')); } catch (e) {}
+      }
       const out = { ref: ref, w: Math.max(1, Math.round(Number(w) || 1)), h: Math.max(1, Math.round(Number(h) || 1)) };
       if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) { out.x = Math.round(Number(x)); out.y = Math.round(Number(y)); }
       return out;
@@ -65734,12 +65755,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1448: putWorkspaceDbValue 는 async 라 이 try/catch 가 **rejection 을 못 잡는다**(쿼터 초과 ·
       // 트랜잭션 abort 가 unhandled rejection 으로 새고, base64 는 디스크에 안 들어간다 → 다음 세션에
       // 빈 코마). 조용히 새지 않게 붙잡아 기록한다.
-      try {
-        const put = putWorkspaceDbValue('gd:' + ref, url);
-        if (put && typeof put.catch === 'function') put.catch(function(err) {
-          console.error('[gengaEncode] IndexedDB write failed for gd:' + ref + ' - this drawing will not survive a reload', err);
-        });
-      } catch (e) { console.error('[gengaEncode] IndexedDB write threw for gd:' + ref, e); }
+      if (gengaDrawingShouldPersist()) { // ver1474
+        try {
+          const put = putWorkspaceDbValue('gd:' + ref, url);
+          if (put && typeof put.catch === 'function') put.catch(function(err) {
+            console.error('[gengaEncode] IndexedDB write failed for gd:' + ref + ' - this drawing will not survive a reload', err);
+          });
+        } catch (e) { console.error('[gengaEncode] IndexedDB write threw for gd:' + ref, e); }
+      }
       gengaLastStrokeCanvas = { dataUrl: url, canvas: entry.fullCanvas || entry.canvas };
       gengaImageFor(url, drawGengaPreview); // start the decode now, off the stroke
       if (entry.layerId != null && state.project && state.project.kind === 'genga') {
