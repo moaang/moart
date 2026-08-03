@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1463</title>
+  <title>MoArt ver1464</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -49181,13 +49181,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return did;
     }
 
-    function paintBinarizeCanvasAlpha(canvas) {
+    // ver1464: **영역 인자**(선택). 안 주면 캔버스 전체 — 기존 호출부 일곱 곳은 한 글자도 안 바뀐다.
+    // 왜 필요했나: ver1464 가 원화 도형 **프리뷰**에도 2値化를 넣었는데(커밋과 같은 그림을 보여 주려고)
+    // 원화 용지는 1754×1240 = **217만 픽셀**이라 전면 getImageData/putImageData 한 번이 13.9ms 였다.
+    // 프레임당 1회로 접고도 예산의 165% — 접는 것만으로는 모자랐다. 도형은 용지의 일부만 차지하므로
+    // **그 범위만** 훑으면 된다. 알파 임계는 픽셀마다 독립이라 범위를 좁혀도 결과가 같다(이웃을 안 본다).
+    function paintBinarizeCanvasAlpha(canvas, rect) {
       try {
         const ctx = canvas.getContext('2d');
-        const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        let x = 0, y = 0, w = canvas.width, h = canvas.height;
+        if (rect) {
+          x = Math.max(0, Math.floor(rect.x) || 0);
+          y = Math.max(0, Math.floor(rect.y) || 0);
+          w = Math.min(canvas.width - x, Math.ceil(rect.w) || 0);
+          h = Math.min(canvas.height - y, Math.ceil(rect.h) || 0);
+          if (!(w > 0 && h > 0)) return; // 빈 범위 = 할 일 없음(전체로 넓히지 **않는다** — 그건 다른 뜻이다)
+        }
+        const img = ctx.getImageData(x, y, w, h);
         const d = img.data;
         for (let i = 3; i < d.length; i += 4) d[i] = d[i] >= 128 ? 255 : 0;
-        ctx.putImageData(img, 0, 0);
+        ctx.putImageData(img, x, y);
       } catch (e) {}
     }
 
@@ -64210,7 +64223,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // span the manual across every clip linked to this block, not just whichever .find() hit first.
           // A multi-piece line used to collapse to its shortest fragment (7 of 44 frames) because the array
           // happened to list the short piece before the long one.
-          const linked = clips.filter(function(c) { return c && (c.dialogBlockId === b.id || (b.audioClipId && c.id === b.audioClipId)); });
+          // ver: exclude hidden clips (kept-but-muted alternate takes) -- a hidden clip can still carry
+          // the same dialogBlockId/audioClipId link as its live replacement, and counting it would drag
+          // the manual's start/end back into a take that never actually plays.
+          const linked = clips.filter(function(c) { return c && !c.hidden && (c.dialogBlockId === b.id || (b.audioClipId && c.id === b.audioClipId)); });
           let fromLocal = localStart + 1, toLocal = localStart + panelFrames;
           if (linked.length) {
             const starts = linked.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)); });
@@ -76421,12 +76437,40 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (gengaSel.auto) return null; // ver1201: a 変形/パース auto-selection is a transform handle, not a paint mask
       return { canvas: gengaSel.mask, x: 0, y: 0 };
     }
-    function gengaShapeDragMove(ev) {
-      const sess = gengaDrawSession;
-      if (!sess || !sess.shape) return;
-      if (sess.shape === 'curve' && sess.curveChord && !sess.curveBending) return; // ver608: pending chord idles
-      const p = gengaPreviewPointerXY(ev); if (!p) return;
-      sess.shapeMoved = true;
+    // ver1464 (#14): 여기서 하던 일을 **둘로 가른다.**
+    //
+    //  · 매 이벤트여야 하는 것 — 포인터 좌표, `shapeMoved`, **`gengaScanMark`**, 그리고 lasso-fill 의
+    //    점 누적. 스캔 마크를 접으면 커밋 때 읽는 잉크 범위가 실제보다 **작아지고**, ver1196 이 적어 둔
+    //    대로 그것은 예외가 아니라 **그림이 조용히 잘리는** 결과다. lasso-fill 은 자기 분기에서 마크를
+    //    안 하고 이 머리의 마크에만 기대므로 특히 그렇다. 점 누적을 접으면 올가미 모양도 거칠어진다.
+    //  · 프레임당 1회여도 되는 것 — **버퍼에 도형을 다시 그리는 것과 합성.** 도형은 매 이동마다 점
+    //    전체를 다시 계산해 버퍼를 지우고 새로 그리므로 **마지막 것만 살아남는다**(ver1196 주석).
+    //
+    // 왜 접는가: 콘티는 ver1451 에서 같은 일을 했고(59%→13%), 원화는 용지가 더 커서 한 번이 더 비싸다.
+    // 그리고 그것이 2値化 파리티의 **선행 조건**이다 — 프리뷰에서도 커밋과 같이 2値化하려면
+    // paintBinarizeCanvasAlpha 가 프레임당 1회여야 한다(원화 용지 1200×900 에서 1회 4.17ms = 예산 25%,
+    // 이벤트마다면 그대로 무너진다).
+    //
+    // **원화는 버퍼 자체가 커밋 소스**라(콘티는 stroke 데이터에서 다시 그린다) 커밋 직전에 대기 프레임을
+    // 반드시 흘려보내야 한다 — gengaDrawEnd 의 gengaShapeFlushPending 이 그것. 안 하면 손 뗀 자리와
+    // 다른 도형이 커밋된다.
+    let gengaShapeRedrawRaf = 0;
+    function gengaShapeScheduleRedraw(sess) {
+      if (gengaShapeRedrawRaf) return;
+      gengaShapeRedrawRaf = requestAnimationFrame(function() {
+        gengaShapeRedrawRaf = 0;
+        if (gengaDrawSession === sess) gengaShapeRenderPending(sess); // 드래그가 끝났으면 버린다
+      });
+    }
+    // 커밋 직전에 부른다 — ver622 가 gengaPenOutlineRedraw 에 세운 것과 같은 계약(대기분을 흡수).
+    function gengaShapeFlushPending(sess) {
+      if (gengaShapeRedrawRaf) { cancelAnimationFrame(gengaShapeRedrawRaf); gengaShapeRedrawRaf = 0; }
+      gengaShapeRenderPending(sess);
+    }
+    function gengaShapeRenderPending(sess) {
+      const pend = sess && sess.shapePending;
+      if (!pend) return;
+      const p = pend.p;
       const b = sess.shapeBuf.getContext('2d');
       b.save();
       b.setTransform(1, 0, 0, 1, 0, 0);
@@ -76438,7 +76482,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1196: the shape buffer is cleared and re-traced every move, so only the LAST trace survives to the
       // commit — marking every intermediate one is a superset either way, and a superset is all we need.
       const shapePad = (Number(sess.shapeLineWidth) || 1) / 2 + 1;
-      gengaScanMark(sess, p.x, p.y, shapePad);
       b.beginPath();
       if (sess.shape === 'curve' && sess.curveChord) { // ver608: bend phase — quadratic through the pointer
         const A = sess.curveChord.a, B = sess.curveChord.b;
@@ -76453,18 +76496,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaScanMark(sess, qcx, qcy, shapePad);
       } else if (sess.shape === 'line' || sess.shape === 'curve') { // curve phase 1 = its chord
         let tx = p.x, ty = p.y;
-        if (ev.shiftKey) { const s = paintSnapChordAngle(ax, ay, tx, ty); tx = s.x; ty = s.y; } // ver872 G1: shared 15° snap
+        if (pend.shiftKey) { const s = paintSnapChordAngle(ax, ay, tx, ty); tx = s.x; ty = s.y; } // ver872 G1: shared 15° snap
         b.moveTo(ax, ay); b.lineTo(tx, ty); b.stroke();
         sess.lastShapePt = { x: tx, y: ty };
         gengaScanMark(sess, tx, ty, shapePad); // ver1196: the SNAPPED end is what got drawn
       } else if (sess.shape === 'lasso-fill') {
         // ver617: no fill while dragging — the buffer stays empty (canvas = base) and drawGengaPreview
         // renders a dashed lasso marquee from shapeLassoPts; the fill is built once at gengaDrawEnd.
-        const pts = sess.shapeLassoPts;
-        const last = pts[pts.length - 1];
-        if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= 1) pts.push({ x: p.x, y: p.y });
+        // ver1464: 점 누적은 **매 이벤트** 쪽으로 옮겼다(아래 gengaShapeDragMove) — 접으면 모양이 거칠어진다.
       } else { // rect / ellipse — Shift: 正方形/正円, Alt: 中心から
-        const r = paintConstrainRect(ax, ay, p.x, p.y, ev.shiftKey, ev.altKey); // ver872 G1: shared 正方形/中心 constraint
+        const r = paintConstrainRect(ax, ay, p.x, p.y, pend.shiftKey, pend.altKey); // ver872 G1: shared 正方形/中心 constraint
         const x0 = r.x0, y0 = r.y0, x1 = r.x1, y1 = r.y1;
         // ver1196: the CONSTRAINED corners, not the pointer — Alt (中心から) puts one of them on the far
         // side of the anchor, past anything the pointer itself marked.
@@ -76475,8 +76516,37 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (paintShapeStrokeWantsFill(sess.shape)) b.fill(); else b.stroke();
       }
       b.restore();
+      // ver1464 (#14): **프리뷰도 커밋과 같이 2値化한다.** 종전에는 gengaDrawEnd 에서만 돌려서, 2値化를
+      // 켠 도형이 드래그 중에는 부드럽게 보이다가 손 떼는 순간 딱딱해졌다 — 콘티는 ver1452 가 같은 것을
+      // 고쳤고(타원 경계 혼합 픽셀 2032→1714), 그때 원화만 남아 **내가 만든 파리티 격차**였다.
+      // 여기가 프레임당 1회이므로 감당된다(그것이 이 판의 선행 조건이었다). 멱등이라 커밋의 2値化가
+      // 다시 돌아도 결과는 같다.
+      // ver1464: 범위는 **커밋이 잉크 범위로 쓰는 그 값**을 그대로 쓴다(gengaScanRectFor) — 새로 계산하면
+      // 두 벌이 되고, 그것이 갈리면 프리뷰와 커밋의 2値化 범위가 달라진다. superset 이라 넉넉하고,
+      // null(스캔 opt-out)이면 전체로 떨어진다 — 안전한 쪽이 기본값이다.
+      if (paintToolBinarizeOn(sess.shape)) paintBinarizeCanvasAlpha(sess.shapeBuf, gengaScanRectFor(sess, sess.shapeBuf));
       gengaShapeComposite(sess);
       scheduleGengaPreviewRedraw(); // ver1445: 표시 재합성은 프레임당 1회 (ver1438 과 같은 계약)
+    }
+
+    function gengaShapeDragMove(ev) {
+      const sess = gengaDrawSession;
+      if (!sess || !sess.shape) return;
+      if (sess.shape === 'curve' && sess.curveChord && !sess.curveBending) return; // ver608: pending chord idles
+      const p = gengaPreviewPointerXY(ev); if (!p) return;
+      sess.shapeMoved = true;
+      // ── 매 이벤트 (접으면 안 되는 것) ─────────────────────────────────────────────
+      // 커밋 스캔 범위: 접으면 실제 잉크보다 작아져 **그림이 조용히 잘린다**(ver1196).
+      gengaScanMark(sess, p.x, p.y, (Number(sess.shapeLineWidth) || 1) / 2 + 1);
+      // 올가미는 점을 **누적**한다 — 프레임당 1회로 접으면 모양이 거칠어진다.
+      if (sess.shape === 'lasso-fill') {
+        const pts = sess.shapeLassoPts;
+        const last = pts[pts.length - 1];
+        if (!last || Math.hypot(p.x - last.x, p.y - last.y) >= 1) pts.push({ x: p.x, y: p.y });
+      }
+      // ── 프레임당 1회 (버퍼 재작성 + 합성) ────────────────────────────────────────
+      sess.shapePending = { p: p, shiftKey: Boolean(ev.shiftKey), altKey: Boolean(ev.altKey) };
+      gengaShapeScheduleRedraw(sess);
       ev.preventDefault();
     }
     // ## SECTION: GENGA: DRAWING / SELECTION ........ stroke pipeline, selection quad, transform, merge
@@ -77028,6 +77098,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!gengaDrawSession) return;
       if (gengaDrawSession.shape) { // ver606: bake the shape once (AA off → hard edge via buffer binarize)
         const shapeSess = gengaDrawSession;
+        // ver1464: **대기 중인 프레임을 먼저 흘려보낸다.** 원화는 버퍼 자체가 커밋 소스라(콘티는 stroke
+        // 데이터에서 다시 그린다) 마지막 이동이 버퍼에 안 들어간 채 커밋되면 **손 뗀 자리와 다른 도형**이
+        // 확정된다. ver622 가 gengaPenOutlineRedraw 에 세운 것과 같은 계약이다. 곡선 1단계(chord)로 빠지는
+        // 아래 return 경로도 이 뒤라, 그 고스트도 마지막 좌표로 남는다.
+        gengaShapeFlushPending(shapeSess);
         if (shapeSess.shape === 'curve' && shapeSess.shapeMoved && !shapeSess.curveChord) {
           // ver608 curve phase 1: keep the session alive as the pending chord — the preview keeps
           // compositing the session canvas, so the ghost stays visible until the bend gesture.
