@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1464</title>
+  <title>MoArt ver1466</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -8427,6 +8427,16 @@
       </div>
     </form>
   </dialog>
+  <dialog id="orphanAudioConfirmDialog" class="choice-dialog">
+    <form method="dialog">
+      <h2 data-i18n="settings.orphanAudio.confirmTitle">タイムラインにない音声クリップを削除</h2>
+      <p data-orphan-audio-prompt></p>
+      <div class="choice-dialog-actions">
+        <button type="submit" value="clean" data-i18n="settings.orphanAudio.clean">今すぐ整理</button>
+        <button type="submit" value="cancel" data-i18n="settings.orphanAudio.cancel">キャンセル</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="exportDialog" class="choice-dialog export-dialog">
     <div class="export-dialog-body">
       <h2 data-i18n="action.export">書き出し</h2>
@@ -8759,6 +8769,19 @@
         <div id="tlInstrModeList" class="gexp-instr-list"></div>
       </div>
       <p class="project-create-hint" id="tlInstrModeNone" data-i18n="export.genga.instrModeNone" hidden>撮影指示：FXキーのあるレイヤーがないため、指示画像は出ません。</p>
+      <!-- Leftover audio clips that are in project.audio.clips but on no track (hidden:true from before
+           deletion became a real splice). Nothing creates these any more -- this section exists so the
+           ones old project files still carry can be seen and cleared. Count only, never a per-clip list:
+           .tl-set-pop has no max-height/overflow, so a long list would run off-screen. -->
+      <div id="tlOrphanAudioSect" hidden>
+        <div class="stage-settings-divider"></div>
+        <div class="stage-settings-label" data-i18n="settings.orphanAudio.label">タイムラインにない音声クリップ</div>
+        <div id="tlOrphanAudioRows" class="stage-settings-slots"></div>
+        <div class="stage-settings-slot-actions" style="margin-top:5px">
+          <button id="tlOrphanAudioCleanBtn" type="button" data-i18n="settings.orphanAudio.clean" disabled>今すぐ整理</button>
+        </div>
+        <div id="tlOrphanAudioStatus" class="stage-settings-status"></div>
+      </div>
     </div>
   </div>
   <!-- ver1246: lifted out of the ⚙ popover, where the slot and version lists were more than half of its
@@ -14878,6 +14901,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ---- status.* (48) ----
         // --- status.genga.* : タイムラインステータスバー (state.timelineStatus) 常時表示の状態文言 ---
         'status.genga.audioClip.hidden': { ja: '音声クリップを非表示にしました。', ko: '오디오 클립을 숨겼습니다.', en: 'Audio clip hidden.' },
+        'status.genga.audioClip.deleted': { ja: '音声クリップを削除しました。', ko: '음성 클립을 삭제했습니다.', en: 'Audio clip deleted.' },
+        'settings.orphanAudio.label': { ja: 'タイムラインにない音声クリップ', ko: '타임라인에 없는 음성 클립', en: 'Audio clips not on the timeline' },
+        'settings.orphanAudio.clean': { ja: '今すぐ整理', ko: '지금 정리', en: 'Clean up now' },
+        'settings.orphanAudio.cancel': { ja: 'キャンセル', ko: '취소', en: 'Cancel' },
+        'settings.orphanAudio.none': { ja: '残っているクリップはありません。', ko: '남아 있는 클립이 없습니다.', en: 'No leftover clips.' },
+        'settings.orphanAudio.count': {
+          ja: function(n) { return n + ' 件残っています'; },
+          ko: function(n) { return n + '건 남아 있습니다'; },
+          en: function(n) { return n + ' leftover clip' + (n === 1 ? '' : 's'); }
+        },
+        'settings.orphanAudio.confirmTitle': { ja: 'タイムラインにない音声クリップを削除', ko: '타임라인에 없는 음성 클립 삭제', en: 'Delete audio clips not on the timeline' },
+        'settings.orphanAudio.confirmBody': {
+          ja: function(n) { return n + ' 件をプロジェクトから削除します。元の音声ファイルは消えません。元に戻すで復元できます。'; },
+          ko: function(n) { return n + '건을 프로젝트에서 삭제합니다. 원본 음성 파일은 지워지지 않으며, 실행 취소로 되돌릴 수 있습니다.'; },
+          en: function(n) { return 'Removes ' + n + ' clip' + (n === 1 ? '' : 's') + ' from the project. The source audio files stay; undo restores them.'; }
+        },
+        'settings.orphanAudio.cleaned': {
+          ja: function(n) { return n + ' 件を整理しました。'; },
+          ko: function(n) { return n + '건을 정리했습니다.'; },
+          en: function(n) { return 'Cleaned up ' + n + ' clip' + (n === 1 ? '' : 's') + '.'; }
+        },
         'status.genga.conteLayer.rowVisibility': {
           ja: function(visible) { return visible ? 'コンテレイヤー行を表示しました。' : 'コンテレイヤー行を非表示にしました。'; },
           ko: function(visible) { return visible ? '콘티 레이어 행을 표시했습니다.' : '콘티 레이어 행을 숨겼습니다.'; },
@@ -19117,29 +19161,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
+    // Undo/redo for "the clip is gone from the array". The inverse of a splice-out is a splice-in at the
+    // same index, so ONE cloned clip + its index is the whole payload (~0.02ms) -- a full
+    // captureAudioTimelineHistoryState costs ~13ms at 547 clips, which is why deletion used to just set a
+    // `hidden` flag and leave the object in the array forever. payload {clip,index} = put it back,
+    // payload null = take it out again. Returns the restored clip so the caller can re-sync it to its cuts.
+    function applyAudioClipRemoveState(project, clipId, payload) {
+      const clips = (project.audio && project.audio.clips) || [];
+      const at = clips.findIndex(function(item) { return item.id === clipId; });
+      let restored = null;
+      if (payload && payload.clip) {
+        if (at >= 0) return clips[at];                      // already present -- double-undo guard
+        const index = Math.max(0, Math.min(clips.length, Math.round(Number(payload.index) || 0)));
+        restored = fastClone(payload.clip);
+        clips.splice(index, 0, restored);
+      } else {
+        if (at < 0) return null;                            // already gone -- double-redo guard
+        clips.splice(at, 1);
+      }
+      bumpAudioCycle();
+      normalizeAudioClips(project);
+      sortAudioClips(project);
+      writeAudioTimelineTrack(project);
+      return restored;
+    }
+
     function commitAudioClipHideFast(clipId) {
       normalizeAudioClips(state.project);
-      const clip = state.project.audio.clips.find(function(item) { return item.id === clipId; });
-      if (!clip) return false;
-      const before = captureAudioClipEditState(clip);
+      const clips = state.project.audio.clips;
+      const index = clips.findIndex(function(item) { return item.id === clipId; });
+      if (index < 0) return false;
+      const clip = clips[index];
+      const removed = fastClone(clip);
       unsyncSingleAudioClipFromCuts(state.project, clip);
-      clip.hidden = true;
+      clips.splice(index, 1);                               // real delete -- see applyAudioClipRemoveState
       state.selectedAudioClipId = '';
       bumpAudioCycle();
-      const after = captureAudioClipEditState(clip);
+      writeAudioTimelineTrack(state.project);
       pushUndoCommand({
-        name: 'Hide audio clip',
-        audioClipEdit: true,
+        name: 'Delete audio clip',
+        audioClipRemove: true,
         clipId: clipId,
-        before: before,
-        after: after,
-        syncCuts: false,
-        syncAudioClipId: clipId
+        before: { clip: removed, index: index },
+        after: null
       });
       state.redoStack = [];
-      writeAudioTimelineTrack(state.project);
       removeAudioClipDom(clipId);
-      state.timelineStatus = t('status.genga.audioClip.hidden');
+      state.timelineStatus = t('status.genga.audioClip.deleted');
       return true;
     }
 
@@ -19270,6 +19338,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return;
         }
         refreshAudioTimelineEdit(Boolean(command.syncCuts));
+        restoreTimelineViewportForHistory(historyViewport);
+        return;
+      }
+      if (command.audioClipRemove) {
+        pushOther(command);
+        const restored = applyAudioClipRemoveState(state.project, command.clipId, payload);
+        if (restored) syncSingleAudioClipToCuts(state.project, restored);
+        refreshAudioTimelineEdit(false);
         restoreTimelineViewportForHistory(historyViewport);
         return;
       }
@@ -22192,11 +22268,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Delete all of them when confirmed; otherwise unlink all so no sibling is left pointing at the deleted block.
         const linked = dialogBlockLinkedClips(p, blockId);
         if (alsoDeleteClip) {
-          linked.forEach(function(clip) {
-            try { deleteAudioClip(p, clip.id); } catch (e) {}
-            const clips = p.audio && p.audio.clips;
-            if (clips) { const ci = clips.findIndex(function(c) { return c.id === clip.id; }); if (ci >= 0) clips.splice(ci, 1); }
-          });
+          linked.forEach(function(clip) { deleteAudioClip(p, clip.id); }); // deleteAudioClip now splices for real
         } else {
           linked.forEach(function(clip) { clip.dialogBlockId = ''; });
         }
@@ -22213,11 +22285,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!block) return;
         block.audioClipId = '';
         // ver656 (BUG-11): remove ALL clips linked to this block (razor-split siblings), not just the primary
-        dialogBlockLinkedClips(p, blockId).forEach(function(clip) {
-          try { deleteAudioClip(p, clip.id); } catch (e) {}
-          const clips = p.audio && p.audio.clips;
-          if (clips) { const ci = clips.findIndex(function(c) { return c.id === clip.id; }); if (ci >= 0) clips.splice(ci, 1); }
-        });
+        dialogBlockLinkedClips(p, blockId).forEach(function(clip) { deleteAudioClip(p, clip.id); }); // splices for real now
         deriveDialogTextFromBlocks(cut);
       });
     }
@@ -26194,6 +26262,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }, 1);
     }
 
+    // `!clip.hidden` is LEGACY-ONLY: nothing sets hidden any more (deletion splices the clip out), but old
+    // project files still carry hidden:true leftovers and they must stay off the timeline until the user
+    // clears them from the timeline-settings cleanup section.
     function audioClipHasSource(project, clip) {
       return Boolean(clip && !clip.hidden && (
         clip.audioFileName ||
@@ -27133,12 +27204,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
 
+    // Removes the clip from project.audio.clips outright. Every caller runs inside runCommand (whole-project
+    // snapshot undo), so no per-clip history is pushed here -- the enclosing command already covers it.
     function deleteAudioClip(project, clipId) {
       normalizeAudioClips(project);
-      const clip = project.audio.clips.find(function(item) { return item.id === clipId; });
-      if (!clip) return;
-      unsyncSingleAudioClipFromCuts(project, clip);
-      clip.hidden = true;
+      const clips = project.audio.clips;
+      const index = clips.findIndex(function(item) { return item.id === clipId; });
+      if (index < 0) return;
+      unsyncSingleAudioClipFromCuts(project, clips[index]);
+      clips.splice(index, 1);
       if (state.selectedAudioClipId === clipId) state.selectedAudioClipId = '';
       bumpAudioCycle();
       writeAudioTimelineTrack(project);
@@ -35253,20 +35327,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         guardedRender('timing', renderTimingDashboard);
         return false;
       }
-      let hidden = false;
-      runTimelineStructureCommand('Hide V media clip', function(project) {
+      let removed = false;
+      // Deletes the clip outright (was: clip.hidden = true, which left it in project.video.clips forever).
+      // runTimelineStructureCommand snapshots the whole project, so undo restores the array as it was --
+      // no per-clip history command is needed here, unlike the audio path's audioClipRemove.
+      runTimelineStructureCommand('Delete V media clip', function(project) {
         normalizeVideoClips(project);
-        const clip = project.video.clips.find(function(item) { return item.id === clipId; });
-        if (!clip) return;
-        clip.hidden = true;
-        clip.panelLocked = false;
-        hidden = true;
+        const clips = project.video.clips;
+        const index = clips.findIndex(function(item) { return item.id === clipId; });
+        if (index < 0) return;
+        clips.splice(index, 1);
+        removed = true;
         state.selectedVideoClipId = '';
         state.selectedVideoTrackId = '';
         state.activeConteSelectionType = '';
         ensureConteLayerActiveFallback(project, currentPicturePanelId());
       });
-      return hidden;
+      return removed;
     }
 
     function bindVideoMediaTimelineDrag(root, totalFrames) {
@@ -61050,6 +61127,60 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // the A,B,C↔1K key-label style finally leaves the keyframe right-click menus it was parked in "일단 임시로"
     // at ver1232 — this popover is the "real settings-panel home" that comment was waiting for. The block is
     // moved in and out, never rebuilt (see #timelineSettingsHome).
+    // ---- timeline settings: leftover audio clips -------------------------------------------------
+    // A clip that is in project.audio.clips but on no track. Since deletion became a real splice the only
+    // way to have one is an older project file, where delete merely set hidden:true. They are invisible in
+    // the timeline yet still counted by the source library and still dragged the CT sheet's dialogue spans
+    // toward takes that never play -- so they get a place to be seen and cleared rather than a silent purge.
+    function orphanAudioClips(project) {
+      const clips = (project && project.audio && project.audio.clips) || [];
+      return clips.filter(function(clip) { return clip && clip.hidden; });
+    }
+    function syncOrphanAudioSection() {
+      const sect = document.getElementById('tlOrphanAudioSect');
+      if (!sect || sect.hidden) return;
+      const rows = document.getElementById('tlOrphanAudioRows');
+      const btn = document.getElementById('tlOrphanAudioCleanBtn');
+      const status = document.getElementById('tlOrphanAudioStatus');
+      const list = orphanAudioClips(state.project);
+      if (rows) {
+        rows.innerHTML = '';
+        if (list.length) {
+          const slot = document.createElement('div');
+          slot.className = 'stage-settings-slot';
+          const info = document.createElement('div');
+          info.className = 'stage-settings-slot-info';
+          const title = document.createElement('div');
+          title.className = 'stage-settings-slot-title';
+          title.textContent = t('settings.orphanAudio.count', list.length);
+          info.appendChild(title);
+          slot.appendChild(info);
+          rows.appendChild(slot);
+        }
+      }
+      if (btn) btn.disabled = !list.length;
+      if (status) status.textContent = list.length ? '' : t('settings.orphanAudio.none');
+    }
+    function runOrphanAudioClean() {
+      const list = orphanAudioClips(state.project);
+      if (!list.length) return;
+      const dialog = document.getElementById('orphanAudioConfirmDialog');
+      if (!dialog) return;
+      const promptEl = dialog.querySelector('[data-orphan-audio-prompt]');
+      if (promptEl) promptEl.textContent = t('settings.orphanAudio.confirmBody', list.length);
+      askDialogChoice(dialog, 'cancel').then(function(choice) {
+        if (choice !== 'clean') return;
+        // One snapshot command for the whole sweep: undo puts every cleared clip back in one step.
+        const removed = orphanAudioClips(state.project).length;
+        if (!removed) { syncOrphanAudioSection(); return; }
+        runAudioTimelineCommand('Clean leftover audio clips', function(project) {
+          project.audio.clips = project.audio.clips.filter(function(clip) { return !(clip && clip.hidden); });
+        });
+        state.timelineStatus = t('settings.orphanAudio.cleaned', removed);
+        syncOrphanAudioSection();
+      });
+    }
+
     function openTimelineSettingsPopup(anchorEl) {
       const block = document.getElementById('timelineSettingsBlock');
       if (!block) return;
@@ -61076,6 +61207,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             const none = document.getElementById('tlInstrModeNone');
             if (sect) sect.hidden = true;
             if (none) none.hidden = true;
+          }
+          // conte-only: genga deletes its audio clips outright already, so it never accumulates leftovers
+          const orphanSect = document.getElementById('tlOrphanAudioSect');
+          if (orphanSect) {
+            orphanSect.hidden = !(state.project && state.project.kind === 'conte');
+            const cleanBtn = document.getElementById('tlOrphanAudioCleanBtn');
+            if (cleanBtn && !cleanBtn.dataset.bound) {
+              cleanBtn.dataset.bound = '1';
+              cleanBtn.addEventListener('click', runOrphanAudioClean);
+            }
+            syncOrphanAudioSection();
           }
           updateStageSettingsUI();     // the checkbox reads its value from here
         },
