@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1462</title>
+  <title>MoArt ver1463</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -13698,6 +13698,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           ko: function(w, h) { return '지시 이미지 생성 실패 (' + w + '×' + h + ')'; },
           en: function(w, h) { return 'Instruction image failed (' + w + '×' + h + ')'; },
         },
+        // ver1463: 일괄 이미지만 「묻는다」 — 영상은 결손이 한 파일 안에 있지만 이미지는 **빈 파일이
+        // 폴더에 남아** 정상 파일과 섞이기 때문이다. 기본은 중단(확인창의 취소).
+        // ver1463: 일괄 이미지만 「묻는다」 — 영상은 결손이 한 파일 안에 있지만 이미지는 **빈 파일이
+        // 폴더에 남아** 정상 파일과 섞이기 때문이다. 기본은 중단(확인창의 취소).
+        'msg.genga.export.decodeFailConfirm': {
+          ja: function(failed, total) { return '読み込めない絵が ' + failed + ' / ' + total + ' 枚あります。このまま続けると、その分は空の画像ファイルとして書き出されます。続けますか？（キャンセル＝中止）'; },
+          ko: function(failed, total) { return '읽을 수 없는 그림이 ' + failed + ' / ' + total + '장 있습니다. 그대로 진행하면 그만큼 빈 이미지 파일로 나옵니다. 계속할까요? (취소 = 중단)'; },
+          en: function(failed, total) { return failed + ' of ' + total + ' drawings cannot be read. Continuing writes them out as EMPTY image files. Continue? (Cancel aborts)'; } },
         'msg.genga.export.warningsTail': {
           ja: function(list) { return '  ⚠' + list; },
           ko: function(list) { return '  ⚠' + list; },
@@ -64198,11 +64206,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const speaker = String(b.speaker || '').trim();
           const body = String(b.body || '').trim();
           if (!speaker && !body) return;
-          const clip = clips.find(function(c) { return c && (c.dialogBlockId === b.id || (b.audioClipId && c.id === b.audioClipId)); });
+          // ver: a line's voice can be split across several clips (sbp-audio-NNNN + -split2 + -split2-split2…) —
+          // span the manual across every clip linked to this block, not just whichever .find() hit first.
+          // A multi-piece line used to collapse to its shortest fragment (7 of 44 frames) because the array
+          // happened to list the short piece before the long one.
+          const linked = clips.filter(function(c) { return c && (c.dialogBlockId === b.id || (b.audioClipId && c.id === b.audioClipId)); });
           let fromLocal = localStart + 1, toLocal = localStart + panelFrames;
-          if (clip) {
-            fromLocal = Math.max(0, Math.round(Number(clip.startFrame) || 0)) - groupGlobalStart + 1;
-            toLocal = fromLocal + Math.max(1, Math.round(Number(clip.durationFrames) || 1)) - 1;
+          if (linked.length) {
+            const starts = linked.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)); });
+            const ends = linked.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)) + Math.max(1, Math.round(Number(c.durationFrames) || 1)); });
+            fromLocal = Math.min.apply(null, starts) - groupGlobalStart + 1;
+            toLocal = Math.max.apply(null, ends) - groupGlobalStart;
           }
           const tag = conteSuffixToSheetTag(b.suffix);
           const label = speaker + (tag ? ' (' + tag + ')' : '');
@@ -66258,8 +66272,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // silently out of the export with zero signal — conte's preloadVideoExportBitmaps counts+warns for the
       // equivalent gap (missing bitmap). onStatus threads from gengaExportVideoFast, same P3-B shape as the
       // audio mix warning two lines up in that caller.
-      let failed = 0;
-      await Promise.all(Array.from(urls).map(function(u) { return new Promise(function(res) { let img = gengaImageCache.get(u); if (img && img.complete) { res(); return; } img = new Image(); img.onload = res; img.onerror = function() { failed += 1; res(); }; img.src = u; gengaImageCache.set(u, img); }); }));
+      // ver1463: 여기 있던 **인라인 디코드 루프를 지웠다.** 같은 일(URL → Image → 캐시)을 하는
+      // gengaDecodeIntoCache 가 이미 있었고, ver1448 이 그쪽에 성공/실패 반환을 붙였는데 **호출부 넷이
+      // 전부 반환값을 버려서** 그 수정이 아무 데도 안 닿고 있었다. 세는 자리와 디코드하는 자리가 갈려
+      // 있던 것이 이 계열의 뿌리다 — 한 벌로 만든다.
+      // 덤으로 판정이 정확해진다: 옛 루프는 `img.complete` 면 무조건 성공으로 셌지만, **이전에 실패해
+      // 캐시에 남은 이미지**(complete=true, naturalWidth=0)가 바로 그 경우다. 공용 디코더는 그것을 실패로 센다.
+      const decoded = await Promise.all(Array.from(urls).map(function(u) { return gengaDecodeIntoCache(u); }));
+      let failed = decoded.filter(function(ok) { return !ok; }).length;
       // ver1111: with every drawing decoded, build the in-between silhouettes NOW if this export wants
       // them. gengaDougaSilhouetteFor returns 'pending' while a source image is still decoding and the
       // compositor answers that by drawing NOTHING for the layer on that frame — on screen a redraw
@@ -66279,6 +66299,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         console.warn('[gengaExport] ' + failed + '/' + urls.size + ' image(s) failed to decode — those drawings are missing from the export');
         if (onStatus) onStatus(t('msg.export.missingImages', failed, urls.size));
       }
+      // ver1463: 세어 놓고 **돌려주지 않으면** 호출부는 판단할 수 없다. 영상·GIF 는 이 값을 무시하므로
+      // 종전 동작 그대로(경고만 하고 진행) — 한 파일 안의 결손이라 그 자리에서 알리면 충분하다.
+      // 일괄 이미지는 다르다(아래 runGengaBatchImageExport 참고).
+      return { failed: failed, total: urls.size };
     }
     function gengaRenderExportFrame(canvas, frame, outW, outH) {
       const gt = state.project.gengaTimeline;
@@ -67883,6 +67907,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const built = gengaBatchExportPlan(gt, opts.padding);
       const plan = built.plan;
       if (!plan.length) throw new Error(t('msg.genga.export.noTargets'));
+      // ver1463 (#13): 영상·GIF 는 ver853 부터 이 선행 디코드를 밟는데 **일괄 이미지만 빠져 있었다.**
+      // 빠진 대가가 여기서 가장 크다: 영상은 결손이 한 파일 안에 있어 「N장 빠졌다」고 말하면 끝이지만,
+      // 이미지는 **빈 그림이 파일로 폴더에 남아** 정상 파일과 섞인다 — 작화 데이터로 그대로 넘어간다.
+      // 그래서 여기서는 알리는 데 그치지 않고 **묻는다.** 기본은 중단이다.
+      const pre = await gengaPreloadExportImages(null);
+      if (pre && pre.failed > 0) {
+        if (!window.confirm(t('msg.genga.export.decodeFailConfirm', pre.failed, pre.total))) {
+          return { written: 0, total: plan.length, failures: [], warnings: [t('msg.export.missingImages', pre.failed, pre.total)],
+                   sheetName: '', cameraImageName: '', cameraNames: [], canceled: true };
+        }
+      }
       const paper = opts.includePaper ? await gengaResolvePaperForExport(gt) : null; // decoded once, composited into every cell
       const ext = opts.format === 'jpeg' ? 'jpg' : 'png';
       // ver1390: _camera 안에 실제로 쓴 파일 이름. 종전에는 이것을 **세지도 이름을 대지도 않아서**,
@@ -67890,6 +67925,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 실패했을 때만(failures) 목소리를 냈다. 그래서 "8/8장 + sheet" 를 보고 "카메라 지시가 안 나왔다"고
       // 읽는 것이 당연했다(실기 보고). 성공도 실패와 같은 크기로 말해야 한다.
       const cameraNames = [];
+      // ver1463: 「계속」을 골랐어도 결과 문구가 그 사실을 실어 나른다 — 폴더를 나중에 열어 본 사람이
+      // 어떤 파일이 비었는지 모르면 조용한 실패와 같다.
+      const preWarnings = (pre && pre.failed > 0) ? [t('msg.export.missingImages', pre.failed, pre.total)] : [];
       let written = 0; const failures = [];
       for (let i = 0; i < plan.length; i += 1) {
         if (state.videoExportCancel) break;
@@ -67987,7 +68025,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           } catch (e) { failures.push((name || label) + '（' + (e && e.message ? e.message : e) + '）'); }
         }
       }
-      return { written: written, total: plan.length, failures: failures, warnings: built.warnings, sheetName: sheetName, cameraImageName: cameraImageName, cameraNames: cameraNames, canceled: Boolean(state.videoExportCancel) };
+      // ver1463: 선행 디코드에서 나온 누락을 계획 단계 경고와 **합쳐서** 낸다 — 「계속」을 고른 실행의
+      // 완료 문구에 그 사실이 없으면, 폴더를 나중에 연 사람에게는 조용한 실패와 같다.
+      return { written: written, total: plan.length, failures: failures, warnings: preWarnings.concat(built.warnings), sheetName: sheetName, cameraImageName: cameraImageName, cameraNames: cameraNames, canceled: Boolean(state.videoExportCancel) };
     }
     // Standalone: write ONLY the Auto Sheet settings JSON (no images). Uses the save picker so it can go anywhere.
     async function gengaExportSheetJsonOnly(onStatus) {
