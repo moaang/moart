@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1483</title>
+  <title>MoArt ver1484</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -56937,10 +56937,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         mode: nextMode,
         layerCanvasOffsetX: offsetX,
         layerCanvasOffsetY: offsetY,
-        // 이어받을 때는 100% 기준도 같이 와야 한다 — 기준만 새 대상 것으로 바꾸면 숫자 패널의
-        // 스케일%가 손대지 않았는데 튄다.
-        refW: carry ? Math.max(1, carry.refW) : Math.max(1, bounds.w), // ver948: original dims — the numeric settings' 100% scale reference
-        refH: carry ? Math.max(1, carry.refH) : Math.max(1, bounds.h),
+        // ver948: 숫자 패널의 100% 기준.
+        // ver1313 은 「이어받을 때는 100% 기준도 같이 와야 한다 — 기준만 새 대상 것으로 바꾸면 스케일%가
+        // 손대지 않았는데 튄다」고 옛 refW/refH 를 실어 왔다. 그 근거는 **quad 를 그대로 이어받던 시절**의
+        // 것이다. ver1483 부터 quad 를 새 base 로 **변환**하므로, 기준만 옛것으로 남기면 정확히 그 주석이
+        // 걱정하던 일이 반대 방향으로 일어난다 — 실측: 옛 base 20px · 새 base 1000px 에서 항등 변형인데
+        // 숫자 패널이 **5000%** 를 가리킨다(1000/20). quad 와 기준은 같은 사각형에서 나와야 한다.
+        refW: Math.max(1, bounds.w), // ver1484
+        refH: Math.max(1, bounds.h),
         // ver1482: 종전에는 `carry.quad` 를 **그대로** 실었다. quad 는 절대 목적지라서, base 가 달라지면
         // 뜻이 통째로 달라진다 — 다른 레이어로 옮기면 그 그림이 **옛 자리로 날아가고**, 선택을 지우면
         // 옛 선택 사각형이 잉크 전체에 씌워진다. TVPaint 는 「절대 좌표계의 **변환**」을 들고 다니지
@@ -56980,9 +56984,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function retargetPaintTransformBoxForRender() {
       if (state.paintEditTool !== 'transform' && state.paintEditTool !== 'perspective') return;
       const box = state.paintTransformBox;
-      if (!box) return; // 미확정 변형 슬롯이 비어 있으면 옮길 것도 없다
       const target = currentPaintTransformLayerTarget();
       if (!target) return; // 대상 자체가 없는 자리(용지 모드 등) — 게이트가 알아서 무효 판정한다
+      // ver1484: 종전에는 `if (!box) return;` 이 맨 앞이라 **박스가 없으면 렌더 경로가 영영 다시
+      // 만들지 않았다.** 확정 직후 ensurePaintTransformBoxForCurrentTarget(true) 가 한 번 실패하면
+      // (previewOnly 타겟이 비트맵 교체 직후 잠깐 없는 등) 박스가 null 로 남고, 그 뒤 다음 패널로 가서
+      // Enter 를 눌러도 **재적용할 박스 자체가 없다** — 사용자 보고: 「첫 번째 조작에선 무조건 안 남고,
+      // 다시 하면 된다」. 그 「다시」가 캔버스 pointerdown 이고, 그 경로만 박스를 만들 수 있었다.
+      // 기즈모가 안 보이던 케이스도 같은 상태다(그릴 박스가 없다).
+      // 툴이 켜져 있고 대상이 있으면 박스는 있어야 한다 — 그 불변식을 여기서 세운다.
+      if (!box) { ensurePaintTransformBoxForCurrentTarget(false); return; }
       // ver1483: 종전에는 **대상만** 비교해 「같은 대상」이면 여기서 돌아갔다. 그래서 ver1482 가
       // ensurePaintTransformBoxForTarget 의 관문에 baseKey 를 넣어 두었는데도 **그 관문까지 가지 못했다** —
       // 대상은 그대로고 선택만 사라진 경우(사용자 보고: 점선은 없고 기즈모만 옛 자리)가 정확히 이
@@ -57320,30 +57331,58 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return { quad: quad.map(function(pt) { return [Number(pt[0]) || 0, Number(pt[1]) || 0]; }),
                bx: bx, by: by, bw: bw, bh: bh };
     }
-    // ver1483: **아핀**으로 푼다. 처음에는 base 를 (u,v) 로 정규화해 paintQuadBilinearPoint 에 넣었는데,
-    // 그러면 **이동량까지 base 크기에 비례**한다 — 작은 선택(20px)에서 100px 옮긴 뒤 선택을 지워 base 가
-    // 잉크 전체(1000px)가 되면 이동이 5000px 로 불어나 기즈모가 화면 밖으로 날아간다(사용자 보고:
-    // 「퍼스펙티브 기즈모가 사라지는 케이스」). T1 실측이 이것을 못 걸러낸 이유는 그 테스트의 두 대상이
-    // **같은 크기**여서 정규화 배율이 1 이었기 때문이다 — 우연히 맞았던 것이다.
+    // ── ver1484: 재적용은 **호모그래피**다 (경위는 세 판에 걸쳐 두 번 틀렸으므로 그대로 남긴다) ─────
+    // ver1482 는 base 를 (u,v) 로 정규화해 paintQuadBilinearPoint 에 넣었다. ver1483 은 그것을 아핀으로
+    // 바꾸며 「bilinear 은 이동량까지 base 크기에 비례한다」고 적었는데 **그 설명이 틀렸다** — 실측으로
+    // 확인했다(두 방식 직접 비교):
+    //   · 평행사변형(이동·배율·회전) → bilinear 과 아핀이 **완전히 같은 값**을 낸다. 폭발이 없다.
+    //   · 비평행 quad(=퍼스펙티브) → bilinear 만 폭발한다(실측: 새 base 로 옮기니 x=14350px).
+    //     u,v 가 [0,1] 밖으로 나가면 bilinear 의 **uv 이차항**이 터지기 때문이다.
+    // 즉 원인은 base 크기가 아니라 **비평행 quad + 외삽**이었고, 사용자가 퍼스펙티브를 쓰던 것과 맞는다.
     //
-    // TVPaint 식 `p' = R·s·(p − P) + P + D` 에서 **D 는 절대 픽셀**이지 base 상대가 아니다. 옛 base 가
-    // 축 정렬 직사각형이므로 그 아핀은 축 이미지 두 개로 바로 나온다:
-    //   e1 = (quad[1] − quad[0]) / bw   (x 축이 어디로 갔나)
-    //   e2 = (quad[3] − quad[0]) / bh   (y 축이 어디로 갔나)
-    //   p'  = quad[0] + e1·(p.x − bx) + e2·(p.y − by)
-    // 이동만이면 e1=(1,0), e2=(0,1) 이라 `p' = p + D` — **base 크기와 무관**하다. 배율이면 피벗 기준
-    // 그대로 나온다. 비아핀 quad(퍼스펙티브)는 아핀 근사가 되는데, 그 손실은 bilinear 쪽도 마찬가지이면서
-    // 폭발까지 얹던 것이라 이쪽이 낫다.
-    function transformReapplyQuad(keep, baseQuad) {
-      if (!keep || !Array.isArray(baseQuad) || baseQuad.length !== 4) return null;
+    // 그런데 아핀은 폭발을 막는 대신 **원근을 잃는다** — quad[2](BR)를 안 보고 e1·e2 만 쓰므로 결과가
+    // 언제나 평행사변형이 된다(실측 확인). 퍼스펙티브 변형을 재적용하는데 원근이 사라지면 그건 그것대로
+    // 틀린 답이다. 셋 중 맞는 것은 하나뿐이다:
+    //   bilinear = 사각형 안에서만 맞는 보간   ·   아핀 = 원근을 버린 근사   ·   **호모그래피 = 사영변환 그 자체**
+    // 우리가 옮기려는 것은 「직사각형 base 를 quad 로 보내는 변환」이고 그것은 정의상 사영변환이다.
+    //
+    // 계수는 단위정사각형 → quad 의 표준 해다. 평행사변형이면 sx=sy=0 → g=h=0 → **아핀과 같은 식**으로
+    // 자연히 떨어지므로, 위에서 검증한 이동·배율·회전 결과는 그대로 유지된다.
+    // 소실선 너머(분모 w ≤ 0)로 나가는 점이 하나라도 있으면 아핀으로 폴백한다 — 수학적으로는 그쪽이
+    // 「맞는」 값이지만 화면 밖 수만 px 이라 기즈모가 사라진 것처럼 보이고, 그것이 이번 버그의 증상이었다.
+    function transformReapplyAffine(keep, baseQuad) {
       const q = keep.quad;
       const e1x = (q[1][0] - q[0][0]) / keep.bw, e1y = (q[1][1] - q[0][1]) / keep.bw;
       const e2x = (q[3][0] - q[0][0]) / keep.bh, e2y = (q[3][1] - q[0][1]) / keep.bh;
-      const out = baseQuad.map(function(pt) {
+      return baseQuad.map(function(pt) {
         const dx = (Number(pt[0]) || 0) - keep.bx, dy = (Number(pt[1]) || 0) - keep.by;
         return [q[0][0] + e1x * dx + e2x * dy, q[0][1] + e1y * dx + e2y * dy];
       });
-      return out.every(function(pt) { return Number.isFinite(pt[0]) && Number.isFinite(pt[1]); }) ? out : null;
+    }
+    function transformReapplyQuad(keep, baseQuad) {
+      if (!keep || !Array.isArray(baseQuad) || baseQuad.length !== 4) return null;
+      const q = keep.quad;
+      const x0 = q[0][0], y0 = q[0][1], x1 = q[1][0], y1 = q[1][1];
+      const x2 = q[2][0], y2 = q[2][1], x3 = q[3][0], y3 = q[3][1];
+      const sx = x0 - x1 + x2 - x3, sy = y0 - y1 + y2 - y3; // 0 이면 평행사변형
+      let g = 0, hh = 0;
+      if (Math.abs(sx) > 1e-9 || Math.abs(sy) > 1e-9) {
+        const dx1 = x1 - x2, dx2 = x3 - x2, dy1 = y1 - y2, dy2 = y3 - y2;
+        const den = dx1 * dy2 - dy1 * dx2;
+        if (Math.abs(den) > 1e-9) { g = (sx * dy2 - sy * dx2) / den; hh = (dx1 * sy - dy1 * sx) / den; }
+      }
+      const a = x1 - x0 + g * x1, b = x3 - x0 + hh * x3, c = x0;
+      const d = y1 - y0 + g * y1, e = y3 - y0 + hh * y3, f = y0;
+      let crossed = false;
+      const out = baseQuad.map(function(pt) {
+        const u = ((Number(pt[0]) || 0) - keep.bx) / keep.bw;
+        const v = ((Number(pt[1]) || 0) - keep.by) / keep.bh;
+        const w = g * u + hh * v + 1;
+        if (!(w > 1e-6)) { crossed = true; return [0, 0]; } // 소실선 너머
+        return [(a * u + b * v + c) / w, (d * u + e * v + f) / w];
+      });
+      const res = crossed ? transformReapplyAffine(keep, baseQuad) : out;
+      return res.every(function(pt) { return Number.isFinite(pt[0]) && Number.isFinite(pt[1]); }) ? res : null;
     }
     // 「이 대상에는 아직 아무것도 안 했다」 — 재적용을 걸어도 되는 상태인가의 판정.
     function transformQuadIsIdentity(quad, baseQuad) {
