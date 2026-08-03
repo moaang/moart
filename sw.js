@@ -6,6 +6,26 @@
 const CACHE = 'conte-shell-v1'; // FIXED on purpose: bumping it per release would force a full re-download every time.
 const SHELL = ['./', './index.html'];
 
+// ver1459: the stale-while-revalidate trade above says "one release behind for one launch". That was fine
+// when releases were rare, but during a run of frequent deploys every launch stays one behind and the app
+// looks like it never updated (reported as "you don't seem to be deploying"). So once the fresh shell is IN
+// THE CACHE, tell the open page — it shows a "new version / reload" bar, and reloading serves the copy we
+// just stored. The offline-instant launch is unchanged; only the not-knowing is fixed.
+// Version is judged from HEADERS, never the 5.7MB body: GitHub Pages sends a strong ETag.
+function shellStamp(res) {
+  if (!res || !res.headers) return '';
+  return res.headers.get('etag') || res.headers.get('last-modified') || '';
+}
+function isShellRequest(request, url) {
+  if (request.mode === 'navigate') return true;
+  return SHELL.some(function (path) { return new URL(path, self.location.href).href === url.href; });
+}
+function notifyShellUpdated() {
+  return self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(function (cs) {
+    cs.forEach(function (c) { c.postMessage({ type: 'moart-shell-updated' }); });
+  });
+}
+
 self.addEventListener('install', function (e) {
   self.skipWaiting();
   e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }));
@@ -28,7 +48,26 @@ self.addEventListener('fetch', function (e) {
   e.respondWith(
     caches.match(e.request).then(function (hit) {
       const net = fetch(e.request).then(function (res) {
-        if (res && res.ok) { const copy = res.clone(); caches.open(CACHE).then(function (c) { c.put(e.request, copy); }); }
+        if (res && res.ok) {
+          const copy = res.clone();
+          const fresh = shellStamp(res);
+          const shell = isShellRequest(e.request, url);
+          caches.open(CACHE).then(function (c) {
+            // read the OLD entry before overwriting it — that is the copy the user is looking at right now
+            return c.match(e.request).then(function (old) {
+              const stale = shellStamp(old);
+              return c.put(e.request, copy).then(function () {
+                // notify only AFTER the put, so a reload is guaranteed to get the new shell.
+                // no old entry = first visit, missing stamp = no grounds to judge -> stay quiet either way
+                // (a false "new version" banner would be worse than the delay it is fixing).
+                if (shell && old && fresh && stale && fresh !== stale) return notifyShellUpdated();
+              });
+            });
+          }).catch(function (err) {
+            // never silent: a failed cache write means the NEXT launch is still stale and nobody would know
+            console.error('[sw] shell cache update failed', err);
+          });
+        }
         return res;
       }).catch(function () {
         // A cache MISS that also fails the network must still resolve to a Response — respondWith(undefined)
