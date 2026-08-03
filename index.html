@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1481</title>
+  <title>MoArt ver1482</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -56863,6 +56863,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         layerCanvasOffsetY: Math.round(Number(box.layerCanvasOffsetY) || 0),
         refW: Math.max(1, Number(box.refW) || 1), // ver948: numeric-settings scale reference rides every clone
         refH: Math.max(1, Number(box.refH) || 1),
+        baseKey: typeof box.baseKey === 'string' ? box.baseKey : '', // ver1482
         quad: Array.isArray(box.quad) ? box.quad.map(function(q) {
           return [Number(q[0]) || 0, Number(q[1]) || 0];
         }) : null,
@@ -56877,12 +56878,35 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 복원 엔트리와 restorePaintTransformSnapshot 도 결국 프로듀서가 없어져 죽었다 — engineId:'paintTransform'을
     // push하는 곳이 전무함을 grep으로 확인 후 함께 삭제.
 
+    // ── ver1482: 변형 박스의 base 는 「지금 무엇이 변형 대상인가」에서 파생된다 ────────────────────
+    // paintTransformInkRegion 이 정하는 규칙: **선택이 있으면 base = 선택 영역, 없으면 잉크 bbox.**
+    // 그래서 선택이 바뀌면 base 도 바뀌어야 하는데, 아래 관문이 대상(drawingRef)만 보고 박스를 그대로
+    // 돌려주고 있었다. 결과가 사용자 보고의 그 화면이다 — **선택은 사라졌는데 기즈모만 옛 선택 자리에
+    // 남고**, 그 상태로 끌면 소스는 지금 기준(잉크 전체)인데 박스는 옛 사각형이라 그림이 박스로 튕겨
+    // 뭉개진다(ver711 의 「box + source 는 하나의 권위」 불변식이 깨진 상태).
+    // 값을 남기는 결정들(ver1281 툴 전환 · ver1282 undo · ver1314 선택 지우기)은 전부 옳다 —
+    // 남겨야 하는 것은 **값**이지 **base** 가 아닌데 둘이 한 객체에 묶여 같이 남았을 뿐이다.
+    //
+    // 키는 state.paintSelection 의 필드만 읽는다. paintSelectionForTransformTarget 은 패치 캔버스를
+    // 뜨고 픽셀을 훑으므로 이 관문에서 부를 물건이 아니다 — 여기서는 「달라졌는가」만 알면 되고,
+    // 진짜 판정은 재구성 경로의 paintTransformBoundsForTarget 이 한다.
+    function paintTransformBaseKey() {
+      const sel = state.paintSelection;
+      if (!sel || !sel.bounds) return '';
+      const b = sel.bounds;
+      return [Math.round(Number(b.x) || 0), Math.round(Number(b.y) || 0),
+              Math.round(Number(b.w) || 0), Math.round(Number(b.h) || 0),
+              sel.inverted ? 1 : 0].join(',');
+    }
+
     function ensurePaintTransformBoxForTarget(layerTarget, mode, activeTarget, forceReset) {
       const target = activeTarget || activeRasterTargetFromLayerTarget(layerTarget, { previewOnly: true });
       if (!target) return null;
       const ref = String(target.drawingRef || '');
       const nextMode = mode === 'perspective' ? 'perspective' : 'transform';
-      if (!forceReset && state.paintTransformBox && state.paintTransformBox.drawingRef === ref && state.paintTransformBox.mode === nextMode) {
+      const baseKey = paintTransformBaseKey(); // ver1482
+      if (!forceReset && state.paintTransformBox && state.paintTransformBox.drawingRef === ref
+          && state.paintTransformBox.mode === nextMode && state.paintTransformBox.baseKey === baseKey) {
         refreshPaintEditOverlays(ref);
         return state.paintTransformBox;
       }
@@ -56917,7 +56941,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 스케일%가 손대지 않았는데 튄다.
         refW: carry ? Math.max(1, carry.refW) : Math.max(1, bounds.w), // ver948: original dims — the numeric settings' 100% scale reference
         refH: carry ? Math.max(1, carry.refH) : Math.max(1, bounds.h),
-        quad: (carry ? carry.quad : identityQuad).map(function(p) { return [Number(p[0]) || 0, Number(p[1]) || 0]; }),
+        // ver1482: 종전에는 `carry.quad` 를 **그대로** 실었다. quad 는 절대 목적지라서, base 가 달라지면
+        // 뜻이 통째로 달라진다 — 다른 레이어로 옮기면 그 그림이 **옛 자리로 날아가고**, 선택을 지우면
+        // 옛 선택 사각형이 잉크 전체에 씌워진다. TVPaint 는 「절대 좌표계의 **변환**」을 들고 다니지
+        // 「절대 목적지」를 들고 다니지 않는다(사용자 실측 T1: 각자 자리에서 같은 만큼).
+        // 그래서 ver1480 의 커널로 **관계를 새 base 에 풀어 넣는다.** 항등이면 항등이 그대로 나오고,
+        // 관계를 못 만드는 입력(납작한 base 등)이면 종전 동작으로 떨어진다.
+        quad: (function() {
+          if (!carry) return identityQuad.map(function(p) { return [p[0], p[1]]; });
+          const keep = transformKeepsakeFrom(carry.quad, carry.baseQuad);
+          const re = keep ? transformReapplyQuad(keep, identityQuad) : null;
+          return (re || carry.quad).map(function(p) { return [Number(p[0]) || 0, Number(p[1]) || 0]; });
+        })(),
+        baseKey: baseKey, // ver1482: 이 base 가 어떤 선택에서 나왔는가 — 관문이 이것으로 갱신을 판정한다
         // ver1282: 이 박스가 태어난 자리 = "아무것도 안 한 상태". 미확정 판정의 기준선이며, 드래그·숫자
         // 입력·undo가 quad만 갈아끼우고 clone이 이 값을 실어 나르므로 별도 갱신 지점이 없다.
         baseQuad: [
