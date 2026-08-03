@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1479</title>
+  <title>MoArt ver1480</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -16041,6 +16041,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintSelection: null,
       paintLassoPreview: null,
       paintTransformBox: null,
+      paintTransformKeepsake: null, // ver1480: 마지막으로 **확정된** 변형의 관계(재적용용). 미확정 좌표(box)와 별개다
       paintTransformPreview: null,
       paintSpacePanActive: false,
       paintSpacePanDrag: null,
@@ -57249,6 +57250,54 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const by = quad[3][1] * (1 - u) + quad[2][1] * u;
       return { x: tx * (1 - v) + bx * v, y: ty * (1 - v) + by * v };
     }
+    // ── ver1480: 확정한 변형을 **다음 대상에 재적용**한다 (TVPaint 방식) ────────────────────────
+    // 사용자가 TVPaint 실물에서 확인해 준 것(docs/transform_reapply_design.md §0-1):
+    //   · 이동만 → 대상이 어디 있든 같은 델타      · 회전 → 대상이 피벗에서 멀면 크게 날아간다
+    //   · 배율   → 배율은 유지되고 위치는 피벗 반대쪽으로 밀린다
+    // 저장하는 것은 **quad 가 아니라 `baseQuad → quad` 라는 관계**다. quad 하나만 이어주면 그것은
+    // 「절대 목적지」라서 대상이 어디 있든 전부 같은 자리로 모인다 — 실측에서 그렇게 만들었다가 잡혔다.
+    // TVPaint 가 재생하는 것은 절대 좌표계의 **변환**이고, 둘은 순수 이동일 때만 우연히 같아 보인다.
+    //
+    // 계산은 새로 만들 것이 없다. baseQuad 는 언제나 축 정렬 직사각형이므로(identityQuad = bounds),
+    // 새 대상의 꼭짓점을 **옛 base 기준으로 정규화**해 옛 quad 에 넣으면 된다. paintQuadBilinearPoint 는
+    // 순수 보간이라 u,v 가 [0,1] 밖이면 **외삽**되고, 그 외삽이 곧 「피벗에서 먼 만큼 밀린다」이다:
+    //   · 이동  → 옛 quad = base + D 이므로 새 대상도 base' + D          (T1)
+    //   · 배율  → 새 대상이 옛 base 밖이면 u,v 가 [0,1] 밖 → 그만큼 밀린다 (T3·T5)
+    //   · 회전  → 옛 base 가 곧 피벗 자리이므로 멀수록 크게 돈다          (T2)
+    // 아핀(이동·회전·배율)에서는 bilinear = 아핀이라 TVPaint 와 정확히 일치한다. 비아핀(퍼스펙티브)은
+    // 갈릴 수 있는데, **워프 자체가 bilinear 메시**(paintWarpQuadMesh)이므로 재적용도 bilinear 로 두는
+    // 편이 자기 일관적이다 — 워프와 재적용이 다른 수학을 쓰면 반드시 갈라진다.
+    //
+    // 두 엔진이 슬롯은 따로 갖지만(q3-A) 이 수학은 한 벌이다.
+    function transformKeepsakeFrom(quad, baseQuad) {
+      if (!Array.isArray(quad) || quad.length !== 4) return null;
+      if (!Array.isArray(baseQuad) || baseQuad.length !== 4) return null;
+      const bx = Number(baseQuad[0][0]) || 0, by = Number(baseQuad[0][1]) || 0;
+      const bw = (Number(baseQuad[1][0]) || 0) - bx, bh = (Number(baseQuad[3][1]) || 0) - by;
+      if (!(Math.abs(bw) > 1e-6 && Math.abs(bh) > 1e-6)) return null; // 납작한 base = 관계를 못 만든다
+      return { quad: quad.map(function(pt) { return [Number(pt[0]) || 0, Number(pt[1]) || 0]; }),
+               bx: bx, by: by, bw: bw, bh: bh };
+    }
+    function transformReapplyQuad(keep, baseQuad) {
+      if (!keep || !Array.isArray(baseQuad) || baseQuad.length !== 4) return null;
+      const out = baseQuad.map(function(pt) {
+        const u = ((Number(pt[0]) || 0) - keep.bx) / keep.bw;
+        const v = ((Number(pt[1]) || 0) - keep.by) / keep.bh;
+        const q = paintQuadBilinearPoint(keep.quad, u, v);
+        return [q.x, q.y];
+      });
+      return out.every(function(pt) { return Number.isFinite(pt[0]) && Number.isFinite(pt[1]); }) ? out : null;
+    }
+    // 「이 대상에는 아직 아무것도 안 했다」 — 재적용을 걸어도 되는 상태인가의 판정.
+    function transformQuadIsIdentity(quad, baseQuad) {
+      if (!Array.isArray(quad) || quad.length !== 4) return true;   // 좌표가 없으면 항등이다
+      if (!Array.isArray(baseQuad) || baseQuad.length !== 4) return false;
+      for (let i = 0; i < 4; i += 1) {
+        if (Math.abs((Number(quad[i][0]) || 0) - (Number(baseQuad[i][0]) || 0)) > 0.01) return false;
+        if (Math.abs((Number(quad[i][1]) || 0) - (Number(baseQuad[i][1]) || 0)) > 0.01) return false;
+      }
+      return true;
+    }
     // 소스 삼각형 하나를 목적지 삼각형으로 워프(삼각형 메시 바이리니어 = 기하적으로 정확).
     // ver711에 genga에서 콘티로 손복사됐다가 ver768에 다시 하나로 합쳐진 함수 — 룰5 세금의 대표 사례.
     // baseM은 호출자 ctx의 현재 변환. genga는 항등이라 baseM.multiply(M) === setTransform(M)과 비트동일이고,
@@ -62789,13 +62838,29 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1281: 단 "프리뷰가 없으면 구울 게 없다"는 더 이상 맞지 않는다. 툴을 갔다 오면 픽셀 프리뷰는
       // 없어도 좌표(box)는 남아 있고, TVPaint에서는 그 상태로 Enter를 누르면 그대로 적용된다. 남은 좌표로
       // 프리뷰를 먼저 만든 뒤(=드래그가 하는 일과 같은 레시피) 굽는다.
+      // ver1480 (q5-A): **Enter 를 누른 순간**에 재적용한다. 이 대상에 아직 아무것도 안 했고(항등)
+      // 지난 확정값이 있으면, 그 관계를 지금 대상의 baseQuad 로 풀어 넣는다. 대상이 바뀌는 순간에
+      // 미리 깔지 않는 이유는 q4-A 와 같다 — 굽지도 않은 변형 박스가 떠 있으면 「아직 안 먹은 변형이
+      // 있다」로 읽힌다.
+      const reBox = state.paintTransformBox;
+      if (reBox && state.paintTransformKeepsake && paintTransformUiRefValid(reBox.drawingRef)
+          && transformQuadIsIdentity(reBox.quad, reBox.baseQuad)) {
+        const reQuad = transformReapplyQuad(state.paintTransformKeepsake, reBox.baseQuad);
+        if (reQuad) reBox.quad = reQuad;
+      }
       if (!state.paintTransformPreview && state.paintTransformBox
           && paintTransformUiRefValid(state.paintTransformBox.drawingRef)) {
         paintTransformApplyQuadFromUI(paintTransformBoxQuadArray(state.paintTransformBox));
       }
+      // 굽기 전에 관계를 떠 둔다 — 커밋이 좌표를 소비한다(그 설계는 ver1314 의 것이고 그대로 옳다:
+      // 새 라쏘가 남의 좌표를 물려받으면 안 된다). 소비되는 것은 **미확정 좌표**이고, 여기서 뜨는 것은
+      // **확정된 관계**라 서로 다른 물건이다.
+      const nextKeepsake = state.paintTransformBox
+        ? transformKeepsakeFrom(state.paintTransformBox.quad, state.paintTransformBox.baseQuad) : null;
       commitPaintTransformPreview();
+      if (nextKeepsake) state.paintTransformKeepsake = nextKeepsake;
       if (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective') {
-        ensurePaintTransformBoxForCurrentTarget(true);
+        ensurePaintTransformBoxForCurrentTarget(true); // q4-A: 확정 직후 박스는 항등으로
         updatePaintUI();
       }
     }
@@ -78032,6 +78097,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     //   대상(레이어·프레임)이 바뀌든, 툴을 갔다 오든, 선택이 아예 없든 좌표는 남는다.
     // null = "미확정 변형 없음" → 실효 quad 는 지금 선택의 bounds 항등(gengaSelIdentityQuad).
     let gengaTransformBox = null; // { quad: [[x,y]×4] 종이좌표 TL,TR,BR,BL, refW, refH } — 콘티 state.paintTransformBox 대응
+    let gengaTransformKeepsake = null; // ver1480: 마지막으로 확정된 변형의 관계 — 콘티 state.paintTransformKeepsake 대응
     // 실효 quad. 인자 없이 부르면 툴 상태 자체를 읽는다(값이 없으면 null) — 콘솔 검증용 오라클이기도
     // 하다(top-level function 은 window 에 있지만 gengaSel/gengaTransformBox 같은 let 은 아니다).
     function gengaSelQuad(sel) {
@@ -78082,6 +78148,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaResetEngineTransients() {
       gengaSel = null; gengaSelDrag = null; gengaLasso = null;
       gengaTransformBox = null;
+      gengaTransformKeepsake = null; // ver1480: 좌표계도 그림도 남의 것이다 — 위 규칙 그대로
       gengaStamp = null; gengaStampPt = null; gengaStampDrag = null;
       gengaCamDrag = null; gengaExpDrag = null; gengaCellDrag = null;
       gengaLastStrokeCanvas = null;              // ★실측된 누수 — 이전 프로젝트의 용지 캔버스
@@ -78454,7 +78521,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 새 라쏘가 옛 선택을 정리하는 경로(gengaSelectPointerDown)까지 눈앞의 그림을 굽어 버린다.
     function gengaApplySelectionTransform() {
       gengaRetargetSelectionToCurrent(false);
+      // ver1480: 콘티와 같은 자리·같은 순서. 원화는 박스가 없으면 그 자체로 항등이다.
+      if (gengaSel && gengaTransformKeepsake) {
+        const base = gengaSelIdentityQuad(gengaSel);
+        if (transformQuadIsIdentity(gengaTransformBox && gengaTransformBox.quad, base)) {
+          const reQuad = transformReapplyQuad(gengaTransformKeepsake, base);
+          if (reQuad) gengaSetSelQuad(gengaSel, reQuad);
+        }
+      }
+      const nextKeepsake = (gengaSel && gengaTransformBox)
+        ? transformKeepsakeFrom(gengaTransformBox.quad, gengaSelIdentityQuad(gengaSel)) : null;
       gengaCommitSelection();
+      if (nextKeepsake) gengaTransformKeepsake = nextKeepsake;
     }
     // ---- selection-tool button actions (genga) — the tool-options buttons route here when kind==='genga' ----
     function gengaClearSelection() {
