@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1469</title>
+  <title>MoArt ver1470</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -65746,10 +65746,36 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // draw a resolved drawing onto a paper-res context with correct placement (trimmed 1:1 at x,y / legacy scaled
     // to paper). Falls back to the kept last-stroke canvas while its freshly-committed dataUrl is still decoding —
     // this is what stops the "line blinks out for a frame right after a fast stroke" flicker.
+    // ver1470 (#9): **그림이 용지 어디에 놓이는가 — 판정은 여기 한 곳이다.**
+    // 같은 법칙이 **여섯 곳**에 따로 적혀 있었다(작업 항목에는 「3중」으로 적혀 있었는데 실제로는 배가
+    // 넘었다): 실제 렌더(gengaDrawDrawingInto ×2) · FX 베이크(gengaBakeExposureFx) · 중간프레임 실루엣
+    // (gengaDougaAlphaCanvas) · 레이어 썸네일(drawGengaLayerThumbs) · 스캔 시드(gengaDrawingSeedRect) ·
+    // 노출 썸네일(gengaExpThumbInnerHtml). 법칙 자체는 한 문장이다 —
+    // **「x,y 가 유한하면 그 자리에 (w,h) 로, 아니면 용지 전체로 늘린다」**(트림된 새 그림 vs 옛 전면 그림).
+    // 그런데 판정식 `Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))` 이 세 벌이라,
+    // 한쪽만 고치는 순간 **같은 그림이 화면과 썸네일에서 다른 자리에 뜬다.**
+    //
+    // 그리고 **계산은 이미 갈려 있었다**: 썸네일 둘은 `dr.w/h` 를, 중간프레임 실루엣은
+    // `img.naturalWidth/Height` 를 쓴다. 정상 데이터에서는 같지만 보장은 없다 — 드리프트가 이미 시작된
+    // 자리다. 이번 판은 **판정만** 모은다(계산은 단위가 저마다 달라 각자 남는다).
+    // 좌표계는 넷이다(용지 px · 썸네일 캔버스 px · 실루엣 캔버스 px · %). **커널에 그 분기를 넣지 않는다** — 커널은
+    // **용지 px** 로만 답하고 각 호출부가 자기 단위로 옮긴다(AGENTS: 단위가 다르면 호출 전에 맞춘다).
+    // 폴백(w,h)은 `placed:false` 일 때만 용지 크기다. `placed:true` 인데 w/h 가 없는 경우는 **그대로
+    // 넘긴다** — 현행과 같은 값(NaN)을 내야 동작이 안 바뀐다. 정상 데이터에는 없는 상태다.
+    function gengaDrawingPlacement(dr, pw, ph) {
+      if (dr && Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) {
+        return { placed: true, x: Number(dr.x), y: Number(dr.y), w: Number(dr.w), h: Number(dr.h) };
+      }
+      return { placed: false, x: 0, y: 0, w: pw, h: ph };
+    }
+
     function gengaDrawDrawingInto(ctx, dr, pw, ph, onReady) {
       if (!dr) return false;
+      // ver1470: 위치 판정은 커널이 한다. **크기는 계속 안 넘긴다**(3인자 = 원본 크기) — 5인자로 바꾸면
+      // dr.w/h 가 이미지 자연 크기와 어긋나는 그림에서 픽셀이 달라진다. 동작 불변이 먼저다.
+      const place = gengaDrawingPlacement(dr, pw, ph);
       if (dr.canvas) { // ver1324: pending-encode drawing — draw the pixels directly (no decode round-trip)
-        if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) ctx.drawImage(dr.canvas, Math.round(dr.x), Math.round(dr.y));
+        if (place.placed) ctx.drawImage(dr.canvas, Math.round(place.x), Math.round(place.y));
         else ctx.drawImage(dr.canvas, 0, 0, pw, ph);
         return true;
       }
@@ -65759,7 +65785,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) { ctx.drawImage(gengaLastStrokeCanvas.canvas, 0, 0); return true; }
         return false;
       }
-      if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) ctx.drawImage(img, Math.round(dr.x), Math.round(dr.y));
+      if (place.placed) ctx.drawImage(img, Math.round(place.x), Math.round(place.y));
       else ctx.drawImage(img, 0, 0, pw, ph);
       return true;
     }
@@ -73397,7 +73423,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const img = gengaImageFor(dr.dataUrl, null); if (!img) return null;
       const src = document.createElement('canvas'); src.width = pw; src.height = ph;
       const sctx = src.getContext('2d');
-      if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) sctx.drawImage(img, Math.round(dr.x), Math.round(dr.y));
+      // ver1470: 이 세 줄은 gengaDrawDrawingInto 의 **복사본**이다. 지금은 판정만 커널로 모은다 —
+      // 통째로 그 함수를 부르게 하면 dr.canvas 분기와 디코드 경합 폴백까지 딸려 와 **동작이 바뀐다**
+      // (그쪽이 더 정확하긴 하다). 별건으로 남긴다 — 근거는 changelog ver1470.
+      const bakePlace = gengaDrawingPlacement(dr, pw, ph);
+      if (bakePlace.placed) sctx.drawImage(img, Math.round(bakePlace.x), Math.round(bakePlace.y));
       else sctx.drawImage(img, 0, 0, pw, ph);
       const out = document.createElement('canvas'); out.width = pw; out.height = ph;
       const octx = out.getContext('2d');
@@ -75041,7 +75071,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaDougaAlphaCanvas(img, dr, W, H, pw, ph) {
       const c = document.createElement('canvas'); c.width = W; c.height = H;
       const x = c.getContext('2d');
-      if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) x.drawImage(img, dr.x * (W / pw), dr.y * (H / ph), img.naturalWidth * (W / pw), img.naturalHeight * (H / ph));
+      // ver1470: 여기만 크기를 **이미지 자연 크기**로 잡는다(썸네일 둘은 dr.w/h). 정상 데이터면 같지만
+      // 보장은 없다 — 그대로 두고 판정만 커널로 모은다(동작 불변이 먼저다).
+      const dp = gengaDrawingPlacement(dr, pw, ph);
+      if (dp.placed) x.drawImage(img, dp.x * (W / pw), dp.y * (H / ph), img.naturalWidth * (W / pw), img.naturalHeight * (H / ph));
       else x.drawImage(img, 0, 0, W, H);
       return c;
     }
@@ -75990,12 +76023,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const thumbSrc = dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr.dataUrl, drawGengaLayerThumbs) : null)) : null; // ver1324: pending-encode drawings paint from their canvas, same placement law
         if (thumbSrc) {
           const gtp = state.project.gengaTimeline, pw = Math.max(1, gtp.paper.w), ph = Math.max(1, gtp.paper.h);
-          if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) {
-            // trimmed: map the paper onto the thumb (same stretch semantics as before), placing the crop inside it
-            ctx.drawImage(thumbSrc, dr.x / pw * cv.width, dr.y / ph * cv.height, dr.w / pw * cv.width, dr.h / ph * cv.height);
-          } else {
-            ctx.drawImage(thumbSrc, 0, 0, cv.width, cv.height);
-          }
+          // ver1470: 커널이 용지 px 로 답하고 여기서 썸네일 캔버스 px 로 옮긴다. `placed:false` 면
+          // (0,0,pw,ph) 라 변환 결과가 (0,0,cv.width,cv.height) — **옛 else 가지와 같은 값**이라 분기가 없다.
+          const place = gengaDrawingPlacement(dr, pw, ph);
+          ctx.drawImage(thumbSrc, place.x / pw * cv.width, place.y / ph * cv.height,
+                                  place.w / pw * cv.width, place.h / ph * cv.height);
         }
       });
     }
@@ -76812,10 +76844,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // A trimmed drawing is placed 1:1 at x,y — and the decode-race fallback (gengaDrawDrawingInto paints
       // gengaLastStrokeCanvas at 0,0) is gated on the same dataUrl, whose ink bbox IS this rect, so both
       // seed paths land inside it.
-      if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) {
+      // ver1470: 그리기가 아니라 rect 계산이지만 **같은 판정**이다 — 여기가 갈리면 커밋 스캔 창이
+      // 그림과 어긋나 잉크가 잘린다(ver1196).
+      const seed = gengaDrawingPlacement(dr, pw, ph);
+      if (seed.placed) {
         return {
-          x: Math.floor(Number(dr.x)), y: Math.floor(Number(dr.y)),
-          w: Math.max(0, Math.ceil(Number(dr.w) || 0)), h: Math.max(0, Math.ceil(Number(dr.h) || 0))
+          x: Math.floor(seed.x), y: Math.floor(seed.y),
+          w: Math.max(0, Math.ceil(Number(seed.w) || 0)), h: Math.max(0, Math.ceil(Number(seed.h) || 0))
         };
       }
       return { x: 0, y: 0, w: pw, h: ph }; // legacy full-paper bitmap: scaled over the whole paper
@@ -77610,9 +77645,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!(dr && dr.dataUrl)) return '';
       const gt = state.project && state.project.gengaTimeline; if (!gt) return '';
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
-      let x = 0, y = 0, w = pw, h = ph;
-      if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) { x = dr.x; y = dr.y; w = dr.w; h = dr.h; }
-      return '<img class="genga-exp-thumb-img" src="' + dr.dataUrl + '" style="left:' + (x / pw * 100).toFixed(3) + '%;top:' + (y / ph * 100).toFixed(3) + '%;width:' + (w / pw * 100).toFixed(3) + '%;height:' + (h / ph * 100).toFixed(3) + '%" alt="">';
+      // ver1470: 같은 커널 — 여기서는 % 로 옮긴다.
+      const place = gengaDrawingPlacement(dr, pw, ph);
+      return '<img class="genga-exp-thumb-img" src="' + dr.dataUrl + '" style="left:' + (place.x / pw * 100).toFixed(3) + '%;top:' + (place.y / ph * 100).toFixed(3) + '%;width:' + (place.w / pw * 100).toFixed(3) + '%;height:' + (place.h / ph * 100).toFixed(3) + '%" alt="">';
     }
     // paper-sized working canvas seeded with the current exposure art (sync, from cache).
     // ver764: the drawing exactly as stored — no selection compositing. This is what a NOT-YET-LIFTED
