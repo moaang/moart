@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1467</title>
+  <title>MoArt ver1468</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -74285,15 +74285,42 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       document.addEventListener('pointerup', host.onUp, true);
       document.addEventListener('pointercancel', host.onUp, true);
     }
+    // ── ver1468 (R2): 라이브 반영을 **프레임당 1회**로 ────────────────────────────────────────────
+    // 값 계산(dx → clamp → s.value)은 **동기 그대로**다. 미루는 것은 host.applyLive 뿐인데, 그 한 번이
+    // host 마다 무겁다 — 실측(16이벤트/프레임 = 고폴링 마우스):
+    //   · 콘티 레이어FX  forceVideoPreviewRebuild 1.14ms → **18.2ms/프레임 = 예산의 109%**
+    //   · 원화 FX        drawGengaPreview 0.50ms        → 8.0ms (48%)
+    //   · 재생바 숫자    paintBrushPanelSyncValues 0.28ms → 4.5ms (27%)
+    // 셋이 **이미 이 커널 하나를 지나므로**(fxScrubMove(ev, host)) 여기 한 곳만 고치면 셋 다 접힌다 —
+    // R2 를 「공용커널화 후보」로 적어 뒀지만 공용화는 ver847 에 이미 되어 있었고, 남은 것은 유량이었다.
+    //
+    // **커밋 계약이 핵심이다.** 콘티의 applyLive(onLayerEffectInput)는 프리뷰가 아니라 **모델 쓰기**이고,
+    // commitLayerEffectEdit 은 `ref.layer.effect` 의 **현재 값**을 읽어 히스토리에 넣는다. 대기 중인
+    // applyLive 를 흘려보내지 않고 커밋하면 **마지막 값이 유실**된다(ver972 가 겪은 「undo 가 다
+    // 안 되돌려짐」과 같은 계열). 그래서 fxScrubUp 이 host.state 를 비우기 **전에** flush 한다.
+    let fxScrubRaf = 0;
+    let fxScrubPendingHost = null;
+    function fxScrubFlushPending() {
+      if (fxScrubRaf) { cancelAnimationFrame(fxScrubRaf); fxScrubRaf = 0; }
+      const h = fxScrubPendingHost; fxScrubPendingHost = null;
+      if (h && h.state) h.applyLive(h.state);
+    }
     function fxScrubMove(ev, host) {
       const s = host.state; if (!s) return;
       const dx = ev.clientX - s.startX;
       if (!s.moved && Math.abs(dx) <= FX_SCRUB_MOVE_THRESH) return;
       s.moved = true;
-      s.value = host.clamp(s, s.startValue + dx * (s.d.step || 1));
-      host.applyLive(s);
+      s.value = host.clamp(s, s.startValue + dx * (s.d.step || 1)); // 값은 **동기** — 커밋이 읽는 것은 이것
+      fxScrubPendingHost = host;
+      if (fxScrubRaf) return;
+      fxScrubRaf = requestAnimationFrame(function() {
+        fxScrubRaf = 0;
+        const h = fxScrubPendingHost; fxScrubPendingHost = null;
+        if (h && h.state) h.applyLive(h.state); // 드래그가 이미 끝났으면 버린다
+      });
     }
     function fxScrubUp(ev, host) {
+      fxScrubFlushPending(); // ver1468: **state 를 비우기 전에** — 안 하면 마지막 값이 모델에 안 들어간다
       const s = host.state; host.state = null; if (!s) return;
       document.removeEventListener('pointermove', host.onMove, true);
       document.removeEventListener('pointerup', host.onUp, true);
