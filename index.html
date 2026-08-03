@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1482</title>
+  <title>MoArt ver1483</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -56983,7 +56983,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!box) return; // 미확정 변형 슬롯이 비어 있으면 옮길 것도 없다
       const target = currentPaintTransformLayerTarget();
       if (!target) return; // 대상 자체가 없는 자리(용지 모드 등) — 게이트가 알아서 무효 판정한다
-      if (String(target.drawingRef || '') === String(box.drawingRef || '')) return; // 같은 대상
+      // ver1483: 종전에는 **대상만** 비교해 「같은 대상」이면 여기서 돌아갔다. 그래서 ver1482 가
+      // ensurePaintTransformBoxForTarget 의 관문에 baseKey 를 넣어 두었는데도 **그 관문까지 가지 못했다** —
+      // 대상은 그대로고 선택만 사라진 경우(사용자 보고: 점선은 없고 기즈모만 옛 자리)가 정확히 이
+      // 조기 반환에 걸린다. 재구성을 부르는 렌더 경로가 여기 하나뿐이라, 여기서 안 걸리면 어디서도 안 걸린다.
+      // baseKey 는 state.paintSelection 의 필드만 읽으므로 렌더마다 불러도 싸다.
+      if (String(target.drawingRef || '') === String(box.drawingRef || '')
+          && box.baseKey === paintTransformBaseKey()) return; // 대상도 선택 기준도 그대로
       ensurePaintTransformBoxForCurrentTarget(false);
     }
 
@@ -57314,13 +57320,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return { quad: quad.map(function(pt) { return [Number(pt[0]) || 0, Number(pt[1]) || 0]; }),
                bx: bx, by: by, bw: bw, bh: bh };
     }
+    // ver1483: **아핀**으로 푼다. 처음에는 base 를 (u,v) 로 정규화해 paintQuadBilinearPoint 에 넣었는데,
+    // 그러면 **이동량까지 base 크기에 비례**한다 — 작은 선택(20px)에서 100px 옮긴 뒤 선택을 지워 base 가
+    // 잉크 전체(1000px)가 되면 이동이 5000px 로 불어나 기즈모가 화면 밖으로 날아간다(사용자 보고:
+    // 「퍼스펙티브 기즈모가 사라지는 케이스」). T1 실측이 이것을 못 걸러낸 이유는 그 테스트의 두 대상이
+    // **같은 크기**여서 정규화 배율이 1 이었기 때문이다 — 우연히 맞았던 것이다.
+    //
+    // TVPaint 식 `p' = R·s·(p − P) + P + D` 에서 **D 는 절대 픽셀**이지 base 상대가 아니다. 옛 base 가
+    // 축 정렬 직사각형이므로 그 아핀은 축 이미지 두 개로 바로 나온다:
+    //   e1 = (quad[1] − quad[0]) / bw   (x 축이 어디로 갔나)
+    //   e2 = (quad[3] − quad[0]) / bh   (y 축이 어디로 갔나)
+    //   p'  = quad[0] + e1·(p.x − bx) + e2·(p.y − by)
+    // 이동만이면 e1=(1,0), e2=(0,1) 이라 `p' = p + D` — **base 크기와 무관**하다. 배율이면 피벗 기준
+    // 그대로 나온다. 비아핀 quad(퍼스펙티브)는 아핀 근사가 되는데, 그 손실은 bilinear 쪽도 마찬가지이면서
+    // 폭발까지 얹던 것이라 이쪽이 낫다.
     function transformReapplyQuad(keep, baseQuad) {
       if (!keep || !Array.isArray(baseQuad) || baseQuad.length !== 4) return null;
+      const q = keep.quad;
+      const e1x = (q[1][0] - q[0][0]) / keep.bw, e1y = (q[1][1] - q[0][1]) / keep.bw;
+      const e2x = (q[3][0] - q[0][0]) / keep.bh, e2y = (q[3][1] - q[0][1]) / keep.bh;
       const out = baseQuad.map(function(pt) {
-        const u = ((Number(pt[0]) || 0) - keep.bx) / keep.bw;
-        const v = ((Number(pt[1]) || 0) - keep.by) / keep.bh;
-        const q = paintQuadBilinearPoint(keep.quad, u, v);
-        return [q.x, q.y];
+        const dx = (Number(pt[0]) || 0) - keep.bx, dy = (Number(pt[1]) || 0) - keep.by;
+        return [q[0][0] + e1x * dx + e2x * dy, q[0][1] + e1y * dx + e2y * dy];
       });
       return out.every(function(pt) { return Number.isFinite(pt[0]) && Number.isFinite(pt[1]); }) ? out : null;
     }
