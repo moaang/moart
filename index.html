@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1468</title>
+  <title>MoArt ver1469</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -46503,6 +46503,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   ④ 저장된 프로젝트 payload 전부  ⑤ 버전 롤백 링 전부
     // ④⑤ 는 portable:false 라 그림을 **ref 로만** 들고 있다 — 빠뜨리면 되돌리기가 빈 코마가 된다.
     // 파싱 실패는 **「참조 없음」이 아니라 「모른다」**로 센다. 모르는 게 하나라도 있으면 삭제하면 안 된다.
+    // ver1469 (#16): 콘티 음성 blob(`indexedDbAudio:<clipId>`)의 참조는 **형태를 열거해서 찾지 않는다.**
+    // 두 가지가 그것을 막는다:
+    //  · 키가 **암묵적**일 수 있다 — `audioStorage.key` 가 비어 있으면 `clip.id` 로 키를 만든다(17326행).
+    //    그래서 payload 에서 `indexedDbAudio:` 문자열만 찾으면 그 클립을 **놓쳐서 지운다.**
+    //  · 히스토리 커맨드가 **15종**이고 계속 는다(applyHistoryCommandPayload). 종류를 나열하는 순간
+    //    다음에 추가되는 하나를 반드시 빠뜨린다 — ver1455 가 레이어 클립보드에서 실증한 그 사고다.
+    //
+    // 그래서 **역방향**으로 판정한다: 행 키에서 clipId 를 뽑아, 그 문자열이 root 텍스트 **어디엔가**
+    // 나타나면 살아 있다고 본다. 형태를 몰라도 되고, 무엇보다 **오탐이 안전한 쪽**이다 —
+    // 우연히 겹쳐 보이면 「안 지움」이고, 위험한 미탐(놓쳐서 지움)은 문자열 포함 검사에 없다.
+    // clipId 는 난수 섞인 고유 문자열이라 우연한 일치는 사실상 없다.
+    function storageScanConteAudioText(text, candidates, alive) {
+      if (!text || !candidates.length) return;
+      const str = String(text);
+      for (let i = 0; i < candidates.length; i += 1) {
+        const cid = candidates[i];
+        if (!alive.has(cid) && str.indexOf(cid) >= 0) alive.add(cid);
+      }
+    }
+
     async function storageLiveRefsScan(onProgress) {
       const drawRefs = new Set(), audioRefs = new Set();
       gengaAddProjectRefs(state.project, drawRefs, audioRefs);   // ①
@@ -46515,13 +46535,35 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
       });
       let keys = [];
-      try { keys = await listWorkspaceDbKeys(); } catch (error) { return { keys: [], drawRefs: drawRefs, audioRefs: audioRefs, unknown: 1, payloadCount: 0 }; }
+      try { keys = await listWorkspaceDbKeys(); } catch (error) { return { keys: [], drawRefs: drawRefs, audioRefs: audioRefs, conteAudioAlive: new Set(), unknown: 1, payloadCount: 0 }; }
+      // 후보 = 지금 저장소에 있는 콘티 음성 행들의 clipId. 이것만 찾으면 된다.
+      const audioCandidates = [];
+      keys.forEach(function(k) {
+        if (storageKeyBucket(k) !== 'conteAudio') return;
+        const cid = k.slice(INDEXED_DB_AUDIO_KEY_PREFIX.length);
+        if (cid) audioCandidates.push(cid);
+      });
+      const conteAudioAlive = new Set();
+      // 현재 프로젝트(미저장 편집 포함)와 히스토리 — 직렬화에 실패하면 **모른다**로 센다(아래 unknown).
+      let liveTextUnknown = 0;
+      const scanObj = function(obj) {
+        if (!obj) return;
+        try { storageScanConteAudioText(JSON.stringify(obj), audioCandidates, conteAudioAlive); }
+        catch (error) { liveTextUnknown += 1; console.error('[storage] live text scan failed', error); }
+      };
+      if (audioCandidates.length) {
+        scanObj(state.project && state.project.audio);
+        [state.undoStack, state.redoStack].forEach(function(stack) { (stack || []).forEach(scanObj); });
+      }
       const payloadKeys = keys.filter(function(k) { const b = storageKeyBucket(k); return b === 'project' || b === 'version'; });
       let unknown = 0;
       for (let i = 0; i < payloadKeys.length; i += 1) {
         let parsed = null;
         try {
           const raw = await getWorkspaceDbValue(payloadKeys[i]);
+          // ver1469: 파싱 **전 원문**에서 콘티 음성 clipId 를 찾는다 — 어차피 문자열로 들고 있으므로
+          // 추가 비용이 거의 없고, 저장 형태가 어떻든(키가 명시든 암묵이든) clipId 는 거기 있다.
+          if (raw && audioCandidates.length) storageScanConteAudioText(raw, audioCandidates, conteAudioAlive);
           // 값이 빈 행도 **모른다**로 센다 — 「참조가 없다」와 구별되어야 한다.
           if (raw) parsed = JSON.parse(String(raw));
         } catch (error) {
@@ -46531,7 +46573,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         else unknown += 1;
         if (onProgress) onProgress(i + 1, payloadKeys.length);
       }
-      return { keys: keys, drawRefs: drawRefs, audioRefs: audioRefs, unknown: unknown, payloadCount: payloadKeys.length };
+      return { keys: keys, drawRefs: drawRefs, audioRefs: audioRefs, conteAudioAlive: conteAudioAlive,
+               unknown: unknown + liveTextUnknown, payloadCount: payloadKeys.length };
     }
 
     // ver1462: **「이 행이 아직 쓰이는가」의 판정은 여기 한 곳이다.**
@@ -46548,11 +46591,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let referenced;
         if (b === 'gd') referenced = live.drawRefs.has(k.slice(3));
         else if (b === 'ga') referenced = live.audioRefs.has(k.slice(3));
-        // ver1467: **`conteAudio` 는 일부러 여기 없다.** 세기는 하지만(패널) 정리는 안 한다 —
-        // 그 참조는 콘티 payload 의 `audio.clips[].audioStorage.key` 에 있고 이 스캔의 root 수집
-        // (gengaAddProjectRefs)은 **원화 타임라인만** 훑는다. root 를 넓히지 않은 채 정리하면
-        // 살아 있는 음성을 지운다 — ver1455 가 레이어 클립보드에서 실증한 그 사고다.
-        else return; // 그림·음성 행이 아니면 이 판정의 대상이 아니다(프로젝트 payload·버전·팁·콘티 음성)
+        // ver1469: 콘티 음성은 clipId 가 root 텍스트 어디엔가 나타나는가로 판정한다(storageLiveRefsScan
+        // 의 주석 참고 — 형태를 열거하지 않는다). `conteAudioAlive` 가 없으면(옛 호출부) 전부 살아 있는
+        // 것으로 본다 — 모르면 안 지운다.
+        else if (b === 'conteAudio') {
+          const cid = k.slice(INDEXED_DB_AUDIO_KEY_PREFIX.length);
+          referenced = !live.conteAudioAlive || live.conteAudioAlive.has(cid);
+        }
+        else return; // 그림·음성 행이 아니면 이 판정의 대상이 아니다(프로젝트 payload·버전·팁)
         if (referenced) kept += 1; else unused.push(k);
       });
       return { unused: unused, kept: kept };
