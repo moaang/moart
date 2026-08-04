@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1515</title>
+  <title>MoArt ver1516</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -15844,9 +15844,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const INDEXED_DB_AUTOSAVE_KEY = 'indexedDbAutosaveProject';
     const INDEXED_DB_PROJECT_INDEX_KEY = 'indexedDbProjectIndex';
     const INDEXED_DB_PROJECT_PAYLOAD_PREFIX = 'indexedDbProject:';
-    // ver1515 (사용자 요청): 고정 4 + 진짜 백업 3 = 7. 이 상수는 둘을 합친 전체 한도이고(ver1259),
-    // 퇴출 로직이 고정을 보호하며 나머지를 오래된 순으로 지우므로 숫자만 낮추면 그 비율이 그대로 지켜진다.
-    const INDEXED_DB_BACKUP_MAX_SLOTS = 7; // was 8(=4+4). 고정 PINNED_PROJECT_MAX(4) + 백업 전용 3.
+    // ver1515 (사용자 요청): 고정 4 + 진짜 백업 3, 처음엔 합쳐서 7 로 낮췄다. 그런데 그건 여전히
+    // **공유 풀**이라 고정이 4개 미만이면 백업이 3개보다 많이 뜰 수 있었다(예: 고정 1개 → 백업 최대 6개).
+    // ver1516 (사용자 재요청, 「백업슬롯을 따로 3개 한도로 못하나?」): 백업 전용을 **독립 한도**로 뗐다 —
+    // 퇴출 판정이 `slots.length`(전체) 가 아니라 「고정 아닌 것의 개수」를 본다(아래 writeProjectToIndexedDbSlot).
+    // 이제 백업은 고정 개수와 무관하게 늘 최대 3개다.
+    const INDEXED_DB_BACKUP_ONLY_MAX_SLOTS = 3;
     // ver902: per-project rollback ring. The autosave overwrites the single latest payload, so a bad edit that
     // got autosaved buries the pre-mistake state. These keep a few time-spread snapshots so it can be rolled
     // back after a reload (undo is in-memory and does not survive a reload).
@@ -15858,8 +15861,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 다 차면 새 프로젝트 생성을 막고, 비울 UI는 화면에 없다 = 출구가 0인 고착(실기 보고).
     // ver1359는 시작 화면에 해제 버튼을 달아 탈출구만 냈지만 그건 증상 처치였다 — 폰에서 존재 이유가
     // 없는 개념을 유지한 채 관리 UI를 새로 만드는 꼴이라, 개념 자체를 끄는 쪽이 맞다.
-    // 끄면 잃는 것: 핀은 자동저장 인덱스의 LRU eviction 보호막이므로(INDEXED_DB_BACKUP_MAX_SLOTS=8),
-    // 폰에서 프로젝트가 8개를 넘으면 오래된 것부터 payload가 지워진다. 백업은 원래 "이 브라우저 안의
+    // 끄면 잃는 것: 핀은 자동저장 인덱스의 LRU eviction 보호막이므로(ver1516: 백업 전용 한도는
+    // INDEXED_DB_BACKUP_ONLY_MAX_SLOTS=3, 고정과 무관하게 늘 3), 폰에서 핀이 꺼지면 모든 프로젝트가
+    // "고정 아님" 취급돼 3개를 넘으면 오래된 것부터 payload가 지워진다. 백업은 원래 "이 브라우저 안의
     // 임시 사본"이라는 성격이고(가이드 문구도 그렇게 말한다), 폰에서 8개를 동시에 굴리는 사용은
     // 상정 밖이라 받아들인다. 데스크톱은 종전 그대로다.
     function pinnedProjectSlotsEnabled() { return !isPhoneLayout(); }
@@ -46459,7 +46463,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // once only pinned ones remain, even if that leaves the list over the nominal cap.
       slots.sort(function(a, b) { return String(a.savedAt).localeCompare(String(b.savedAt)); });
       const pinnedForEviction = await loadPinnedProjectSlots();
-      while (slots.length > INDEXED_DB_BACKUP_MAX_SLOTS) {
+      // ver1516: 백업 전용 한도는 고정 개수와 무관하게 늘 INDEXED_DB_BACKUP_ONLY_MAX_SLOTS 다 —
+      // 전체 길이가 아니라 「고정 아닌 것」의 개수를 판정 대상으로 삼는다.
+      const countNonPinned = function() { return slots.filter(function(s) { return pinnedForEviction.indexOf(s.id) === -1; }).length; };
+      while (countNonPinned() > INDEXED_DB_BACKUP_ONLY_MAX_SLOTS) {
         const evictIdx = slots.findIndex(function(slot) { return pinnedForEviction.indexOf(slot.id) === -1; });
         if (evictIdx === -1) break;
         const evicted = slots.splice(evictIdx, 1)[0];
@@ -47027,7 +47034,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const heading = document.getElementById('indexedDbProjectSlotsHeading');
       if (!container) return;
       // ver1457: 상한은 상수가 정본 — 문구에 숫자를 따로 적으면 상수를 바꾼 날 화면만 거짓말한다.
-      if (heading) heading.textContent = t('settings.slots.heading', INDEXED_DB_BACKUP_MAX_SLOTS);
+      // ver1516: 고정·백업이 독립 한도로 갈린 뒤에도 이 목록(둘을 합쳐 보여준다)의 이론상 최댓값은
+      // 두 상수의 합이다 — 실제로는 고정이 4개 미만이면 그보다 적게 뜬다(「최大」의 뜻 그대로).
+      if (heading) heading.textContent = t('settings.slots.heading', PINNED_PROJECT_MAX + INDEXED_DB_BACKUP_ONLY_MAX_SLOTS);
       if (!indexedDbAutosaveAvailable()) { container.innerHTML = ''; if (heading) heading.textContent = ''; return; }
       let index = { slots: [], lastActiveId: '' };
       try { index = await loadIndexedDbProjectIndex(); } catch (error) { index = { slots: [], lastActiveId: '' }; }
