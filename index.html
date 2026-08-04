@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1524</title>
+  <title>MoArt ver1525</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -13529,7 +13529,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'menu.audio.rename.prompt': { ja: 'クリップ名', ko: '클립 이름', en: 'Clip name' },
         'menu.audio.revertFileName': { ja: '元のファイル名に戻す（話者名・台詞リンク解除）', ko: '원래 파일명으로 되돌리기 (화자명·대사 링크 해제)', en: 'Revert to file name (unlink speaker/dialogue)' },
         'menu.audio.resetVolume': { ja: '音量をリセット（0dB）', ko: '음량 초기화 (0dB)', en: 'Reset volume (0dB)' },
-        'menu.audio.splitAtPlayhead': { ja: '現在の再生位置で分割', ko: '현재 재생 위치에서 분할', en: 'Split at playhead' },
+        // ver1525: 오디오 클립과 그림 패널이 **같은 문구**를 쓴다 — 문맥(무엇을 우클릭했는가)이
+        // 대상을 말해 주므로 문구를 두 벌로 적지 않고 키 하나를 공유한다.
+        'menu.splitAtPlayhead': { ja: '現在の再生位置で分割', ko: '현재 재생 위치에서 분할', en: 'Split at playhead' },
         'menu.delete': { ja: '削除', ko: '삭제', en: 'Delete' },
         'menu.audio.recordStart': { ja: '録音開始', ko: '녹음 시작', en: 'Start recording' },
         'menu.audio.deleteAudioTrack': { ja: '音声トラック削除', ko: '오디오 트랙 삭제', en: 'Delete audio track' },
@@ -30412,7 +30414,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         } },
         { label: t('menu.audio.revertFileName'), disabled: !hasDialogState, action: function() { if (hasDialogState) resetAudioClipToFileName(id); } },
         { label: t('menu.audio.resetVolume'), disabled: clampAudioClipVolume(clip.volume) === 1, action: function() { resetAudioClipVolume(id); } },
-        { label: t('menu.audio.splitAtPlayhead'), disabled: !canSplit, action: function() { if (canSplit) splitAudioClipAtPlayhead(id); } },
+        { label: t('menu.splitAtPlayhead'), disabled: !canSplit, action: function() { if (canSplit) splitAudioClipAtPlayhead(id); } },
         { separator: true },
         { label: t('menu.delete'), action: function() { runCommand('Delete dialog audio', function(project) { deleteAudioClip(project, id); }); } }
       ];
@@ -32640,9 +32642,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const hasOl = cutGroupHasOl(state.project, targetCutId);
       const prevMerge = cutMergeAllowed(state.project, targetCutId, 'prev');
       const nextMerge = cutMergeAllowed(state.project, targetCutId, 'next');
+      const canSplitPanel = Boolean(picturePanelSplitPlan(state.project, targetCutId));
       openSimpleContextMenu(event, [
         { label: t('menu.conte.cut.add'), action: function() { addConteCutAfterSelection(); } },
         { label: t('menu.conte.cut.delete'), disabled: !canDelete, action: function() { deletePrimarySelectedPicturePanel(); } },
+        { separator: true },
+        // ver1525: 패널 기준의 동작이라 컷 기준(추가·삭제·결합·OL·번호)과 구분선으로 갈라 둔다.
+        // 재생바가 이 패널 안에 없거나 경계에 정확히 있으면 자를 것이 없다 — 오디오 분할과 같은 규칙.
+        { label: t('menu.splitAtPlayhead'), disabled: !canSplitPanel, action: function() { splitPicturePanelAtPlayhead(targetCutId); } },
         { separator: true },
         { label: prevMerge ? t('menu.conte.cut.mergePrev', prevMerge.neighborCutNo) : '', hidden: !prevMerge, action: function() { mergeCutIntoNeighbor(targetCutId, 'prev'); } },
         { label: nextMerge ? t('menu.conte.cut.mergeNext', nextMerge.neighborCutNo) : '', hidden: !nextMerge, action: function() { mergeCutIntoNeighbor(targetCutId, 'next'); } },
@@ -45506,6 +45513,88 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
+    // ver1525: 그림 패널을 재생바에서 자르는 면도날. 「컷」은 cutNo 가 있는 패널에서 시작해 cutNo 가
+    // 빈 패널들을 삼키는 그룹이므로(cutGroupLastIndex), **새 패널의 cutNo 를 비워 두는 것만으로**
+    // 컷 판정은 그대로다. 총 길이도 원본의 pictureFrames 를 둘이 나눠 가지므로 불변이라, 패널 추가와
+    // 달리 뒤 컷·오디오를 밀 필요가 없다(shiftTimelineMediaAfterFrame 를 부르지 않는 이유).
+    // panelStart 는 손대지 않는다 — normalizeConteLayer 가 startPanelCutId 로부터 다시 세는 파생값이다.
+    function picturePanelSplitPlan(project, cutId) {
+      const index = cutIndexById(project, cutId);
+      if (index < 0) return null;
+      const slots = (buildVideoTimeline(project) || {}).slots || [];
+      const slot = slots.find(function(s) { return s.cut && s.cut.id === cutId; });
+      if (!slot) return null;
+      const total = Math.max(1, Math.round(Number(slot.endFrame) - Number(slot.startFrame)));
+      const splitAt = Math.round(Number(state.videoPlayheadFrames) || 0) - Math.round(Number(slot.startFrame) || 0);
+      // 경계 위나 패널 밖이면 0프레임 조각이 생긴다 — 자르지 않는다(오디오 분할과 같은 가드).
+      if (splitAt <= 0 || splitAt >= total) return null;
+      const owner = conteLayerOwnerCut(project, cutId);
+      if (!owner) return null;
+      const layers = (owner.conteLayers || []).filter(Boolean);
+      const spanOf = function(layer) { return Math.max(1, Math.round(Number(layer.panelSpan) || 1)); };
+      const covering = layers.filter(function(layer) {
+        const start = cutIndexById(project, layer.startPanelCutId);
+        return start >= 0 && start <= index && index <= start + spanOf(layer) - 1;
+      });
+      return {
+        index: index, splitAt: splitAt, total: total, owner: owner,
+        // 이 패널만 덮던 코마 = 둘로 쪼갤 것. 여러 패널에 걸친 코마(BG 등) = 새 패널까지 늘릴 것 —
+        // 늘리지 않으면 뒤쪽 패널에서 그 레이어만 사라진다(원래 그 시간대를 덮고 있었으므로).
+        splitting: covering.filter(function(layer) { return spanOf(layer) === 1; }),
+        widening: covering.filter(function(layer) { return spanOf(layer) > 1; }),
+        fits: layers.length + covering.filter(function(layer) { return spanOf(layer) === 1; }).length <= CONTE_LAYER_ORDER_MAX
+      };
+    }
+
+    function splitPicturePanelAtPlayhead(cutId) {
+      const id = String(cutId || '');
+      const pre = picturePanelSplitPlan(state.project, id);
+      if (!pre) return;
+      // 조용한 실패 금지 — 코마 상한에 걸리면 반쪽만 쪼개지 않고 아예 안 하고 이유를 낸다.
+      if (!pre.fits) { state.timelineStatus = t('status.genga.conteLayer.limitAZ'); renderApp(); return; }
+      runTimelineStructureCommand('パネル分割', function(project) {
+        const plan = picturePanelSplitPlan(project, id);
+        if (!plan || !plan.fits) return;
+        const src = project.cuts[plan.index];
+        const panel = createBlankCut(project.cuts.length + 1);
+        panel.id = 'panel-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+        // cutNo 는 createBlankCut 이 준 빈 문자열 그대로 둔다 — 그것이 「같은 컷에 남는다」의 전부다.
+        panel.pictureFrames = plan.total - plan.splitAt;
+        panel.pictureFramesManual = true;
+        panel.pictureFramesInferred = 0;
+        panel.meta = Object.assign({}, panel.meta, { userOverride: true, insertedPanel: true });
+        src.pictureFrames = plan.splitAt;
+        src.pictureFramesManual = true;
+        src.pictureFramesInferred = 0;
+        src.meta = Object.assign({}, src.meta, { userOverride: true });
+        plan.widening.forEach(function(layer) {
+          layer.panelSpan = Math.max(1, Math.round(Number(layer.panelSpan) || 1)) + 1;
+        });
+        // 뒤쪽 코마는 그림까지 복제한다(copyDrawing) — 처음엔 똑같이 보이고 뒤쪽만 고쳐 그릴 수 있다.
+        // createConteLayer 는 effect 를 안 실어 준다(복제 계열 공통) — 같은 그림의 뒷부분인데 FX 만
+        // 초기화되면 화면이 튄다. 정규화가 읽는 자리에 그대로 얹어 둔다.
+        const clones = plan.splitting.map(function(layer) {
+          const clone = createConteLayer(Object.assign({}, layer, {
+            id: newConteLayerId('conte-layer'),
+            originLayerId: layer.originLayerId || layer.id,
+            drawingRef: duplicateConteLayerDrawingRef(project, layer, false, { copyDrawing: true }),
+            derivedFrom: layer.id,
+            startPanelCutId: panel.id,
+            panelSpan: 1
+          }));
+          clone.effect = normalizeStoredLayerEffect(layer.effect);
+          return clone;
+        });
+        project.cuts.splice(plan.index + 1, 0, panel);
+        resetCutOrders(project);
+        if (clones.length) {
+          plan.owner.conteLayers = (plan.owner.conteLayers || []).concat(clones);
+          markConteLayerOwnerHasLayers(plan.owner);
+        }
+        setCurrentPicturePanelId(src.id);
+      }, { deferThumbnails: true, deferThumbnailMs: 520, partialTimeline: true });
+    }
+
     function addPicturePanelAfterSelection() {
       runTimelineStructureCommand('Add picture panel', function(project) {
         const selectedIndex = selectedCutIndexForEdit(project);
@@ -54966,7 +55055,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
                  ['af.volume', 'guide.audio.clip.volV']] },
         // 재생헤드 분할은 콘티에만 있다 — 원화 클립의 컨텍스트 메뉴는 音量/削除 둘뿐(:66953).
         { h: 'guide.audio.split.h', mode: 'conte',
-          rows: [['menu.audio.splitAtPlayhead', 'guide.audio.clip.splitV']] },
+          rows: [['menu.splitAtPlayhead', 'guide.audio.clip.splitV']] },
         { h: 'guide.audio.lib.h', mode: 'conte', p: ['guide.audio.lib.p1'], note: 'guide.audio.lib.note' },
         { h: 'guide.audio.vv.h', mode: 'conte', p: ['guide.audio.vv.p1'], note: 'guide.audio.vv.note' },
         // ver1511: 드래그 진입로가 ♪ 하나뿐이라 문서 없이는 존재를 모른다. 대사블록은 콘티 전용.
