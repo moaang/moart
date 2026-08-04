@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1527</title>
+  <title>MoArt ver1528</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -15080,6 +15080,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'status.genga.layerKoma.pasted': { ja: 'レイヤーコマを貼り付けました。', ko: '레이어 코마를 붙여넣었습니다.', en: 'Layer koma pasted.' },
         'status.genga.conteLayer.linkExists': { ja: 'このCUTには既にコンテレイヤーのリンクが存在します。', ko: '이 CUT에는 이미 콘티 레이어 링크가 존재합니다.', en: 'Conte layer link already exists in this CUT.' },
         'status.genga.conteLayer.limitAZ': { ja: 'コンテレイヤーの上限はA〜Zです。', ko: '콘티 레이어 한도는 A~Z까지입니다.', en: 'Conte layer limit is A-Z.' },
+        // ver1528: 재생 중 소리를 못 낸 클립이 있으면 멈출 때 알린다(종전에는 흔적 없이 사라졌다).
+        'status.audio.playbackMissed': {
+          ja: function(count, detail) { return '音声 ' + count + ' クリップが再生されませんでした（' + detail + '）。もう一度再生すると鳴ります。'; },
+          ko: function(count, detail) { return '음성 ' + count + '개 클립이 재생되지 않았습니다(' + detail + '). 다시 재생하면 소리가 납니다.'; },
+          en: function(count, detail) { return count + ' audio clip(s) did not play (' + detail + '). Playing again will sound them.'; },
+        },
         'status.genga.layerKoma.moveBlockedRowNotEmpty': { ja: 'レイヤーコマの移動をブロックしました：移動先の行が空いていません。', ko: '레이어 코마 이동이 차단되었습니다: 이동할 행이 비어 있지 않습니다.', en: 'Layer koma move blocked: target row is not empty.' },
         'status.genga.layerKoma.moved': { ja: 'レイヤーコマを移動しました。', ko: '레이어 코마를 이동했습니다.', en: 'Layer koma moved.' },
         'status.genga.audioTrack.deleteBlockedOverlap': { ja: 'トラック削除をブロックしました：音声が重なってしまいます。', ko: '트랙 삭제가 차단되었습니다: 오디오가 겹치게 됩니다.', en: 'Track delete blocked: overlapping audio would be created.' },
@@ -19447,6 +19453,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         skipWriteTrack: true
       });
       if (trace) trace('audioEdit:refresh');
+      // ver1528: 편집 직후 재생하면 소리가 늦게 나오던 것. **트림은 디코드 캐시의 키를 바꾼다** —
+      // 슬라이스 키가 clipSourceSliceRange(=audioTrim* + speed)로 만들어지므로(audioClipSliceCacheKey)
+      // 트림을 건드린 뒤 첫 재생은 반드시 캐시 미스다. 그리고 재생 루프는 버퍼가 아직 없는 틱을
+      // **조용히 건너뛴다**("stay silent this tick") — 그래서 「몇 번 다시 재생하거나 기다려야」 났다.
+      // 분할이 이미 같은 이유로 primeSplitClipAudioUrl → preloadAudioBufferForClip 을 하고 있었으니,
+      // 그 프리페치를 편집 일반으로 넓힌다. 새로 짜는 것은 없다.
+      // 위치 이동(startFrame)만 한 편집은 슬라이스 범위가 그대로라 캐시가 살아 있고, 그때는 이 호출이
+      // 첫 줄에서 그대로 돌아온다(캐시·pending 검사). 그래서 연타해도 중복 디코드가 쌓이지 않는다.
+      preloadAudioBufferForClip(clip);
       if (state.audioPerfTrace) console.log('[audioEdit] trackIdOnly=' + trackIdOnlyChange + ', syncCutsRequested=' + syncCutsRequested + ', effectiveSyncCuts=' + effectiveSyncCuts + ', skipRender=' + Boolean(options.skipRender));
       if (trace) trace('audioEdit:total');
     }
@@ -36311,6 +36326,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ##################################################################################
     // ## SECTION: AUDIO PLAYBACK
     // ##################################################################################
+    const AUDIO_PLAYBACK_WARM_CAP_MS = 700; // ver1528: 첫 클립 디코드를 기다리는 상한
     function playbackAudioContextConstructor() {
       return window.AudioContext || window.webkitAudioContext || null;
     }
@@ -36343,6 +36359,51 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function currentPlaybackFrameFromClock(fps) {
       return state.videoPlaybackStartFrame + playbackElapsedFrames(fps, performance.now());
+    }
+
+    // ver1528: 「소리가 안 났다」를 삼키지 않는다. 재생 경로는 버퍼가 아직 없으면 그 클립을 조용히
+    // 건너뛰게 되어 있어서(디코드 await 뒤에 클립이 이미 지나가 있는 경우) 사용자에겐 「몇 번 다시
+    // 재생해야 들린다」로만 보였다. 원인별로 세어 두고 재생이 멈출 때 한 줄로 알린다.
+    function noteAudioPlaybackMiss(clip, reason) {
+      state.audioPlaybackMisses = state.audioPlaybackMisses || {};
+      const key = String(reason || 'unknown');
+      state.audioPlaybackMisses[key] = (state.audioPlaybackMisses[key] || 0) + 1;
+      console.warn('[audio] clip skipped (' + key + ')', clip && clip.id, clip && clip.audioFileName);
+    }
+
+    function reportAudioPlaybackMisses() {
+      const misses = state.audioPlaybackMisses;
+      if (!misses) return;
+      state.audioPlaybackMisses = null;
+      const total = Object.keys(misses).reduce(function(sum, k) { return sum + misses[k]; }, 0);
+      if (!total) return;
+      const detail = Object.keys(misses).map(function(k) { return k + '\u00d7' + misses[k]; }).join(', ');
+      state.timelineStatus = t('status.audio.playbackMissed', total, detail);
+    }
+
+    // 재생 시작 직후의 클립은 프리캐시(primePlaybackCachesForRange)가 120ms 뒤에나 도는 데다 await 도
+    // 안 되므로 **첫 클립이 늘 미준비**였다. 시작 시점에 겹치거나 곧 시작할 클립만 짧게 기다린다.
+    // 상한을 두는 이유: 큰 소스의 첫 디코드는 초 단위라 무한정 기다리면 재생 버튼이 먹통으로 보인다.
+    // 상한을 넘기면 그대로 시작하고, 못 낸 소리는 위 카운터가 잡아 보고한다.
+    async function warmPlaybackAudioForStart(project, startFrame, fps) {
+      const clips = (state.playbackClipQueue || []).filter(function(clip) {
+        return clip && clip.startFrame <= startFrame + fps && audioClipHasSource(project, clip);
+      }).slice(0, 4);
+      if (!clips.length) return;
+      const work = Promise.all(clips.map(function(clip) {
+        return ensurePlaybackAudioUrlForClip(clip).then(function(url) {
+          if (!url) return null;
+          return ensurePlaybackAudioContext().then(function(ctx) {
+            if (!ctx) return null;
+            return audioClipDecodePlan(clip, url).then(function(plan) {
+              if (plan === 'html') return null;
+              return plan === 'slice' ? audioBufferSliceForClip(ctx, clip, url) : audioBufferForClip(ctx, clip, url);
+            });
+          });
+        }).catch(function(error) { noteAudioPlaybackMiss(clip, 'warm-failed'); return null; });
+      }));
+      const cap = new Promise(function(resolve) { setTimeout(resolve, AUDIO_PLAYBACK_WARM_CAP_MS); });
+      await Promise.race([work, cap]);
     }
 
     function primePlaybackCachesForRange(project, startFrame, totalFrames) {
@@ -36443,13 +36504,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       await ensurePlaybackAudioContext().catch(function() { return null; }); // ver951: binding was dead — only the resume side effect matters
       if (playbackToken !== state.videoPlaybackStartToken) return;
       state.videoPlaybackStarting = false;
-      const startClock = performance.now();
-      state.videoPlaybackStartClock = startClock;
+      // ver1528: 시계는 프리워밍을 기다린 뒤에 찍는다(아래) — 여기서 찍으면 대기 시간만큼 재생 위치가
+      // 앞질러 시작한다. 옛 startClock 지역 변수는 그 이동으로 아무도 읽지 않게 되어 지웠다.
       state.videoPlaybackStartFrame = startFrame;
       state.videoPlaybackLastUiUpdate = 0;
       state.videoPlaybackLastScrollUpdate = 0;
       state.voicevoxPlaybackCacheWarned = false;
       primePlaybackCachesForRange(state.project, startFrame, totalFrames);
+      // ver1528: 첫 클립이 준비될 때까지만 짧게 기다린다. 여기까지는 아직 videoPlaybackStarting 이
+      // 아니라 이미 videoPlaying 이므로, 재는 시계(videoPlaybackStartClock)를 **기다린 뒤에** 찍어야
+      // 대기 시간이 재생 위치로 새지 않는다 — 그래서 시계 설정을 이 아래로 옮겼다.
+      await warmPlaybackAudioForStart(state.project, startFrame, fps);
+      if (playbackToken !== state.videoPlaybackStartToken) return;
+      state.videoPlaybackStartClock = performance.now();
       updateTransportRuntimeDom(document);
       updateTimelineRuntimeDom(totalFrames, { lightweight: true, updateTimecode: true });
       if (state.videoEditMode) renderVideoPreview(totalFrames);
@@ -36512,6 +36579,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.videoPlaybackStarting = false;
       state.videoPlaying = false;
       state.activeSpeechClipId = '';
+      reportAudioPlaybackMisses(); // ver1528: 이번 재생에서 못 낸 소리를 상태줄에 남긴다
       syncTimelineThumbnailSuspensionClass(document);
       if (speechSynthesisAvailable()) window.speechSynthesis.cancel();
       updateTransportRuntimeDom(document);
@@ -43212,7 +43280,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }, Math.max(20, Math.round(trimDuration * 1000)));
         }
       }, { once: true });
-      audio.play();
+      // ver1528: play() 는 Promise 다 — 자동재생 정책이나 디코드 실패로 거절되면 종전에는 흔적 없이
+      // 소리만 사라졌다(unhandled rejection 도 안 났다: 반환값을 버렸으므로).
+      const played = audio.play();
+      if (played && typeof played.catch === 'function') played.catch(function(error) { noteAudioPlaybackMiss(clip, 'audio-element-rejected'); });
       refreshVideoPreviewForSpeechEvent();
       return audio;
     }
@@ -43268,7 +43339,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const audioUrl = state.workspaceObjectUrls.audio[clip.id];
         if (!audioUrl) continue;
         const buffer = state.audioBufferCache[audioClipSourceKey(clip) || audioUrl] || audioClipCachedSliceBuffer(clip);
-        if (!buffer) { preloadAudioBufferForClip(clip); continue; } // not decoded yet -- kick off decode, stay silent this tick
+        // not decoded yet -- kick off decode, stay silent this tick. 스크럽은 await 할 수 없으므로
+        // 이 스킵 자체는 설계대로다. 다만 ver1528 부터 **세어는 둔다**(조용한 실패 금지).
+        if (!buffer) { preloadAudioBufferForClip(clip); noteAudioPlaybackMiss(clip, 'scrub-not-decoded'); continue; }
         const boxOffsetSec = (frame - Math.round(Number(clip.startFrame) || 0)) / fps;
         const mapped = clipBoxOffsetToSourceSeconds(clip, fps, boxOffsetSec); // same kernel playback uses -- keep scrub/pipeline math from drifting apart again (ver489)
         const relOffsetSec = mapped.offsetSec - (Number(buffer.conteSliceStartSec) || 0); // slice buffers: rebase source time into buffer time
@@ -43337,7 +43410,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (plan === 'html') return null; // streamed at play time -- nothing to pre-decode
           return audioBufferForClip(ctx, clip, audioUrl);
         });
-      }).catch(function() {});
+      }).catch(function(error) { noteAudioPlaybackMiss(clip, 'preload-failed'); }); // ver1528: 삼키지 않는다
     }
 
     // Decode-cache identity of a clip's SOURCE AUDIO FILE. Clips share sources heavily (real data: one
@@ -43882,7 +43955,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const offsetInClipSeconds = Math.max(0, (currentFrame - clip.startFrame) / fps);
         const trimStart = clipAudioTrimStartSeconds(clip, fps);
         const trimDuration = clipAudioTrimDurationSeconds(clip, fps) || Math.max(0.01, (sliceStartSec + buffer.duration) - trimStart);
-        if (offsetInClipSeconds >= trimDuration) return;
+        // ver1528: 위의 디코드 await 가 클립 길이보다 오래 걸리면 여기서 클립이 이미 지나가 있다.
+        // 종전에는 그대로 return 해서 **소리가 통째로 사라졌는데 아무 흔적이 없었다** — 사용자가 겪은
+        // 「곧바로 재생하면 소리가 안 나고 몇 번 다시 재생해야 들린다」가 정확히 이것이다.
+        if (offsetInClipSeconds >= trimDuration) { noteAudioPlaybackMiss(clip, 'decode-too-slow'); return; }
         const boxDuration = Math.max(0.01, trimDuration - offsetInClipSeconds); // timeline box length (may exceed source audio when slowed); resolveClipSourcePlayback clamps per path
         const source = ctx.createBufferSource();
         const r4 = resolveClipSourcePlayback(ctx, clip, buffer, fps, offsetInClipSeconds, boxDuration);
@@ -43908,6 +43984,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         };
         source.start(ctx.currentTime + delaySeconds, r4.offset, r4.duration);
       } catch (error) {
+        console.warn('[audio] buffer path failed, falling back to <audio>', clip && clip.id, error); // ver1528
         playHtmlAudioUrlForClip(clip, audioUrl);
       }
     }
