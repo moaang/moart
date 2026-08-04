@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1493</title>
+  <title>MoArt ver1494</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64913,6 +64913,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const groupGlobalStart = conteGlobalFrameForCut(project, ownerCut);
       const clips = (project.audio && project.audio.clips) || [];
       const lines = [];
+      // ver1494: one VOICE = one sheet line. syncDialogBlockClipToCuts() splits a straddling line's text
+      // across the panels it covers (splitTextByFrameRatios) and SBP imports arrive pre-split the same way,
+      // so a single recorded take can sit behind several dialog blocks. Printing one line per block made the
+      // sheet show the take's full span on the linked piece and a bare panel span on the rest -- two rows
+      // claiming overlapping komas for one utterance. Blocks are now collected first and merged per voice.
+      const entries = [];
       layout.groupCuts.forEach(function(panel) {
         const localStart = layout.panelLocalStart.get(panel.id) || 0;
         const panelFrames = Math.max(1, Math.round(Number(panel.pictureFrames) || 1));
@@ -64928,19 +64934,53 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // ver: exclude hidden clips (kept-but-muted alternate takes) -- a hidden clip can still carry
           // the same dialogBlockId/audioClipId link as its live replacement, and counting it would drag
           // the manual's start/end back into a take that never actually plays.
-          const linked = clips.filter(function(c) { return c && !c.hidden && (c.dialogBlockId === b.id || (b.audioClipId && c.id === b.audioClipId)); });
-          let fromLocal = localStart + 1, toLocal = localStart + panelFrames;
-          if (linked.length) {
-            const starts = linked.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)); });
-            const ends = linked.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)) + Math.max(1, Math.round(Number(c.durationFrames) || 1)); });
-            fromLocal = Math.min.apply(null, starts) - groupGlobalStart + 1;
-            toLocal = Math.max.apply(null, ends) - groupGlobalStart;
-          }
-          const tag = conteSuffixToSheetTag(b.suffix);
-          const label = speaker + (tag ? ' (' + tag + ')' : '');
-          const text = b.suffix === 'flashback' ? '（回想）' + body : body;
-          lines.push([gengaSheetTimecode(fromLocal), gengaSheetTimecode(toLocal), label, text].join(' | '));
+          // ver1494: a sync-split sibling is born with audioClipId '' and is reachable ONLY through the
+          // clip's syncedDialogBlockIds -- the third arm below. Without it those pieces fell to the panel
+          // fallback and printed a span the voice never occupied.
+          const linked = clips.filter(function(c) {
+            return c && !c.hidden && (c.dialogBlockId === b.id
+              || (b.audioClipId && c.id === b.audioClipId)
+              || (Array.isArray(c.syncedDialogBlockIds) && c.syncedDialogBlockIds.indexOf(b.id) >= 0));
+          });
+          entries.push({ block: b, localStart: localStart, panelFrames: panelFrames, linked: linked, speaker: speaker, body: body });
         });
+      });
+      // Union entries that share a voice. The key carries the speaker too: one clip standing behind two
+      // DIFFERENT speakers is broken data, and merging it would hide that behind a plausible-looking row.
+      const parent = entries.map(function(_, i) { return i; });
+      const find = function(i) { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+      const owner = new Map();
+      entries.forEach(function(e, i) {
+        e.linked.forEach(function(c) {
+          const key = c.id + '\u0000' + e.speaker;
+          if (owner.has(key)) { const a = find(owner.get(key)), b2 = find(i); if (a !== b2) parent[b2] = a; }
+          else owner.set(key, i);
+        });
+      });
+      const order = [], byRoot = new Map();
+      entries.forEach(function(e, i) {
+        const r = find(i);
+        if (!byRoot.has(r)) { byRoot.set(r, []); order.push(r); }
+        byRoot.get(r).push(e);
+      });
+      order.forEach(function(r) {
+        const items = byRoot.get(r);
+        const head = items[0];
+        const voices = [];
+        items.forEach(function(e) { e.linked.forEach(function(c) { if (voices.indexOf(c) < 0) voices.push(c); }); });
+        let fromLocal = head.localStart + 1, toLocal = head.localStart + head.panelFrames;
+        if (voices.length) {
+          const starts = voices.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)); });
+          const ends = voices.map(function(c) { return Math.max(0, Math.round(Number(c.startFrame) || 0)) + Math.max(1, Math.round(Number(c.durationFrames) || 1)); });
+          fromLocal = Math.min.apply(null, starts) - groupGlobalStart + 1;
+          toLocal = Math.max.apply(null, ends) - groupGlobalStart;
+        }
+        const tag = conteSuffixToSheetTag(head.block.suffix);
+        const label = head.speaker + (tag ? ' (' + tag + ')' : '');
+        // Re-joined with no separator: the pieces are what splitTextByFrameRatios cut out of one string.
+        const body = items.map(function(e) { return e.body; }).join('');
+        const text = head.block.suffix === 'flashback' ? '（回想）' + body : body;
+        lines.push([gengaSheetTimecode(fromLocal), gengaSheetTimecode(toLocal), label, text].join(' | '));
       });
       return lines.join('\n');
     }
