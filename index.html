@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1494</title>
+  <title>MoArt ver1495</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -13847,7 +13847,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'msg.toast.audioClipNotFound': { ja: '音声クリップが見つかりません', ko: '오디오 클립을 찾을 수 없습니다', en: 'Audio clip not found' },
         'msg.toast.alreadyLinked': { ja: '既にこの音声クリップにリンク済みです', ko: '이미 이 오디오 클립에 링크되어 있습니다', en: 'Already linked to this audio clip' },
         'msg.toast.emptyTextForLink': { ja: '台詞本文が空です — 本文を入力してからリンクしてください', ko: '대사 본문이 비어 있습니다 — 본문을 입력한 후 링크해주세요', en: 'The dialog text is empty — enter text before linking' },
-        'msg.toast.linkedToOtherBlock': { ja: 'この音声クリップは既に別の台詞ブロックにリンクされています', ko: '이 오디오 클립은 이미 다른 대사 블록에 링크되어 있습니다', en: 'This audio clip is already linked to a different dialog block' },
+        'msg.toast.linkedToOtherSpeaker': { ja: 'この音声クリップは別の話者の台詞ブロックにリンクされています', ko: '이 오디오 클립은 다른 화자의 대사 블록에 링크되어 있습니다', en: 'This audio clip is linked to a dialog block of a different speaker' },
         'msg.toast.linked': {
           ja: function(speaker) { return 'リンクしました：' + (speaker || '（話者未設定）'); },
           ko: function(speaker) { return '링크했습니다: ' + (speaker || '(화자 미설정)'); },
@@ -22293,13 +22293,50 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // OWN audioClipId field is only a "primary/most recently linked" convenience pointer, never authoritative
     // for "how many / which clips" once more than one clip is linked to the same block (e.g. one spoken line
     // whose audio was razor-split into two clips, both still representing the same dialogue text).
-    function dialogBlockLinkedClips(project, blockId) {
-      if (!blockId) return [];
-      return ((project.audio && project.audio.clips) || []).filter(function(c) { return c && c.dialogBlockId === blockId; });
+    // ver1495: the ONE place that answers "does this block ride this clip?". A link is recorded three ways:
+    //   clip.dialogBlockId        — primary pointer (the first block linked; the one syncDialogBlockClipToCuts owns)
+    //   block.audioClipId         — the block's own pointer (a second block joining the same take)
+    //   clip.syncedDialogBlockIds — siblings that sync split out of a straddling line (born with audioClipId '')
+    // Sheet lines, the ♪ count and the clip label all read this, so those three can never drift apart.
+    function dialogBlockLinksClip(block, clip) {
+      if (!block || !clip) return false;
+      if (clip.dialogBlockId && clip.dialogBlockId === block.id) return true;
+      if (block.audioClipId && block.audioClipId === clip.id) return true;
+      return Array.isArray(clip.syncedDialogBlockIds) && clip.syncedDialogBlockIds.indexOf(block.id) >= 0;
+    }
+    // Accepts the block itself (callers that already hold it — every render path does) or its id.
+    function dialogBlockLinkedClips(project, blockOrId) {
+      let block = (blockOrId && typeof blockOrId === 'object') ? blockOrId : null;
+      if (!block) {
+        const hit = findDialogBlockAnywhere(project, String(blockOrId || ''));
+        block = hit ? hit.block : null;
+      }
+      if (!block) return [];
+      return ((project.audio && project.audio.clips) || []).filter(function(c) { return dialogBlockLinksClip(block, c); });
+    }
+    // The same relation read from the clip's side, in document order (cut order, then block order).
+    function audioClipLinkedDialogBlocks(project, clip) {
+      const out = [];
+      if (!project || !clip) return out;
+      (project.cuts || []).forEach(function(cut) {
+        if (!Array.isArray(cut.dialogBlocks)) return;
+        cut.dialogBlocks.forEach(function(b) { if (dialogBlockLinksClip(b, clip)) out.push(b); });
+      });
+      return out;
+    }
+    // The body shown on a clip. One take can carry several blocks (a line split across panels) -- join them
+    // with '/' so the timeline says what the clip actually holds. clip.text itself is NOT rewritten:
+    // syncDialogBlockClipToCuts feeds it to splitTextByFrameRatios, and a '/' in there would be cut into
+    // the dialogue as if it were part of the line.
+    function audioClipDisplayBody(project, clip) {
+      const blocks = audioClipLinkedDialogBlocks(project, clip);
+      if (blocks.length < 2) return String((clip && clip.text) || '');
+      const parts = blocks.map(function(b) { return String(b.body || '').trim(); }).filter(Boolean);
+      return parts.length ? parts.join('/') : String((clip && clip.text) || '');
     }
     function syncAudioClipFromDialogBlock(project, block) {
       if (!block) return;
-      const clips = dialogBlockLinkedClips(project, block.id);
+      const clips = dialogBlockLinkedClips(project, block);
       if (!clips.length) return;
       clips.forEach(function(clip) {
         clip.text = block.body;
@@ -22314,7 +22351,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const cut = project.cuts.find(function(c) { return c.id === cutId; });
       if (!cut) return;
       const block = dialogBlocksForDisplay(project, cut).find(function(b) { return b.id === blockId; });
-      const hasClip = block && dialogBlockLinkedClips(project, blockId).length > 0; // ver656 (BUG-11): N clips via dialogBlockId, not just the primary audioClipId
+      const hasClip = block && dialogBlockLinkedClips(project, block).length > 0; // ver656 (BUG-11): N clips per block, not just the primary audioClipId
       let alsoDeleteClip = false;
       if (hasClip) alsoDeleteClip = confirm(t('msg.dialog.deleteLinkedAudioConfirm'));
       runCommand('Delete dialog block', function(p) {
@@ -22327,7 +22364,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         blocks.splice(i, 1);
         // ver656 (BUG-11): a block can own N clips via clip.dialogBlockId (razor-split), not just removed.audioClipId.
         // Delete all of them when confirmed; otherwise unlink all so no sibling is left pointing at the deleted block.
-        const linked = dialogBlockLinkedClips(p, blockId);
+        const linked = dialogBlockLinkedClips(p, removed);
         if (alsoDeleteClip) {
           linked.forEach(function(clip) { deleteAudioClip(p, clip.id); }); // deleteAudioClip now splices for real
         } else {
@@ -22346,7 +22383,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!block) return;
         block.audioClipId = '';
         // ver656 (BUG-11): remove ALL clips linked to this block (razor-split siblings), not just the primary
-        dialogBlockLinkedClips(p, blockId).forEach(function(clip) { deleteAudioClip(p, clip.id); }); // splices for real now
+        dialogBlockLinkedClips(p, removed).forEach(function(clip) { deleteAudioClip(p, clip.id); }); // splices for real now
         deriveDialogTextFromBlocks(cut);
       });
     }
@@ -22366,7 +22403,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const clip = ((p.audio && p.audio.clips) || []).find(function(c) { return c.id === clipId; });
           if (clip && clip.dialogBlockId === blockId) clip.dialogBlockId = '';
         }
-        const remaining = dialogBlockLinkedClips(p, blockId).filter(function(c) { return c.id !== clipId; });
+        const remaining = dialogBlockLinkedClips(p, block).filter(function(c) { return c.id !== clipId; });
         block.audioClipId = remaining.length ? remaining[0].id : '';
         deriveDialogTextFromBlocks(cut);
       });
@@ -22566,9 +22603,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!clip) { showToast(t('msg.toast.audioClipNotFound'), { warn: true, x: tx, y: ty }); return; }
       if (clip.dialogBlockId === blockId) { showToast(t('msg.toast.alreadyLinked'), { x: tx, y: ty }); return; }
       if (!String(block.body || '').trim()) { showToast(t('msg.toast.emptyTextForLink'), { warn: true, x: tx, y: ty }); return; }
-      // GUARD (block+warn): clip already linked to a DIFFERENT, still-existing dialog block
-      if (clip.dialogBlockId && clip.dialogBlockId !== blockId && findDialogBlockAnywhere(project, clip.dialogBlockId)) {
-        showToast(t('msg.toast.linkedToOtherBlock'), { warn: true, x: tx, y: ty });
+      // ver1495: a clip may carry SEVERAL blocks -- one take whose line is split across panels. The only
+      // bar is the speaker: a clip standing behind two different characters is broken data, not a straddle,
+      // and letting it through would hide that behind a plausible-looking merged row on the sheet.
+      const held = clip.dialogBlockId && clip.dialogBlockId !== blockId ? findDialogBlockAnywhere(project, clip.dialogBlockId) : null;
+      if (held && scenarioMetaKey(held.block.speaker || '') !== scenarioMetaKey(block.speaker || '')) {
+        showToast(t('msg.toast.linkedToOtherSpeaker'), { warn: true, x: tx, y: ty });
         return;
       }
       runCommand('台詞ブロックを音声クリップにリンク', function(p) {
@@ -22582,9 +22622,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // still represent the same block — dragging the ♪ note onto a NEW clip links it ALONGSIDE any clips
         // already linked, rather than replacing them (dropping the previous "release the old link" step here
         // used to silently steal the link away, which is exactly the bug this fixes).
-        tclip.dialogBlockId = blockId;
-        tclip.sourceCutId = cutId;
-        tblock.audioClipId = clipId; // "primary/most recently linked" convenience pointer only
+        // ver1495: the FIRST block stays the primary. A second block joining the same take records itself
+        // in its own audioClipId -- overwriting dialogBlockId would hand the take over and strand the first
+        // block (and drag sourceCutId, hence the clip's owning panel, along with it).
+        if (!tclip.dialogBlockId || !findDialogBlockAnywhere(p, tclip.dialogBlockId)) {
+          tclip.dialogBlockId = blockId;
+          tclip.sourceCutId = cutId;
+        }
+        tblock.audioClipId = clipId;
         syncAudioClipFromDialogBlock(p, tblock); // pushes speaker/body/tags → ALL linked clips' title "話者 台詞"
         deriveDialogTextFromBlocks(tcut);
       });
@@ -22596,7 +22641,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Derived from the clip side (dialogBlockLinkedClips), NOT block.audioClipId alone — a block can have
       // more than one clip linked (e.g. a line whose audio was razor-split into two clips), and audioClipId
       // only ever tracks the most-recently-linked one.
-      const linkedClips = isFree ? [] : dialogBlockLinkedClips(project, block.id);
+      const linkedClips = isFree ? [] : dialogBlockLinkedClips(project, block);
       const hasAudio = linkedClips.length > 0;
       const hasScenario = Boolean(block.sourceBlockId);
       let linkBits = '';
@@ -22688,7 +22733,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const textEl = el.querySelector('.audio-text');
           if (!textEl) { ok = false; return; }
           el.style.setProperty('--clip-color', audioClipColor(clip.characterName || clip.id));
-          el.title = audioClipTitleText(clip);
+          el.title = audioClipTitleText(state.project, clip);
           const speakerName = String(clip.characterName || '').trim();
           el.classList.toggle('no-speaker', !speakerName);
           let sp = el.querySelector('.audio-speaker');
@@ -22698,7 +22743,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           } else if (sp) {
             sp.remove();
           }
-          textEl.textContent = clip.text;
+          textEl.textContent = audioClipDisplayBody(state.project, clip);
         });
       });
       return ok;
@@ -22868,7 +22913,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const project = state.project;
       const cut = project.cuts.find(function(c) { return c.id === cutId; });
       const block = cut ? dialogBlocksForDisplay(project, cut).find(function(b) { return b.id === blockId; }) : null;
-      const linkedClips = block ? dialogBlockLinkedClips(project, block.id) : [];
+      const linkedClips = block ? dialogBlockLinkedClips(project, block) : [];
       const hasClip = linkedClips.length > 0;
       // when more than one clip is linked, these two actions only affect the PRIMARY (most recently linked)
       // one — say so, rather than let the user assume it clears every link at once.
@@ -29770,8 +29815,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // Shared with updateDialogLinkedClipLabelDom's in-place patch — kept as one formula so the two
     // never drift apart (P1b).
-    function audioClipTitleText(clip) {
-      return clip.text + (clip.audioDurationFrames ? '\nsource ' + framesToTimeInput(clip.audioDurationFrames) + ' / trim ' + framesToTimeInput(clip.audioTrimDurationFrames || clip.durationFrames) : '');
+    function audioClipTitleText(project, clip) {
+      return audioClipDisplayBody(project, clip) + (clip.audioDurationFrames ? '\nsource ' + framesToTimeInput(clip.audioDurationFrames) + ' / trim ' + framesToTimeInput(clip.audioTrimDurationFrames || clip.durationFrames) : '');
     }
     function audioTimelineClipHtml(clip, totalFrames, continuationIds) {
       const left = framePercent(clip.startFrame, totalFrames);
@@ -29785,12 +29830,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver550 PERF: the waveform data:URL (~20KB × hundreds of clips ≈ 9MB) is NOT inlined in the
       // style attribute anymore — it was the single biggest innerHTML parse cost of a full timeline
       // render. applyAudioClipWaveformStyles() sets --waveform via CSSOM after the parse.
-      const title = audioClipTitleText(clip);
+      const title = audioClipTitleText(state.project, clip);
       const speakerName = String(clip.characterName || '').trim();
       return '<div class="audio-clip' + continuation + active + selected + dialogGlow + conflict + (speakerName ? '' : ' no-speaker') + '" data-audio-clip-id="' + escapeAttr(clip.id) + '" style="--left:' + left.toFixed(4) + '%;--width:' + width.toFixed(4) + '%;--clip-color:' + color + '" title="' + escapeAttr(title) + '">' +
         '<span class="audio-trim-handle left" data-audio-trim-edge="left" aria-hidden="true"></span>' +
         (speakerName ? '<span class="audio-speaker">' + escapeHtml(speakerName) + '</span>' : '') +
-        '<span class="audio-text">' + escapeHtml(clip.text) + '</span>' +
+        '<span class="audio-text">' + escapeHtml(audioClipDisplayBody(state.project, clip)) + '</span>' +
         '<span class="audio-trim-handle right" data-audio-trim-edge="right" aria-hidden="true"></span>' +
         '<span class="audio-volume-line" data-audio-volume-line="true" style="--vol-top:' + audioVolumeToLineTopPercent(clip.volume).toFixed(2) + '%"></span>' +
         '<span class="audio-volume-label" aria-hidden="true">' + escapeHtml(audioClipVolumeDbLabel(clip.volume)) + '</span>' +
@@ -39404,7 +39449,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // A block can have MULTIPLE clips linked (e.g. one line's audio razor-split into two clips) — every
         // one of them independently gates the SAME text/speaker during its OWN time window, so the plate
         // shows during whichever clip is currently playing (dedup guards against literal overlap only).
-        let clips = dialogBlockLinkedClips(project, b.id);
+        let clips = dialogBlockLinkedClips(project, b);
         if (!clips.length && b.audioClipId && clipsById[b.audioClipId]) clips = [clipsById[b.audioClipId]]; // legacy single-resolution fallback (findClipForDialogBlock)
         if (!clips.length) {
           // Mirrors videoExportActiveDialogLines: a block that never resolved to any clip (stale/older
@@ -64031,7 +64076,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!text) continue;
         // A block can have MULTIPLE clips linked (e.g. one line's audio razor-split into two clips) — export
         // shows the line whenever ANY of them is active, mirroring cutOwnedBoldActiveClips.
-        let clips = dialogBlockLinkedClips(project, b.id);
+        let clips = dialogBlockLinkedClips(project, b);
         if (!clips.length && b.audioClipId && clipsById[b.audioClipId]) clips = [clipsById[b.audioClipId]];
         const on = !clips.length /* unlinked block -> persists across the whole cut */ || clips.some(isOn);
         if (!on) continue;
@@ -64934,14 +64979,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // ver: exclude hidden clips (kept-but-muted alternate takes) -- a hidden clip can still carry
           // the same dialogBlockId/audioClipId link as its live replacement, and counting it would drag
           // the manual's start/end back into a take that never actually plays.
-          // ver1494: a sync-split sibling is born with audioClipId '' and is reachable ONLY through the
-          // clip's syncedDialogBlockIds -- the third arm below. Without it those pieces fell to the panel
-          // fallback and printed a span the voice never occupied.
-          const linked = clips.filter(function(c) {
-            return c && !c.hidden && (c.dialogBlockId === b.id
-              || (b.audioClipId && c.id === b.audioClipId)
-              || (Array.isArray(c.syncedDialogBlockIds) && c.syncedDialogBlockIds.indexOf(b.id) >= 0));
-          });
+          // ver1495: dialogBlockLinksClip() is the single owner of this judgement (ver1494 spelled the three
+          // arms out here; the clip label needed the same answer, so it moved to one predicate).
+          const linked = clips.filter(function(c) { return c && !c.hidden && dialogBlockLinksClip(b, c); });
           entries.push({ block: b, localStart: localStart, panelFrames: panelFrames, linked: linked, speaker: speaker, body: body });
         });
       });
