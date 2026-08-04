@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1526</title>
+  <title>MoArt ver1527</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -32723,9 +32723,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function bindConteLayerTimeline(root, totalFrames) {
       const lane = root.querySelector('[data-conte-layer-lane="true"]');
-      const boundTotalFrames = function(el) {
-        return Math.max(1, Math.round(Number(el && el.dataset && el.dataset.timelineTotalFrames) || Number(totalFrames) || 1));
-      };
+      const boundTotalFrames = function(el) { return runtimeTimelineTotalFrames(root, el, totalFrames); }; // ver1527: 커널로 (el dataset 우선이라 동작 불변)
       root.querySelectorAll('.timeline-ruler, .conte-cut-number-track').forEach(function(trackEl) {
         trackEl.dataset.timelineTotalFrames = String(totalFrames);
         if (trackEl.dataset.conteLayerTimelineBound === 'true') return;
@@ -34672,11 +34670,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
     function bindTimelineSeekAndZoom(root, totalFrames) {
-      const runtimeTotalFrames = function(anchor) {
-        const rootFrames = root && root.dataset ? Number(root.dataset.timelineTotalFrames) : 0;
-        const anchorFrames = anchor && anchor.dataset ? Number(anchor.dataset.timelineTotalFrames) : 0;
-        return Math.max(1, Math.round(anchorFrames || rootFrames || totalFrames || videoTimelineDisplayTotalFrames(state.project) || 1));
-      };
+      const runtimeTotalFrames = function(anchor) { return runtimeTimelineTotalFrames(root, anchor, totalFrames); }; // ver1527: 커널로
       // timeline zoom = custom .ggauge (data-gauge="conte-zoom"); handled by the delegated gauge drag.
       const scrollEls = Array.from(root.querySelectorAll('.timeline-scroll'));
       state.timelineScrollEls = scrollEls;
@@ -35325,6 +35319,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       jumpTimelineViewportToScrollLeft(targetRoot, 0);
     }
 
+    // ver1527: 「지금 화면이 그려져 있는 기준의 총 프레임」의 정본. 렌더는 전체든 부분이든 끝에
+    // cacheTimelineRuntimeDom 에서 이 값을 root(#timingDashboard) dataset 에 찍는다 — 클립이 실제로
+    // 배치된 그 total 이다. bind 함수가 인자로 받은 값은 **바인딩 당시의 값**이라, 컷 편집처럼 부분
+    // 렌더로 끝나는(=재바인딩이 없는) 변경 뒤에는 낡는다. 그 낡은 값으로 delta 를 계산한 것이
+    // ver1527 이 고치는 버그다. videoTimelineDisplayTotalFrames 를 그때그때 다시 계산하면 안 된다 —
+    // 그 값은 재생 위치(reach)를 타므로 드래그 도중에 흔들린다. 화면과 **같은 값**을 읽어야 한다.
+    function runtimeTimelineTotalFrames(root, anchor, fallback) {
+      const anchorFrames = anchor && anchor.dataset ? Number(anchor.dataset.timelineTotalFrames) : 0;
+      const rootEl = root || state.timelineRuntimeRoot || document.getElementById('timingDashboard');
+      const rootFrames = rootEl && rootEl.dataset ? Number(rootEl.dataset.timelineTotalFrames) : 0;
+      return Math.max(1, Math.round(anchorFrames || rootFrames || Number(fallback) || videoTimelineDisplayTotalFrames(state.project) || 1));
+    }
+
     function timelineDragFrameDelta(startX, currentX, totalFrames, track) {
       const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || (track ? track.getBoundingClientRect().width / uiReadScale() : 0) || 1));
       return Math.round((currentX - startX) / uiReadScale() / width * Math.max(1, Math.round(Number(totalFrames) || 1)));
@@ -35645,7 +35652,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return removed;
     }
 
-    function bindVideoMediaTimelineDrag(root, totalFrames) {
+    function bindVideoMediaTimelineDrag(root, totalFramesAtBind) {
+      // ver1527: 영상 클립을 잡아 옮기는 좌표 는 **지금 화면 기준**으로 읽는다 — 이 bind 는 컷 편집 뒤에
+      // 다시 불리지 않는데(부분 렌더는 카메라·콘티만 재바인딩) 클립의 화면 위치는
+      // refreshAudioClipPixelStyles 가 새 total 로 다시 그려서, 옛 값을 쓰면 그만큼 어긋났다.
+      const liveTotalFrames = function() { return runtimeTimelineTotalFrames(root, null, totalFramesAtBind); };
       if (videoMediaDisabledOnThisDevice()) return;
       root.querySelectorAll('.video-media-clip').forEach(function(clipEl) {
         clipEl.addEventListener('pointerdown', function(event) {
@@ -35664,7 +35675,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             durationFrames: Math.max(1, Math.round(Number(clip.durationFrames) || 1))
           };
           if (trimEdge) {
-            const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, totalFrames);
+            const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, liveTotalFrames());
             // ver976: thin spec on beginDragStrand. raf:true replaces the makeRafThrottled wrapper (the kernel
             // coalesces to the latest event and drops the pending tick on release, which is what .cancel() did).
             // The capture target is whatever node the press landed on — a trim handle — while the dragging class
@@ -35675,9 +35686,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               captureEl: (event.target && event.target.setPointerCapture) ? event.target : clipEl,
               raf: true,
               onMove: function(moveEvent) {
-                const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, totalFrames, track);
+                const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
                 const preview = previewVideoMediaTrim(originalClip, trimEdge, deltaFrames);
-                updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, totalFrames);
+                updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, liveTotalFrames());
               },
               // ver842: cancel = drop, never commit (the ver749 sweep, conte side). The commit re-reads clientX
               // and writes the project, so a gesture iPadOS stole used to land as a real trim at the abduction
@@ -35686,7 +35697,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               onCancel: cleanupPreview,
               onCommit: function(upEvent) {
                 cleanupPreview();
-                const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, totalFrames, track);
+                const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
                 if (!deltaFrames) return;
                 commitVideoMediaClipTrim(clipId, trimEdge, originalClip, deltaFrames);
               }
@@ -35695,9 +35706,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           const originalStart = originalClip.startFrame;
           const originalTrackId = clip.trackId || track.dataset.videoMediaTrackId || 'video-media-main';
-          const maxStart = Math.max(0, totalFrames - originalClip.durationFrames);
+          const maxStart = Math.max(0, liveTotalFrames() - originalClip.durationFrames);
           const rippleMode = Boolean(event.shiftKey); // shift+drag = move this clip + everything to its right
-          const movePreviewEl = createAudioDragPreview(track, originalStart, originalClip.durationFrames, totalFrames);
+          const movePreviewEl = createAudioDragPreview(track, originalStart, originalClip.durationFrames, liveTotalFrames());
           let lastPreviewFrame = originalStart;
           let lastPreviewTrackId = originalTrackId;
           let lastSnapped = false;
@@ -35712,9 +35723,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             onMove: function(moveEvent) {
               const targetTrack = videoMediaTrackFromPointer(root, moveEvent) || track;
               const targetTrackId = targetTrack.dataset.videoMediaTrackId || originalTrackId;
-              const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, totalFrames, track);
+              const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
               const proposedStart = clampNumber(originalStart + deltaFrames, 0, maxStart, originalStart);
-              const snapped = snapVideoMediaClipMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, totalFrames);
+              const snapped = snapVideoMediaClipMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
               const nextStart = clampNumber(snapped.startFrame, 0, maxStart, originalStart);
               if (nextStart === lastPreviewFrame && targetTrackId === lastPreviewTrackId && Boolean(snapped.snapped) === lastSnapped) return;
               lastPreviewFrame = nextStart;
@@ -35722,8 +35733,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               lastSnapped = Boolean(snapped.snapped);
               moveVideoMediaDragPreviewToTrack(movePreviewEl, targetTrack);
               movePreviewEl.classList.toggle('snapped', lastSnapped);
-              updateTimelineSnapGuide(root, snapped.snapFrame, totalFrames, lastSnapped);
-              updateAudioDragPreview(movePreviewEl, nextStart, originalClip.durationFrames, totalFrames);
+              updateTimelineSnapGuide(root, snapped.snapFrame, liveTotalFrames(), lastSnapped);
+              updateAudioDragPreview(movePreviewEl, nextStart, originalClip.durationFrames, liveTotalFrames());
             },
             // ver842: cancel = drop, never commit. A canceled pointer's coordinate would otherwise pick a target
             // track AND a frame delta, committing either a ripple shift of the whole timeline or a clip move —
@@ -35734,7 +35745,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               removeVideoMediaDragPreview(movePreviewEl);
               const targetTrack = videoMediaTrackFromPointer(root, upEvent) || track;
               const targetTrackId = targetTrack.dataset.videoMediaTrackId || originalTrackId;
-              const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, totalFrames, track);
+              const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
               if (rippleMode) {
                 let rippleDelta = deltaFrames;
                 if (originalStart + rippleDelta < 0) rippleDelta = -originalStart;
@@ -35742,7 +35753,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 return;
               }
               const proposedStart = clampNumber(originalStart + deltaFrames, 0, maxStart, originalStart);
-              const snapped = snapVideoMediaClipMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, totalFrames);
+              const snapped = snapVideoMediaClipMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
               const nextStart = clampNumber(snapped.startFrame, 0, maxStart, originalStart);
               if (nextStart === originalStart && targetTrackId === originalTrackId) return;
               commitVideoMediaClipMove(clipId, nextStart, targetTrackId);
@@ -35790,7 +35801,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ((project.video && project.video.clips) || []).forEach(shift);
     }
 
-    function bindAudioTimelineDrag(root, totalFrames) {
+    function bindAudioTimelineDrag(root, totalFramesAtBind) {
+      // ver1527: 클립을 잡아 옮기는 좌표 는 **지금 화면 기준**으로 읽는다 — 이 bind 는 컷 편집 뒤에
+      // 다시 불리지 않는데(부분 렌더는 카메라·콘티만 재바인딩) 클립의 화면 위치는
+      // refreshAudioClipPixelStyles 가 새 total 로 다시 그려서, 옛 값을 쓰면 그만큼 어긋났다.
+      const liveTotalFrames = function() { return runtimeTimelineTotalFrames(root, null, totalFramesAtBind); };
       root.querySelectorAll('.audio-clip').forEach(function(clipEl) {
         clipEl.addEventListener('pointerdown', function(event) {
           if (event.button !== 0) return;
@@ -35815,7 +35830,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             audioDurationFrames: clip.audioDurationFrames
           };
           if (trimEdge) {
-            const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, totalFrames);
+            const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, liveTotalFrames());
             // ver976: thin spec on beginDragStrand — twin of the video-media trim above.
             const cleanupPreview = function() { updateTimelineSnapGuide(root, 0, 1, false); removeAudioDragPreview(previewEl); };
             beginDragStrand(event, {
@@ -35823,9 +35838,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               captureEl: (event.target && event.target.setPointerCapture) ? event.target : clipEl,
               raf: true,
               onMove: function(moveEvent) {
-                const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, totalFrames, track);
+                const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
                 const preview = previewAudioTrim(originalClip, trimEdge, deltaFrames);
-                updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, totalFrames);
+                updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, liveTotalFrames());
               },
               // ver842: cancel = drop, never commit. The commit re-reads clientX and rewrites the clip's trim
               // in/out, so a stolen iPad gesture used to destroy the trim at the abduction coordinate — and trim
@@ -35833,7 +35848,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               onCancel: cleanupPreview,
               onCommit: function(upEvent) {
                 cleanupPreview();
-                const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, totalFrames, track);
+                const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
                 if (!deltaFrames) return;
                 runAudioClipEditCommand('Trim dialog audio', clipId, function(targetClip, project) {
                   applyAudioClipTrimDelta(targetClip, trimEdge, originalClip, deltaFrames);
@@ -35850,7 +35865,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           const originalStart = clip.startFrame;
           const originalTrackId = clip.trackId || track.dataset.audioTrackId || 'dialog-main';
-          const maxStart = Math.max(0, totalFrames - clip.durationFrames);
+          const maxStart = Math.max(0, liveTotalFrames() - clip.durationFrames);
           const rippleMode = Boolean(event.shiftKey); // shift+drag = move this clip + everything to its right
           // Defer the move-drag until the pointer actually travels a bit, so a still long-press (the
           // mobile context-menu / delete gesture) isn't swallowed by an instant grab. Without this the
@@ -35866,7 +35881,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (dragActive) return;
             dragActive = true;
             clipEl.classList.add('dragging');
-            movePreviewEl = createAudioDragPreview(track, originalStart, clip.durationFrames, totalFrames);
+            movePreviewEl = createAudioDragPreview(track, originalStart, clip.durationFrames, liveTotalFrames());
             try { clipEl.setPointerCapture(pointerId); } catch (error) {}
           };
           // ver976: thin spec on beginDragStrand, but WITHOUT spec.el — this is the one clip drag that arms
@@ -35892,9 +35907,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               if (!movePreviewEl) return;
               const targetTrack = audioTrackFromPointer(root, moveEvent, clip) || track;
               const targetTrackId = targetTrack.dataset.audioTrackId || originalTrackId;
-              const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, totalFrames, track);
+              const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
               const proposedStart = clampNumber(originalStart + deltaFrames, 0, maxStart, originalStart);
-              const snapped = snapAudioClipMove(state.project, clipId, proposedStart, clip.durationFrames, originalStart, targetTrackId, originalTrackId, totalFrames);
+              const snapped = snapAudioClipMove(state.project, clipId, proposedStart, clip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
               const nextStart = clampNumber(snapped.startFrame, 0, maxStart, originalStart);
               if (nextStart === lastPreviewFrame && targetTrackId === lastPreviewTrackId && Boolean(snapped.snapped) === lastSnapped) return;
               lastPreviewFrame = nextStart;
@@ -35902,8 +35917,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               lastSnapped = Boolean(snapped.snapped);
               moveAudioDragPreviewToTrack(movePreviewEl, targetTrack);
               movePreviewEl.classList.toggle('snapped', lastSnapped);
-              updateTimelineSnapGuide(root, snapped.snapFrame, totalFrames, lastSnapped);
-              updateAudioDragPreview(movePreviewEl, nextStart, clip.durationFrames, totalFrames);
+              updateTimelineSnapGuide(root, snapped.snapFrame, liveTotalFrames(), lastSnapped);
+              updateAudioDragPreview(movePreviewEl, nextStart, clip.durationFrames, liveTotalFrames());
             },
             // ver842: cancel = drop, never commit. Nothing was built unless the drag armed, so an unarmed
             // cancel is a plain no-op; an armed one tears the preview down and commits nothing.
@@ -35913,7 +35928,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               teardownMoveDrag();
               const targetTrack = audioTrackFromPointer(root, upEvent, clip) || track;
             const targetTrackId = targetTrack.dataset.audioTrackId || originalTrackId;
-            const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, totalFrames, track);
+            const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
             if (rippleMode) {
               let rippleDelta = deltaFrames;
               if (originalStart + rippleDelta < 0) rippleDelta = -originalStart;
@@ -35921,7 +35936,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               return;
             }
             const proposedStart = clampNumber(originalStart + deltaFrames, 0, maxStart, originalStart);
-            const snapped = snapAudioClipMove(state.project, clipId, proposedStart, clip.durationFrames, originalStart, targetTrackId, originalTrackId, totalFrames);
+            const snapped = snapAudioClipMove(state.project, clipId, proposedStart, clip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
             const nextStart = clampNumber(snapped.startFrame, 0, maxStart, originalStart);
             if (nextStart === originalStart && targetTrackId === originalTrackId) return;
             const result = commitAudioClipMoveFast('Move dialog audio', clipId, nextStart, targetTrackId);
@@ -35932,7 +35947,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               guardedRender('chrome', refreshChromeControls);
               return;
             }
-            partialUpdateAudioClipDom(clipId, result.trackId, result.startFrame, result.durationFrames, totalFrames);
+            partialUpdateAudioClipDom(clipId, result.trackId, result.startFrame, result.durationFrames, liveTotalFrames());
             }
           });
         });
@@ -35952,7 +35967,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    function bindAudioTimelineDrop(root, totalFrames) {
+    function bindAudioTimelineDrop(root, totalFramesAtBind) {
+      // ver1527: 파일을 떨어뜨린 지점의 프레임 는 **지금 화면 기준**으로 읽는다 — 이 bind 는 컷 편집 뒤에
+      // 다시 불리지 않는데(부분 렌더는 카메라·콘티만 재바인딩) 클립의 화면 위치는
+      // refreshAudioClipPixelStyles 가 새 total 로 다시 그려서, 옛 값을 쓰면 그만큼 어긋났다.
+      const liveTotalFrames = function() { return runtimeTimelineTotalFrames(root, null, totalFramesAtBind); };
       root.querySelectorAll('.audio-track').forEach(function(track) {
         const trackId = track.dataset.audioTrackId || '';
         const targetIsAudioClip = function(event) {
@@ -35983,7 +36002,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           setElementActiveClass(track, 'board-drop-active', false);
           const file = firstDroppedAudioFile(event);
           if (!file) return;
-          const frame = timelineFrameFromPointer(track, event, totalFrames);
+          const frame = timelineFrameFromPointer(track, event, liveTotalFrames());
           importExternalAudioFileToTimeline(file, frame, trackId);
         });
       });
@@ -36009,7 +36028,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function bindVideoMediaTimelineDrop(root, totalFrames) {
+    function bindVideoMediaTimelineDrop(root, totalFramesAtBind) {
       if (videoMediaDisabledOnThisDevice()) return;
       root.querySelectorAll('[data-video-media-track-id]').forEach(function(track) {
         const trackId = track.dataset.videoMediaTrackId || 'video-media-main';
