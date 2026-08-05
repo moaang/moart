@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1546</title>
+  <title>MoArt ver1547</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21801,6 +21801,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1547, items: [
+        { ja: 'ホイールのズームがマウスポインタ基準になりました — 縮小側でも、ポインタの下の点がその場に留まります。', ko: '휠 줌이 마우스 포인터 기준이 됐습니다 — 축소할 때도 포인터 아래 지점이 제자리에 머뭅니다.', en: 'Wheel zoom now anchors on the mouse pointer at every zoom level, including below 100%.' },
+        { ja: 'コンテ用紙の2本指ズーム・回転をさらに軽くしました。', ko: '콘티 용지의 두 손가락 확대·회전을 더 가볍게 했습니다.', en: 'Further reduced the cost of two-finger zoom/rotate on the conte paper.' }
+      ] },
       { ver: 1546, items: [
         { ja: 'iPadでの2本指ズーム・回転のカクつきを軽減しました（原画キャンバス・コンテ用紙とも、描画をフレームごと1回にまとめる方式に）。', ko: 'iPad 두 손가락 확대·회전의 버벅임을 완화했습니다 (원화 캔버스·콘티 용지 모두 그리기를 프레임당 1회로 묶는 방식으로).', en: 'Smoother two-finger zoom/rotate on iPad — both the genga canvas and the conte paper now coalesce redraws to one per frame.' }
       ] },
@@ -58982,10 +58986,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function applyPaperZoomDom() {
       const host = paperZoomHostEl(); // ver1308: CSS 변수는 이제 줌 호스트가 받는다
+      // ver1547: 회전 여백을 **먼저** 낸다. 이 함수는 offsetWidth 를 읽는데, --paper-zoom 을 먼저 쓰면
+      // 그 읽기가 강제 동기 레이아웃이 됐다(핀치 프레임당 0.35ms). 여백은 state 의 줌 값을 쓰고
+      // offsetWidth 는 줌과 무관하므로(위 ver1547 정정) 순서를 바꿔도 결과는 같다.
+      applyPaperRotationDom();
       if (host) host.style.setProperty('--paper-zoom', paperZoomValue());
       const label = document.getElementById('paperZoomResetBtn');
       if (label) label.textContent = Math.round(paperZoomValue() * 100) + '%';
-      applyPaperRotationDom(); // the rotated bbox depends on the zoomed size
     }
 
     // ── ver835: 用紙 rotation (iPad pinch-twist) ──────────────────────────────────────────────────
@@ -59042,6 +59049,32 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // Grow the sheet's layout footprint to its rotated bounding box (see the CSS note on .conte-youshi-stage).
     // offsetWidth/Height are LAYOUT px and are unaffected by the transform, so this never feeds back on itself.
+    // ver1547: 한 제스처 동안 **불변인 측정값**을 시작에 1회만 읽는다. 프레임마다 읽으면 그 읽기가
+    // 직전 프레임의 쓰기 뒤에 놓여 매번 강제 동기 레이아웃이 된다(읽기를 함수 안에서 앞으로 옮기는
+    // 것만으로는 못 없앤다 — 실측 2.97→2.50ms 에서 멈췄고, 캐시까지 해야 0.9ms 대가 나왔다).
+    // 캐시해도 되는 근거는 실측이다: 용지 offsetWidth 는 --paper-zoom 과 무관한 자연폭이고(줌 2.5 에서도
+    // 594x835 불변), 스크롤 호스트 자신의 박스도 줌·회전에 안 움직인다. 수명은 핀치 시작~teardown 뿐이라
+    // 그 밖의 경로(버튼·리셋·창 리사이즈)는 예전처럼 매번 읽는다.
+    let paperGestureMetrics = null;
+    function beginPaperGestureMetrics(stage) {
+      const el = document.getElementById('conteYoushiStage');
+      const host = stage || paperScrollHostEl();
+      if (!host) { paperGestureMetrics = null; return; }
+      paperGestureMetrics = { rect: host.getBoundingClientRect(), w: el ? el.offsetWidth : 0, h: el ? el.offsetHeight : 0 };
+    }
+    function endPaperGestureMetrics() { paperGestureMetrics = null; }
+    // ver1547: 회전한 용지의 bounding box 여백. **한 벌만 둔다** — applyPaperRotationDom 이 CSS 로 내고,
+    // setPaperRotation 이 스크롤 보정량을 같은 값으로 예측한다(그쪽은 예전에 scrollWidth 를 읽어 구했는데,
+    // 쓰기 뒤 읽기라 프레임마다 강제 동기 레이아웃이 났다). 실측으로 둘이 정확히 같은 값임을 확인했다:
+    // 회전 4구간에서 scrollWidth/Height 변화 = 2*(mx/my 변화), 8/8 오차 0.
+    function paperRotMargins(rot, zoom, w, h) {
+      if (!rot || !(w > 0) || !(h > 0)) return { mx: 0, my: 0 };
+      const c = Math.abs(Math.cos(rot)), s = Math.abs(Math.sin(rot));
+      return {
+        mx: Math.max(0, Math.round((w * c + h * s - w) / 2 * zoom)),
+        my: Math.max(0, Math.round((w * s + h * c - h) / 2 * zoom))
+      };
+    }
     function applyPaperRotationDom() {
       const stage = paperZoomHostEl(); // ver1308: was paperViewportEl() — CSS 변수는 줌 호스트로
       const page = document.getElementById('conteYoushiStage');
@@ -59051,21 +59084,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // reading them first is arithmetically identical — but reading them AFTER the --paper-rotation write
       // forced a synchronous layout on every pinch tick. Same shape as the ver971 setGengaFrame fix: the cost
       // was the ordering, not the calls. The read stays inside the `rot` guard so an upright sheet still reads
-      // nothing at all. (applyPaperZoomDom's --paper-zoom write must still precede this, and does — paper zoom
-      // scales LAYOUT width, so offsetWidth genuinely depends on it.)
+      // nothing at all.
+      // ver1547 정정: 여기 있던 「applyPaperZoomDom's --paper-zoom write must still precede this … offsetWidth
+      // genuinely depends on it」은 **틀렸다.** ver1308 이 줌을 transform: scale() 로 옮긴 뒤 offsetWidth 는
+      // 줌과 무관한 자연폭이다(실측: --paper-zoom 1 → 2.5 에서 594x835 불변 — 바로 아래 ver1308 주석이 말하는
+      // 그대로다). 그래서 applyPaperZoomDom 은 이제 이 함수를 --paper-zoom 쓰기 **앞에서** 부른다.
       let mx = 0, my = 0;
       if (page && rot) {
-        const w = page.offsetWidth, h = page.offsetHeight;
-        const c = Math.abs(Math.cos(rot)), s = Math.abs(Math.sin(rot));
+        const gm = paperGestureMetrics; // ver1547: 핀치 중이면 시작에 잰 값 (프레임마다 읽으면 강제 레이아웃)
+        const w = gm ? gm.w : page.offsetWidth, h = gm ? gm.h : page.offsetHeight;
         // ver1308: 이 여백은 이제 #paperZoomHost 자신의 margin 이고, 호스트 자신의
         // transform: scale() 은 자기 margin 을 함께 키우지 않는다(transform 은 레이아웃-후
         // 페인트 단계라 margin 은 layout 단계에서 이미 확정된 원본 px 그대로 쓰인다).
         // page.offsetWidth/Height 는 늘 자연폭이므로 여기서 나오는 mx/my 도 자연폭 기준인데,
         // 실제로 필요한 건 "지금 줌 배율에서 보이는" 여백이다 — 곱해두지 않으면 확대 상태에서
         // 회전된 모서리까지 스크롤이 살짝 못 미친다(실측으로 발견).
-        const z = paperZoomValue();
-        mx = Math.max(0, Math.round((w * c + h * s - w) / 2 * z));
-        my = Math.max(0, Math.round((w * s + h * c - h) / 2 * z));
+        const m = paperRotMargins(rot, paperZoomValue(), w, h);
+        mx = m.mx; my = m.my;
       }
       stage.style.setProperty('--paper-rotation', rot + 'rad');
       stage.style.setProperty('--paper-flip-x', paperViewFlipSign()); // ver1001: written in the same pass — one style batch, no extra layout boundary
@@ -59088,19 +59123,27 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (Math.abs(next - before) < 1e-6) return;
       if (!stage) { state.paperRotation = next; applyPaperRotationDom(); return; }
       const uz = uiReadScale(); // scrollLeft/Top are local px; the anchor is a viewport point
-      const rect = stage.getBoundingClientRect();
+      const gm = paperGestureMetrics;
+      const rect = gm ? gm.rect : stage.getBoundingClientRect();
       const ax = Number.isFinite(anchorX) ? anchorX : rect.left + rect.width / 2;
       const ay = Number.isFinite(anchorY) ? anchorY : rect.top + rect.height / 2;
       const holdX = stage.scrollLeft + (ax - rect.left) / uz;
       const holdY = stage.scrollTop + (ay - rect.top) / uz;
-      const beforeW = stage.scrollWidth, beforeH = stage.scrollHeight;
+      // ver1547: footprint 변화를 **읽지 않고 예측한다.** 예전에는 applyPaperRotationDom() 뒤에
+      // scrollWidth/Height 를 읽어 구했는데(쓰기→읽기 = 강제 동기 레이아웃), 그 변화량은 CSS 여백
+      // mx/my 변화의 정확히 2배다 — 같은 커널로 구하면 값이 동일하고 레이아웃은 강제되지 않는다.
+      // 읽기는 전부 쓰기 앞에 모인다(ver971·ver993 과 같은 패턴).
+      const pageEl = gm ? null : document.getElementById('conteYoushiStage');
+      const pz = paperZoomValue();
+      const pgW = gm ? gm.w : (pageEl ? pageEl.offsetWidth : 0), pgH = gm ? gm.h : (pageEl ? pageEl.offsetHeight : 0);
+      const m0 = paperRotMargins(before, pz, pgW, pgH), m1 = paperRotMargins(next, pz, pgW, pgH);
       state.paperRotation = next;
       applyPaperRotationDom();
-      const afterW = stage.scrollWidth, afterH = stage.scrollHeight;
-      const rect2 = stage.getBoundingClientRect();
-      // the footprint grew/shrank around the sheet's centre, so the held content point moved by half the delta
-      stage.scrollLeft = holdX + (afterW - beforeW) / 2 - (ax - rect2.left) / uz;
-      stage.scrollTop = holdY + (afterH - beforeH) / 2 - (ay - rect2.top) / uz;
+      // the footprint grew/shrank around the sheet's centre, so the held content point moved by half the delta.
+      // rect is reused for the post-write position: rotating/zooming changes what is INSIDE the scroll host,
+      // not the host's own viewport box (실측: 줌 1 → 1.8 에서 (180,175,620,460) 불변).
+      stage.scrollLeft = holdX + (m1.mx - m0.mx) - (ax - rect.left) / uz;
+      stage.scrollTop = holdY + (m1.my - m0.my) - (ay - rect.top) / uz;
     }
     // Zoom about a viewport anchor point (pinch midpoint / stage centre) by fixing that point's
     // position in CONTENT space across the scale change.
@@ -59112,7 +59155,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let ratioX = 0, ratioY = 0, useAnchor = false;
       if (stage) {
         const uz = uiReadScale(); // scrollLeft/Top are local px; the anchor is a viewport point
-        const rect = stage.getBoundingClientRect();
+        const rect = paperGestureMetrics ? paperGestureMetrics.rect : stage.getBoundingClientRect();
         const ax = Number.isFinite(anchorX) ? anchorX : rect.left + rect.width / 2;
         const ay = Number.isFinite(anchorY) ? anchorY : rect.top + rect.height / 2;
         ratioX = (stage.scrollLeft + (ax - rect.left) / uz) / before;
@@ -59120,9 +59163,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         useAnchor = true;
         state.paperZoom = next;
         applyPaperZoomDom();
-        const rect2 = stage.getBoundingClientRect();
-        stage.scrollLeft = ratioX * next - (ax - rect2.left) / uz;
-        stage.scrollTop = ratioY * next - (ay - rect2.top) / uz;
+        // ver1547: rect 재사용 — 위 setPaperRotation 과 같은 근거(호스트 자신의 박스는 안 움직인다).
+        stage.scrollLeft = ratioX * next - (ax - rect.left) / uz;
+        stage.scrollTop = ratioY * next - (ay - rect.top) / uz;
       }
       if (!useAnchor) { state.paperZoom = next; applyPaperZoomDom(); }
       saveEditorUiState();
@@ -59186,6 +59229,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function teardownPaperPinch(evType) {
       if (!paperPinch) return;
       applyPendingPaperPinch(); // ver1546: land the last pinch frame before saveEditorUiState reads zoom/rot
+      endPaperGestureMetrics(); // ver1547: 캐시는 제스처와 함께 끝난다 — 다음 호출자는 다시 실측한다
       paperPinch = null;
       // a cancelled gesture is never a tap; a clean lift may be one (ver837)
       if (evType === 'pointercancel') twoFingerGestureClear();
@@ -59283,6 +59327,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
               startDist: v.d, startAngle: v.a, lastRaw: v.a, turns: 0,
               startZoom: paperZoomValue(), startRot: paperRotationValue()
             };
+            beginPaperGestureMetrics(stage); // ver1547: 이 제스처 동안 쓸 측정값을 여기서 한 번만 읽는다
             // ver837: the half-drawn stroke is dropped once this is a CONFIRMED pinch (see the move
             // handler) — not here. Killing it on the second pointerdown meant a two-finger tap, or even
             // a stray second finger resting on the canvas, destroyed whatever was being drawn.
@@ -80296,7 +80341,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function gengaSetZoom(z) {
       state.gengaZoom = gengaClampZoom(z);
-      if (state.gengaZoom <= 1.0001) { state.gengaPanX = 0; state.gengaPanY = 0; }
+      // ver1547 (a3): 여기 있던 `if (zoom <= 1.0001) { panX = panY = 0 }` 를 없앴다. 버튼은 앵커가 없어
+      // 중앙 줌이 되는 것이 맞지만 pan 을 0 으로 되돌릴 이유는 없었다 — 휠은 유지하는데 버튼만 리셋해
+      // 같은 배율에서 경로에 따라 화면이 달랐다(콘티 버튼도 리셋하지 않는다). 「초기화」는 fit 계열 담당.
       drawGengaPreview(); updateGengaZoomLabel();
     }
     function gengaZoomStep(dir) { gengaSetZoom(Math.round((gengaClampZoom(state.gengaZoom) * (dir > 0 ? 1.25 : 1 / 1.25)) * 100) / 100); }
@@ -84480,13 +84527,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const f = gengaPreviewFit(), xf = gengaPreviewXform;
           const c = gengaClientToCanvasXY(ev.clientX, ev.clientY);
           const nextZoom = gengaClampZoom(gengaClampZoom(state.gengaZoom) * (ev.deltaY < 0 ? 1.15 : 1 / 1.15));
-          if (nextZoom <= 1.0001) { state.gengaZoom = nextZoom; gengaScheduleViewDraw(); updateGengaZoomLabel(); return; } // ver1129: wheel keeps the pan (the clamp centres it enough when it fits); no snap-to-centre
+          // ver1547 (a1): ver1129 의 `nextZoom <= 1.0001` 조기 return 을 없앴다. 그 분기는 축소 구간
+          // **전체**(gengaClampZoom 하한 0.1 ~ 1)에서 pan 을 안 건드리고 빠져나갔고, 그리는 쪽은 매번
+          // 중앙 정렬을 다시 잡으므로 「어디서 굴려도 화면 중앙 기준으로 커지고 작아지는」 것으로 나타났다
+          // (사용자 관찰). 콘티 비디오 프리뷰는 처음부터 배율 조건 없이 앵커를 걸었으니 이것은 파리티 회복이고,
+          // TVPaint 도 포인터 단일 기준이다. ver1129 의 다른 의도였던 no-snap-to-centre 는 그대로다 —
+          // 중앙으로 되돌리는 코드를 넣는 게 아니라 앵커를 켜는 것이므로 방향이 같다.
           if (!f || !xf || !c) { state.gengaZoom = nextZoom; gengaScheduleViewDraw(); updateGengaZoomLabel(); return; }
-          const anchorX = (c.x - xf.ox) / xf.scale, anchorY = (c.y - xf.oy) / xf.scale; // RAW paper point under the cursor
+          // ver1547 (a2): 앵커 수학을 콘티와 **한 벌로**. 원화의 옛 식
+          //   pan1 = c - (c - ox)/scale0 * scale1 - (W - size1)/2
+          // 은 zoomAnchoredPan(pan0, size0, size1, u) = pan0 + (size1-size0)(0.5-u) 와 대수적으로 같다
+          // (u = (c - ox)/size0, pan0 = ox - (W - size0)/2 를 대입하면 항등). 좌표계가 다르므로 커널에
+          // 분기를 넣지 않고 **호출 전에 원화 좌표로 u 를 구해** 넘긴다. 커널에는 배율 조건이 없다.
+          const size0X = f.pw * xf.scale, size0Y = f.ph * xf.scale;
           state.gengaZoom = nextZoom;
           const newScale = f.fit * nextZoom;
-          state.gengaPanX = c.x - anchorX * newScale - (f.W - f.pw * newScale) / 2;
-          state.gengaPanY = c.y - anchorY * newScale - (f.H - f.ph * newScale) / 2;
+          const size1X = f.pw * newScale, size1Y = f.ph * newScale;
+          state.gengaPanX = zoomAnchoredPan(state.gengaPanX, size0X, size1X, (c.x - xf.ox) / size0X);
+          state.gengaPanY = zoomAnchoredPan(state.gengaPanY, size0Y, size1Y, (c.y - xf.oy) / size0Y);
           gengaScheduleViewDraw();
           updateGengaZoomLabel();
         }, { passive: false });
