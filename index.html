@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1538</title>
+  <title>MoArt ver1539</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -47626,6 +47626,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }, Math.max(300, Math.round(Number(delay) || INDEXED_DB_AUTOSAVE_DELAY_MS)));
     }
 
+    // ver1539: 영속 저장의 실패를 **삼키지 않는 한 곳**. `putWorkspaceDbValue` 계열은 async 인데
+    // 여러 호출부가 `try { put(...) } catch {}` 로 감싸고 있었다 — **그 try 는 아무것도 못 잡는다**
+    // (async 함수는 동기 예외를 던지지 않고 rejected Promise 를 반환한다). 그래서 그림·음성·브러시
+    // 팁이 메모리에만 남고 디스크에 못 들어가도 **아무 흔적이 없었다** — 다음 실행에 조용히 사라진다.
+    // 실패는 flushIndexedDbAutosave 와 같은 채널(indexedDbAutosaveStatus + 설정 화면)로 드러낸다.
+    function trackPersistFailure(what, promise) {
+      if (!promise || typeof promise.catch !== 'function') return promise;
+      return promise.catch(function(error) {
+        console.error('[persist] ' + what + ' failed', error);
+        try {
+          state.indexedDbAutosaveStatus = t('msg.workspace.saveFailed', (what + ': ') + (error && error.message ? error.message : error));
+          updateStageSettingsUI();
+        } catch (e) {}
+        return null;
+      });
+    }
+
     function flushIndexedDbAutosave() {
       // Run any pending debounced autosave immediately (e.g. tab hidden / closing),
       // so the long pen-stroke debounce never loses the most recent strokes.
@@ -51482,7 +51499,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
       [e.tipRef, e.brush && e.brush.paperTexId].forEach(function(ref) {
         if (!ref || stillUsed(ref)) return;
-        try { deleteWorkspaceDbValue('bt:' + ref); } catch (err) {}
+        deleteWorkspaceDbValue('bt:' + ref).catch(function(err) { console.error('[persist] brush tip cleanup failed', err); }); // ver1539
         paintUnregisterTip(ref);
       });
       if (brushLibrarySelectedId === id) brushLibrarySelectedId = null;
@@ -51512,7 +51529,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         rd.onload = function() {
           const dataUrl = String(rd.result || '');
           const ref = brushLibraryNewRef();
-          try { putWorkspaceDbValue('bt:' + ref, dataUrl); } catch (e) {}
+          trackPersistFailure('brush tip', putWorkspaceDbValue('bt:' + ref, dataUrl)); // ver1539
           brushLibraryRegisterTipFromDataUrl(ref, dataUrl, function(ok) {
             const lib = brushLibraryLoad();
             lib.entries.push({
@@ -51578,7 +51595,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let ref = null;
       if (tipDataUrl) {
         ref = brushLibraryNewRef();
-        try { putWorkspaceDbValue('bt:' + ref, tipDataUrl); } catch (e) {}
+        trackPersistFailure('brush tip', putWorkspaceDbValue('bt:' + ref, tipDataUrl)); // ver1539
         brushLibraryRegisterTipFromDataUrl(ref, tipDataUrl, function() { brushLibraryRenderGrid(); });
         const probe = new Image();
         probe.onload = function() { const lib = brushLibraryLoad(); lib.entries.forEach(function(en) { if (en.tipRef === ref) { en.tipW = probe.width; en.tipH = probe.height; } }); brushLibrarySave(); };
@@ -51588,7 +51605,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let paperRef = null;
       if (paperDataUrl) {
         paperRef = brushLibraryNewRef();
-        try { putWorkspaceDbValue('bt:' + paperRef, paperDataUrl); } catch (e) {}
+        trackPersistFailure('brush paper', putWorkspaceDbValue('bt:' + paperRef, paperDataUrl)); // ver1539
         brushLibraryRegisterTipFromDataUrl(paperRef, paperDataUrl, function() { brushLibraryRenderGrid(); });
       }
       const lib = brushLibraryLoad();
@@ -56093,7 +56110,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         tlTutToast(tlTutL({ja:'原画プロジェクトを開いてから始めてください。', ko:'원화 프로젝트를 연 뒤 시작하세요.', en:'Open a genga project first.'}), true);
         return;
       }
-      try { flushIndexedDbAutosave(); } catch(e){}      // persist the user's work before we swap it out
+      // ver1539: 주석대로 「스왑 전에 사용자 작업을 저장」하는 자리인데, 실패를 삼키면 **작업이 날아간
+      // 채로 프로젝트가 바뀐다.** flushIndexedDbAutosave 는 내부에서 실패를 상태로 남기므로 여기서는
+      // 그 상태를 확인해 알린다(동기 예외도 여전히 잡는다).
+      try { flushIndexedDbAutosave(); } catch (error) { console.error('[tlTut] autosave flush failed', error); }
       const drawKeysAtStart = new Set(gengaDrawStore.keys()); // ver1474
       tlTut = { idx:0, solved:false, mini: !!miniContainer, drawKeysAtStart: drawKeysAtStart, saved:{
         project: state.project, undo: state.undoStack, redo: state.redoStack,
@@ -66862,7 +66882,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
       gengaDrawStore.set(ref, String(dataUrl || ''));
       if (gengaDrawingShouldPersist()) { // ver1474
-        try { putWorkspaceDbValue('gd:' + ref, String(dataUrl || '')); } catch (e) {}
+        trackPersistFailure('genga drawing', putWorkspaceDbValue('gd:' + ref, String(dataUrl || ''))); // ver1539
       }
       const out = { ref: ref, w: Math.max(1, Math.round(Number(w) || 1)), h: Math.max(1, Math.round(Number(h) || 1)) };
       if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) { out.x = Math.round(Number(x)); out.y = Math.round(Number(y)); }
@@ -67113,7 +67133,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaPutAudioData(dataUrl) {
       const ref = 'ga_' + Date.now().toString(36) + '_' + (gengaAudioRefSeq++).toString(36);
       gengaAudioStore.set(ref, String(dataUrl || ''));
-      try { putWorkspaceDbValue('ga:' + ref, String(dataUrl || '')); } catch (e) {}
+      trackPersistFailure('genga audio', putWorkspaceDbValue('ga:' + ref, String(dataUrl || ''))); // ver1539
       return ref;
     }
     function gengaIngestAudioClip(c) { // externalize an inline dataUrl → {ref}
