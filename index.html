@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1535</title>
+  <title>MoArt ver1536</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -15198,6 +15198,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'ui.eyedropper': { ja: 'スポイト', ko: '스포이드', en: 'Eyedropper' },
         // --- 共通ボタン ---
         'ui.close': { ja: '閉じる', ko: '닫기', en: 'Close' },
+        // ver1536: 자동복원을 포기했을 때 조용히 넘어가지 않기 위한 문구들.
+        'msg.workspace.permissionExpired': { ja: '作業フォルダのアクセス許可が切れています。「フォルダを開く」からもう一度つないでください。', ko: '작업 폴더 접근 권한이 만료됐습니다. 「폴더 열기」로 다시 연결해 주세요.', en: 'The working folder permission has lapsed. Reconnect it with "Open folder".' },
+        'msg.boot.timedOut': { ja: '起動時の自動復元が時間内に終わらず、スタート画面を開きました。', ko: '시작 시 자동 복원이 제시간에 끝나지 않아 시작 화면을 열었습니다.', en: 'Startup restore did not finish in time, so the start screen was opened instead.' },
         // ver1535: 업데이트 로그 모달. 항목 문구는 UPDATE_LOG 자체가 정본이다(사전에 판마다 수십 개씩
         // 키를 더하면 사전이 금세 롭고, 그 문구는 다른 곳에서 안 쓰인다) — 여기는 틀만 둔다.
         'updateLog.title': { ja: '更新履歴', ko: '업데이트 내역', en: "What's new" },
@@ -16219,6 +16222,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       workspaceHandle: null,
       workspaceName: '',
       workspaceStatus: '',
+      workspaceNeedsReconnect: false, // ver1536: 권한 만료로 자동복원을 포기했다 — 시작 화면에서 알린다
+      bootRestoreTimedOut: false,    // ver1536: 안전장치가 걸렸다
       workspaceObjectUrls: { pictures: {}, audio: {}, layers: {} },
       workspaceProjectSaveTimer: 0,
       workspaceAutosaveTimer: 0,
@@ -21817,6 +21822,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
+    const BOOT_RESTORE_TIMEOUT_MS = 8000; // ver1536: 자동복원 한 단계의 상한
     async function bootProjectStartup() {
       // Ask the browser to exempt this origin's storage (IndexedDB) from eviction-under-pressure. Matters
       // more now that large ZIP imports route media through IndexedDB refs instead of inlining everything
@@ -21830,13 +21836,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       setProjectActive(false);
       showLoadingOverlay(t('msg.loading.checkingProject'));
       let restored = false;
+      // ver1536: 이 단계가 어떤 이유로든 안 끝나면 로딩 오버레이가 안 걷혀 **앱이 통째로 잠긴다**.
+      // 실제로 그런 사례가 있었다(폴더 권한 프롬프트 대기). 상한을 두고, 넘어가면 알린다.
+      const bootStep = async function(label, run) {
+        let timedOut = false;
+        const capped = new Promise(function(resolve) {
+          setTimeout(function() { timedOut = true; resolve(false); }, BOOT_RESTORE_TIMEOUT_MS);
+        });
+        let value = false;
+        try { value = await Promise.race([run(), capped]); } catch (error) { value = false; }
+        if (timedOut) {
+          state.bootRestoreTimedOut = true;
+          console.warn('[boot] restore step timed out: ' + label);
+          return false;
+        }
+        return value;
+      };
       // 1) A remembered working folder (desktop) reopens its project.
-      try { restored = await restoreWorkspaceHandle(); } catch (error) { restored = false; }
+      restored = await bootStep('workspace', restoreWorkspaceHandle);
       // 2) Otherwise the most-recently-active IndexedDB project (mobile / desktop without a folder).
       if (!restored) {
-        try { restored = await restoreLastIndexedDbProject(); } catch (error) { restored = false; }
+        restored = await bootStep('indexeddb', restoreLastIndexedDbProject);
       }
       hideLoadingOverlay();
+      // 왜 자동으로 안 열렸는지를 그 자리에서 말한다(조용한 실패 금지).
+      if (state.workspaceNeedsReconnect) {
+        state.workspaceNeedsReconnect = false;
+        try { showToast(t('msg.workspace.permissionExpired')); } catch (error) {}
+      } else if (state.bootRestoreTimedOut) {
+        try { showToast(t('msg.boot.timedOut')); } catch (error) {}
+      }
+      state.bootRestoreTimedOut = false;
       if (restored) {
         // ver573: the project IS restored and the editor is unlocked -- but the entry screen still shows
         // on top, so a reload always lands on a real choice (continue / new / open) instead of silently
@@ -46270,7 +46300,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try {
         const handle = await loadWorkspaceHandle();
         if (!handle) return false;
-        if (!await ensureWorkspacePermission(handle, false)) return false;
+        // ver1536: 부팅은 프롬프트를 부르지 않는다(위 주석). 권한이 끊겼으면 자동복원을 포기하되
+        // **조용히 포기하지 않는다** — 그러면 「폴더를 기억했는데 왜 자동으로 안 열리지」가 된다.
+        if (!await ensureWorkspacePermission(handle, false, false)) {
+          state.workspaceNeedsReconnect = true;
+          return false;
+        }
         state.workspaceHandle = handle;
         state.workspaceName = handle.name || 'Local workspace';
         state.workspaceStatus = '';
@@ -46289,11 +46324,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    async function ensureWorkspacePermission(handle, write) {
+    // ver1536: allowPrompt 를 받는다(기본값은 종전 동작 = 프롬프트 허용).
+    // **requestPermission 은 사용자 제스처가 있어야 제대로 동작한다.** 부팅 자동복원은 클릭 없이
+    // 돌아서, 권한이 granted 가 아니면 이 await 가 끝나지 않고 부팅이 통째로 멈췄다 — 에러가 아니라
+    // 「안 끝나는」 것이라 catch 도 안 걸렸다(사용자에겐 「프로젝트 확인 중…」에서 영영 멈춰 보였다).
+    // 그래서 부팅은 allowPrompt=false 로 부르고, 프롬프트는 사용자가 「폴더 열기」를 누를 때만 띄운다.
+    async function ensureWorkspacePermission(handle, write, allowPrompt) {
       if (!handle || typeof handle.queryPermission !== 'function') return false;
       const options = { mode: write ? 'readwrite' : 'read' };
       let permission = await handle.queryPermission(options);
       if (permission === 'granted') return true;
+      if (allowPrompt === false) return false;
       if (typeof handle.requestPermission !== 'function') return false;
       permission = await handle.requestPermission(options);
       return permission === 'granted';
