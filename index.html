@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1540</title>
+  <title>MoArt ver1541</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21709,7 +21709,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function showLoadingOverlay(message) {
       const overlay = document.getElementById('projectLoadingOverlay');
       const msg = document.getElementById('projectLoadingMessage');
-      if (msg) msg.textContent = message || t('msg.loading.default');
+      if (msg) { delete msg.dataset.baseText; msg.textContent = message || t('msg.loading.default'); } // ver1541: 진행률 잔재 제거
       if (overlay) overlay.hidden = false;
     }
 
@@ -47644,6 +47644,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
+    // ver1541: 로딩 오버레이의 문구 뒤에 진행률을 덧붙인다. 오래 걸리는 동안 「멈춘 것」과
+    // 「읽는 중」을 구분할 수 있어야 한다 — 그 구분이 없어서 이번에 「응답 없는 페이지」로 읽혔다.
+    function updateLoadingOverlayProgress(done, total) {
+      try {
+        const el = document.getElementById('projectLoadingMessage');   // showLoadingOverlay 가 쓰는 그 요소
+        if (!el) return;
+        const base = el.dataset.baseText || (el.dataset.baseText = String(el.textContent || ''));
+        el.textContent = base + '  ' + done + ' / ' + total;
+      } catch (error) {}
+    }
+
     function flushIndexedDbAutosave() {
       // Run any pending debounced autosave immediately (e.g. tab hidden / closing),
       // so the long pen-stroke debounce never loses the most recent strokes.
@@ -67090,6 +67101,27 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return { dataUrl: t.toDataURL('image/png'), w: b.w, h: b.h, x: b.x, y: b.y };
     }
     // pull any {ref} drawings whose base64 isn't in memory yet from IndexedDB, then re-render (load/restore).
+    // ver1541: 저장된 값 여러 개를 **묶어서 병렬로** 읽는다. 종전에는 참조 하나당 트랜잭션 하나를
+    // 순차로 열었다 — 코마가 수백 장인 원화 프로젝트에서 그 왕복이 그대로 쌓여 「불러오기가 엄청
+    // 렉」이 됐다(사용자 제보). 한 번에 다 던지지 않고 청크로 끊는 이유는, 수백 개를 동시에 열면
+    // IndexedDB 쪽이 되레 밀리기 때문이다. 실패는 null 로 떨어뜨려 호출부가 결측으로 센다.
+    const DB_READ_CHUNK = 24;
+    async function readWorkspaceDbValues(keys, onProgress) {
+      const out = new Map();
+      for (let i = 0; i < keys.length; i += DB_READ_CHUNK) {
+        const part = keys.slice(i, i + DB_READ_CHUNK);
+        const vals = await Promise.all(part.map(function(key) {
+          return getWorkspaceDbValue(key).catch(function(error) {
+            console.error('[db] read failed for ' + key, error);
+            return null;
+          });
+        }));
+        part.forEach(function(key, j) { out.set(key, vals[j]); });
+        if (typeof onProgress === 'function') { try { onProgress(Math.min(keys.length, i + part.length), keys.length); } catch (e) {} }
+      }
+      return out;
+    }
+
     async function gengaHydrateDrawStore(project) {
       const gt = project && project.gengaTimeline; if (!gt) return;
       const refs = new Set();
@@ -67100,13 +67132,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!refs.size) return;
       let loaded = 0;
       let missing = 0;
-      for (const ref of refs) {
-        try {
-          const v = await getWorkspaceDbValue('gd:' + ref);
-          if (v) { gengaDrawStore.set(ref, String(v)); loaded++; }
-          else missing += 1; // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
-        } catch (e) { missing += 1; console.error('[gengaHydrate] read failed for gd:' + ref, e); }
-      }
+      const list = Array.from(refs);
+      // ver1541: 순차 → 청크 병렬. 진행률을 로딩 오버레이에 흘려 「멈춘 게 아니라 읽는 중」을 보인다.
+      const values = await readWorkspaceDbValues(list.map(function(ref) { return 'gd:' + ref; }), function(done, total) {
+        if (total > DB_READ_CHUNK) updateLoadingOverlayProgress(done, total);
+      });
+      list.forEach(function(ref) {
+        const v = values.get('gd:' + ref);
+        if (v) { gengaDrawStore.set(ref, String(v)); loaded++; }
+        else missing += 1; // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
+      });
       // ver1448: 종전에는 loaded 만 세고 결측은 조용히 지나갔다 — 사용자는 **원인 불명의 빈 코마**를 본다.
       // 형제인 gengaPreloadExportImages 는 같은 상황을 이미 카운트+경고한다(ver853).
       if (missing) console.error('[gengaHydrate] ' + missing + ' of ' + refs.size + ' drawing(s) had no stored data - those komas will appear blank');
@@ -67148,7 +67183,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const refs = new Set();
       (gt.audioClips || []).forEach(function(c) { if (c.ref && !gengaAudioStore.has(c.ref)) refs.add(c.ref); });
       if (!refs.size) return;
-      for (const ref of refs) { try { const v = await getWorkspaceDbValue('ga:' + ref); if (v) gengaAudioStore.set(ref, String(v)); } catch (e) {} }
+      const list = Array.from(refs); // ver1541: 순차 → 청크 병렬(그림 쪽과 같은 커널)
+      const values = await readWorkspaceDbValues(list.map(function(ref) { return 'ga:' + ref; }));
+      list.forEach(function(ref) { const v = values.get('ga:' + ref); if (v) gengaAudioStore.set(ref, String(v)); });
     }
     function gengaInlineAudio(gt) { // {ref}→inline dataUrl for portable serialization (operates on a clone)
       if (!gt || !Array.isArray(gt.audioClips)) return;
