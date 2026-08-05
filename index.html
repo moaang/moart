@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1543</title>
+  <title>MoArt ver1546</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21801,6 +21801,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1546, items: [
+        { ja: 'iPadでの2本指ズーム・回転のカクつきを軽減しました（原画キャンバス・コンテ用紙とも、描画をフレームごと1回にまとめる方式に）。', ko: 'iPad 두 손가락 확대·회전의 버벅임을 완화했습니다 (원화 캔버스·콘티 용지 모두 그리기를 프레임당 1회로 묶는 방식으로).', en: 'Smoother two-finger zoom/rotate on iPad — both the genga canvas and the conte paper now coalesce redraws to one per frame.' }
+      ] },
       { ver: 1543, items: [
         { ja: '一部の原画プロジェクトが開くのに数十秒かかり、「応答なし」になっていた不具合を修正しました。', ko: '일부 원화 프로젝트가 열리는 데 수십 초가 걸리며 「응답 없음」이 되던 문제를 고쳤습니다.', en: 'Fixed genga projects that took tens of seconds to open and froze the page.' },
         { ja: '用紙レイヤーにサブレイヤーを追加できないようにしました — 用紙は1プロジェクトに1枚です。', ko: '용지 레이어에는 서브레이어를 추가할 수 없게 했습니다 — 용지는 프로젝트당 한 장입니다.', en: 'The paper layer can no longer take a sub-layer — there is one paper per project.' }
@@ -59154,6 +59157,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return (raw + st.turns * Math.PI * 2) - st.startAngle;
     }
     function paperPinchTwist(raw) { return pinchTwistSince(paperPinch, raw); }
+    // ver1546: coalesce the paper-pinch APPLY to one per frame (parity with gengaScheduleViewDraw).
+    // The genga pinch only defers its DRAW; here the whole apply is deferred because rotation+zoom each
+    // force a synchronous layout. The math still runs per pointermove — only the landing is throttled.
+    let paperPinchPendingApply = null;
+    let paperPinchApplyRaf = 0;
+    function applyPendingPaperPinch() {
+      const p = paperPinchPendingApply;
+      paperPinchPendingApply = null;
+      if (!p) return;
+      // rotate first: setPaperZoom re-derives scroll from the anchor, so it must run on the final angle
+      setPaperRotation(p.rot, p.mx, p.my);
+      setPaperZoom(p.zoom, p.mx, p.my);
+    }
+    function schedulePaperPinchApply() {
+      if (paperPinchApplyRaf) return;
+      paperPinchApplyRaf = requestAnimationFrame(function() {
+        paperPinchApplyRaf = 0;
+        applyPendingPaperPinch();
+      });
+    }
     // ver840: the ONE place a paper pinch ends — both the stage's own pointerup/cancel handler and the
     // document janitor's deferred leak check call this. Guarded on the pinch object and
     // twoFingerGestureEnd consumes its candidate, so whichever caller arrives first does the work and
@@ -59162,6 +59185,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // pinch first — so the two-finger tap never fired on 用紙. See the janitor note.)
     function teardownPaperPinch(evType) {
       if (!paperPinch) return;
+      applyPendingPaperPinch(); // ver1546: land the last pinch frame before saveEditorUiState reads zoom/rot
       paperPinch = null;
       // a cancelled gesture is never a tap; a clean lift may be one (ver837)
       if (evType === 'pointercancel') twoFingerGestureClear();
@@ -59274,9 +59298,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (v) {
           // ver837: crossing the tap threshold is what makes this a pinch — and only then does it own the stroke
           if (twoFingerGestureMove(v.mx, v.my)) conteCancelSingleFingerOpsForGesture(); // ver842: one cancel path for both conte surfaces (the flip branch is provably inert here — previewPanelFlipStartZone requires state.videoEditMode)
-          // rotate first: setPaperZoom re-derives scroll from the anchor, so it must run on the final angle
-          setPaperRotation(paperPinch.startRot + paperPinchTwist(v.a) * paperViewFlipSign(), v.mx, v.my); // ver1154: flip-aware twist
-          setPaperZoom(paperPinch.startZoom * v.d / Math.max(1, paperPinch.startDist), v.mx, v.my);
+          // ver1546: MATH per event, APPLY once per frame. setPaperRotation/setPaperZoom each write the
+          // DOM then immediately read scrollWidth/getBoundingClientRect — two forced layouts per
+          // pointermove (report A: iPad lag). The pending slot always holds the LATEST values.
+          paperPinchPendingApply = {
+            rot: paperPinch.startRot + paperPinchTwist(v.a) * paperViewFlipSign(), // ver1154: flip-aware twist
+            zoom: paperPinch.startZoom * v.d / Math.max(1, paperPinch.startDist),
+            mx: v.mx, my: v.my
+          };
+          schedulePaperPinchApply();
         }
         if (event.cancelable) event.preventDefault();
       }, { passive: false });
@@ -79404,7 +79434,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       clearTimeout(gengaWheelViewTimer);
       gengaWheelViewTimer = setTimeout(function() { gengaWheelViewToken = null; if (perfSoftwareCanvas()) drawGengaPreview(); }, 300); // ver1135: final frame at full smoothing
     }
-    // ver1134: coalesce VIEW-gesture redraws (wheel zoom / space-pan) into one draw per animation frame. A pan
+    // ver1134: coalesce VIEW-gesture redraws (wheel zoom / space-pan; pinch joined in ver1546) into one draw per animation frame. A pan
     // pointermove or a trackpad wheel fires far faster than a full-viewport blit can complete — on a software
     // (GPU-disabled) canvas each blit is many ms, so the synchronous per-event draws pile into a backlog and the
     // gesture stutters. The zoom/pan MATH still runs per event (state stays exact); only the paint is throttled to
@@ -80464,7 +80494,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // keep the anchored paper point under the (current) midpoint → zoom doesn't bounce, pan follows the fingers
       state.gengaPanX = mcx - gengaPinch.anchorX * newScale - newCenX;
       state.gengaPanY = mcy - gengaPinch.anchorY * newScale - newCenY;
-      drawGengaPreview(); updateGengaZoomLabel();
+      gengaScheduleViewDraw(); updateGengaZoomLabel(); // ver1546: parity with wheel/pan — pinch was the one view gesture still drawing synchronously per pointermove (report A: iPad lag)
     }
     // a 2nd finger arriving cancels whatever single-finger op finger 1 started (no stray stroke / stuck flip)
     function gengaCancelSingleFingerOps() {
