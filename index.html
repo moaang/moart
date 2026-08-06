@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1556</title>
+  <title>MoArt ver1557</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -65408,10 +65408,79 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Real-time webm capture (canvas.captureStream + MediaRecorder) + audio mix of all non-muted clips,
     // scheduled on a WebAudio MediaStreamDestination synced to the frame loop's wall-clock. This is the
     // FALLBACK path; exportConteVideoFast (WebCodecs) is the default. fps follows the project.
+    // ---- ver1557: 실시간 녹화 커널 (conte + genga 공용) ----------------------------------------
+    // ver966 이 고속 경로(runWebCodecsExport)에 한 일을 실시간에도 한다. 이 커널이 갖는 것은
+    // **가드·captureStream·MediaRecorder·프레임 루프·blob** 이고, 엔진이 주는 것은 spec 뿐이다:
+    //   renderFrame(canvas, frame)  — 그 프레임을 캔버스에 그린다(첫 호출이 캔버스 크기를 정한다)
+    //   audio.prepare(ctx, onStatus) → opaque  — 디코드/믹스. 커널은 그 값을 들여다보지 않는다
+    //   audio.start(ctx, dest, t0, opaque) → 클립수  — recorder.start 뒤 t0 기준으로 재생 시작
+    //   fileName — 내려받을 이름
+    // 오디오가 두 단계인 것은 **디코드는 녹화 전에, 재생 시작은 녹화 후**여야 하기 때문이다.
+    // 원화에 폴백이 없어 iOS 에서 WebCodecs 가 떨어지면 동영상을 못 내던 것이 이 판의 동기다.
+    async function runRealtimeRecordExport(spec, onStatus) {
+      if (typeof MediaRecorder === 'undefined' || !HTMLCanvasElement.prototype.captureStream) throw new Error(t('msg.export.noMediaRecorder'));
+      const fps = Math.max(1, Math.round(Number(spec.fps) || 24));
+      const startFrame = Math.max(0, Math.round(Number(spec.startFrame) || 0));
+      const endFrame = Math.max(startFrame + 1, Math.round(Number(spec.endFrame) || (startFrame + 1)));
+      const recFrames = endFrame - startFrame;
+      const canvas = document.createElement('canvas');
+      await spec.renderFrame(canvas, startFrame);
+
+      let audioCtx = null, audioDest = null, prepared = null, audioClips = 0;
+      if (spec.audio && spec.audio.prepare) {
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (AC) {
+            audioCtx = new AC();
+            await audioCtx.resume().catch(function() {});
+            audioDest = audioCtx.createMediaStreamDestination();
+            prepared = await spec.audio.prepare(audioCtx, onStatus);
+          }
+        } catch (e) { audioCtx = null; audioDest = null; prepared = null; }
+      }
+
+      const stream = canvas.captureStream(fps);
+      if (audioDest) audioDest.stream.getAudioTracks().forEach(function(tr) { stream.addTrack(tr); });
+      const mime = pickVideoExportMime();
+      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      const chunks = [];
+      recorder.ondataavailable = function(event) { if (event.data && event.data.size) chunks.push(event.data); };
+      const stopped = new Promise(function(resolve) { recorder.onstop = resolve; });
+      state.videoExportCancel = false;
+      recorder.start(1000);
+      const startT = performance.now();
+      if (audioCtx && audioDest && spec.audio && spec.audio.start) {
+        try { audioClips = Number(spec.audio.start(audioCtx, audioDest, audioCtx.currentTime + 0.12, prepared)) || 0; } catch (e) {}
+      }
+      await new Promise(function(resolve) {
+        function tick() {
+          if (state.videoExportCancel) { resolve(); return; }
+          const frame = startFrame + Math.floor((performance.now() - startT) / 1000 * fps);
+          if (frame >= endFrame) {
+            spec.renderFrame(canvas, endFrame - 1);
+            resolve(); return;
+          }
+          spec.renderFrame(canvas, frame);
+          if (onStatus) onStatus(t('msg.export.recording', Math.round((frame - startFrame) / Math.max(1, recFrames) * 100), frame - startFrame, recFrames));
+          requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+      });
+      await new Promise(function(resolve) { setTimeout(resolve, 300); });
+      try { recorder.stop(); } catch (error) {}
+      await stopped;
+      if (audioCtx) { try { await audioCtx.close(); } catch (e) {} }
+      const blob = new Blob(chunks, { type: mime || 'video/webm' });
+      downloadBlobAs(blob, spec.fileName || 'video.webm');
+      // ver1557: format 은 실제로 잡힌 mime 에서 낸다 — 예전엔 'webm' 고정이라 iOS(mp4)에서 거짓이었다.
+      const format = (mime && mime.indexOf('mp4') >= 0) ? 'mp4' : 'webm';
+      return { canceled: Boolean(state.videoExportCancel), frames: recFrames, blobSize: blob.size, audioClips: audioClips, format: format };
+    }
     async function recordConteVideoWebm(opts, onStatus) {
       opts = opts || {};
       videoExportResetFrameCache();
-      if (typeof MediaRecorder === 'undefined' || !HTMLCanvasElement.prototype.captureStream) throw new Error(t('msg.export.noMediaRecorder'));
+      // ver1557: MediaRecorder/captureStream 가드는 **커널 한 곳**에 있다(runRealtimeRecordExport).
+      // 같은 판정을 두 곳에 두면 한쪽만 고쳐질 때 갈린다.
       const project = state.project;
       const fps = Math.max(1, Math.round(fpsForProject(project)));
       const outWidth = Math.max(320, Math.min(3840, Math.round(Number(opts.outWidth) || 1280)));
@@ -65423,20 +65492,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const recEndSec = recFrames / fps;
       const cache = await preloadVideoExportBitmaps(project, onStatus);
       const renderOpts = { outWidth: outWidth, frameCrop: frameCrop, cache: cache, subtitle: opts.subtitle !== false, bold: opts.bold !== false };
-      const canvas = document.createElement('canvas');
-      await renderConteVideoFrameToCanvas(canvas, startFrame, renderOpts);
 
-      // audio: every clip the preview would play (= all clips with a source on a non-muted track,
-      // any type — dialogue / BGM / SFX), limited to those overlapping the recorded range.
-      let audioCtx = null, audioDest = null;
-      const scheduled = [];
-      if (opts.audio !== false) {
-        try {
-          const AC = window.AudioContext || window.webkitAudioContext;
-          if (AC) {
-            audioCtx = new AC();
-            await audioCtx.resume().catch(function() {});
-            audioDest = audioCtx.createMediaStreamDestination();
+      // ver1557: 아래 오디오 로직은 **한 줄도 바뀌지 않았다** — 커널의 두 콜백 안으로 자리만 옮겼다.
+      // 디코드는 녹화 전(prepare), 재생 시작은 recorder.start 뒤(start)라는 순서가 그대로 유지된다.
+      return runRealtimeRecordExport({
+        fps: fps, startFrame: startFrame, endFrame: endFrame,
+        fileName: 'conte_video.webm',
+        renderFrame: function(canvas, frame) { return renderConteVideoFrameToCanvas(canvas, frame, renderOpts); },
+        audio: opts.audio === false ? null : {
+          prepare: async function(audioCtx, status) {
+            const scheduled = [];
             const clips = audioTimelineAudibleClips(project).filter(function(c) {
               if (!c) return false;
               const cs = Math.round(Number(c.startFrame) || 0);
@@ -65451,67 +65516,36 @@ const MARQUEE_COLOR_PENDING = '#e02424';
               try { buffer = await decodeAudioForExport(audioCtx, url); } catch (e) { recFailed += 1; continue; }
               if (buffer) scheduled.push({ clip: clips[i], buffer: buffer });
               done += 1;
-              if (onStatus && done % 8 === 0) onStatus(t('msg.export.loadingAudio', done, clips.length));
+              if (status && done % 8 === 0) status(t('msg.export.loadingAudio', done, clips.length));
             }
             if (recFailed) { // ver750 (fix_design P3-B)
               console.warn('[recordExport] ' + recFailed + '/' + clips.length + ' clip(s) failed to load — missing from the recording audio');
-              if (onStatus) onStatus(t('msg.export.audioLoadFailedPartial', recFailed, clips.length));
+              if (status) status(t('msg.export.audioLoadFailedPartial', recFailed, clips.length));
             }
+            return scheduled;
+          },
+          start: function(audioCtx, audioDest, t0, scheduled) {
+            (scheduled || []).forEach(function(s) {
+              const cs = Math.round(Number(s.clip.startFrame) || 0);
+              const offsetSec = (cs - startFrame) / fps;
+              const trimStartSec = Math.max(0, Number(s.clip.audioTrimStartFrames) || 0) / fps;
+              const trimDurSec = Math.max(0.01, Number(s.clip.audioTrimDurationFrames || s.clip.durationFrames) || 1) / fps;
+              const skip = Math.max(0, -offsetSec);
+              const when = t0 + Math.max(0, offsetSec);
+              const bufOffset = trimStartSec + skip;
+              if (bufOffset >= s.buffer.duration) return;
+              let playDur = Math.min(trimDurSec - skip, recEndSec - Math.max(0, offsetSec)); // box length within range (no source-audio clamp; resolve clamps per path so slowed clips aren't cut)
+              if (playDur <= 0.02) return;
+              const r4 = resolveClipSourcePlayback(audioCtx, s.clip, s.buffer, fps, skip, playDur);
+              const src = audioCtx.createBufferSource(); src.buffer = r4.buffer;
+              wireAudioClipGraph(audioCtx, src, s.clip, when, playDur, audioDest, skip);
+              if (src.playbackRate) src.playbackRate.value = r4.rate;
+              try { src.start(when, r4.offset, r4.duration); } catch (e) {}
+            });
+            return (scheduled || []).length;
           }
-        } catch (e) { audioCtx = null; audioDest = null; }
-      }
-
-      const stream = canvas.captureStream(fps);
-      if (audioDest) audioDest.stream.getAudioTracks().forEach(function(t) { stream.addTrack(t); });
-      const mime = pickVideoExportMime();
-      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-      const chunks = [];
-      recorder.ondataavailable = function(event) { if (event.data && event.data.size) chunks.push(event.data); };
-      const stopped = new Promise(function(resolve) { recorder.onstop = resolve; });
-      state.videoExportCancel = false;
-      recorder.start(1000);
-      const startT = performance.now();
-      if (audioCtx && audioDest) {
-        const t0 = audioCtx.currentTime + 0.12;
-        scheduled.forEach(function(s) {
-          const cs = Math.round(Number(s.clip.startFrame) || 0);
-          const offsetSec = (cs - startFrame) / fps;
-          const trimStartSec = Math.max(0, Number(s.clip.audioTrimStartFrames) || 0) / fps;
-          const trimDurSec = Math.max(0.01, Number(s.clip.audioTrimDurationFrames || s.clip.durationFrames) || 1) / fps;
-          const skip = Math.max(0, -offsetSec);
-          const when = t0 + Math.max(0, offsetSec);
-          const bufOffset = trimStartSec + skip;
-          if (bufOffset >= s.buffer.duration) return;
-          let playDur = Math.min(trimDurSec - skip, recEndSec - Math.max(0, offsetSec)); // box length within range (no source-audio clamp; resolve clamps per path so slowed clips aren't cut)
-          if (playDur <= 0.02) return;
-          const r4 = resolveClipSourcePlayback(audioCtx, s.clip, s.buffer, fps, skip, playDur);
-          const src = audioCtx.createBufferSource(); src.buffer = r4.buffer;
-          wireAudioClipGraph(audioCtx, src, s.clip, when, playDur, audioDest, skip);
-          if (src.playbackRate) src.playbackRate.value = r4.rate;
-          try { src.start(when, r4.offset, r4.duration); } catch (e) {}
-        });
-      }
-      await new Promise(function(resolve) {
-        function tick() {
-          if (state.videoExportCancel) { resolve(); return; }
-          const frame = startFrame + Math.floor((performance.now() - startT) / 1000 * fps);
-          if (frame >= endFrame) {
-            renderConteVideoFrameToCanvas(canvas, endFrame - 1, renderOpts);
-            resolve(); return;
-          }
-          renderConteVideoFrameToCanvas(canvas, frame, renderOpts);
-          if (onStatus) onStatus(t('msg.export.recording', Math.round((frame - startFrame) / Math.max(1, recFrames) * 100), frame - startFrame, recFrames));
-          requestAnimationFrame(tick);
         }
-        requestAnimationFrame(tick);
-      });
-      await new Promise(function(resolve) { setTimeout(resolve, 300); });
-      try { recorder.stop(); } catch (error) {}
-      await stopped;
-      if (audioCtx) { try { await audioCtx.close(); } catch (e) {} }
-      const blob = new Blob(chunks, { type: mime || 'video/webm' });
-      downloadBlobAs(blob, 'conte_video.webm');
-      return { canceled: Boolean(state.videoExportCancel), frames: recFrames, blobSize: blob.size, audioClips: scheduled.length, format: 'webm' };
+      }, onStatus);
     }
 
     // ---- Phase 2: faster-than-real-time export via WebCodecs (VideoEncoder/AudioEncoder) + a small
@@ -68220,6 +68254,71 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!any) return null;
       return await oac.startRendering();
     }
+    // ver1557: 원화의 **실시간 폴백**. 이것이 없어서 iOS 처럼 WebCodecs 가 떨어지는 환경에서는
+    // 원화 동영상 출력이 그대로 실패했다(제보 A). 콘티는 처음부터 이 경로가 있었다.
+    // 오디오는 이미 오프라인 믹스 버퍼 한 개로 나오므로(gengaMixAudioOffline — 고속 경로가 쓰는 그것)
+    // spec 이 콘티보다 훨씬 단순하다: 버퍼 하나를 t0 에 재생하면 끝이다.
+    async function recordGengaVideoRealtime(opts, onStatus) {
+      opts = opts || {};
+      const gt = state.project && state.project.gengaTimeline;
+      if (!gt) throw new Error(t('msg.export.noWebCodecs'));
+      const fps = Math.max(1, Math.round(gt.fps || 24));
+      const total = Math.max(1, Math.round(gengaTimelineTotalFrames(gt)));
+      const r = gengaExportFrameRange(gt, total);
+      const startFrame = r.lo, endFrame = Math.min(r.hi, Math.max(r.lo, total));
+      const camW = gt.camera.w || gt.output.w || 1920, camH = gt.camera.h || gt.output.h || 1080;
+      let outW = Math.max(160, Math.min(3840, Math.round(Number(opts.outWidth) || camW))); if (outW % 2) outW -= 1;
+      let outH = Math.round(outW * camH / Math.max(1, camW)); if (outH % 2) outH += 1;
+      await gengaPreloadExportImages(startFrame, endFrame, onStatus);
+      const res = await runRealtimeRecordExport({
+        fps: fps, startFrame: startFrame, endFrame: endFrame + 1, // 고속 경로와 같은 포함 범위
+        fileName: 'genga_video.webm',
+        renderFrame: function(canvas, frame) { return gengaRenderExportFrame(canvas, frame, outW, outH); },
+        audio: ((gt.audioClips || []).length ? {
+          prepare: function(audioCtx, status) { return gengaMixAudioOffline(startFrame, endFrame, fps, audioCtx.sampleRate || 48000, status); },
+          start: function(audioCtx, audioDest, t0, buffer) {
+            if (!buffer) return 0;
+            const src = audioCtx.createBufferSource();
+            src.buffer = buffer; src.connect(audioDest);
+            try { src.start(t0); } catch (e) { return 0; }
+            return 1;
+          }
+        } : null)
+      }, onStatus);
+      return { canceled: res.canceled, frames: res.frames, blobSize: res.blobSize, format: res.format, outW: outW, outH: outH };
+    }
+    // ver1557: 원화 동영상 출력의 **입구**. 고속(WebCodecs)을 먼저 쓰고 떨어지면 실시간으로 갈아탄다 —
+    // 콘티의 runConteExportVideo 와 같은 모양이다. 예전에는 이 갈아타기가 없어 고속 실패 = 출력 실패였다.
+    async function runGengaExportVideo(opts, onStatus) {
+      let fallbackReason = '';
+      const miss = [];
+      if (typeof VideoEncoder === 'undefined') miss.push('VideoEncoder');
+      if (typeof VideoFrame === 'undefined') miss.push('VideoFrame');
+      if (miss.length) {
+        fallbackReason = t('export.video.err.webCodecsUnsupported') + '(' + miss.join('/') + ')';
+      } else {
+        try { return await exportGengaVideoFast(opts, onStatus); }
+        catch (e) {
+          fallbackReason = (e && e.message ? e.message : String(e));
+          if (typeof console !== 'undefined' && console.warn) console.warn('[genga video export] WebCodecs path failed; falling back to real-time', e);
+          if (onStatus) onStatus(t('export.video.status.fastFailedFallback') + fallbackReason);
+        }
+      }
+      try {
+        const r = await recordGengaVideoRealtime(opts, onStatus);
+        if (fallbackReason && r) r.fallbackReason = fallbackReason;
+        return r;
+      } catch (e) {
+        // ver1554 와 같은 이유로 두 경로의 사유를 함께 싣는다 — 하나만 남으면 원인을 못 찾는다.
+        const detail = (e && e.message ? e.message : String(e))
+          + (fallbackReason ? ' ／ 高速: ' + fallbackReason : '')
+          + ' ／ ' + videoExportEnvSummary();
+        if (typeof console !== 'undefined' && console.error) console.error('[genga video export] both paths failed', { realtime: e, fast: fallbackReason, env: videoExportEnvSummary() });
+        const wrapped = new Error(detail);
+        try { wrapped.cause = e; } catch (ignored) {}
+        throw wrapped;
+      }
+    }
     // ver1556: 이름 규칙 — **동사로 시작하면 엔진이 중간**(exportConteVideoFast 와 짝),
     // 동사가 없으면 엔진이 접두(gengaExportOutputDims 처럼). 예전 이름 gengaExportVideoFast 만
     // 그 규칙을 어겨 같은 일을 하는 다섯 쌍 중 이것 하나만 모양이 달랐다.
@@ -68812,15 +68911,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // exportGengaVideoFast defaulted to the camera-crop px and ignored gt.output) and is remembered.
       const dims = gengaExportOutputDims();
       if (dims) rememberGengaExportOutput(dims.w, dims.h);
-      exportGengaVideoFast(dims ? { outWidth: dims.w } : {}, onStatus).then(function(r) {
+      runGengaExportVideo(dims ? { outWidth: dims.w } : {}, onStatus).then(function(r) { // ver1557: 고속 실패 시 실시간으로 갈아탄다
         if (status) status.textContent = '完了 (' + r.format + ' ' + r.outW + '×' + r.outH + ')';
         runBtn.disabled = false; runBtn.textContent = orig;
       }).catch(function(e) {
-        // ver1555: 원화 출력은 **폴백이 없다** — 콘티(runConteExportVideo)는 WebCodecs 가 떨어지면
-        // MediaRecorder 실시간으로 갈아타는데 이쪽은 exportGengaVideoFast 하나뿐이라 그대로 끝난다.
-        // 제보(iOS, 「Encoding task failed」)가 원화에서만 난 이유가 이것이다. 폴백 신설은 판정 대기라
-        // (docs/reports_video_export_and_scrollbar_2026-08-06.md §1-7) 우선 **환경을 드러낸다** —
-        // 어떤 기능이 없어서 떨어졌는지가 메시지에 없으면 다음 제보도 원인을 못 담고 온다.
+        // ver1557: 이제 폴백이 있다(runGengaExportVideo). 여기까지 왔다는 것은 **두 경로가 다 떨어진**
+        // 것이므로, 그 두 사유와 환경이 detail 에 이미 실려 있다.
         const detail = (e && e.message ? e.message : String(e)) + ' ／ ' + videoExportEnvSummary();
         if (typeof console !== 'undefined' && console.error) console.error('[genga video export] failed (no fallback path exists)', { error: e, env: videoExportEnvSummary() });
         if (status) status.textContent = t('export.video.err.videoFailedPrefix') + detail;
