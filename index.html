@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1550</title>
+  <title>MoArt ver1551</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -38447,7 +38447,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (twoFingerGestureMove(v.mx, v.my)) conteCancelSingleFingerOpsForGesture();
           setVideoPreviewZoom(Math.round(clampVideoPreviewZoom(videoPreviewPinch.startZoom * v.d / Math.max(1, videoPreviewPinch.startDist), videoPreviewPinch.startZoom) * 100) / 100);
           // ver1549: 비틀기 = 뷰 회전. 用紙와 같은 식(미러는 각도 손잡이를 뒤집는다 — ver1154)에 정위치 스냅.
-          setVideoViewRot(snapViewRotToQuarter(videoPreviewPinch.startRot + pinchTwistSince(videoPreviewPinch, v.a) * videoViewFlipSign()));
+          // ver1551: **일시 차단.** 전수조사에서 이 표면의 좌표 경로 중 넷이 아직 회전을 모른다는 것이
+          //   드러났다 — 카메라 프레임 드래그(beginCameraFrameDrag)·레이어 기즈모(bindLayerGizmo)·
+          //   줌 앵커(setVideoPreviewZoom)·터치 판정(videoPreviewDrawableTouchRect). 넷 다 종이의 gBCR 을
+          //   읽는데, 회전하면 그것은 종이가 아니라 **회전 bbox** 라 좌표가 어긋난다(사용자 제보의 「카메라
+          //   좌표가 어긋난다」가 이것이다). 판정 a1 의 조건이 「좌표가 보장 안 되면 작업하면 안 됨」이므로,
+          //   그 넷을 고쳐 증명하기 전까지 회전 진입을 막는다. 되살릴 때 이 두 줄만 바꾸면 된다.
+          //   경위·남은 목록: docs/canvas_rotation_snap_2026-08-06.md §5.
+          // setVideoViewRot(snapViewRotToQuarter(videoPreviewPinch.startRot + pinchTwistSince(videoPreviewPinch, v.a) * videoViewFlipSign()));
           state.paintViewportPanX = videoPreviewPinch.basePanX + (v.mx - videoPreviewPinch.startMidX);
           state.paintViewportPanY = videoPreviewPinch.basePanY + (v.my - videoPreviewPinch.startMidY);
           applyPaintViewportPan();
@@ -56557,8 +56564,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // frame rect in overlay BACKING px (both gBCRs share the same visual/zoom space → normalize by the
       // overlay's own backing/visual ratio, engine-agnostic).
       const sx = backW / oRect.width, sy = backH / oRect.height;
-      const fbx = (fRect.left - oRect.left) * sx, fby = (fRect.top - oRect.top) * sy;
-      const fbw = fRect.width * sx, fbh = fRect.height * sy;
+      // ver1551: 회전이 걸리면 gBCR 은 **회전 bbox** 라 종이보다 크다 — 그 폭·위치로 좌표계를 세우면
+      // 오버레이(선택 앤츠·변형 박스·스탬프 프리뷰)가 그림에서 벗어난다. 회전해도 **중심은 안 움직이므로**
+      // 중심은 gBCR 에서 그대로 쓰고, 크기만 레이아웃(offsetWidth/Height — transform 면역)에서 가져온다.
+      const vrot = videoViewRotValue();
+      const uzo = uiReadScale() || 1;
+      const fpw = (frame.offsetWidth || fRect.width / uzo) * uzo, fph = (frame.offsetHeight || fRect.height / uzo) * uzo;
+      const fcx = fRect.left + fRect.width / 2, fcy = fRect.top + fRect.height / 2;
+      const fbx = (fcx - fpw / 2 - oRect.left) * sx, fby = (fcy - fph / 2 - oRect.top) * sy;
+      const fbw = fpw * sx, fbh = fph * sy;
       // ver721: PAPER's LAYER rect from the canonical norm→layer mapping (norm 0/1 = PAPER edges post-flip;
       // fRect above is the .video-preview-camera-target = the paper). The f*-prefixed locals hold PAPER
       // values (kept the names to minimize churn; the anchor is the paper, not the camera frame).
@@ -56570,9 +56584,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1012: mirror the horizontal axis about the PAPER's centre, not the overlay's -- the overlay spans
       // the whole viewport while the paper is a box inside it, so mirroring about the wrong one puts every
       // handle on the far side of the screen. fbx..fbx+fbw is that box in backing px, already computed above.
-      if (videoViewFlipSign() < 0) ctx.setTransform(-scaleX, 0, 0, scaleY, fbx + fbw + fx0 * scaleX, fby - fy0 * scaleY);
-      else ctx.setTransform(scaleX, 0, 0, scaleY, fbx - fx0 * scaleX, fby - fy0 * scaleY);
-      const dispScale = fRect.width / flw; // display(visual) px per layer px → constant screen-size marquee/handles
+      // ver1551: 회전까지 포함해 **CSS 와 같은 순서**로 쌓는다 — translate(중심) → 미러 → 회전 →
+      // 종이 좌상단 → 레이어 스케일. 회전 0·미러 없음이면 옛 setTransform 과 대수적으로 같은 행렬이
+      // 나오므로(중심에서 fbw/2 를 빼면 정확히 fbx 다) 기존 화면은 안 움직인다.
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.translate((fcx - oRect.left) * sx, (fcy - oRect.top) * sy);
+      if (videoViewFlipSign() < 0) ctx.scale(-1, 1); // 미러가 바깥 (ver1001 과 같은 순서)
+      if (vrot) ctx.rotate(vrot);
+      ctx.translate(-fbw / 2, -fbh / 2);
+      ctx.scale(scaleX, scaleY);
+      ctx.translate(-fx0, -fy0);
+      const dispScale = fpw / flw; // ver1551: 회전 bbox 가 아니라 종이 실폭 기준 (핸들 크기가 각도에 따라 커지면 안 된다)
       const mstyle = paintMarqueeStyle(dispScale);
       const rawPreview = state.paintTransformPreview;
       const transformPreview = rawPreview && paintTransformUiRefValid(rawPreview.drawingRef) ? rawPreview : null;
