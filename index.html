@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1582</title>
+  <title>MoArt ver1583</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21908,6 +21908,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1583, items: [
+        { ja: 'セルの範囲選択が分かりやすくなりました。Ctrl（⌘）+クリックでも Shift+クリックと同じく範囲選択でき、**選択が消えた後は前の起点を引きずりません**（そのマスから選び直します）。', ko: '셀 범위 선택이 명확해졌습니다. Ctrl(⌘)+클릭도 Shift+클릭과 같이 범위 선택이 되고, **선택이 사라진 뒤에는 이전 기준점을 끌고 오지 않습니다**(누른 칸부터 새로 잡습니다).', en: 'Cell range-selection is clearer: Ctrl (⌘) + click now range-selects like Shift + click, and a stale anchor is no longer carried over once the selection is gone.' }
+      ] },
       { ver: 1581, items: [
         { ja: '原画タイムラインの音声レーン1段の高さが、カメラレーンと同じになりました（縦がすっきりします）。', ko: '원화 타임라인 오디오 레인 한 칸 높이가 카메라 레인과 같아졌습니다 (세로가 정돈됩니다).', en: 'The genga audio lane row is now the same height as the camera lane.' },
         { ja: '録音ボタンが最初から赤くなりました（録音ボタンだと分かるように）。', ko: '녹음 버튼이 처음부터 빨간색입니다 (녹음 버튼임을 알 수 있게).', en: 'The record button is red from the start, so it reads as a record button.' },
@@ -82174,6 +82177,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // guard, added via gengaKomasInRange(). Keeping the range exact is what lets a セリフ区間 be created on empty
     // cells without a special-case bypass. NOTE: the drag surface (.genga-exp-num) still only spans the koma-content
     // region, so selecting BEYOND the last koma needs a different entry point (empty-lane context menu).
+    // ver1583: 「이 칸까지 범위로 잡는다」의 **한 벌**. Shift+클릭과 Ctrl+클릭이 같은 것을 부른다
+    // (TVPaint 도 두 키가 같은 동작이다 — 사용자 실기 확인).
+    // 앵커는 **살아 있는 선택에만** 붙는다. 종전에는 앵커를 지우는 곳이 없어 무기한 남았고, 한참 전에
+    // 누른 자리부터 범위가 잡혀 기준을 알 수 없었다(사용자 지적). 선택이 없으면 앵커도 없는 것으로 보고
+    // 누른 칸 하나를 새 앵커로 삼는다 — 그러면 「직전 동작에서 이어진다」가 눈에 보이는 규칙이 된다.
+    function gengaRangeSelectTo(layerId, frame) {
+      const a = state.gengaCellSelAnchor;
+      const sel = state.gengaCellSel;
+      const alive = !!(a && a.layerId === layerId && sel && sel.layerId === layerId);
+      const startFrame = alive ? a.frame : frame;
+      if (!alive) state.gengaCellSelAnchor = { layerId: layerId, frame: frame };
+      gengaSetCellSel(layerId, startFrame, frame);
+      gengaJumpToCellSel();
+    }
     function gengaCellSelPointerDown(ev) {
       if (ev.button != null && ev.button !== 0) return;
       const nm = ev.currentTarget, layerId = nm.getAttribute('data-genga-layer');
@@ -82183,6 +82200,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // Shift+CLICK (no movement) range-selects from the last plain-click anchor to here. Previously only an
       // exact hit on the tiny "・" glyph triggered the drag, so a near-miss fell through to a fresh 1-cell
       // selection instead — this unifies both under one pointerdown so there is no ambiguity by pixel position.
+      // ver1583: Ctrl(⌘)+클릭도 범위 선택. Shift 와 달리 드래그 제스처가 없으므로 누른 그 자리에서
+      // 바로 정한다. Shift 분기보다 앞이다 — 두 키를 같이 눌러도 범위 한 번이면 충분하다.
+      if (ev.ctrlKey || ev.metaKey) {
+        ev.preventDefault(); ev.stopPropagation();
+        const ctrlContent = document.querySelector('#gengaStage .genga-tl-content');
+        if (!ctrlContent) return;
+        gengaRangeSelectTo(layerId, Math.max(1, gengaFrameAtClientX(ev.clientX, ctrlContent.getBoundingClientRect().left)));
+        gengaArmCellSelClickGuard();
+        return;
+      }
       if (ev.shiftKey) {
         ev.preventDefault(); ev.stopPropagation();
         gengaStartShiftPointerOp(ev, nm, layerId);
@@ -82326,13 +82353,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const d = gengaShiftCellOp; gengaShiftCellOp = null;
       if (ev && ev.type === 'pointercancel') return; // ver749: a canceled press is not a Shift+click — no range-select
       if (!d || d.moved || d.clickFrame == null) return; // moved → already handled by the douga-mark drag hand-off
-      // plain Shift+click (no drag) → range-select from the last plain-click anchor to this cell. The anchor
-      // itself does NOT move (matches Explorer/Finder: repeated Shift+clicks keep extending from the original
-      // anchor until a plain click sets a new one) — only gengaCellSelPointerDown's non-shift branch updates it.
-      const anchor = state.gengaCellSelAnchor;
-      const startFrame = (anchor && anchor.layerId === d.layerId) ? anchor.frame : d.clickFrame;
-      gengaSetCellSel(d.layerId, startFrame, d.clickFrame);
-      gengaJumpToCellSel(); // ver1107: a Shift range-extend is a selection the user made, same as a click
+      // plain Shift+click (no drag) → 이 칸까지 범위. 앵커는 그대로 있으므로 Shift 를 거듭 누르면 원래
+      // 앵커에서 계속 늘어난다(Explorer/Finder 와 같다). 평범한 클릭만 앵커를 옮긴다.
+      // ver1583: 커널 한 벌로 — 앵커가 살아 있는지의 판정도 거기 있다(Ctrl+클릭과 같은 규칙).
+      gengaRangeSelectTo(d.layerId, d.clickFrame);
       gengaArmCellSelClickGuard(); // ver970: event-bounded, see the declaration
     }
     // copy (or cut) the komas whose startFrame is within the cell selection → clipboard (offsets relative to start)
