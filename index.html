@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1560</title>
+  <title>MoArt ver1561</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -3809,8 +3809,8 @@
       background: rgba(0, 0, 0, 0.16); border-radius: 6px; pointer-events: none;
     }
     .stage-scrollbar.is-active { opacity: 1; pointer-events: auto; }
-    .stage-scrollbar.axis-x { left: 8px; right: 20px; bottom: 6px; height: 8px; }
-    .stage-scrollbar.axis-y { top: 8px; bottom: 20px; right: 6px; width: 8px; }
+    .stage-scrollbar.axis-x { left: calc(var(--ssb-left, 0px) + 8px); right: calc(var(--ssb-right, 0px) + 20px); bottom: calc(var(--ssb-bottom, 0px) + 6px); height: 8px; }
+    .stage-scrollbar.axis-y { top: calc(var(--ssb-top, 0px) + 8px); bottom: calc(var(--ssb-bottom, 0px) + 20px); right: calc(var(--ssb-right, 0px) + 6px); width: 8px; }
     .stage-scrollbar .ssb-thumb {
       position: absolute; background: rgba(255, 255, 255, 0.5); border-radius: 6px;
       /* 엄지 자신에게만 인라인 스타일을 쓴다 — 조상에 CSS 변수를 쓰면 자손 전체가 재계산된다(ver1412) */
@@ -65452,16 +65452,52 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const view = axis === 'x' ? m.viewW : m.viewH;
       const content = axis === 'x' ? m.contentW : m.contentH;
       const pan = axis === 'x' ? m.panX : m.panY;
-      if (!(view > 0) || !(content > 0) || content <= view + 0.5) return null; // 다 보이면 스크롤바 없음
-      const scroll = (content - view) / 2 - pan; // pan 0 = 중앙 (양 표면 공통 규약)
-      const max = content - view;
-      return { ratio: view / content, pos: Math.max(0, Math.min(1, scroll / max)), max: max };
+      if (!(view > 0) || !(content > 0)) return null;
+      // ver1561: 「콘텐츠가 넘치는가」가 아니라 **팬이 실제로 갈 수 있는 범위**를 보여 준다. 클램프가
+      // ±(overhang + 뷰포트 한 벌)이므로(ver1131) 캔버스가 화면에 다 들어와도 움직일 곳이 있고,
+      // 그래서 축소해도 트랙이 남는다(100% 미만에서도 스크롤바가 있는 편이 편하다 — 사용자 관찰,
+      // TVPaint 도 그렇다고 한다. 공식 문서에는 그 서술이 없어 관찰을 근거로 삼았다).
+      const slack = view;                                   // ver1131 과 같은 여유
+      const overhang = Math.max(0, (content - view) / 2);
+      const range = 2 * (overhang + slack);                 // pan 의 전체 이동 거리
+      const span = view + range;                            // 그것을 콘텐츠 길이로 환산
+      const fromMax = (overhang + slack) - pan;             // pan 최대(=콘텐츠 오른쪽 끝)에서 얼마나 왔나
+      return { ratio: view / span, pos: Math.max(0, Math.min(1, fromMax / range)), max: range };
+    }
+    // ver1561: 스테이지 요소는 **창 전체**를 덮고 도킹 칼럼·타임라인이 그 위에 겹쳐 그려진다 —
+    // 그래서 「스테이지 안쪽 가장자리」가 곧 화면 가장자리였고 트랙이 도크 뒤로 갔다(사용자 지적).
+    // 그것들이 실제로 차지한 만큼 들여쓴다. 도크 폭은 상태값이라 공짜이고(ver1412), 타임라인만
+    // 레이아웃을 한 번 읽는다. **값이 달라졌을 때만** 쓰므로 팬 프레임에서 스타일 쓰기는 0 이다.
+    function stageScrollbarInsets(hostEl) {
+      const left = (typeof sideDockOccupiedWidth === 'function' ? sideDockOccupiedWidth('left') : 0) || 0;
+      const right = (typeof sideDockOccupiedWidth === 'function' ? sideDockOccupiedWidth('right') : 0) || 0;
+      let bottom = 0, top = 0;
+      const tl = document.getElementById('timingDashboard');
+      if (tl && tl.offsetHeight > 0 && getComputedStyle(tl).display !== 'none') {
+        const hb = hostEl.getBoundingClientRect().bottom, tb = tl.getBoundingClientRect();
+        if (tb.height > 0 && tb.bottom >= hb - 1) bottom = Math.max(0, Math.round(hb - tb.top)); // 아래에 겹쳐 있다
+      }
+      return { left: left, right: right, top: top, bottom: bottom };
+    }
+    function applyStageScrollbarInsets(hostEl, rec) {
+      const ins = stageScrollbarInsets(hostEl);
+      const key = ins.left + '/' + ins.right + '/' + ins.top + '/' + ins.bottom;
+      if (rec.insetKey === key) return; // 안 바뀌었으면 쓰지 않는다
+      rec.insetKey = key;
+      ['x', 'y'].forEach(function(axis) {
+        const t = rec[axis].track;
+        t.style.setProperty('--ssb-left', ins.left + 'px');
+        t.style.setProperty('--ssb-right', ins.right + 'px');
+        t.style.setProperty('--ssb-top', ins.top + 'px');
+        t.style.setProperty('--ssb-bottom', ins.bottom + 'px');
+      });
     }
     function syncStageScrollbars(hostEl) {
       const rec = stageScrollbars.get(hostEl);
       if (!rec) return;
       const m = rec.spec.getMetrics();
       if (!m) return;
+      applyStageScrollbarInsets(hostEl, rec);
       ['x', 'y'].forEach(function(axis) {
         const side = rec[axis];
         const g = stageScrollGeometry(m, axis);
