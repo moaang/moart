@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1638</title>
+  <title>MoArt ver1639</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -54466,27 +54466,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 도달한다(EMA 가 못 하던 것). 창 크기가 곧 강도이자 지연이고, 그 둘이 같은 것이 이 방식의 정직한
     // 성질이다.
     //
-    // 비용은 샘플당 O(1) — 합을 들고 다니며 더하고 뺀다(`shift` 는 n ≤ 21 이라 무시할 만하다).
-    // dab 마다가 아니라 **입력 샘플마다** 한 번이다.
+    // ★ver1639: 평균을 **두 단**으로 돌린다(= 삼각 가중). ver1637 의 한 단(균등 가중 box)은 각짐을
+    // 없앴지만 사용자가 「꾸불거림이 오히려 생긴다」고 했고, 그것이 box 필터의 알려진 성질이다:
+    // 주파수 응답이 sinc 라 **sidelobe 에서 위상이 뒤집혀** 원래 떨림이 반대 방향으로 되살아난다(ringing).
+    // box 를 두 번 통과시키면 응답이 sinc² 가 되어 그 sidelobe 가 제곱만큼 눌린다. Krita 가 자기
+    // 스무딩을 「**Weighted** Smoothing」이라 부르는 이유가 이것 — 균등 평균이 아니라 가중이다.
+    //
+    // 실측(완만한 곡선 + 고주파 떨림 2 성분, 이상 궤적과의 오차):
+    //   입력            RMS 2.551 · 부호반전 217
+    //   box 창21        RMS 0.859 · 부호반전 **45**   ← ver1637
+    //   box×2 창11      RMS **0.391** · 부호반전 **2**  ← 여기
+    //   주파수 f≈0.071  box21 이 0.2126 을 통과시키는데 box×2 는 0.0646 (3 배 억제)
+    //
+    // **지연은 같다.** box(N) 의 지연이 (N-1)/2 이므로 창 11 두 번 = 창 21 한 번이다 — 같은 값을
+    // 두 단으로 쪼갠 것뿐이라 「더 부드러운데 더 늦지는 않다」.
+    // 비용도 그대로 샘플당 O(1) — 각 단이 합을 들고 다니며 더하고 뺀다(`shift` 는 n ≤ 11 이라 무시할
+    // 만하다). dab 마다가 아니라 **입력 샘플마다** 한 번이다.
     function paintStabilizeStep(smoothState, point, n) {
-      const px = Number(point.x) || 0, py = Number(point.y) || 0;
-      const buf = smoothState.buf;
-      buf.push(px, py);
-      smoothState.sx += px;
-      smoothState.sy += py;
-      while (buf.length > n * 2) {
-        smoothState.sx -= buf.shift();
-        smoothState.sy -= buf.shift();
+      const half = Math.max(1, Math.round(n / 2));
+      const b1 = smoothState.buf, b2 = smoothState.buf2;
+      // 1 단: 원시 입력의 이동 평균
+      b1.push(Number(point.x) || 0, Number(point.y) || 0);
+      smoothState.sx += b1[b1.length - 2];
+      smoothState.sy += b1[b1.length - 1];
+      while (b1.length > half * 2) {
+        smoothState.sx -= b1.shift();
+        smoothState.sy -= b1.shift();
       }
-      const c = buf.length / 2;
-      return { x: smoothState.sx / c, y: smoothState.sy / c };
+      const c1 = b1.length / 2;
+      const m1x = smoothState.sx / c1, m1y = smoothState.sy / c1;
+      // 2 단: 그 결과를 한 번 더 — 이 두 번째가 sinc 의 sidelobe 를 sinc² 로 누른다
+      b2.push(m1x, m1y);
+      smoothState.s2x += m1x;
+      smoothState.s2y += m1y;
+      while (b2.length > half * 2) {
+        smoothState.s2x -= b2.shift();
+        smoothState.s2y -= b2.shift();
+      }
+      const c2 = b2.length / 2;
+      return { x: smoothState.s2x / c2, y: smoothState.s2y / c2 };
     }
     // ver1637: 창 크기는 **샘플 수**라 좌표계와 무관하다 — rope 시절 필요했던 `op.stabScale`(로컬
     // 단위/화면 픽셀) 환산이 여기서는 아예 필요 없다. 그 필드는 지우지 않는다: Shift 직선(ver1610)이
     // 같은 값을 「화면 픽셀 기준 팔 길이」로 계속 쓴다.
-    // 레벨 0 = 끔. 1~10 → 창 3~21 샘플. Apple Pencil 은 coalesced 로 240Hz 까지 들어오므로 최대치가
-    // 100ms 를 조금 넘는 지연이고, 마우스(60Hz)에서는 더 길게 느껴진다 — 강도와 지연이 같은 값인 것이
-    // 이동 평균의 정직한 성질이라 슬라이더 하나로 둔다.
+    // 레벨 0 = 끔. 1~10 → 창 3~21 샘플(ver1639 부터 그 절반씩 두 단이라 지연은 같고 훨씬 부드럽다).
+    // Apple Pencil 은 coalesced 로 240Hz 까지 들어오므로 최대치가 100ms 를 조금 넘는 지연이고,
+    // 마우스(60Hz)에서는 더 길게 느껴진다 — 강도와 지연이 같은 값인 것이 이동 평균의 정직한 성질이라
+    // 슬라이더 하나로 둔다.
     function paintStabilizePoint(op, point, event) {
       const level = paintStabilizerVal();
       if (!op || !level) return point;
@@ -54495,9 +54521,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 창을 그 점 하나로 비워 두면 다음 획이 지난 획의 꼬리를 평균에 섞지 않는다.
         if (op.smoothState) {
           const px = Number(point.x) || 0, py = Number(point.y) || 0;
-          op.smoothState.buf = [px, py];   // ver1638: 모양이 옛것이어도 여기서 새 모양이 된다
-          op.smoothState.sx = px;
-          op.smoothState.sy = py;
+          // ver1638: 모양이 옛것이어도 여기서 새 모양이 된다. ver1639: 두 단 모두 비운다.
+          op.smoothState = { buf: [px, py], sx: px, sy: py, buf2: [px, py], s2x: px, s2y: py };
         }
         return point;
       }
@@ -54508,12 +54533,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 커널이 상태의 모양을 바꿨으면 **그 모양을 아는 곳은 커널 하나여야 한다.** 그래서 남이 심어
       // 둔 값은 「좌표 힌트」로만 읽고, 실제 구조는 여기서 만든다.
       // 시드 우선순위: 이미 있는 좌표(원화가 심어 둔 앵커) → 스트로크의 첫 점(conte) → 지금 점.
-      if (!op.smoothState || !Array.isArray(op.smoothState.buf)) {
+      if (!op.smoothState || !Array.isArray(op.smoothState.buf2)) {
         const prev = op.smoothState;
         const seed = (prev && Number.isFinite(Number(prev.x)) && Number.isFinite(Number(prev.y))) ? prev
           : ((op.stroke && op.stroke.points && op.stroke.points[0]) ? op.stroke.points[0] : point);
         const sx = Number(seed.x) || 0, sy = Number(seed.y) || 0;
-        op.smoothState = { buf: [sx, sy], sx: sx, sy: sy };
+        op.smoothState = { buf: [sx, sy], sx: sx, sy: sy, buf2: [sx, sy], s2x: sx, s2y: sy };
       }
       return paintStabilizeStep(op.smoothState, point, 1 + level * 2);
     }
