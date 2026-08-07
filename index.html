@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1642</title>
+  <title>MoArt ver1643</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -54618,7 +54618,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const PAINT_BUCKET_OPTIONS = {
       tolerance: { field: 'paintBucketTolerance', key: 'memoBucketTolerance', max: 96 },
       gapClose:  { field: 'paintBucketGapClose',  key: 'memoBucketGapClose',  max: 3 },
-      expand:    { field: 'paintBucketExpand',    key: 'memoBucketExpand',    max: 2 }
+      expand:    { field: 'paintBucketExpand',    key: 'memoBucketExpand',    max: 4 }   // ver1643 (판정 q3=A)
     };
     function setPaintBucketOption(name, value) {
       const o = PAINT_BUCKET_OPTIONS[name]; if (!o) return;
@@ -54642,7 +54642,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintBucketExpandVal() {
       if (state.paintBucketExpand == null) {
-        try { const v = Number(localStorage.getItem('memoBucketExpand')); state.paintBucketExpand = Number.isFinite(v) && v >= 0 ? Math.min(2, Math.round(v)) : 1; }
+        try { const v = Number(localStorage.getItem('memoBucketExpand')); state.paintBucketExpand = Number.isFinite(v) && v >= 0 ? Math.min(4, Math.round(v)) : 1; }
         catch (e) { state.paintBucketExpand = 1; }
       }
       return state.paintBucketExpand;
@@ -54698,6 +54698,80 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         return cur;
       }
+      // ★ver1643: 「어디까지 확장할까」를 **거리**로 정한다 (판정 q1=B).
+      //
+      // 그전에는 `dilate(mask, expand)` 로 **무조건 N 픽셀** 밀었다. 그래서 선이 굵으면 못 미쳐
+      // 자글자글하게 남고(사용자 제보: 「칠한 부분과 외곽선 사이가 엄청 자글자글」), 얇으면 선을
+      // 넘어 반대편으로 샜다. 미는 거리가 선의 굵기와 무관했기 때문이다.
+      //
+      // 업계 조사(설계문서 §3)의 결론은 GIMP 방식이었다 — 「alpha 비교가 아니라 **거리** 비교」로
+      // 획의 최대 절반까지만 채운다. 그 본질은 두 줄로 적을 수 있다:
+      //
+      //     선 픽셀 p 를 흡수한다  ⟺  dist(p, 채운 영역) ≤ dist(p, 바깥 배경)
+      //
+      // 「내 쪽이 더 가까우면 내 것」 — 이것이 정확히 **능선(중심축)** 의 정의이고, 정의상 능선을
+      // 넘을 수 없다. 알파를 아예 안 보므로 설계문서 §3-4 가 걱정한 **비단조 알파**(텍스처 브러시 ·
+      // 손떨림 잉크 · T자 교차점)에서 사슬이 반대편으로 이어지는 문제가 **원천적으로 사라진다**.
+      // 국소 두께 지도도 BFS 도 필요 없다 — 거리 지도 두 벌과 비교 한 줄이면 같은 보장을 얻는다.
+      //
+      // 거리는 chamfer(3,4) 2-패스 근사다(직교 3 · 대각 4, 실제 픽셀 거리의 3 배). 유클리드 오차가
+      // 몇 % 라 능선 판정에는 충분하고, 전체가 정수 연산 O(W×H) 두 번이다 — 종전 dilate 가
+      // O(W×H×expand) 였으므로 expand 가 클수록 오히려 싸진다.
+      //
+      // 바깥 배경이 없으면(캔버스가 통째로 채워진 경우) dOut 이 없으므로 조건이 상한 하나로
+      // 떨어져 **종전 동작과 같아진다** — 안전한 물러섬이다.
+      function chamferFrom(seed) {
+        const INF = 0x3fffffff;
+        const dist = new Int32Array(N);
+        for (let i = 0; i < N; i += 1) dist[i] = seed[i] ? 0 : INF;
+        for (let y = 0; y < H; y += 1) {          // 앞으로 한 번
+          const row = y * W;
+          for (let x = 0; x < W; x += 1) {
+            const i = row + x;
+            let v = dist[i];
+            if (y > 0) {
+              if (x > 0 && dist[i - W - 1] + 4 < v) v = dist[i - W - 1] + 4;
+              if (dist[i - W] + 3 < v) v = dist[i - W] + 3;
+              if (x < W - 1 && dist[i - W + 1] + 4 < v) v = dist[i - W + 1] + 4;
+            }
+            if (x > 0 && dist[i - 1] + 3 < v) v = dist[i - 1] + 3;
+            dist[i] = v;
+          }
+        }
+        for (let y = H - 1; y >= 0; y -= 1) {     // 뒤로 한 번
+          const row = y * W;
+          for (let x = W - 1; x >= 0; x -= 1) {
+            const i = row + x;
+            let v = dist[i];
+            if (y < H - 1) {
+              if (x < W - 1 && dist[i + W + 1] + 4 < v) v = dist[i + W + 1] + 4;
+              if (dist[i + W] + 3 < v) v = dist[i + W] + 3;
+              if (x > 0 && dist[i + W - 1] + 4 < v) v = dist[i + W - 1] + 4;
+            }
+            if (x < W - 1 && dist[i + 1] + 3 < v) v = dist[i + 1] + 3;
+            dist[i] = v;
+          }
+        }
+        return dist;
+      }
+      function growToRidge(mask, limitPx) {
+        const outside = new Uint8Array(N);
+        let hasOutside = false;
+        for (let i = 0; i < N; i += 1) {
+          if (match[i] && !mask[i]) { outside[i] = 1; hasOutside = true; }
+        }
+        const dIn = chamferFrom(mask);
+        const dOut = hasOutside ? chamferFrom(outside) : null;
+        const lim = limitPx * 3;   // chamfer 단위(직교 = 3)
+        const out = new Uint8Array(mask);
+        for (let i = 0; i < N; i += 1) {
+          if (mask[i] || match[i]) continue;        // 이미 채웠거나 애초에 선이 아니다
+          if (dIn[i] > lim) continue;               // 사용자가 정한 상한(px)
+          if (dOut && dIn[i] > dOut[i]) continue;   // 능선 너머 — 반대편이 더 가깝다
+          out[i] = 1;
+        }
+        return out;
+      }
       function flood(allowed) {
         const seedIdx = seedY * W + seedX;
         if (!allowed[seedIdx]) return null;
@@ -54728,7 +54802,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         mask = flood(match);
       }
       if (!mask) return false;
-      if (expand > 0) mask = dilate(mask, expand, null);
+      if (expand > 0) mask = growToRidge(mask, expand);   // ver1643
       const paint = document.createElement('canvas');
       paint.width = W; paint.height = H;
       const pctx = paint.getContext('2d');
