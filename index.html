@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1610</title>
+  <title>MoArt ver1611</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22277,6 +22277,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1611, items: [
+        { ja: '**2値化（アンチエイリアスなし）で描くときの重さを直しました。** 太いブラシほど効きます——線を1本引くのにかかる描画命令が、ブラシ140で約2,900回から20回程度まで減りました。描かれるドットは今までと同じです。', ko: '**2値化(안티에일리어싱 없음)로 그릴 때의 무거움을 고쳤습니다.** 굵은 브러시일수록 효과가 큽니다 — 선 하나를 긋는 데 드는 그리기 명령이 브러시 140에서 약 2,900회에서 20회 정도로 줄었습니다. 찍히는 점은 종전과 같습니다.', en: '**Drawing with Binarize (no anti-aliasing) is much lighter now**, and the bigger the brush the bigger the win — one stroke segment went from about 2,900 draw calls to roughly 20 at brush size 140. The pixels it lays down are unchanged.' },
+      ] },
       { ver: 1610, items: [
         { ja: 'ペン・消しゴムでも **Shift を押しながら引くと直線**になりました（15度ずつ。直線ツールと同じ角度です）。押している間だけ効き、離すとその場からまた自由な線に戻ります。', ko: '펜·지우개도 **Shift 를 누른 채 그으면 직선**이 됩니다 (15도씩. 직선 도구와 같은 각도입니다). 누르고 있는 동안만 먹고, 떼면 그 자리에서 다시 자유로운 선으로 돌아옵니다.', en: 'Holding **Shift while drawing with the pen or eraser now draws a straight line**, snapped to 15° just like the Line tool. It applies only while held - let go and the stroke returns to freehand from that point.' },
       ] },
@@ -79495,20 +79498,56 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         for (let dx = 0; dx < s; dx++) { if ((dx - cN) * (dx - cN) + (dy - cN) * (dy - cN) <= r2) { if (x0 < 0) x0 = dx; len++; } }
         if (len > 0) rows.push([dy, x0, len]);
       }
-      return { rows: rows, off: Math.floor((s - 1) / 2) };
+      return { rows: rows, off: Math.floor((s - 1) / 2), size: s }; // ver1611: size = 구울 캔버스의 한 변이자 캐시 키
     }
-    function paintPixelStampAt(ctx, stamp, x, y) {
+    // ver1611: 원반 한 장을 **오프스크린 캔버스에 구워** 찍을 때는 drawImage 한 번으로 끝낸다.
+    // 종전에는 스탬프 한 번이 **행마다** fillRect 였다 — 비용이 「이동거리 × 브러시 크기」라, 140px
+    // 브러시로 20px 움직이면 2,940회(실측 1.14ms), 300px 면 6,300회(2.72ms)였다. 데스크톱에서도
+    // 프레임 예산을 갉아먹는 양이고, 그것이 「imported brush lags when Binarize is Active」 제보의
+    // 정체다(reports_brush_lag_and_ipad_2026-08-06.md §1 — 임포트 브러시가 아니라 이 렌더러다).
+    // 구운 원반을 1:1 로 blit 하므로 **픽셀은 그대로**다: 같은 rows 를 같은 정수 좌표에 같은
+    // fillStyle 로 그려 둔 것을 옮겨 붙일 뿐이라 라이브 = 커밋 불변식(ver943)이 유지된다.
+    // 알파는 굽지 않는다 — 대상 ctx 의 globalAlpha 가 drawImage 에 곱해지는 것이 fillRect 와 같다.
+    // 실측 손익분기 ≈11 — blit 은 크기와 무관하게 선분당 ~0.085ms 로 **평평**하고 행 fillRect 는
+    // 크기에 비례한다(≈0.0075ms × size). 그 아래는 행 경로가 더 싸므로 굽지 않는다.
+    const PAINT_PIXEL_STAMP_SHEET_MIN = 12;
+    const PAINT_PIXEL_STAMP_SHEET_MAX = 8;  // 미스 비용 = 종전 스탬프 1회라 캐시를 작게 잡아도 손해가 없다
+    const paintPixelStampSheets = []; // FIFO [{key, canvas}] — 키는 size|색 (같은 획은 색이 하나다)
+    function paintPixelStampSheetFor(ctx, stamp) {
+      const size = stamp && stamp.size;
+      if (!size || size < PAINT_PIXEL_STAMP_SHEET_MIN) return null;
+      const fill = ctx.fillStyle;
+      if (typeof fill !== 'string') return null; // 그라디언트/패턴은 구울 수 없다 — 행 경로로 떨어진다
+      const key = size + '|' + fill;
+      for (let i = 0; i < paintPixelStampSheets.length; i++) {
+        if (paintPixelStampSheets[i].key === key) return paintPixelStampSheets[i].canvas;
+      }
+      const cv = document.createElement('canvas');
+      cv.width = size; cv.height = size;
+      const c = cv.getContext('2d');
+      c.fillStyle = fill;
+      for (let i = 0; i < stamp.rows.length; i++) { const r = stamp.rows[i]; c.fillRect(r[1], r[0], r[2], 1); }
+      paintPixelStampSheets.push({ key: key, canvas: cv });
+      if (paintPixelStampSheets.length > PAINT_PIXEL_STAMP_SHEET_MAX) paintPixelStampSheets.shift();
+      return cv;
+    }
+    // sheet 를 넘기면 그것을 쓴다(paintPixelLine 이 스텝마다 캐시를 뒤지지 않게). null 을 넘기면
+    // 「구운 것 없음」이라는 뜻이고, 생략하면 여기서 찾는다.
+    function paintPixelStampAt(ctx, stamp, x, y, sheet) {
       const bx = Math.round(x) - stamp.off, by = Math.round(y) - stamp.off;
+      const img = sheet === undefined ? paintPixelStampSheetFor(ctx, stamp) : sheet;
+      if (img) { ctx.drawImage(img, bx, by); return; }
       for (let i = 0; i < stamp.rows.length; i++) { const r = stamp.rows[i]; ctx.fillRect(bx + r[1], by + r[0], r[2], 1); }
     }
     function paintPixelLine(ctx, stamp, x0, y0, x1, y1) { // integer Bresenham, stamping every step
+      const sheet = paintPixelStampSheetFor(ctx, stamp); // ver1611: 스텝마다가 아니라 선분마다 한 번 찾는다
       let ix = Math.round(x0), iy = Math.round(y0);
       const tx = Math.round(x1), ty = Math.round(y1);
       const dx = Math.abs(tx - ix), sx = ix < tx ? 1 : -1;
       const dy = -Math.abs(ty - iy), sy = iy < ty ? 1 : -1;
       let err = dx + dy, guard = 0;
       for (;;) {
-        paintPixelStampAt(ctx, stamp, ix, iy);
+        paintPixelStampAt(ctx, stamp, ix, iy, sheet);
         if ((ix === tx && iy === ty) || guard++ > 100000) break;
         const e2 = 2 * err;
         if (e2 >= dy) { err += dy; ix += sx; }
