@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1639</title>
+  <title>MoArt ver1640</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -52407,7 +52407,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 정한 最小サイズ(paintPressureCurve의 minS)와 렌더러의 물리적 하한(paintVariableWidthRadii의
       // 0.15px, 2値化의 1px)이 담당한다 — 그게 원래 그 값들이 있는 이유다.
       if (stroke && stroke.pressure && sampleEvent && typeof sampleEvent.pressure === 'number' && sampleEvent.pressure >= 0) {
-        pointObj.p = Math.max(0, Math.min(1, sampleEvent.pressure));
+        // ver1640: 원화와 **같은 커널**을 지난다(상태는 stroke 에 산다). 콘티·용지는 그전까지
+        // 스파이크 방어도 손떨림 창도 전혀 없이 raw 를 그대로 실었다.
+        pointObj.p = paintStabilizePressure(stroke, sampleEvent.pressure);
       }
       if (stroke && (stroke.tiltSizePct || stroke.tiltAlphaPct) && sampleEvent) pointObj.t = paintSampleTiltNorm(sampleEvent); // ver1328 ③
       if (stroke && stroke.tipRotate === 'azimuth' && sampleEvent) { // ver1335: 방위 추종일 때만 싣는다
@@ -54482,29 +54484,54 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 두 단으로 쪼갠 것뿐이라 「더 부드러운데 더 늦지는 않다」.
     // 비용도 그대로 샘플당 O(1) — 각 단이 합을 들고 다니며 더하고 뺀다(`shift` 는 n ≤ 11 이라 무시할
     // 만하다). dab 마다가 아니라 **입력 샘플마다** 한 번이다.
+    // ver1640: **한 축**의 삼각 가중 이동 평균. 좌표의 x·y 와 필압이 전부 이 함수를 지난다 —
+    // 「같은 수학이면 공용 커널 먼저」이고, 무엇보다 **셋이 같은 창을 써야 서로 정렬된다**(아래).
+    function paintStabilizeAxis(seed) {
+      const v = Number(seed) || 0;
+      return { b1: [v], s1: v, b2: [v], s2: v };
+    }
+    function paintStabilizeScalar(ax, v, half) {
+      const b1 = ax.b1, b2 = ax.b2;
+      b1.push(v);
+      ax.s1 += v;
+      while (b1.length > half) ax.s1 -= b1.shift();
+      const m = ax.s1 / b1.length;      // 1 단
+      b2.push(m);
+      ax.s2 += m;
+      while (b2.length > half) ax.s2 -= b2.shift();
+      return ax.s2 / b2.length;         // 2 단 — sinc 의 sidelobe 를 sinc² 로 누른다
+    }
     function paintStabilizeStep(smoothState, point, n) {
       const half = Math.max(1, Math.round(n / 2));
-      const b1 = smoothState.buf, b2 = smoothState.buf2;
-      // 1 단: 원시 입력의 이동 평균
-      b1.push(Number(point.x) || 0, Number(point.y) || 0);
-      smoothState.sx += b1[b1.length - 2];
-      smoothState.sy += b1[b1.length - 1];
-      while (b1.length > half * 2) {
-        smoothState.sx -= b1.shift();
-        smoothState.sy -= b1.shift();
-      }
-      const c1 = b1.length / 2;
-      const m1x = smoothState.sx / c1, m1y = smoothState.sy / c1;
-      // 2 단: 그 결과를 한 번 더 — 이 두 번째가 sinc 의 sidelobe 를 sinc² 로 누른다
-      b2.push(m1x, m1y);
-      smoothState.s2x += m1x;
-      smoothState.s2y += m1y;
-      while (b2.length > half * 2) {
-        smoothState.s2x -= b2.shift();
-        smoothState.s2y -= b2.shift();
-      }
-      const c2 = b2.length / 2;
-      return { x: smoothState.s2x / c2, y: smoothState.s2y / c2 };
+      return {
+        x: paintStabilizeScalar(smoothState.ax, Number(point.x) || 0, half),
+        y: paintStabilizeScalar(smoothState.ay, Number(point.y) || 0, half)
+      };
+    }
+    // ── ver1640: 필압도 **좌표와 같은 창**을 지난다 ─────────────────────────────────────────────
+    // 그전에는 셋이 제각각이었다: 원화는 **비대칭** slew-limit(올라갈 때만 프레임당 0.1, 내려갈 때는
+    // raw — ver616 이 Apple Pencil 의 lift-spike 로 꼬리가 굵어지는 것을 막으려고 넣었다), 콘티·용지는
+    // 아무것도 없었다. 그래서 (1) 굵어질 때와 얇아질 때의 반응이 다르고, (2) 엔진마다 같은 필압이 다른
+    // 굵기로 나오고, (3) ver1637 부터 **좌표만 창 지연을 타면서 필압과 시간이 어긋나** 굵기가 제 자리보다
+    // 앞서 붙었다. 사용자 보고의 「필압이 불안정하다」가 이 셋이다.
+    // 좌표와 **같은 창**으로 평균하면 지연이 같아져 (3) 이 자동으로 정렬되고, 같은 커널이라 (1)·(2) 도
+    // 함께 사라진다. 대가는 정직하게 하나 있다: 보정을 세게 할수록 **入り抜き(입·빼기)의 빠른 필압
+    // 변화도 함께 뭉개진다.** 보정 0 이면 창이 없어 raw 그대로다.
+    // 상승 slew-limit 은 남긴다 — 보정이 0 일 때도 lift-spike 방어가 필요하고, 창 평균은 스파이크를
+    // 1/n 로 희석할 뿐 없애지는 않는다.
+    // 상태는 **스트로크 수명 객체**에 산다(콘티·용지는 stroke, 원화는 세션) — 그래서 호출부를 고치지
+    // 않고도 세 엔진이 같은 함수를 쓴다.
+    const PAINT_PRESSURE_RISE_MAX = 0.1;   // ver616
+    function paintStabilizePressure(host, rawP) {
+      if (rawP == null || !host) return rawP;
+      let v = Math.max(0, Math.min(1, Number(rawP) || 0));
+      const prev = host.pressPrev;
+      if (prev != null && v > prev) v = Math.min(v, prev + PAINT_PRESSURE_RISE_MAX);
+      host.pressPrev = v;
+      const level = paintStabilizerVal();
+      if (!level) { host.pressAxis = null; return v; }
+      if (!host.pressAxis) host.pressAxis = paintStabilizeAxis(v);
+      return Math.max(0, Math.min(1, paintStabilizeScalar(host.pressAxis, v, Math.max(1, Math.round((1 + level * 2) / 2)))));
     }
     // ver1637: 창 크기는 **샘플 수**라 좌표계와 무관하다 — rope 시절 필요했던 `op.stabScale`(로컬
     // 단위/화면 픽셀) 환산이 여기서는 아예 필요 없다. 그 필드는 지우지 않는다: Shift 직선(ver1610)이
@@ -54520,9 +54547,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // catch-up: 획은 펜을 뗀 자리에서 끝난다(ver750 = TVPaint 의 Catch Up, ver1636 에서 원화에도 배선).
         // 창을 그 점 하나로 비워 두면 다음 획이 지난 획의 꼬리를 평균에 섞지 않는다.
         if (op.smoothState) {
-          const px = Number(point.x) || 0, py = Number(point.y) || 0;
-          // ver1638: 모양이 옛것이어도 여기서 새 모양이 된다. ver1639: 두 단 모두 비운다.
-          op.smoothState = { buf: [px, py], sx: px, sy: py, buf2: [px, py], s2x: px, s2y: py };
+          // ver1638: 모양이 옛것이어도 여기서 새 모양이 된다. ver1639/1640: 두 단 모두 비운다.
+          op.smoothState = { ax: paintStabilizeAxis(point.x), ay: paintStabilizeAxis(point.y) };
         }
         return point;
       }
@@ -54533,12 +54559,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 커널이 상태의 모양을 바꿨으면 **그 모양을 아는 곳은 커널 하나여야 한다.** 그래서 남이 심어
       // 둔 값은 「좌표 힌트」로만 읽고, 실제 구조는 여기서 만든다.
       // 시드 우선순위: 이미 있는 좌표(원화가 심어 둔 앵커) → 스트로크의 첫 점(conte) → 지금 점.
-      if (!op.smoothState || !Array.isArray(op.smoothState.buf2)) {
+      if (!op.smoothState || !op.smoothState.ax) {
         const prev = op.smoothState;
         const seed = (prev && Number.isFinite(Number(prev.x)) && Number.isFinite(Number(prev.y))) ? prev
           : ((op.stroke && op.stroke.points && op.stroke.points[0]) ? op.stroke.points[0] : point);
-        const sx = Number(seed.x) || 0, sy = Number(seed.y) || 0;
-        op.smoothState = { buf: [sx, sy], sx: sx, sy: sy, buf2: [sx, sy], s2x: sx, s2y: sy };
+        op.smoothState = { ax: paintStabilizeAxis(seed.x), ay: paintStabilizeAxis(seed.y) };
       }
       return paintStabilizeStep(op.smoothState, point, 1 + level * 2);
     }
@@ -81273,11 +81298,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 샘플에 0을 흔히 보고하므로 획 머리에 블롭이 생겼다(gengaDrawStart의 downPressure는 이미
         // `>= 0`이라 시작점과 이후 샘플이 서로 다른 규칙을 쓰고 있었다).
         const rawPressure = (sample.pointerType === 'pen' && typeof sample.pressure === 'number' && sample.pressure >= 0) ? Math.min(1, sample.pressure) : null;
-        if (rawPressure != null) {
-          if (penSess.smoothP == null) penSess.smoothP = rawPressure;
-          else if (rawPressure > penSess.smoothP) penSess.smoothP = Math.min(rawPressure, penSess.smoothP + 0.1);
-          else penSess.smoothP = rawPressure;
-        }
+        // ver1640: 손으로 적은 비대칭 slew-limit 을 공용 커널(paintStabilizePressure)로 옮겼다 —
+        // 상승 제한은 그대로 살아 있고(ver616), 그 위에 좌표와 같은 창의 평균이 얹힌다.
+        if (rawPressure != null) penSess.smoothP = paintStabilizePressure(penSess, rawPressure);
         const usePressure = penSess.smoothP != null ? penSess.smoothP : 0.5;
         // ver1328 ③: tilt, slewed like pressure so one orientation jitter can't kink the width envelope
         const tiltRaw = paintSampleTiltNorm(sample);
