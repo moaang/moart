@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1636</title>
+  <title>MoArt ver1637</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22362,6 +22362,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1637, items: [
+        { ja: '**手ブレ補正の方式を変えました。** これまでは補正を強くするほど線が**カクカク**して、細かい動きが丸ごと捨てられていました。今は直近の入力を平均する方式なので、曲線が曲線のまま残り、ペンを止めればちゃんとその位置まで届きます。強さのスライダーはそのままです。', ko: '**손떨림 보정 방식을 바꿨습니다.** 종전에는 보정을 세게 할수록 선이 **각지고** 작은 움직임이 통째로 버려졌습니다. 이제는 최근 입력을 평균내는 방식이라 곡선이 곡선으로 남고, 펜을 멈추면 그 자리까지 제대로 도달합니다. 세기 슬라이더는 그대로입니다.', en: '**Stabilization works a different way now.** It used to make lines more **angular** the stronger you set it, and small movements were discarded entirely. It now averages your recent input, so curves stay curves and the line reaches where you stopped the pen. The strength slider is unchanged.' },
+      ] },
       { ver: 1636, items: [
         { ja: '**原画で手ブレ補正を強くすると線が最後まで届かなかったのを直しました。** ペンを離した位置まで線が追いつくようになり、補正の半径より短いストロークが**まったく描かれなかった**のも解消しました。コンテ側は元から追いついていました。', ko: '**원화에서 손떨림 보정을 세게 하면 선이 끝까지 안 가던 것을 고쳤습니다.** 펜을 뗀 자리까지 선이 따라오고, 보정 반경보다 짧은 획이 **아예 안 그어지던** 것도 해결했습니다. 콘티 쪽은 원래 따라오고 있었습니다.', en: '**Fixed strokes falling short in 原画 when stabilization was turned up.** The line now catches up to where you lifted the pen, and strokes shorter than the stabilizer radius \u2014 which used to leave no mark at all \u2014 draw properly. The storyboard side already caught up.' },
       ] },
@@ -50694,7 +50697,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const dx = ((Number(point.x) || 0) - line.ax) * kx;
       const dy = ((Number(point.y) || 0) - line.ay) * ky;
       if (!line.locked) {
-        // 화면 픽셀로 환산 - 손떨림 보정과 **같은 척도**(sess.stabScale)를 쓴다. 로컬 픽셀로 고정하면
+        // 화면 픽셀로 환산 - `sess.stabScale`(로컬 단위/화면 픽셀)을 쓴다. ver1637 이 손떨림 보정을
+        // 이동 평균으로 바꾸면서 그쪽은 이 값을 안 보게 됐지만(창 크기가 샘플 수라 좌표계 무관),
+        // 「화면 기준 거리」가 필요한 것은 여기도 마찬가지라 그대로 쓴다. 로컬 픽셀로 고정하면
         // 用紙가 561px 인 conte 와 수천 px 인 원화에서 체감이 완전히 갈린다.
         const arm = Math.max(2, PAINT_SHIFT_LINE_ARM_SCREEN_PX * (Number(sess.stabScale) || 0) * kx);
         if (Math.hypot(dx, dy) < arm) return null;
@@ -54438,47 +54443,72 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // second caller is gone and this is the live gesture's smoother again. Kept as its own function anyway:
     // paintStabilizePoint owns the gesture rules (seeding from the pointerdown anchor, the raw pointerup
     // snap) and this owns the arithmetic — a clean split on its own merits.
-    // ver1328 ②: the step is a PULLED STRING (dead zone), no longer a pull-average EMA. The EMA's one
-    // knob k = 1/(1+level*0.8) made smoothing and LAG the same thing — every sample was filtered toward
-    // the pen, so the line trailed in TIME, which is why the user drew with it off. The rope has zero
-    // temporal lag: the drawn point stands STILL while the pen is within `radius` of it (hand tremor
-    // lives entirely inside that circle and never reaches the ink), and once the string is taut the
-    // point follows exactly AT the radius — a fixed spatial trail, not an accumulating delay. This is
-    // what the reference tools ship: TVPaint's Line Smoothing has a literal "Pulled string" mode,
-    // Krita's stabilizer is the same dead-zone device, Lazy Nezumi calls it the rope. Catch-up on pen
-    // lift already existed here: the pointerup branch below returns the RAW point (ver750) — that IS
-    // TVPaint's Catch Up, unchanged.
-    function paintStabilizeStep(smoothState, point, radius) {
+    // ★ver1637: **이동 평균 창**이다. 최근 n 개 입력 좌표의 평균을 잉크로 삼는다.
+    //
+    // 그전 두 판의 경위 — ver1328 ② 는 EMA(`x += (pen-x)*k`)를 버리고 **pulled string(dead zone)** 을
+    // 넣었다. EMA 는 지연이 지수적으로 남아 **영원히 펜을 못 따라잡는** 것이 문제였고, rope 는 시간
+    // 지연이 0 이라 그 문제가 없다. 그런데 rope 에는 다른 대가가 있었고 그것이 실사용에서 터졌다
+    // (사용자 필기 스크린샷 비교, 2026-08-08):
+    //   · **각진다** — 끈이 팽팽하면 잉크는 「펜에서 정확히 radius 떨어진 점」을 따라가므로, 곡선이
+    //     펜 궤적의 **내측 다각형**이 된다. 글씨처럼 방향 전환이 잦은 획에서 전부 직선 조각이 됐다.
+    //   · **버려진다** — dead zone 안의 입력은 결과에 **하나도 기여하지 않는다.** 반경보다 짧은 획은
+    //     한 점도 안 나갔다(ver1636 의 catch-up 이 그 끝만 겨우 이어 준 상태였다).
+    //   · **빠르면 더 심하다** — 샘플 간격이 radius 를 넘으면 매 샘플이 큰 스텝이라 다각형이 거칠어진다.
+    //
+    // Krita 를 보면 그 둘은 애초에 **다른 자리**의 장치다: 스무딩 본체는 `Sample Count`(가중 이동
+    // 평균)이고 dead zone 은 `Delay` 라는 **별도 옵션**이며, 문서가 그 목적을 「Without the delay dead
+    // zone, it is impossible to make sharp corners」라고 적는다 — **날카로운 코너를 만들기 위한** 것이다.
+    // 우리는 보조만 갖고 본체를 안 만든 상태였다. CSP 의 手ブレ補正도 「값이 클수록 지연이 는다」는
+    // 시간 지연형이지 dead zone 이 아니다.
+    //
+    // 이동 평균은 세 증상이 구조적으로 없다: 모든 샘플이 평균에 기여하고(버려짐 없음), 평균이라
+    // 곡선이 곡선으로 남고(각짐 없음), 지연이 **유한**하다 — 펜이 멈추면 n 샘플 뒤 정확히 그 자리에
+    // 도달한다(EMA 가 못 하던 것). 창 크기가 곧 강도이자 지연이고, 그 둘이 같은 것이 이 방식의 정직한
+    // 성질이다.
+    //
+    // 비용은 샘플당 O(1) — 합을 들고 다니며 더하고 뺀다(`shift` 는 n ≤ 21 이라 무시할 만하다).
+    // dab 마다가 아니라 **입력 샘플마다** 한 번이다.
+    function paintStabilizeStep(smoothState, point, n) {
       const px = Number(point.x) || 0, py = Number(point.y) || 0;
-      const dx = px - smoothState.x, dy = py - smoothState.y;
-      const d = Math.hypot(dx, dy);
-      if (d <= radius || d === 0) return { x: smoothState.x, y: smoothState.y }; // inside the dead zone — the ink stands still
-      const k = (d - radius) / d;
-      smoothState.x += dx * k;
-      smoothState.y += dy * k;
-      return { x: smoothState.x, y: smoothState.y };
+      const buf = smoothState.buf;
+      buf.push(px, py);
+      smoothState.sx += px;
+      smoothState.sy += py;
+      while (buf.length > n * 2) {
+        smoothState.sx -= buf.shift();
+        smoothState.sy -= buf.shift();
+      }
+      const c = buf.length / 2;
+      return { x: smoothState.sx / c, y: smoothState.sy / c };
     }
-    // The radius is a SCREEN-space feel (level 0..10 → 0..35 screen px — the same level slider as
-    // before, remapped), while every stroke owner hands this function points in its own LOCAL space
-    // (genga paper px / conte normalized page / pad normalized). So each owner records
-    // `op.stabScale` = local-units-per-screen-px on its op or session; an op without the field gets
-    // radius 0 = pass-through — the safe failure is "no stabilization", never a wrong-space radius.
+    // ver1637: 창 크기는 **샘플 수**라 좌표계와 무관하다 — rope 시절 필요했던 `op.stabScale`(로컬
+    // 단위/화면 픽셀) 환산이 여기서는 아예 필요 없다. 그 필드는 지우지 않는다: Shift 직선(ver1610)이
+    // 같은 값을 「화면 픽셀 기준 팔 길이」로 계속 쓴다.
+    // 레벨 0 = 끔. 1~10 → 창 3~21 샘플. Apple Pencil 은 coalesced 로 240Hz 까지 들어오므로 최대치가
+    // 100ms 를 조금 넘는 지연이고, 마우스(60Hz)에서는 더 길게 느껴진다 — 강도와 지연이 같은 값인 것이
+    // 이동 평균의 정직한 성질이라 슬라이더 하나로 둔다.
     function paintStabilizePoint(op, point, event) {
       const level = paintStabilizerVal();
       if (!op || !level) return point;
       if (event && (event.type === 'pointerup' || event.type === 'pointercancel')) {
-        if (op.smoothState) { op.smoothState.x = point.x; op.smoothState.y = point.y; }
-        return point; // catch-up: the stroke ends where the pen lifted (ver750 = TVPaint's Catch Up)
+        // catch-up: 획은 펜을 뗀 자리에서 끝난다(ver750 = TVPaint 의 Catch Up, ver1636 에서 원화에도 배선).
+        // 창을 그 점 하나로 비워 두면 다음 획이 지난 획의 꼬리를 평균에 섞지 않는다.
+        if (op.smoothState) {
+          const px = Number(point.x) || 0, py = Number(point.y) || 0;
+          op.smoothState.buf = [px, py];
+          op.smoothState.sx = px;
+          op.smoothState.sy = py;
+        }
+        return point;
       }
       if (!op.smoothState) {
-        // seed from the stroke's anchor (the pointerdown position) so the FIRST move is already
-        // pulled — seeding from the first move itself would pass one raw jitter point through.
+        // 창을 스트로크의 앵커(pointerdown 자리) 하나로 시작한다 — 첫 이동이 곧바로 평균에 들어가
+        // 원시 지터 한 점이 그대로 지나가지 않는다(rope 시절의 seed 와 같은 이유).
         const seed = op.stroke && op.stroke.points && op.stroke.points[0] ? op.stroke.points[0] : point;
-        op.smoothState = { x: Number(seed.x) || 0, y: Number(seed.y) || 0 };
+        const sx = Number(seed.x) || 0, sy = Number(seed.y) || 0;
+        op.smoothState = { buf: [sx, sy], sx: sx, sy: sy };
       }
-      const radius = level * 3.5 * (Number(op.stabScale) || 0);
-      if (!radius) return point;
-      return paintStabilizeStep(op.smoothState, point, radius);
+      return paintStabilizeStep(op.smoothState, point, 1 + level * 2);
     }
 
     // ===========================================================================================
