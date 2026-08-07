@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1619</title>
+  <title>MoArt ver1620</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22332,6 +22332,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1620, items: [
+        { ja: '**2値化で描くときの重さを大きく減らしました。** 縁を硬くする処理をGPU側でやるようにしたので、太いブラシや大きな作画用紙でも引っかかりにくくなります。描かれる点は今までと同じです。', ko: '**2値化로 그릴 때의 무거움을 크게 줄였습니다.** 가장자리를 굳히는 처리를 GPU 쪽에서 하도록 바꿔, 굵은 브러시나 큰 작화 용지에서도 덜 걸립니다. 찍히는 점은 종전과 같습니다.', en: '**Drawing with hard edge is much lighter.** The edge-hardening pass now runs on the GPU instead of reading the canvas back pixel by pixel, so big brushes and large paper sizes stutter far less. The pixels it lays down are unchanged.' },
+      ] },
       { ver: 1619, items: [
         { ja: '**紙目（グレイン）や2値化を入れたときの重さを直しました。** 用紙全体を毎回塗り直していたのを、線が通った範囲だけにしています——描かれる絵は今までと同じで、速さだけが変わります。', ko: '**종이결(그레인)이나 2値化를 넣었을 때의 무거움을 고쳤습니다.** 용지 전체를 매번 다시 칠하던 것을 선이 지나간 범위만으로 좁혔습니다 — 그려지는 그림은 종전과 같고 속도만 달라집니다.', en: '**Drawing with paper grain or hard edge is lighter now.** Both used to repaint the whole sheet every frame; they now touch only the area the stroke passed through. What gets drawn is unchanged — only the speed.' },
       ] },
@@ -50732,6 +50735,81 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 원화 용지는 1754×1240 = **217만 픽셀**이라 전면 getImageData/putImageData 한 번이 13.9ms 였다.
     // 프레임당 1회로 접고도 예산의 165% — 접는 것만으로는 모자랐다. 도형은 용지의 일부만 차지하므로
     // **그 범위만** 훑으면 된다. 알파 임계는 픽셀마다 독립이라 범위를 좁혀도 결과가 같다(이웃을 안 본다).
+    // ver1620: 알파 임계화의 **진짜 비용은 범위가 아니라 getImageData 왕복**이었다. ver1619 가 범위를
+    // 캔버스의 6% 로 좁혔는데도 원화에서 1 회 10~20ms 였고(같은 크기를 격리 캔버스에서 재면 0.4ms),
+    // 2値化 를 끄면 같은 획이 57.4 → 18.6ms 였다 — 전체의 68% 가 이 함수였다는 뜻이다.
+    // 픽셀을 CPU 로 내렸다 올리는 대신 **SVG 필터로 GPU 에서** 자른다: 같은 임계(alpha ≥ 128 → 255)를
+    // feFuncA discrete tableValues="0 1" 이 그대로 표현한다(경계도 일치 — discrete 의 0.5 = 127.5).
+    // 실측 10.94 → 0.57ms(19배), 알파·RGB 픽셀 차이 0.
+    // 필터를 못 쓰면(아래 프로브가 실제 픽셀로 확인한다) 종전 경로로 그대로 떨어진다.
+    let paintBinAlphaFilterCss = null;
+    function paintBinarizeAlphaFilter() {
+      if (paintBinAlphaFilterCss != null) return paintBinAlphaFilterCss;
+      paintBinAlphaFilterCss = '';
+      try {
+        const NS = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(NS, 'svg');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none';
+        const f = document.createElementNS(NS, 'filter');
+        f.id = 'paintBinarizeAlpha';
+        f.setAttribute('color-interpolation-filters', 'sRGB'); // 색공간 변환 금지 — RGB 는 그대로 통과해야 한다
+        const t = document.createElementNS(NS, 'feComponentTransfer');
+        const fa = document.createElementNS(NS, 'feFuncA');
+        fa.setAttribute('type', 'discrete');
+        fa.setAttribute('tableValues', '0 1');
+        t.appendChild(fa);
+        f.appendChild(t);
+        svg.appendChild(f);
+        document.body.appendChild(svg);
+        // ver1369 의 교훈 그대로: **문자열이 받아들여졌는지 묻지 않고 실제로 통과시켜 픽셀을 읽는다.**
+        // iOS/WebKit 은 filter 문자열은 받으면서 그리기에는 안 걸어 문자열 판정을 거짓 통과한다.
+        // 임계 아래(알파 0.25)와 위(0.75)를 **둘 다** 확인해야 「안 걸렸다」와 「전부 지웠다」를 함께 배제한다.
+        const probe = document.createElement('canvas');
+        probe.width = 2; probe.height = 1;
+        const pctx = probe.getContext('2d', { willReadFrequently: true });
+        const seed = document.createElement('canvas');
+        seed.width = 2; seed.height = 1;
+        const sctx = seed.getContext('2d');
+        sctx.fillStyle = 'rgba(255,0,0,0.25)'; sctx.fillRect(0, 0, 1, 1);
+        sctx.fillStyle = 'rgba(255,0,0,0.75)'; sctx.fillRect(1, 0, 1, 1);
+        pctx.filter = 'url(#paintBinarizeAlpha)';
+        pctx.drawImage(seed, 0, 0);
+        pctx.filter = 'none';
+        const px = pctx.getImageData(0, 0, 2, 1).data;
+        if (px[3] === 0 && px[7] === 255) paintBinAlphaFilterCss = 'url(#paintBinarizeAlpha)';
+      } catch (error) { paintBinAlphaFilterCss = ''; }
+      return paintBinAlphaFilterCss;
+    }
+    let paintBinAlphaScratch = null;
+    function paintBinarizeViaFilter(canvas, x, y, w, h, filterCss) {
+      try {
+        if (!paintBinAlphaScratch) paintBinAlphaScratch = document.createElement('canvas');
+        const sc = paintBinAlphaScratch;
+        if (sc.width < canvas.width) sc.width = canvas.width;
+        if (sc.height < canvas.height) sc.height = canvas.height;
+        const s = sc.getContext('2d');
+        s.setTransform(1, 0, 0, 1, 0, 0);
+        s.globalAlpha = 1;
+        s.globalCompositeOperation = 'source-over';
+        s.filter = 'none';
+        s.clearRect(x, y, w, h);
+        s.filter = filterCss;
+        s.drawImage(canvas, x, y, w, h, x, y, w, h);
+        s.filter = 'none';
+        const c = canvas.getContext('2d');
+        c.save();
+        c.setTransform(1, 0, 0, 1, 0, 0);
+        c.globalAlpha = 1;
+        c.filter = 'none';
+        // **copy 를 쓰지 않는다** — copy 는 캔버스 전체를 소스로 갈아치우므로 rect 밖이 지워진다.
+        c.globalCompositeOperation = 'source-over';
+        c.clearRect(x, y, w, h);
+        c.drawImage(sc, x, y, w, h, x, y, w, h);
+        c.restore();
+        return true;
+      } catch (error) { return false; }
+    }
     function paintBinarizeCanvasAlpha(canvas, rect) {
       try {
         const ctx = canvas.getContext('2d');
@@ -50743,6 +50821,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           h = Math.min(canvas.height - y, Math.ceil(rect.h) || 0);
           if (!(w > 0 && h > 0)) return; // 빈 범위 = 할 일 없음(전체로 넓히지 **않는다** — 그건 다른 뜻이다)
         }
+        const filterCss = paintBinarizeAlphaFilter();
+        if (filterCss && paintBinarizeViaFilter(canvas, x, y, w, h, filterCss)) return; // ver1620
         const img = ctx.getImageData(x, y, w, h);
         const d = img.data;
         for (let i = 3; i < d.length; i += 4) d[i] = d[i] >= 128 ? 255 : 0;
