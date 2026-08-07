@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1640</title>
+  <title>MoArt ver1641</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -52409,9 +52409,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (stroke && stroke.pressure && sampleEvent && typeof sampleEvent.pressure === 'number' && sampleEvent.pressure >= 0) {
         // ver1640: 원화와 **같은 커널**을 지난다(상태는 stroke 에 산다). 콘티·용지는 그전까지
         // 스파이크 방어도 손떨림 창도 전혀 없이 raw 를 그대로 실었다.
-        pointObj.p = paintStabilizePressure(stroke, sampleEvent.pressure);
+        pointObj.p = paintStabilizeAux(stroke, 'p', sampleEvent.pressure, PAINT_PRESSURE_RISE_MAX);
       }
-      if (stroke && (stroke.tiltSizePct || stroke.tiltAlphaPct) && sampleEvent) pointObj.t = paintSampleTiltNorm(sampleEvent); // ver1328 ③
+      // ver1328 ③ / ver1641: 기울기도 원화와 **같은 커널**을 지난다(상태는 stroke 에 산다).
+      // 그전까지 콘티는 raw 를 그대로 실어, 같은 브러시가 원화와 다른 굵기를 냈다.
+      if (stroke && (stroke.tiltSizePct || stroke.tiltAlphaPct) && sampleEvent) {
+        pointObj.t = paintStabilizeAux(stroke, 't', paintSampleTiltNorm(sampleEvent), 0);
+      }
       if (stroke && stroke.tipRotate === 'azimuth' && sampleEvent) { // ver1335: 방위 추종일 때만 싣는다
         const az = paintSampleAzimuthDeg(sampleEvent);
         if (az != null) pointObj.a = az;
@@ -54521,17 +54525,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 1/n 로 희석할 뿐 없애지는 않는다.
     // 상태는 **스트로크 수명 객체**에 산다(콘티·용지는 stroke, 원화는 세션) — 그래서 호출부를 고치지
     // 않고도 세 엔진이 같은 함수를 쓴다.
+    // ver1641: **좌표 밖의 축**(필압·기울기)을 하나가 맡는다. ver1640 이 필압 전용으로 만든 것을
+    // 일반화했다 — 기울기도 같은 이유(손이 떨리면 값이 흔들린다)로 같은 처리가 필요한데, 그때까지는
+    // 원화만 EMA(0.35)로 따로 하고 콘티에는 아무것도 없었다. ver1640 직전의 필압과 **똑같은 모양의
+    // 파리티 구멍**이다. 이제 이 파일에서 손떨림 보정을 타는 축은 x · y · 필압 · 기울기 넷이고
+    // 커널은 `paintStabilizeScalar` 한 벌이다.
+    //   · key      — host 에 상태를 둘 이름(`p` · `t`). 축마다 창이 따로 돈다.
+    //   · riseMax  — 상승 slew-limit. 필압만 쓴다(ver616: Apple Pencil 이 펜을 뗄 때 필압을 튀겨
+    //                꼬리를 굵히는 것을 막는다). 기울기에는 그런 스파이크가 없으므로 0 을 준다.
+    // 창은 좌표와 **같다** — 그래야 세 축의 지연이 같아져 굵기가 제 자리에 붙는다(ver1640 참조).
     const PAINT_PRESSURE_RISE_MAX = 0.1;   // ver616
-    function paintStabilizePressure(host, rawP) {
-      if (rawP == null || !host) return rawP;
-      let v = Math.max(0, Math.min(1, Number(rawP) || 0));
-      const prev = host.pressPrev;
-      if (prev != null && v > prev) v = Math.min(v, prev + PAINT_PRESSURE_RISE_MAX);
-      host.pressPrev = v;
+    function paintStabilizeAux(host, key, raw, riseMax) {
+      if (raw == null || !host) return raw;
+      let v = Math.max(0, Math.min(1, Number(raw) || 0));
+      const pk = key + 'Prev', ak = key + 'Axis';
+      const prev = host[pk];
+      if (riseMax && prev != null && v > prev) v = Math.min(v, prev + riseMax);
+      host[pk] = v;
       const level = paintStabilizerVal();
-      if (!level) { host.pressAxis = null; return v; }
-      if (!host.pressAxis) host.pressAxis = paintStabilizeAxis(v);
-      return Math.max(0, Math.min(1, paintStabilizeScalar(host.pressAxis, v, Math.max(1, Math.round((1 + level * 2) / 2)))));
+      if (!level) { host[ak] = null; return v; }
+      if (!host[ak]) host[ak] = paintStabilizeAxis(v);
+      return Math.max(0, Math.min(1, paintStabilizeScalar(host[ak], v, Math.max(1, Math.round((1 + level * 2) / 2)))));
     }
     // ver1637: 창 크기는 **샘플 수**라 좌표계와 무관하다 — rope 시절 필요했던 `op.stabScale`(로컬
     // 단위/화면 픽셀) 환산이 여기서는 아예 필요 없다. 그 필드는 지우지 않는다: Shift 직선(ver1610)이
@@ -81298,14 +81312,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 샘플에 0을 흔히 보고하므로 획 머리에 블롭이 생겼다(gengaDrawStart의 downPressure는 이미
         // `>= 0`이라 시작점과 이후 샘플이 서로 다른 규칙을 쓰고 있었다).
         const rawPressure = (sample.pointerType === 'pen' && typeof sample.pressure === 'number' && sample.pressure >= 0) ? Math.min(1, sample.pressure) : null;
-        // ver1640: 손으로 적은 비대칭 slew-limit 을 공용 커널(paintStabilizePressure)로 옮겼다 —
+        // ver1640/1641: 손으로 적은 비대칭 slew-limit 을 공용 커널(paintStabilizeAux)로 옮겼다 —
         // 상승 제한은 그대로 살아 있고(ver616), 그 위에 좌표와 같은 창의 평균이 얹힌다.
-        if (rawPressure != null) penSess.smoothP = paintStabilizePressure(penSess, rawPressure);
+        if (rawPressure != null) penSess.smoothP = paintStabilizeAux(penSess, 'p', rawPressure, PAINT_PRESSURE_RISE_MAX);
         const usePressure = penSess.smoothP != null ? penSess.smoothP : 0.5;
-        // ver1328 ③: tilt, slewed like pressure so one orientation jitter can't kink the width envelope
-        const tiltRaw = paintSampleTiltNorm(sample);
-        if (penSess.smoothT == null) penSess.smoothT = tiltRaw;
-        else penSess.smoothT += (tiltRaw - penSess.smoothT) * 0.35;
+        // ver1328 ③: tilt, slewed like pressure so one orientation jitter can't kink the width envelope.
+        // ver1641: 그 「pressure 처럼」이 이제 **말 그대로** 같은 함수다 — 손으로 적은 EMA(0.35)를
+        // 공용 커널로 옮겼다. 좌표·필압과 같은 창이라 세 축의 지연이 맞는다.
+        penSess.smoothT = paintStabilizeAux(penSess, 't', paintSampleTiltNorm(sample), 0);
         const useTilt = penSess.smoothT;
         const useAz = penSess.azOn ? paintSampleAzimuthDeg(sample) : null; // ver1345: 방위(方位 추종 팁 전용)
         if (penSess.penOutline) { // ver621: outline mode just accumulates; ONE whole redraw after the loop
