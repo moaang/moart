@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1628</title>
+  <title>MoArt ver1629</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22340,6 +22340,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1629, items: [
+        { ja: '**紙目を入れたときの重さがほぼなくなりました。** これまでは線が長くなるほど重くなっていましたが、毎フレーム描き直すのを「新しく増えた分だけ」に変えました。描かれる点は今までと1ピクセルも変わりません。', ko: '**종이결을 넣었을 때의 무거움이 거의 사라졌습니다.** 종전에는 획이 길어질수록 무거워졌는데, 매 프레임 다시 그리던 것을 「새로 늘어난 만큼만」으로 바꿨습니다. 찍히는 점은 종전과 1픽셀도 다르지 않습니다.', en: '**Paper grain barely costs anything now.** It used to get heavier the longer your stroke grew; each frame now redraws only the part that was just added. The pixels it lays down are unchanged, down to the last one.' },
+      ] },
       { ver: 1628, items: [
         { ja: '**ブラシ先の「厚さ」を追加しました。** 先端を平たく潰せます — 「向き」と合わせると平筆やカリグラフィになります。.sut からも読み込むので、鉛筆Rのように元から平たいブラシが**やっと本来の形**で入ります。リボン設定のブラシも、点線のように途切れていたのが直りました。', ko: '**팁 「두께」가 생겼습니다.** 팁을 납작하게 누를 수 있습니다 — 「방향」과 합치면 평붓·캘리그라피가 됩니다. .sut 에서도 읽어 오므로, 鉛筆R처럼 원래 납작한 브러시가 **비로소 제 모양으로** 들어옵니다. 리본 설정 브러시가 점선처럼 끊기던 것도 고쳤습니다.', en: '**Tips can be squashed flat now.** The new Thickness setting, combined with the angle source, gives you chisel and calligraphy brushes. It is imported from .sut too, so a brush that was flat to begin with \u2014 like \u9245\u7b46R \u2014 finally arrives in its real shape. Ribbon brushes that came in as dotted lines are fixed as well.' },
       ] },
@@ -51249,7 +51252,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintGrainScratch = null;
     // ver1619: box 를 주면 그 범위만 비운다. 캔버스 크기가 바뀌면 브라우저가 알아서 전부 비우므로
     // 그때는 box 를 무시해도 된다(오히려 비우면 안 되는 상태가 없다).
-    function paintGrainScratchFor(w, h, box) {
+    // ver1629: `ownerKey` 는 **이 스크래치에 남아 있는 그림이 누구 것인가**다. 그레인 합성을 증분으로
+    // 돌리려면 「지난 프레임 내 결과가 아직 여기 있다」가 보장돼야 하는데, 이 캔버스는 전역 한 장이라
+    // 다른 스트로크·다른 레이어·브러시 미리보기가 언제든 덮어쓴다 — 그게 증분화의 유일한 실패 경로였고,
+    // 소유권을 적어 두면 구조적으로 막힌다(남이 썼으면 키가 달라져 그 프레임만 전체를 다시 만든다).
+    // 재사용일 때는 **클리어하지 않는다** — 호출부가 clip 안에서 새 범위만 지운다.
+    let paintGrainScratchKey = null;
+    function paintGrainScratchFor(w, h, box, ownerKey) {
       if (!paintGrainScratch) paintGrainScratch = document.createElement('canvas');
       let resized = false;
       if (paintGrainScratch.width !== w) { paintGrainScratch.width = w; resized = true; }
@@ -51258,9 +51267,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       c.setTransform(1, 0, 0, 1, 0, 0);
       c.globalAlpha = 1;
       c.globalCompositeOperation = 'source-over';
-      if (box && !resized) c.clearRect(box.x, box.y, box.w, box.h);
-      else c.clearRect(0, 0, w, h);
-      return { cv: paintGrainScratch, ctx: c };
+      c.filter = 'none';
+      const reused = ownerKey != null && paintGrainScratchKey === ownerKey && !resized;
+      paintGrainScratchKey = (ownerKey == null) ? null : ownerKey;
+      if (!reused) {
+        if (box && !resized) c.clearRect(box.x, box.y, box.w, box.h);
+        else c.clearRect(0, 0, w, h);
+      }
+      return { cv: paintGrainScratch, ctx: c, reused: reused };
     }
 
     // ── ver___: brush stroke preview ──────────────────────────────────────────────────────────────
@@ -53892,27 +53906,48 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gbox = paintStrokeScratchBox(s && s.box, pts, radii, w, h);
       const bx = gbox ? gbox.x : 0, by = gbox ? gbox.y : 0;
       const bw = gbox ? gbox.w : w, bh = gbox ? gbox.h : h;
-      const sc = paintGrainScratchFor(w, h, gbox);
-      let flatAlpha = 1;   // 장을 못 만든 경우의 물러섬(아래)
+      const sc = paintGrainScratchFor(w, h, gbox, opts.strokeKey == null ? null : opts.strokeKey);
+      // ── ver1629: 그레인 증분 ────────────────────────────────────────────────────────────────
+      // 지금까지 그레인은 **매 프레임 획 전체(gbox)** 를 다시 만들었다: 스크래치 클리어 → 장 복사 →
+      // 마스크 곱. 획이 길어질수록 그 면적이 커져 비용이 「그은 길이」에 비례했다(실측: 원화에서
+      // +0.4~0.6ms/프레임, 그 안에서 패턴 destination-in 이 지배적).
+      // 그런데 **그레인은 용지에 고정**이라 이미 만들어 둔 부분의 결과는 다음 프레임에도 그대로
+      // 유효하다 — 다시 만들 필요가 있는 곳은 이번 프레임에 dab 이 새로 찍힌 범위(s.newBox)뿐이다.
+      // 성립 조건 둘: (1) 스크래치에 아직 **내 그림**이 남아 있을 것(sc.reused — 위 소유권 토큰),
+      // (2) 세션이 이번 범위를 알 것(s.newBox). 하나라도 없으면 종전대로 gbox 전체를 만든다.
+      // ★ clip 이 필수다. destination-in / source-in 은 **그리지 않은 곳의 목적지를 지우는** 연산이라,
+      //   범위만 좁혀 그리면 이미 만들어 둔 나머지가 통째로 날아간다. clip 을 걸면 그 파괴가 clip
+      //   안으로 제한된다(실측으로 확인: clip 밖 픽셀이 그대로 남는다).
+      // JS 폴백(paintInkFieldToAlpha)과 평균 알파 물러섬은 증분에서 제외한다 — 그쪽은 자기 구역
+      // 계산을 따로 하고 iOS 전용이라 데스크톱에서 회귀를 증명할 수 없다.
+      // lumFilter 를 여기서 먼저 구한다 — 증분을 켜도 되는지가 그것에 달렸다(아래 조건).
       const lumFilter = alphaFor ? paintLumToAlphaFilter() : '';
+      // 증분이 성립하는 경로는 둘뿐이다: 필터로 도는 잉크 장, 그리고 잉크가 아닌 팁 세션.
+      const incOk = Boolean(sc.reused && s && s.newBox && (alphaFor ? (s.inkMode && lumFilter) : true));
+      const incBox = incOk ? s.newBox : null;
+      const wx = incBox ? incBox.x : bx, wy = incBox ? incBox.y : by;
+      const ww = incBox ? incBox.w : bw, wh = incBox ? incBox.h : bh;
+      sc.ctx.save();
+      if (incBox) {
+        sc.ctx.beginPath();
+        sc.ctx.rect(wx, wy, ww, wh);
+        sc.ctx.clip();
+        sc.ctx.clearRect(wx, wy, ww, wh);
+      }
+      let flatAlpha = 1;   // 장을 못 만든 경우의 물러섬(아래)
       if (alphaFor && s && s.inkMode && lumFilter) {
         // 잉크 장(불투명 회색, 휘도=농도) → 휘도를 알파로 옮기고 → 그 알파를 색으로 채운다.
         // 여기서 나오는 것이 스트로크 그 자체다(모양을 따로 그리지 않는다).
         sc.ctx.filter = lumFilter;
-        sc.ctx.drawImage(s.cv, 0, 0);
+        sc.ctx.drawImage(s.cv, wx, wy, ww, wh, wx, wy, ww, wh);   // ver1629: 작업 구역만
         sc.ctx.filter = 'none';
         sc.ctx.globalCompositeOperation = 'source-in';
         // ver1627: 혼색이면 색이 픽셀마다 다르므로 한 색으로 채우지 않고 **색 장**을 얹는다.
         // 범위를 gbox 로 좁히는 것이 안전한 이유는 ver1619 와 같다: source-in 은 그리지 않은 곳의
         // 목적지를 지우지만, gbox 밖은 획이 지나가지 않아 이미 비어 있다. 색 장은 캔버스 한 장
         // 통째(원화 8.7MB)라 전체 복사와 획 범위 복사의 차이가 그대로 프레임 비용이 된다.
-        if (s.colorField) {
-          if (gbox) sc.ctx.drawImage(s.colorField, bx, by, bw, bh, bx, by, bw, bh);
-          else sc.ctx.drawImage(s.colorField, 0, 0);
-        } else {
-          sc.ctx.fillStyle = color || '#111111';
-          sc.ctx.fillRect(bx, by, bw, bh);
-        }
+        if (s.colorField) sc.ctx.drawImage(s.colorField, wx, wy, ww, wh, wx, wy, ww, wh);
+        else { sc.ctx.fillStyle = color || '#111111'; sc.ctx.fillRect(wx, wy, ww, wh); }
         sc.ctx.globalCompositeOperation = 'source-over';
       } else if (alphaFor && s && s.inkMode && paintInkFieldToAlpha(sc, s, w, h, color)) {
         // ver1370: 필터가 없는 브라우저(iOS/WebKit)도 **같은 잉크 장**을 쓴다 — 휘도→알파만 JS로 옮긴다.
@@ -53931,8 +53966,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (pts.length) flatAlpha = sum / pts.length;
       } else if (s) {
-        if (gbox) sc.ctx.drawImage(s.cv, bx, by, bw, bh, bx, by, bw, bh); // ver1619
-        else sc.ctx.drawImage(s.cv, 0, 0);
+        sc.ctx.drawImage(s.cv, wx, wy, ww, wh, wx, wy, ww, wh); // ver1619/1629
       } else {
         paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
       }
@@ -53947,14 +53981,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             pat.setTransform(new DOMMatrix([k, 0, 0, k, -(Number(grain.originX) || 0), -(Number(grain.originY) || 0)]));
           }
           sc.ctx.fillStyle = pat;
-          sc.ctx.fillRect(bx, by, bw, bh); // ver1619: destination-in — box 밖은 방금 비워 둔 자리다
+          // ver1619/1629: destination-in — 작업 구역 밖은 방금 클리어했거나(전체) clip 이 지키고 있다(증분).
+          sc.ctx.fillRect(wx, wy, ww, wh);
         }
         sc.ctx.globalCompositeOperation = 'source-over';
       }
+      sc.ctx.restore();   // ver1629: clip 해제
       const prevAlpha = ctx.globalAlpha;
       if (flatAlpha !== 1) ctx.globalAlpha = prevAlpha * flatAlpha; // ver1346: 장이 없을 때의 물러섬
-      if (gbox) ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // ver1619
-      else ctx.drawImage(sc.cv, 0, 0);
+      // 최종 blit 은 **획 전체**다 — 목적지(ctx)는 프레임마다 비워지므로 증분이 성립하지 않는다.
+      ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // ver1619
       ctx.globalAlpha = prevAlpha;
     }
     // ver1619: 그레인 합성이 훑을 구역. 세션이 쌓아 둔 범위가 있으면 그것이 정확하고, 없으면 점과
@@ -54155,6 +54191,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.av = [];
         s.done = 0;
         s.box = null; // ver1370: 이 스트로크가 장에서 실제로 건드린 범위(휘도→알파를 JS로 옮길 때의 작업 구역)
+        s.newBox = null; // ver1629: **이번 호출**에 새로 찍은 범위(그레인 증분 합성의 작업 구역)
         // ver1625: 혼색. **아래 색은 여기서 한 번만 읽는다** — 세션 수명이 곧 획 수명이라 이 자리가
         // 「획 시작 전」의 유일한 정의다. 라이브는 ctx 가 버퍼(빈 캔버스)라 아래 색이 host 에 있고
         // (conte: op.modeBaseCanvas · genga: sess.shapeBase, 둘 다 획 시작 때 뜬 레이어 스냅샷),
@@ -54206,19 +54243,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 옮겨야 하는 브라우저(iOS/WebKit)에서 훑을 구역이 이것 — 캔버스 전체가 아니라 획이 지나간 곳만.
         if (grew) {
           const b = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx);
+          // ver1629: 스탬퍼가 돌려주는 것이 **이번 호출이 건드린 범위**다 — 그레인 증분이 다시 만들
+          // 구역이 정확히 이것이다. s.box 는 그것들의 합집합(스트로크 전체)이라 쓰임이 다르다.
+          s.newBox = b ? paintStrokeScratchBox(b, null, null, w, h) : null;
           if (b) {
             s.box = s.box
               ? { x0: Math.min(s.box.x0, b.x0), y0: Math.min(s.box.y0, b.y0),
                   x1: Math.max(s.box.x1, b.x1), y1: Math.max(s.box.y1, b.y1) }
               : b;
           }
-        }
+        } else s.newBox = null;
       } else if (grew) {
+        // ver1629: 이번에 새로 들어온 점들의 범위 = 이번 프레임에 dab 이 찍힐 범위. 직전 점 하나를
+        // 포함해야 한다 — dab 은 **점과 점 사이**에 놓이므로, 새 점만 재면 그 앞 구간이 빠진다.
+        const from = Math.max(0, s.done - 1);
+        s.newBox = paintStrokeScratchBox(null, pts.slice(from), radii.slice(from), w, h);
         // ver1625: 혼색이면 dab 마다 틴트하므로 **원본 팁**을 넘긴다(미리 틴트하면 그 색을 다시
         // 덮어쓰는 헛일이 된다). 아니면 종전대로 한 번 틴트한 한 장.
         paintStampTexturedPath(cx, pts, radii, s.mixTipFor ? tipImage : paintTintedTip(tipImage, color),
           opts.tip, s.walk, s.mixTipFor);
-      }
+      } else s.newBox = null;
       s.done = n;
       return s;
     }
