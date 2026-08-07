@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1641</title>
+  <title>MoArt ver1642</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -52276,6 +52276,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 비원형 팁을 "돌리는" 값이다. Apple Pencil/최신 Chromium은 azimuthAngle(라디안, +x에서 반시계),
     // Wacom/Windows Ink는 tiltX/tiltY로 방향을 유도할 수 있다. 도(deg) 0..359로 정규화, pen 전용.
     // 기기가 방위를 전혀 안 주면 null — 호출부가 'off'로 강등한다(추측한 각도로 마크를 돌리지 않는다).
+    // ver1642: 방위(각도)의 보정. **새 커널을 만들지 않는다** — sin·cos 을 각각
+    // `paintStabilizeScalar` 에 태우고 `atan2` 로 되돌린다(원형 평균). 각도를 그냥 평균하면 0°↔359°
+    // 를 넘나드는 순간 **정반대 값**이 나오기 때문이다(단순 평균 179.5° vs 원형 평균 359.5°).
+    // sin·cos 은 -1..1 이라 0..1 로 접는 `paintStabilizeAux` 를 못 쓰고 스칼라 커널을 직접 부른다 —
+    // 창은 좌표·필압·기울기와 **같은 값**이라 네 축의 지연이 그대로 맞는다.
+    // 기기가 방위를 안 주면(대부분) null 이 그대로 지나가 아무 일도 일어나지 않는다.
+    function paintStabilizeAzimuth(host, deg) {
+      if (deg == null || !host) return deg;
+      const level = paintStabilizerVal();
+      if (!level) { host.azSin = null; host.azCos = null; return deg; }
+      const r = (Number(deg) || 0) * Math.PI / 180;
+      const s = Math.sin(r), c = Math.cos(r);
+      if (!host.azSin) { host.azSin = paintStabilizeAxis(s); host.azCos = paintStabilizeAxis(c); }
+      const half = Math.max(1, Math.round((1 + level * 2) / 2));
+      const ms = paintStabilizeScalar(host.azSin, s, half);
+      const mc = paintStabilizeScalar(host.azCos, c, half);
+      if (ms === 0 && mc === 0) return deg;   // 정반대 값들이 상쇄된 드문 경우 — 원본을 그대로 쓴다
+      return ((Math.atan2(ms, mc) * 180 / Math.PI) % 360 + 360) % 360;
+    }
     function paintSampleAzimuthDeg(ev) {
       if (!ev || ev.pointerType !== 'pen') return null;
       if (typeof ev.azimuthAngle === 'number' && Number.isFinite(ev.azimuthAngle)) {
@@ -52417,7 +52436,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         pointObj.t = paintStabilizeAux(stroke, 't', paintSampleTiltNorm(sampleEvent), 0);
       }
       if (stroke && stroke.tipRotate === 'azimuth' && sampleEvent) { // ver1335: 방위 추종일 때만 싣는다
-        const az = paintSampleAzimuthDeg(sampleEvent);
+        const az = paintStabilizeAzimuth(stroke, paintSampleAzimuthDeg(sampleEvent)); // ver1642
         if (az != null) pointObj.a = az;
       }
       return pointObj;
@@ -81321,7 +81340,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 공용 커널로 옮겼다. 좌표·필압과 같은 창이라 세 축의 지연이 맞는다.
         penSess.smoothT = paintStabilizeAux(penSess, 't', paintSampleTiltNorm(sample), 0);
         const useTilt = penSess.smoothT;
-        const useAz = penSess.azOn ? paintSampleAzimuthDeg(sample) : null; // ver1345: 방위(方位 추종 팁 전용)
+        const useAz = penSess.azOn ? paintStabilizeAzimuth(penSess, paintSampleAzimuthDeg(sample)) : null; // ver1345/1642
         if (penSess.penOutline) { // ver621: outline mode just accumulates; ONE whole redraw after the loop
           // ver1328 ①: accumulate RESAMPLED points (uniform arc-length + interpolated pressure), not raw
           const emitted = paintArcResampleEmit(penSess.arc, p.x, p.y, usePressure, useTilt, useAz);
