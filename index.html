@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1620</title>
+  <title>MoArt ver1621</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22332,6 +22332,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1621, items: [
+        { ja: '**.sut ブラシの筆圧設定も読み込むようになりました** — 筆圧でサイズを変えるか、不透明度を変えるか、そして「最小サイズ」まで元のブラシのまま入ります。読み取った値と、まだ移せない項目（筆圧カーブの形など）はブラシ一覧の備考に出ます。', ko: '**.sut 브러시의 필압 설정도 불러옵니다** — 필압으로 크기를 바꿀지, 불투명도를 바꿀지, 그리고 「최소 크기」까지 원래 브러시 그대로 들어옵니다. 읽어 온 값과 아직 못 옮기는 항목(필압 커브 모양 등)은 브러시 목록의 비고에 나옵니다.', en: '**Pressure settings now come across from .sut brushes too** — whether pressure drives size or opacity, and the minimum size, all as the original brush had them. What was read and what still cannot be carried over (the curve shape, for one) is listed in the brush entry notes.' },
+      ] },
       { ver: 1620, items: [
         { ja: '**2値化で描くときの重さを大きく減らしました。** 縁を硬くする処理をGPU側でやるようにしたので、太いブラシや大きな作画用紙でも引っかかりにくくなります。描かれる点は今までと同じです。', ko: '**2値化로 그릴 때의 무거움을 크게 줄였습니다.** 가장자리를 굳히는 처리를 GPU 쪽에서 하도록 바꿔, 굵은 브러시나 큰 작화 용지에서도 덜 걸립니다. 찍히는 점은 종전과 같습니다.', en: '**Drawing with hard edge is much lighter.** The edge-hardening pass now runs on the GPU instead of reading the canvas back pixel by pixel, so big brushes and large paper sizes stutter far less. The pixels it lays down are unchanged.' },
       ] },
@@ -52626,6 +52629,62 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       brushLibrarySetStatus((ref ? t('brushLib.imported') : t('brushLib.importedNoTip')) + fileName);
       return true;
     }
+    // ver1621: .sut 의 `Brush*Effector` BLOB — **필압·기울기 설정이 여기 산다.** ver1618 은 이것을
+    // 「표본이 둘뿐이라 별건」으로 남겼는데, 구조는 KennethEvans/VS-CSPBrushInfo(CSPBrushParam.cs 의
+    // interpretEffector)가 이미 역설계해 두었다. CSP 공식 문서가 아니고 그 저자도 「CSP 버전에 따라
+    // 형식이 바뀐다」고 적어 두었으므로, 여기서도 **못 읽으면 조용히 포기**한다(값을 지어내지 않는다).
+    //
+    //   big-endian
+    //   [헤더 nHeader 바이트]  nHeader(40|44) · ? · usedFlag · pmin · tMin · vMax · rMin · ?·?·? · [tMax]
+    //   [섹션]  ? · nPoints · ?   그 뒤 (x,y) double 쌍 × nPoints      ← 섹션은 최대 두 벌
+    //   usedFlag 비트: 0x10 필압 · 0x20 기울기 · 0x40 속도 · 0x80 랜덤
+    //
+    // 손에 있는 .sut 9 개(27 개 Effector)를 이 구조로 읽으면 **헤더 길이가 nHeader 와 정확히 맞고
+    // 남는 바이트가 0** 이다 — 구조가 맞다는 첫 검산이다.
+    //
+    // 첫 섹션의 점들이 **필압→출력 곡선**(x=입력 0~1, y=출력 배율 0~1)이고, 그 **첫 점의 y 가 곧
+    // 최소 크기**다. 사용자가 같은 브러시의 최소 크기만 바꿔 저장한 세 파일이 그것을 못박았다:
+    // 오일 파스텔 (0,0.000) / 02 (0,0.252) / 03 (0,0.491) — 첫 점 y 말고는 한 바이트도 안 움직인다.
+    function paintSutParseEffector(blob) {
+      try {
+        const u8 = (blob instanceof Uint8Array) ? blob
+          : (blob && blob.buffer) ? new Uint8Array(blob.buffer, blob.byteOffset || 0, blob.byteLength)
+          : null;
+        if (!u8 || u8.length < 12) return null;
+        const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        let p = 0;
+        const u32 = function() { const v = dv.getUint32(p, false); p += 4; return v; };
+        const f64 = function() { const v = dv.getFloat64(p, false); p += 8; return v; };
+        const nHeader = u32();
+        if (nHeader !== 40 && nHeader !== 44) return null; // 아는 형식만 — 모르면 포기한다
+        if (u8.length < nHeader) return null;
+        u32();                       // undetermined2
+        const flag = u32();
+        const pmin = u32();
+        u32(); u32(); u32(); u32(); u32(); u32(); // tMin vMax rMin + undetermined 3
+        if (nHeader > 40) u32();     // tMax
+        if (p !== nHeader) return null;
+        const sections = [];
+        while (p + 12 <= u8.length) {
+          u32();                     // undetermined1
+          const n = u32();
+          u32();                     // undetermined3
+          if (!(n >= 0) || p + n * 16 > u8.length) { p -= 12; break; }
+          const pts = [];
+          for (let i = 0; i < n; i += 1) { const x = f64(); const y = f64(); pts.push({ x: x, y: y }); }
+          sections.push(pts);
+        }
+        return {
+          usesPressure: (flag & 0x10) !== 0,
+          usesTilt: (flag & 0x20) !== 0,
+          usesVelocity: (flag & 0x40) !== 0,
+          usesRandom: (flag & 0x80) !== 0,
+          pmin: pmin,
+          curve: sections[0] || null,
+          trailing: u8.length - p
+        };
+      } catch (error) { return null; }
+    }
     // ver1618: .sut Variant → 앱 브러시 설정. ver1332 는 리더를 다 만들어 놓고 **Opacity 하나만**
     // 적용했다 — 나머지 109 컬럼은 console.info 로 찍고 notes 에 「미적용」이라 적을 뿐이었다.
     // CSP 는 이 스키마를 공개한 적이 없어(검색해도 컬럼 의미를 적은 자료가 없다) 값의 뜻은 **샘플에서
@@ -52656,6 +52715,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const ts = num(v.TextureScale2), td = num(v.TextureDensity);
         if (ts != null && ts > 0) { brush.paperTexScale = Math.max(25, Math.min(400, Math.round(ts))); notes.push('TextureScale2=' + ts + ' → 종이결 배율'); }
         if (td != null) { brush.paperTexDepth = Math.max(0, Math.min(100, Math.round(td))); notes.push('TextureDensity=' + td + ' → 종이결 농도'); }
+      }
+      // ver1621: 필압·기울기 — Effector BLOB 에서.
+      const sizeEff = paintSutParseEffector(v.BrushSizeEffector);
+      const opacEff = paintSutParseEffector(v.BrushOpacityEffector);
+      if (sizeEff) {
+        brush.pSize = !!sizeEff.usesPressure;
+        notes.push('BrushSizeEffector: 筆圧→サイズ ' + (sizeEff.usesPressure ? 'ON' : 'OFF')
+          + (sizeEff.usesTilt ? ' · 傾き도 씀' : '') + (sizeEff.usesVelocity ? ' · 속도도 씀' : ''));
+        // 곡선 첫 점의 y = 필압 0 에서의 출력 = 최소 크기. (오일 파스텔 3 형제가 이것만 다르다)
+        if (sizeEff.usesPressure && sizeEff.curve && sizeEff.curve.length) {
+          const y0 = Number(sizeEff.curve[0].y);
+          if (Number.isFinite(y0)) {
+            brush.pMin = Math.max(0, Math.min(100, Math.round(y0 * 100)));
+            notes.push('필압 곡선 첫 점 y=' + y0.toFixed(3) + ' → 최소 크기 ' + brush.pMin + '%');
+          }
+          // 곡선 전체는 앱의 -2~2 단계로 옮기기에는 정보가 남는다 — 모양만 적어 둔다.
+          notes.push('필압 곡선(' + sizeEff.curve.length + '점): '
+            + sizeEff.curve.map(function(pt) { return '(' + pt.x.toFixed(2) + ',' + pt.y.toFixed(2) + ')'; }).join(' ')
+            + ' (앱의 커브 단계로는 미적용)');
+        }
+        if (sizeEff.usesTilt) notes.push('기울기→사이즈를 쓰는 브러시 (앱의 傾き 값은 추정 근거가 없어 미적용)');
+      }
+      if (opacEff) {
+        brush.pAlpha = !!opacEff.usesPressure;
+        notes.push('BrushOpacityEffector: 筆圧→不透明度 ' + (opacEff.usesPressure ? 'ON' : 'OFF')
+          + (opacEff.usesVelocity ? ' · 속도도 씀' : '') + (opacEff.usesRandom ? ' · 랜덤도 씀' : ''));
       }
       // 앱에 대응 항목이 없는 것들 — 값이 있었다는 사실만 남긴다(다음에 항목이 생기면 여기부터 본다).
       const aa = num(v.AntiAlias);
