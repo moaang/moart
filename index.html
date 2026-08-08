@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1660</title>
+  <title>MoArt ver1662</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22241,6 +22241,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1662, items: [
+        { ja: '**指で描けなくなっていたのを直しました（ver1658〜1660 の不具合）。** 指は「動かしたとき」に描き始める方式にしたのですが、iOS が最初の指をスクロール判定してしまうと動きの通知自体が来ず、いつまでも描き始めませんでした。待機の間もポインタを掴んでおくようにし、さらに動きが来なくても一定時間で描き始める保険を入れました。', ko: '**손가락으로 그릴 수 없게 됐던 것을 고쳤습니다(ver1658~1660 의 결함).** 손가락은 「움직일 때」 긋기 시작하는 방식으로 바꿨는데, iOS 가 첫 손가락을 스크롤로 판정해 버리면 움직임 통지 자체가 안 와서 영영 시작되지 않았습니다. 대기하는 동안에도 포인터를 붙잡아 두고, 움직임이 안 와도 일정 시간 뒤에는 긋기 시작하는 보험을 넣었습니다.', en: '**Fixed being unable to draw with a finger (a defect in ver1658–1660).** A finger now starts drawing when it moves, but if iOS decided the first finger was a scroll, the move notification never arrived and drawing never began. The pointer is now held during the wait, and a fallback starts the stroke even if no move arrives.' },
+      ] },
       { ver: 1660, items: [
         { ja: '**塗りつぶしの「はみ出し」を3・4pxにもできるようになりました。** 上限は前の版で4まで上がっていたのに、ゲージだけが2で止まっていて選べませんでした。', ko: '**페인트통의 「번짐」을 3·4px 로도 설정할 수 있습니다.** 상한은 지난 판에서 4 까지 올라갔는데 게이지만 2 에 멈춰 있어 고를 수 없었습니다.', en: '**Bucket fill expand can now be set to 3 or 4 px.** The limit was raised to 4 in an earlier release, but the gauge stayed at 2 so those values were unreachable.' },
       ] },
@@ -50633,19 +50636,35 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 비운 상태로 begin 에 들어가면 그 맨 앞의 게이트가 **새 보류를 만들고 또 return** 해서
     // 손가락 그리기가 통째로 죽는다(ver1658 회귀. 실측이 begin 을 스파이로 갈아끼워 그 재진입을
     // 못 봤다 — 함수를 대체하는 스파이는 그 함수 안의 게이트를 안 탄다).
-    const fingerDrawPending = { key: null, ev: null, id: -1, replaying: false };
+    const fingerDrawPending = { key: null, ev: null, id: -1, replaying: false, timer: 0 };
+    // ver1661: **안전망.** 이 방식은 「첫 move 가 온다」를 전제로 하는데, iOS 는 터치를 스크롤/제스처로
+    // 판정하면 move 를 아예 안 주고 pointercancel 만 보낼 수 있다. 그러면 보류가 버려져 「손가락으로
+    // 아예 안 그려진다」가 된다 — 실제로 ver1658~1660 이 그 상태였다. 그래서 보류가 이 시간 안에
+    // 승격도 폐기도 안 되면 **스스로 승격**한다. 두 손가락 탭은 두 번째 손가락이 훨씬 먼저 닿으므로
+    // (사람 손은 보통 10~40ms) 이 타이머가 그것을 살려 내지는 않는다.
+    const FINGER_DRAW_ARM_FALLBACK_MS = 120;
     function fingerDrawPendingClear() {
+      if (fingerDrawPending.timer) { clearTimeout(fingerDrawPending.timer); fingerDrawPending.timer = 0; }
       fingerDrawPending.key = null; fingerDrawPending.ev = null; fingerDrawPending.id = -1;
     }
     // 호출부는 true 를 받으면 **거기서 return** 한다(이번 down 으로는 아무것도 시작하지 않는다).
     function fingerDrawDeferBegin(ev, key) {
       if (fingerDrawPending.replaying) return false;   // 재생된 down — 여기서 막으면 안 된다
       if (!ev || ev.pointerType !== 'touch') return false;
+      // ver1661: 보류하는 동안에도 **포인터를 붙잡아 둔다.** 기존 경로는 down 에서 곰바로
+      // begin → setPointerCapture 였기 때문에 이 문제가 없었다. 캐프처 없이 첫 move 를 기다리면
+      // iOS 가 그 터치를 스크롤/제스처로 가져가 **pointermove 가 오지 않고 pointercancel 이 온다** —
+      // 그러면 보류가 그대로 버려져 「손가락으로 아예 안 그려진다」가 된다(ver1658~1660 증상).
+      safePaintSetPointerCapture(ev.currentTarget || ev.target, ev.pointerId);
       if (fingerDrawPending.id >= 0 && fingerDrawPending.id !== ev.pointerId) {
         fingerDrawPendingClear();       // 두 번째 손가락 = 제스처다. 첫 손가락의 보류를 버린다
         return true;
       }
       fingerDrawPending.key = key; fingerDrawPending.ev = ev; fingerDrawPending.id = ev.pointerId;
+      fingerDrawPending.timer = setTimeout(function() {
+        fingerDrawPending.timer = 0;
+        if (fingerDrawPending.id === ev.pointerId) fingerDrawPromote(ev); // move 가 안 와도 살린다
+      }, FINGER_DRAW_ARM_FALLBACK_MS);
       return true;
     }
     function fingerDrawPromote(ev) {
@@ -61777,7 +61796,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (beginPaintMiddleClickPan(event, document.getElementById('memoCanvas'))) return;
       if (!state.memoMode || !memoPrimaryPointerDownAllowed(event)) return;
       if (event.pointerType === 'touch' && !fingerDrawingEnabled()) return; // ver728: finger-draw OFF → paper page-memo finger draw suppressed (paper pinch rides its own PointerEvent registry since ver835, still works)
-      if (fingerDrawDeferBegin(event, 'paper')) return; // ver1658: 손가락은 움직일 때 시작
+      if (fingerDrawDeferBegin(event, 'paper')) { if (event.cancelable) event.preventDefault(); return; } // ver1658 / ver1661
       if (state.paintRasterOp) {
         // ver608: a video-side pending curve chord left behind (e.g. after a mode switch) must not
         // block paper input — discard it and continue; a live op still blocks as before.
