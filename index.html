@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1666</title>
+  <title>MoArt ver1667</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -38932,12 +38932,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 사용자에게는 「두 손가락 탭이 안 먹는다」로 보인다(가이드가 그 조건을 적어 두고 설정으로
     // 우회하게 했는데, 폰은 그 설정을 끌 수 없어 우회로가 아예 없었다).
     // 탭 판정 자체에는 finger-draw 게이트가 없다 — 막힌 적은 없고, 결과가 상쇄됐을 뿐이다.
-    function twoFingerGestureEnd() {
+    function twoFingerGestureEnd(cancelStroke) {
       const c = twoFingerTapCandidate;
       twoFingerTapCandidate = null;
       if (!c || c.moved) return null;
       const now = Date.now();
       if (now - c.t > TWO_FINGER_TAP_MAX_MS) return null;
+      // ver1667: 탭이 확정된 뒤 · undo 전에 첫 손가락의 획을 버린다.
+      // ver1658~1664 는 「손가락은 움직일 때 시작」으로 이 프레임을 없애려 했으나 iOS 에서
+      // 성립하지 않는다(조사로 확인): 소유권 판정은 touch 레이어에서 touchstart 처리가 끝나는
+      // 순간 이미 내려지고, pointerdown 의 preventDefault 는 viewport 조작을 못 막으며(스펙 명시),
+      // 터치는 pointerdown 에서 implicit capture 가 이미 걸려 setPointerCapture 는 no-op 이다. 타이머
+      // 폴백은 touch 핸들러의 동기 창 밖이라 판정을 되돌리지 못한다. 대안은 「입력은 즉시,
+      // 출력만 유예」다 — WebKit 의 제스처 판정은 렌더링을 보지 않는다.
+      if (typeof cancelStroke === 'function') cancelStroke();
       // ver1658: ver1655 가 여기서 획을 버리던 훅은 사라졌다 — 손가락은 이제 움직여야 긋기
       // 시작하므로 두 손가락 탭에는 **버릴 획이 애초에 없다**. 호출부의 인자도 함께 지웠다.
       if (now - twoFingerLastTapAt <= TWO_FINGER_DOUBLE_TAP_MS) {
@@ -38984,8 +38992,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Draining is safe precisely BECAUSE a tap fired: a tap means the fingers are coming off, and
     // twoFingerGestureEnd returns null for any gesture that MOVED — so a live pinch, where lifting one
     // finger and setting it back down has to resume the zoom, keeps its entries untouched.
-    function twoFingerGestureEndDraining(map) {
-      const acted = twoFingerGestureEnd();
+    function twoFingerGestureEndDraining(map, cancelStroke) {
+      const acted = twoFingerGestureEnd(cancelStroke);
       if (acted && map) map.clear();
       return acted;
     }
@@ -39075,7 +39083,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       videoPreviewPinch = null;
       // a cancelled gesture is never a tap; a clean lift may be one (ver837)
       if (evType === 'pointercancel') twoFingerGestureClear();
-      else twoFingerGestureEndDraining(videoPreviewPointers); // ver1104
+      else twoFingerGestureEndDraining(videoPreviewPointers, conteCancelSingleFingerOpsForGesture); // ver1104 / ver1667
       saveEditorUiState();
     }
     function bindVideoPreviewPinchZoom(stage) {
@@ -50644,75 +50652,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver1657: Shift 직선의 정위치 스냅 허용각. 뷰 회전의 VIEW_ROT_SNAP_RAD(5도)보다 좁다 —
     // 그림은 원하는 각도로 긋는 것이 먼저고, 가로·세로만 거들면 된다.
     const PAINT_LINE_QUARTER_SNAP_RAD = 3 * Math.PI / 180;
-    // ── ver1658: 손가락은 「움직일 때」 그리기를 시작한다 ───────────────────────────────────
-    // 손가락이 닿는 순간에는 그것이 「한 손가락 그리기」인지 「두 손가락 제스처(탭·핀치·줌·비틀기·
-    // 팬)의 첫 손가락」인지 **알 수 없다.** ver1655 까지는 일단 긋고 나중에 되돌렸는데, 되돌리기
-    // 전 한 프레임이 화면에 남아 「두 손가락 탭하면 브러시 점이 한순간 보인다」가 됐다(사용자 실기).
-    //
-    // 그래서 순서를 뒤집는다: down 에서는 **보류만** 하고, 첫 move 에서 그 down 을 그대로 재생해
-    // 시작한다. 두 번째 손가락이 닿으면 보류를 버린다 — **그린 적이 없으므로 취소할 것도 없다.**
-    // 움직임 없이 뗐으면(=탭) 그 순간 재생해 점 하나를 찍는다. 그래서 지연은 0 이고 점 찍기도 산다.
-    //
-    // 펜·마우스는 두 손가락 제스처를 만들지 않으므로 예전처럼 즉시 시작한다.
-    // replaying: 재생 중인 down 은 이 게이트를 **그냥 통과**해야 한다. 비우기만 해서는 안 된다 —
-    // 비운 상태로 begin 에 들어가면 그 맨 앞의 게이트가 **새 보류를 만들고 또 return** 해서
-    // 손가락 그리기가 통째로 죽는다(ver1658 회귀. 실측이 begin 을 스파이로 갈아끼워 그 재진입을
-    // 못 봤다 — 함수를 대체하는 스파이는 그 함수 안의 게이트를 안 탄다).
-    const fingerDrawPending = { key: null, ev: null, id: -1, replaying: false, timer: 0 };
-    // ver1661: **안전망.** 이 방식은 「첫 move 가 온다」를 전제로 하는데, iOS 는 터치를 스크롤/제스처로
-    // 판정하면 move 를 아예 안 주고 pointercancel 만 보낼 수 있다. 그러면 보류가 버려져 「손가락으로
-    // 아예 안 그려진다」가 된다 — 실제로 ver1658~1660 이 그 상태였다. 그래서 보류가 이 시간 안에
-    // 승격도 폐기도 안 되면 **스스로 승격**한다. 두 손가락 탭은 두 번째 손가락이 훨씬 먼저 닿으므로
-    // (사람 손은 보통 10~40ms) 이 타이머가 그것을 살려 내지는 않는다.
-    const FINGER_DRAW_ARM_FALLBACK_MS = 120;
-    // ver1664: 보류 중에도 「그리는 중」과 **똑같이** 취급해야 하는 자리가 있다 — iOS 의 touchmove
-    // 가드가 그것이다. 아래 두 가드는 지금까지 state.paintRasterOp(=획이 이미 시작됨)만 봤는데,
-    // 시작을 첫 move 로 미루면 그 순간 paintRasterOp 가 없어 preventDefault 를 안 하고, WebKit 이
-    // **그 자리에서 스크롤로 판정해 포인터를 가져간다**. 그래서 pointermove 가 영영 안 오고
-    // (폴백 타이머로 begin 을 불러도 후속 이벤트가 캔버스에 닿지 않는다) 손가락 그리기가 죽었다.
-    // ver1658~1662 가 세 판 연속 실패한 진짜 이유다 — setPointerCapture 로는 못 막는다.
-    function fingerDrawIsPending() { return fingerDrawPending.id >= 0; }
-    function fingerDrawPendingClear() {
-      if (fingerDrawPending.timer) { clearTimeout(fingerDrawPending.timer); fingerDrawPending.timer = 0; }
-      fingerDrawPending.key = null; fingerDrawPending.ev = null; fingerDrawPending.id = -1;
-    }
-    // 호출부는 true 를 받으면 **거기서 return** 한다(이번 down 으로는 아무것도 시작하지 않는다).
-    function fingerDrawDeferBegin(ev, key) {
-      if (fingerDrawPending.replaying) return false;   // 재생된 down — 여기서 막으면 안 된다
-      if (!ev || ev.pointerType !== 'touch') return false;
-      // ver1661: 보류하는 동안에도 **포인터를 붙잡아 둔다.** 기존 경로는 down 에서 곰바로
-      // begin → setPointerCapture 였기 때문에 이 문제가 없었다. 캐프처 없이 첫 move 를 기다리면
-      // iOS 가 그 터치를 스크롤/제스처로 가져가 **pointermove 가 오지 않고 pointercancel 이 온다** —
-      // 그러면 보류가 그대로 버려져 「손가락으로 아예 안 그려진다」가 된다(ver1658~1660 증상).
-      safePaintSetPointerCapture(ev.currentTarget || ev.target, ev.pointerId);
-      if (fingerDrawPending.id >= 0 && fingerDrawPending.id !== ev.pointerId) {
-        fingerDrawPendingClear();       // 두 번째 손가락 = 제스처다. 첫 손가락의 보류를 버린다
-        return true;
-      }
-      fingerDrawPending.key = key; fingerDrawPending.ev = ev; fingerDrawPending.id = ev.pointerId;
-      fingerDrawPending.timer = setTimeout(function() {
-        fingerDrawPending.timer = 0;
-        if (fingerDrawPending.id === ev.pointerId) fingerDrawPromote(ev); // move 가 안 와도 살린다
-      }, FINGER_DRAW_ARM_FALLBACK_MS);
-      return true;
-    }
-    function fingerDrawPromote(ev) {
-      if (!ev || fingerDrawPending.id < 0 || fingerDrawPending.id !== ev.pointerId) return false;
-      const key = fingerDrawPending.key, down = fingerDrawPending.ev;
-      fingerDrawPendingClear();
-      fingerDrawPending.replaying = true;
-      try {
-        if (key === 'paper') beginPaintStroke(down);
-        else if (key === 'video') beginVideoPaintStroke(down);
-        else if (key === 'genga') gengaDrawStart(down);
-      } finally { fingerDrawPending.replaying = false; }
-      return true;
-    }
-    function fingerDrawPromoteFromDocument(ev) { fingerDrawPromote(ev); }
-    function fingerDrawCancelFromDocument(ev) {
-      if (ev && fingerDrawPending.id === ev.pointerId) fingerDrawPendingClear();
-    }
-
     function paintShiftLineConstrain(sess, point, shiftOn, lastPoint, sx, sy) {
       if (!sess || !point) return point;
       if (!shiftOn) { sess.shiftLine = null; return point; } // 떼면 잠금과 앵커를 함께 버린다
@@ -61288,7 +61227,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       paperPinch = null;
       // a cancelled gesture is never a tap; a clean lift may be one (ver837)
       if (evType === 'pointercancel') twoFingerGestureClear();
-      else twoFingerGestureEndDraining(paperPointers); // ver1104
+      else twoFingerGestureEndDraining(paperPointers, conteCancelSingleFingerOpsForGesture); // ver1104 / ver1667
       saveEditorUiState();
     }
     function stepPaperZoom(direction) {
@@ -61825,7 +61764,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (beginPaintMiddleClickPan(event, document.getElementById('memoCanvas'))) return;
       if (!state.memoMode || !memoPrimaryPointerDownAllowed(event)) return;
       if (event.pointerType === 'touch' && !fingerDrawingEnabled()) return; // ver728: finger-draw OFF → paper page-memo finger draw suppressed (paper pinch rides its own PointerEvent registry since ver835, still works)
-      if (fingerDrawDeferBegin(event, 'paper')) { if (event.cancelable) event.preventDefault(); return; } // ver1658 / ver1661
       if (state.paintRasterOp) {
         // ver608: a video-side pending curve chord left behind (e.g. after a mode switch) must not
         // block paper input — discard it and continue; a live op still blocks as before.
@@ -62296,7 +62234,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 2-finger pinch/pan (bindVideoPreviewPinchZoom, its own PointerEvent registry since ver842) still work; only the
       // stroke/edit is suppressed. Pencil (pointerType 'pen') and mouse are never gated.
       if (event.pointerType === 'touch' && !fingerDrawingEnabled()) { event.preventDefault(); event.stopPropagation(); return; }
-      if (fingerDrawDeferBegin(event, 'video')) { event.preventDefault(); event.stopPropagation(); return; } // ver1658
       event.preventDefault();
       event.stopPropagation();
       const canvas = ensureVideoPreviewReadyForDrawing(event.currentTarget);
@@ -62590,7 +62527,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // Guard touchmove only — that is the cancelable event driving WebKit's scroll decision.
       // Avoid touchstart/touchend so the pointer-event pipeline (which does the drawing) is untouched.
       canvas.addEventListener('touchmove', function(event) {
-        if (!paintInteractionActive() && !fingerDrawIsPending()) return; // ver1664
+        if (!paintInteractionActive()) return;
         if (event.cancelable) event.preventDefault();
       }, { passive: false });
     }
@@ -66607,10 +66544,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver535: the five paint-window drags run through beginPanelDrag (kernel owns move/up/cancel)
       document.addEventListener('pointermove', continuePaintSpacePan);
       document.addEventListener('pointermove', continuePaintTransformDocument);
-      // ver1658: 승격은 획 종료 **앞에** 서야 한다 — 움직임 없이 뗀 탭이 여기서 점 하나가 된다.
-      document.addEventListener('pointermove', fingerDrawPromoteFromDocument, true);
-      document.addEventListener('pointerup', fingerDrawPromoteFromDocument, true);
-      document.addEventListener('pointercancel', fingerDrawCancelFromDocument, true);
       document.addEventListener('pointerup', endActivePaintRasterStrokeFromDocument, true);
       document.addEventListener('pointerup', function(event) { endPaintSpacePan(event, null); });
       document.addEventListener('pointerup', endPaintTransformDocument);
@@ -66896,7 +66829,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const paintDrawStage = document.querySelector('.editor-stage');
       if (paintDrawStage) {
         paintDrawStage.addEventListener('touchmove', function(event) {
-          if ((state.paintRasterOp || fingerDrawIsPending()) && event.cancelable) event.preventDefault(); // ver1664
+          if (state.paintRasterOp && event.cancelable) event.preventDefault();
         }, { passive: false });
       }
       document.addEventListener('pointermove', continueCameraFrameDrag);
@@ -81157,7 +81090,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // margin flip (above) still fire; everything below (stroke, lasso, transform, stamp, eyedropper) is
       // suppressed for a finger. Pencil is never gated — it still draws/edits normally.
       if (ev.pointerType === 'touch' && !fingerDrawingEnabled()) { if (ev.cancelable) ev.preventDefault(); return; }
-      if (fingerDrawDeferBegin(ev, 'genga')) { if (ev.cancelable) ev.preventDefault(); return; } // ver1658
       // ver747: middle-drag OR pan-key held = pan the preview — now the SAME shared trigger conte uses
       // (state.paintSpacePanActive armed by the shared keydown listener, which already respects
       // state.shortcuts.canvasPan as of ver746). Inherits conte's document-level pointerup/pointercancel +
@@ -81616,7 +81548,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaPinch = null;
       // ver837: clean lift → two-finger tap (undo) / double-tap (redo); a cancel is never a tap
       if (evType === 'pointercancel') twoFingerGestureClear();
-      else twoFingerGestureEndDraining(gengaPointers); // ver1104
+      else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps); // ver1104 / ver1667
     }
     function gengaDrawEnd(ev) {
       if (ev.pointerType === 'touch') gengaPointers.delete(ev.pointerId);
@@ -83699,7 +83631,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // iPad Apple Pencil fires pen PointerEvents AND TouchEvents; touch-action:none doesn't suppress the
     // pencil's touchmove, so WebKit's scroll/gesture decision eats the stroke + scrolls. Cancel it ourselves.
-    // ver1664: 보류 중에도 막아야 한다(.editor-stage 가드와 같은 이유 — 위 fingerDrawIsPending 주석).
     function gengaCanvasTouchGuard(ev) {
       // the preview canvas is a draw/gesture surface, never a scroll target. iPad Apple Pencil fires pen
       // PointerEvents + cancelable TouchEvents that touch-action:none doesn't suppress; if we don't cancel the
