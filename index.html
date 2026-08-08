@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1692</title>
+  <title>MoArt ver1693</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -15457,9 +15457,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'status.genga.paintMode.bucketVideoOnly': { ja: '塗りつぶしは映像編集モードで使用できます', ko: '채우기는 영상 편집 모드에서 사용할 수 있습니다', en: 'Fill is only available in video edit mode.' },
         'status.genga.paintMode.transformVideoOnly': { ja: '選択・変形ツールは映像編集モードで使用できます', ko: '선택・변형 도구는 영상 편집 모드에서 사용할 수 있습니다', en: 'Select/transform tools are only available in video edit mode.' },
         'status.genga.audioImport.decodeFailed': {
-          ja: function(fileName) { return '音声を取り出せませんでした: ' + fileName; },
-          ko: function(fileName) { return '오디오를 추출하지 못했습니다: ' + fileName; },
-          en: function(fileName) { return 'Could not extract audio: ' + fileName; },
+          // ver1693: 이유(why)를 함께 낸다. 종전에는 파일명만 나와서, 제보를 받아도 코덱인지 메모리인지
+          // AudioContext 상태인지 구분할 수 없었다.
+          ja: function(fileName, why) { return '音声を取り出せませんでした: ' + fileName + (why ? '（' + why + '）' : ''); },
+          ko: function(fileName, why) { return '오디오를 추출하지 못했습니다: ' + fileName + (why ? ' (' + why + ')' : ''); },
+          en: function(fileName, why) { return 'Could not extract audio: ' + fileName + (why ? ' (' + why + ')' : ''); },
         },
         'status.genga.micRecord.autoStopped': {
           ja: function(reason) { return '録音を自動停止（' + reason + '）'; },
@@ -22374,6 +22376,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1693, items: [
+        { ja: '**音声・動画ファイルの読み込みに失敗したとき、何も出ずに終わっていました。**失敗した理由がその場に出るようにしました（原画の画面では表示先そのものがありませんでした）。', ko: '**오디오·영상 파일 읽기에 실패했을 때 아무것도 나오지 않고 끝났습니다.** 실패한 이유가 그 자리에 나오게 했습니다(원화 화면에는 표시될 곳 자체가 없었습니다).', en: '**When an audio or video file failed to load, nothing appeared at all.** The reason now shows up on the spot — in key animation there was no place for it to appear.' },
+      ] },
       { ver: 1692, items: [
         { ja: '**コンテでカメラのキーを打ってあると、フレーム中央を右クリックしても「位置リセット」が出ませんでした。**出るようにしました。', ko: '**콘티에서 카메라 키를 찍어 둔 상태면 프레임 중앙을 우클릭해도 「위치 리셋」이 나오지 않았습니다.** 나오게 했습니다.', en: '**Reset position did not appear when you right-clicked the camera frame centre in a storyboard that had camera keys.** It does now.' },
       ] },
@@ -70121,6 +70126,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     let gengaAudioStore = new Map();   // ref → dataURL
     let gengaAudioBuf = new Map();     // ref → AudioBuffer (decoded, lazy)
     let gengaAudioBufPending = new Map(); // ver842: ref → in-flight decode promise (mirrors conte's audioBufferPendingCache)
+    let gengaAudioDecodeError = new Map(); // ver1693: ref → 마지막 디코드 실패 이유 (삼키지 않고 남긴다)
     let gengaAudioRefSeq = 0;
     let gengaAudioCtx = null;
     function gengaAudioClipId() { return 'ac_' + Date.now().toString(36) + '_' + (gengaAudioRefSeq++).toString(36); }
@@ -70279,7 +70285,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           gengaAudioBuf.set(ref, buf);
           gengaTrimAudioBufCache(ref);
           return buf;
-        } catch (e) { return null; }
+        } catch (e) {
+          // ver1693: 종전에는 여기서 이유를 통째로 삼켰다(return null). 실패는 화면에 「추출 실패」로만
+          // 나타나 코덱·메모리·AudioContext 중 무엇인지 알 수 없었다. 조용한 실패 금지.
+          const why = (e && e.message ? e.message : String(e));
+          gengaAudioDecodeError.set(ref, why);
+          console.warn('[genga audio] decode failed', ref, why);
+          return null;
+        }
         finally { gengaAudioBufPending.delete(ref); }
       })();
       gengaAudioBufPending.set(ref, job);
@@ -70429,24 +70442,53 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       while (overlaps(t)) t++;
       return t;
     }
-    function gengaAddAudioFile(f, atFrame, track) {
+    function gengaReadFile(f, asDataUrl) { // FileReader 를 Promise 로 (거절 이유를 살려 둔다)
+      return new Promise(function(res, rej) {
+        const r = new FileReader();
+        r.onload = function() { res(r.result); };
+        r.onerror = function() { rej(r.error || new Error('file read failed')); };
+        if (asDataUrl) r.readAsDataURL(f); else r.readAsArrayBuffer(f);
+      });
+    }
+    // ver1693: **파일에서 바로 디코드해 본다.** 종전에는 base64 data URL 을 먼저 만들고(원본의 약
+    // 1.33 배 문자열) 그것을 fetch 로 다시 바이너리로 되돌려 디코드했다 — 실패해도 그 왕복을 전부
+    // 치른 뒤였고, 이유는 gengaDecodeAudio 의 catch 가 삼켜서 화면에는 「추출 실패」만 남았다.
+    // 이제 (a) 실패하면 그 자리에서 **이유와 함께** 멈추고 (b) base64 는 성공한 파일에만 만들며
+    // (c) 방금 디코드한 버퍼를 그대로 캐시에 넣어 **재디코드가 없다**.
+    async function gengaAddAudioFile(f, atFrame, track) {
       if (!f) return;
       const isMedia = /^(audio|video)\//.test(String(f.type || '')) || /\.(wav|mp3|m4a|aac|ogg|opus|flac|webm|mp4|mov|m4v)$/i.test(String(f.name || ''));
       if (!isMedia) return;
-      const rd = new FileReader();
-      rd.onload = function() {
-        const ref = gengaPutAudioData(rd.result);
-        gengaDecodeAudio(ref).then(function(buf) {
-          if (!buf) { state.timelineStatus = t('status.genga.audioImport.decodeFailed', f.name || ''); renderGengaView(); return; } // no decodable audio track
-          runCommand('音声追加', function(proj) {
-            const gt = proj.gengaTimeline; if (!Array.isArray(gt.audioClips)) gt.audioClips = [];
-            const sf = Math.max(1, Math.round(atFrame) || 1);
-            const tr = gengaAudioFreeTrack(gt, sf, buf.duration, track); // would overlap in the target lane → next free lane (created below when needed)
-            gt.audioClips.push({ id: gengaAudioClipId(), name: String(f.name || 'audio'), ref: ref, startFrame: sf, durationSec: Math.max(0.05, buf.duration), volume: 1, track: tr });
-          });
-        });
+      const fail = function(why) {
+        const msg = t('status.genga.audioImport.decodeFailed', f.name || '', why);
+        state.timelineStatus = msg;
+        // ver1693: **토스트로도 낸다.** 원화 화면에서 .timeline-status 는 콘티 타임라인 안에 있어
+        // display:none 조상 아래 숨는다(실측 rect 0x0) — 그래서 이 실패는 그동안 화면 어디에도
+        // 나오지 않았고, 사용자에게는 「넣었는데 아무 일도 안 일어남」이었다. 조용한 실패 금지.
+        showToast(msg, { warn: true });
+        console.warn('[genga audio] import failed', f.name, f.type, f.size, why);
+        renderGengaView();
       };
-      rd.readAsDataURL(f);
+      let buf = null;
+      try {
+        const ctx = gengaEnsureAudioCtx();
+        if (!ctx) throw new Error('AudioContext unavailable');
+        const ab = f.arrayBuffer ? await f.arrayBuffer() : await gengaReadFile(f, false);
+        buf = await new Promise(function(res, rej) { ctx.decodeAudioData(ab, res, rej); });
+      } catch (e) {
+        fail((e && e.message ? e.message : String(e))); return;
+      }
+      if (!buf) { fail('empty audio'); return; } // 디코드는 됐는데 트랙이 없다(영상만 든 파일 등)
+      let dataUrl = '';
+      try { dataUrl = await gengaReadFile(f, true); } catch (e) { fail((e && e.message ? e.message : String(e))); return; }
+      const ref = gengaPutAudioData(dataUrl);
+      gengaAudioBuf.set(ref, buf); gengaTrimAudioBufCache(ref); // 방금 디코드한 것 — 재생 때 다시 풀지 않는다
+      runCommand('音声追加', function(proj) {
+        const gt = proj.gengaTimeline; if (!Array.isArray(gt.audioClips)) gt.audioClips = [];
+        const sf = Math.max(1, Math.round(atFrame) || 1);
+        const tr = gengaAudioFreeTrack(gt, sf, buf.duration, track); // would overlap in the target lane → next free lane (created below when needed)
+        gt.audioClips.push({ id: gengaAudioClipId(), name: String(f.name || 'audio'), ref: ref, startFrame: sf, durationSec: Math.max(0.05, buf.duration), volume: 1, track: tr });
+      });
     }
     function gengaImportAudio() {
       const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'audio/*,video/*';
