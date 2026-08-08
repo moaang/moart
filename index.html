@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1668</title>
+  <title>MoArt ver1670</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22244,6 +22244,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1670, items: [
+        { ja: '**二本指でタップしたとき、ブラシの点が一瞬出てしまうのをなくしました。** 指で触れた瞬間の点だけを、指が動くまで画面に出さないようにしています。二本目の指が触れればそのまま消えるので、描いた跡が残りません。一本指で軽く叩く点打ちは今までどおりです。', ko: '**두 손가락으로 탭할 때 브러시 점이 한순간 보이던 것을 없앴습니다.** 손가락이 닿은 순간의 점만, 손가락이 움직일 때까지 화면에 내지 않습니다. 두 번째 손가락이 닿으면 그대로 사라지므로 그린 자국이 남지 않습니다. 한 손가락으로 톡 찍는 점 찍기는 종전대로입니다.', en: '**The brush dot no longer flashes when you tap with two fingers.** Only the very first dab is held back until the finger moves; if a second finger lands it is dropped, so nothing was ever drawn. Tapping once with a single finger still places a dot as before.' },
+      ] },
       { ver: 1668, items: [
         { ja: '**なげなわ選択・スタンプに「ぼかし」を追加しました。** 0 のときは今までどおりアンチエイリアスなしの硬い縁です。値を上げるとその分だけ縁が無くなります — アンチエイリアスの代わりではありません。ぼかしは内側にも広がるので、範囲が少し削れます。', ko: '**올가미 선택·스탬프에 「흐림」을 추가했습니다.** 0 일 때는 종전대로 안티에일리어싱 없는 단단한 가장자리입니다. 값을 올리면 그만큼 가장자리가 물러집니다 — 안티에일리어싱의 대체가 아닙니다. 흐림은 안쪽으로도 번지므로 범위가 조금 깎입니다.', en: '**Added Feather to the lasso selection and stamp.** At 0 the edge stays aliased exactly as before. Raising it softens the edge — but this is not a substitute for anti-aliasing: feather spreads inward as well, so the area shrinks a little.' },
       ] },
@@ -59272,16 +59275,41 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 는 위 ver1355 가드 완화로 1점 스트로크를 그릴 수 있고, drawPaintStroke의 1점 분기는 ver1354부터
       // 팁 인식 커널(paintFillVariableWidthBody)이다. rAF를 기다리지 않고 동기로 부른다 — 누른 순간
       // 보이는 것이 곧 최종 렌더다.
+      // ver1669: **입력은 즉시, 출력만 유예.** pointerdown 에서 begin·capture·preventDefault 는
+      // 종전과 **한 글자도 다르지 않게** 끝낸다(iOS 의 터치 소유권 판정은 touchstart 처리가 끝나는
+      // 순간 내려지므로, 그 창을 놓치면 그 터치는 스크롤로 넘어간다 — ver1658~1664 가 그렇게 네 판을
+      // 실패했다). 대신 **화면에 찍는 첫 dab 만** 첫 move 까지 미룬다. WebKit 의 제스처 판정은
+      // 렌더링을 보지 않으므로 이것은 안전하다.
+      // 두 손가락 탭이면 그 사이에 획이 통째로 폐기되고 **그린 적이 없어 점이 남지 않는다**
+      // (ver1655~1667 은 그려 놓고 되돌려서 한 프레임이 보였다).
+      // 도형은 원래 첫 move 까지 아무것도 안 그린다 — 같은 계약을 손가락 스트로크로 넓힌 것이다.
       if (!shapeKind) {
-        if (pressureOutline && state.paintRasterOp.modeBaseCanvas) {
-          if (state.paintRasterOp.allowExpand) ensurePaintRasterOpBounds(state.paintRasterOp, paintLayerPointsBounds([stroke.points[0]], paintStrokeLayerPadPx(stroke)));
-          paintShapePreviewRedraw(state.paintRasterOp);
-        } else {
-          drawCurrentLayerStrokeSegment(stroke, null, stroke.points[0]); // 팁·필압 없는 순수 원형 브러시: 원 dot이 곧 정답
-        }
+        if (event.pointerType === 'touch') state.paintRasterOp.pendingFirstDab = true;
+        else paintDrawFirstDab(state.paintRasterOp);
       } // shapes: nothing until the first move (preview handles it)
       updatePaintUndoRedoButtonsOnly();
       return true;
+    }
+
+    // ver1669: begin 이 찍던 첫 dab. 유예했다가 첫 move / 탭 종료에서 이 함수로 흡수한다 —
+    // **한 자리에서** 그려야 세 표면이 갈리지 않는다.
+    function paintDrawFirstDab(op) {
+      if (!op || !op.pendingFirstDab && op.firstDabDrawn) return;
+      op.pendingFirstDab = false;
+      op.firstDabDrawn = true;
+      const stroke = op.stroke;
+      if (!stroke || !stroke.points || !stroke.points.length) return;
+      if (paintStrokeWantsWholePath(stroke) && op.modeBaseCanvas) {
+        if (op.allowExpand) ensurePaintRasterOpBounds(op, paintLayerPointsBounds([stroke.points[0]], paintStrokeLayerPadPx(stroke)));
+        paintShapePreviewRedraw(op);
+      } else {
+        drawCurrentLayerStrokeSegment(stroke, null, stroke.points[0]); // 팁·필압 없는 순수 원형 브러시: 원 dot이 곧 정답
+      }
+    }
+    // 유예분이 남아 있으면 흡수한다. 세그먼트를 긋기 **전에** 불러야 첫 점이 빠지지 않는다.
+    function paintFlushPendingFirstDab() {
+      const op = state.paintRasterOp;
+      if (op && op.pendingFirstDab) paintDrawFirstDab(op);
     }
 
     function beginPaintLassoOp(event, canvas, layerTarget, localPoint) {
@@ -61980,7 +62008,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             const nextPoint = paintAttachPressure({ x: Number(evNextRaw.x) || 0, y: Number(evNextRaw.y) || 0 }, ev, state.paintCurrentStroke);
             state.paintCurrentStroke.points.push(nextPoint);
             if (outlineLive) outlineNewPts.push(nextPoint);
-            else drawCurrentLayerStrokeSegment(state.paintCurrentStroke, previousPoint, nextPoint);
+            else { paintFlushPendingFirstDab(); drawCurrentLayerStrokeSegment(state.paintCurrentStroke, previousPoint, nextPoint); } // ver1669
           }
         }
         if (outlineLive && outlineNewPts.length) {
@@ -62025,6 +62053,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       event.preventDefault();
       continuePaintStroke(event);
       cancelScheduledMemoCanvasRedraw();
+      paintFlushPendingFirstDab(); // ver1669: 움직임 없이 넙 탭 — 여기서 점 하나가 된다
       const op = state.paintRasterOp;
       const pointerId = event.pointerId;
       state.paintPointerId = null;
@@ -62372,7 +62401,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             const nextPoint = paintAttachPressure({ x: Number(evRaw.x) || 0, y: Number(evRaw.y) || 0 }, samples[i], state.paintCurrentStroke);
             state.paintCurrentStroke.points.push(nextPoint);
             if (outlineLive) outlineNewPts.push(nextPoint);
-            else drawCurrentLayerStrokeSegment(state.paintCurrentStroke, previousPoint, nextPoint);
+            else { paintFlushPendingFirstDab(); drawCurrentLayerStrokeSegment(state.paintCurrentStroke, previousPoint, nextPoint); } // ver1669
           }
         }
         if (outlineLive && outlineNewPts.length) {
@@ -62416,6 +62445,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       event.preventDefault();
       event.stopPropagation();
       continueVideoPaintStroke(event);
+      paintFlushPendingFirstDab(); // ver1669: 움직임 없이 넙 탭 — 여기서 점 하나가 된다
       const op = state.paintRasterOp;
       const pointerId = event.pointerId;
       state.paintPointerId = null;
@@ -81385,6 +81415,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // radius at baseWidth/2 (paintPressureCurve returns ≤ 1) and a per-segment width is Math.round of the
       // same product — so half the wider of {base, start} is the largest radius this session can produce.
       gengaScanMark(gengaDrawSession, p.x, p.y, Math.max(startWidth, c.lineWidth) / 2 + 1);
+      let gengaFirstDab = null;   // ver1669: 세 갈래 중 하나가 담긴다
       if (startStamp && startWidth !== c.lineWidth) gengaDrawSession.pxStampCache[String(startWidth)] = startStamp; // ver943: outline implies !startStamp, guard dropped
       if (penOpacity < 1 || penOutlineMode || gengaStrokeClipFor(gengaDrawSession) || (!eraser && paintBrushModeIsBlend(paintBrushModeVal())) || paintGrainActive(gengaDrawSession)) { // ver1337: 그레인도 버퍼 경로를 강제
         // ver869 (tool-unify G0): a real BLEND mode (multiply/screen/dodge/colorize) also forces the buffer path —
@@ -81413,17 +81444,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaDrawSession.shapeAlphaLock = Boolean(!eraser && layer.alphaLock);
         gengaDrawSession.shapeOpacity = penOpacity;
         gengaDrawSession.penColor = pb.fillStyle;
-        if (penOutlineMode) gengaPenOutlineRedraw(gengaDrawSession);
-        else {
-          if (startStamp) paintPixelStampAt(pb, startStamp, p.x, p.y);
-          else { pb.beginPath(); pb.arc(p.x, p.y, startWidth / 2, 0, Math.PI * 2); pb.fill(); }
-          gengaShapeComposite(gengaDrawSession);
-        }
+        gengaFirstDab = function() {
+          if (penOutlineMode) gengaPenOutlineRedraw(gengaDrawSession);
+          else {
+            if (startStamp) paintPixelStampAt(pb, startStamp, p.x, p.y);
+            else { pb.beginPath(); pb.arc(p.x, p.y, startWidth / 2, 0, Math.PI * 2); pb.fill(); }
+            gengaShapeComposite(gengaDrawSession);
+          }
+        };
       } else if (startStamp) {
-        paintPixelStampAt(c, startStamp, p.x, p.y);
+        gengaFirstDab = function() { paintPixelStampAt(c, startStamp, p.x, p.y); };
       } else {
-        c.beginPath(); c.arc(p.x, p.y, startWidth / 2, 0, Math.PI * 2); c.fill();
+        gengaFirstDab = function() { c.beginPath(); c.arc(p.x, p.y, startWidth / 2, 0, Math.PI * 2); c.fill(); };
       }
+      // ver1669: **입력은 즉시, 출력만 유예** — 아래 setPointerCapture·preventDefault 는 종전 그대로
+      // 이 프레임에서 끝난다(iOS 의 터치 소유권 판정 창을 놓치지 않는다). 화면에 찍는 첫 dab 만
+      // 첫 move 까지 미룬다. 두 손가락 탭이면 그 사이 세션이 폐기되어 **그린 적이 없다**.
+      if (ev.pointerType === 'touch') gengaDrawSession.pendingFirstDab = gengaFirstDab;
+      else gengaFirstDab();
       try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
       if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); } // ver994: drawing retargeted the layer — show which one
       drawGengaPreview();
@@ -81431,6 +81469,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ver621: whole-outline re-render for pressure pen strokes — clear the session buffer, trace the
     // variable-width outline from every accumulated point, fill once, composite over the base.
+    // ver1669: genga 쪽 유예분 흡수. conte 의 paintFlushPendingFirstDab 과 같은 계약이다 —
+    // 세그먼트를 긋기 **전에** 불러야 첫 점이 빠지지 않는다. 두 엔진이 같은 시점에 같은 일을 한다.
+    function gengaFlushPendingFirstDab() {
+      const s = gengaDrawSession;
+      if (!s || typeof s.pendingFirstDab !== 'function') return;
+      const f = s.pendingFirstDab;
+      s.pendingFirstDab = null;   // 먼저 비운다 — 재진입해도 두 번 찍히지 않는다
+      f();
+    }
     function gengaPenOutlineRedraw(sess) {
       if (!sess || !sess.shapeBuf || !Array.isArray(sess.pts) || !sess.pts.length) return;
       const b = sess.shapeBuf.getContext('2d');
@@ -81460,6 +81507,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaShapeComposite(sess);
     }
     function gengaDrawMove(ev) {
+      gengaFlushPendingFirstDab(); // ver1669: 세그먼트 전에 유예분을 흡수한다
       if (ev.pointerType === 'touch' && gengaPointers.has(ev.pointerId)) gengaPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
       if (gengaPinch) { if (gengaPointers.size >= 2) gengaPinchMove(); if (ev.cancelable) ev.preventDefault(); return; } // pinch owns it
       if (gengaFlipTouch && gengaFlipTouch.pointerId === ev.pointerId) { gengaFlipTouchMove(ev); return; }
@@ -81602,6 +81650,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps); // ver1104 / ver1667
     }
     function gengaDrawEnd(ev) {
+      gengaFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
       if (ev.pointerType === 'touch') gengaPointers.delete(ev.pointerId);
       if (gengaPinch) {
         if (gengaPointers.size < 2) teardownGengaPinch(ev.type); // ver840: shared teardown (tap decision lives there)
