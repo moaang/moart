@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1677</title>
+  <title>MoArt ver1678</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -39002,6 +39002,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 시간도 300 → 420ms. 롱프레스 메뉴가 520ms 에 시작하므로 그 앞에 여유가 남는다.
     const TWO_FINGER_TAP_MOVE_MAX = 16;   // px of midpoint travel (long-press canon cancels at 9px)
     const TWO_FINGER_TAP_MAX_MS = 420;    // a tap is brief; the long-press menu only starts at 520ms
+    // ver1678: 길게 누르기 전용 자 두 개.
+    // 시간 — 탭이 위 임계에서 끝나므로 그보다 조금만 길면 구분된다. 컨텍스트 메뉴의
+    // LONG_PRESS.delay(520ms) 를 쓰다가 「undo 는 진짜 순간인데 너무 길다」는 제보로 줄였다.
+    // **탭 임계에서 파생**시킨다 — 값을 두 벌 두면 갈라지고, 이 둘은 반드시 붙어 움직여야 한다.
+    const TWO_FINGER_LONG_PRESS_MS = TWO_FINGER_TAP_MAX_MS + 40;   // 460ms
+    // 이동 — 그만큼 대고 있으면 중점은 탭의 16px 을 거의 반드시 넘긴다. 그렇다고 핀치는
+    // 아니다(확대·회전은 이보다 훨씬 크게 움직인다).
+    const TWO_FINGER_LONG_PRESS_MOVE_MAX = 48;
     const TWO_FINGER_DOUBLE_TAP_MS = 350; // gap between the two taps of a double-tap
     let twoFingerTapCandidate = null;     // { t, x, y, moved, maxPoints }
     let twoFingerLastTapAt = 0;
@@ -39017,7 +39025,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 타이머·플래그가 통째로 사라져 구조도 줄었다. 대가는 누르는 동안 피드백이 없다는 것인데,
     // 두 손가락 탭 undo 도 원래 그렇다(일관적이다).
     function twoFingerGestureBegin(midX, midY) {
-      twoFingerTapCandidate = { t: Date.now(), x: Number(midX) || 0, y: Number(midY) || 0, moved: false, maxPoints: 2 };
+      twoFingerTapCandidate = { t: Date.now(), x: Number(midX) || 0, y: Number(midY) || 0, moved: false, maxPoints: 2, maxMove: 0 };
     }
     // ver1674: 제스처가 도중에 몇 손가락까지 갔는지 기억한다. 세 손가락은 거의 동시에 닿아도
     // 2 에서 begin 이 불린 뒤 3 이 되므로, begin 시점의 수만으로는 절대 3 을 볼 수 없다.
@@ -39034,7 +39042,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!c || c.moved) return false;
       // ver1671: 축별 비교였다 — 대각선으로 흔들리면 실질 임계가 √2 배(14px)라 방향에 따라
       // 판정이 갈렸다. 거리로 보면 어느 방향이든 같다.
-      if (Math.hypot((Number(midX) || 0) - c.x, (Number(midY) || 0) - c.y) > TWO_FINGER_TAP_MOVE_MAX) {
+      // ver1678: 불린 하나로는 「얼마나」를 잃는다. 길게 누르기는 탭보다 훨씬 크게 흔들리므로
+      // 실제 이동량이 있어야 판정할 수 있다.
+      const d = Math.hypot((Number(midX) || 0) - c.x, (Number(midY) || 0) - c.y);
+      if (d > c.maxMove) c.maxMove = d;
+      if (d > TWO_FINGER_TAP_MOVE_MAX) {
         c.moved = true;
         return true;
       }
@@ -39061,18 +39073,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver1671: 탭이 아니라고 판정한 **이유**를 남긴다. 조용히 null 만 돌려주면 실기에서
       // 「될 때가 있고 안 될 때가 있다」는 제보가 왔을 때 되물을 것밖에 없다(실제로 그랬다).
       if (!c) { state.twoFingerTapWhy = 'no-candidate'; return null; }
-      if (c.moved) { state.twoFingerTapWhy = 'moved'; return null; }
       const now = Date.now();
-      // ver1676: 길게 누르기 redo. 「느려서 탭이 아니다」로 죽이기 **전에** 본다 — 길게 누르기는
-      // 정의상 그 임계를 넘기므로, 뒤에 두면 영영 닿지 않는 분기가 된다.
-      // 지연은 LONG_PRESS.delay 를 그대로 쓴다: 값을 두 벌 두면 갈라지고, 사용자가 타임라인·
-      // 레이어에서 이미 익힌 「길게 누름」 감각과도 같아야 한다.
-      if (redoGestureMode() === 'long-press' && now - c.t >= LONG_PRESS.delay) {
-        state.twoFingerTapWhy = 'long-press-redo';
+      // ver1678: 길게 누르기 redo 는 **moved 게이트보다 앞**에서 본다. ver1676 은 뒤에 두었고
+      // 실기에서 아예 안 먹었다 — 당연하다. moved 는 탭의 임계(16px)이고, 두 손가락을 520ms 넘게
+      // 대고 있으면 그 정도는 거의 반드시 넘긴다. 탭의 자로 길게 누르기를 재고 있었던 것이다.
+      // 그래서 자를 따로 둔다: 시간은 TWO_FINGER_LONG_PRESS_MS, 이동은 TWO_FINGER_LONG_PRESS_MOVE_MAX.
+      // 그보다 크게 움직였으면 그건 정말로 핀치라 아래 moved 로 떨어진다.
+      // 판정 순서상 「느려서 탭이 아니다」보다도 앞이다 — 길게 누르기는 정의상 그 임계를 넘긴다.
+      if (redoGestureMode() === 'long-press'
+          && now - c.t >= TWO_FINGER_LONG_PRESS_MS && c.maxMove <= TWO_FINGER_LONG_PRESS_MOVE_MAX) {
+        state.twoFingerTapWhy = 'long-press-redo:' + Math.round(c.maxMove) + 'px';
         twoFingerLastTapAt = 0;
         runPrimaryRedo();
         return 'redo';
       }
+      if (c.moved) { state.twoFingerTapWhy = 'moved:' + Math.round(c.maxMove) + 'px'; return null; }
       if (now - c.t > TWO_FINGER_TAP_MAX_MS) {
         state.twoFingerTapWhy = 'slow:' + (now - c.t) + 'ms';
         return null;
