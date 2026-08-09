@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1717</title>
+  <title>MoArt ver1718</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22429,6 +22429,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1718, items: [
+        { ja: '**ブラシの見本（サムネイル）が実際のブラシと違って見えていたのを直しました。**先端の角度・回転・ゆらぎ・太さ・紙目・下地混色を変えても見本が変わらなかったのが、ちゃんと変わります。', ko: '**브러시 견본(썸네일)이 실제 브러시와 다르게 보이던 것을 고쳤습니다.** 팁의 각도·회전·흔들림·두께·종이결·밑바탕 혼색을 바꿔도 견본이 안 바뀌던 것이 이제 바뀝니다.', en: '**Fixed brush thumbnails not matching the actual brush.** Changing tip angle, rotation, jitter, thickness, paper grain, or ground-colour mixing now updates the swatch as it should.' },
+      ] },
       { ver: 1716, items: [
         { ja: '**不透明度を下げたブラシが、手を離した瞬間に濃さが変わっていたのを直しました。**描いている間から仕上がりと同じ濃さで見えます（先端画像や筆圧を使うブラシでは元から合っていました）。', ko: '**불투명도를 낮춘 브러시가 손을 떼는 순간 농도가 바뀌던 것을 고쳤습니다.** 그리는 동안에도 최종 결과와 같은 농도로 보입니다(팁이나 필압을 쓰는 브러시는 원래 맞았습니다).', en: '**Fixed a reduced-opacity brush changing density the moment you lift the pen.** What you see while drawing is now the finished density (tip and pressure brushes already matched).' },
       ] },
@@ -52131,7 +52134,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (pj.a) stroke.tipJitAngle = pj.a;
         if (pj.c) stroke.tipScatter = pj.c;
         if (pj.s || pj.a || pj.c) stroke.tipSeed = 0x5eed1;
+        // ver1718: 팁 두께(ver1628)도 스와치에 나타난다. 그 판이 값을 넣을 때 이 빌더를 안 봐서
+        // **얇게 만든 브러시가 타일에서는 원래 두께로 보였다** — ver1239(tipId) · ver1335(각도·회전) ·
+        // ver1336(지터) · ver1337(종이결)이 각각 고친 것과 같은 종류의 거짓말이고 이번이 다섯 번째다.
+        if (brush.tipThick != null) stroke.tipThick = Number(brush.tipThick);
       }
+      // ver1718: 혼색(下地混色)도 스와치에 나타난다. 필드 매핑은 **실제 빌더와 같은 함수**를 부른다 —
+      // 읽는 곳만 레코드로 바꾼다(그러지 않으면 필드가 늘 때마다 두 곳이 갈린다).
+      // 아래 색은 이 아래에서 종이 칸을 넘긴다 — 잉크가 투명한 자기 레이어에 그려지므로 그냥 싣기만
+      // 하면 붓이 **투명을 물고** 간다(그래서 필드만 실었으면 오히려 더 큰 거짓말이 됐을 것이다).
+      paintAttachMix(stroke, function(k) { return brush[k]; });
       // ver1337: 종이결도 스와치에 나타난다 — tipId 블록 **밖**에 있는 게 요점이다(팁 없는 브러시도
       // 종이결을 가질 수 있으므로, 팁 조건 안에 두면 그 조합이 타일에서 조용히 사라진다).
       if (brush.paperTexId) {
@@ -52145,19 +52157,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ink.width = W; ink.height = H;
       const ictx = ink.getContext('2d');
       if (isEraser) { ictx.fillStyle = BRUSH_PREVIEW_ERASER_BAND; ictx.fillRect(0, 0, W, H); }
-      paintBrushPreviewStrokeInto(ictx, stroke, W, H);
+      // ver1718: 혼색의 아래 색 = **지금까지 그린 종이 칸**(ctx.canvas). 앱이 실제로 쌓는 순서와 같다.
+      paintBrushPreviewStrokeInto(ictx, stroke, W, H, ctx.canvas);
       ctx.drawImage(ink, 0, 0);
 
       if (opts.chip !== false) paintBrushPreviewSizeChip(ctx, W, H, dpr, actualSize, mul < 1, scaled);
     }
     // THE one dispatch between the two rasterizers, shared by the thumbnail and by the pad's live redraw —
     // so a pad stroke and its preview can never diverge in edge treatment.
-    function paintBrushPreviewStrokeInto(ctx, stroke, W, H) {
+    function paintBrushPreviewStrokeInto(ctx, stroke, W, H, mixBase) {
       if (stroke.aa === false && !paintTipOrGrainActive(stroke)) {
         ctx.imageSmoothingEnabled = false;             // 2値化: the jaggies ARE the parameter being shown
         paintPixelStampStrokeInto(ctx, stroke, W, H, 0, 0);
       } else {
-        drawPaintStroke(ctx, stroke, W, H, 0, 0);
+        // ver1718: mixBase(ver1710) — 이 잉크 캔버스는 투명이라 아래 색이 여기 없다. 안 넘기면
+        // 커널이 ctx.canvas 로 떨어져 붓이 투명을 물고 간다.
+        drawPaintStroke(ctx, stroke, W, H, 0, 0, null, mixBase || null);
         // ver1617: 팁·종이결이 있는 2値化 획은 실물이 임계화로 그려지므로 미리보기도 같아야 한다.
         // 이 분기가 없어서 **미리보기에서도 팁이 원으로 보였다** — 실물과 같은 이유였다.
         if (stroke.aa === false) paintBinarizeCanvasAlpha(ctx.canvas);
@@ -52203,16 +52218,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // Every field the raster depends on, plus the device geometry — a bitmap made at dpr 1 must never be
     // blitted into a dpr 2 canvas.
+    // ver1718: **필드 목록을 손으로 적지 않는다.** 종전 목록에는 각도·회전·지터·팁 두께·종이결·혼색·
+    // 필압 곡선이 빠져 있었고, 그 값들만 다른 두 브러시는 **같은 키**를 내므로 캐시가 **남의 썸네일을
+    // 그대로 돌려줬다**(「브러시를 바꿔도 미리보기가 안 바뀐다」). 프리뷰 빌더가 브러시에서 읽는
+    // 필드가 늘 때마다 여기를 같이 고쳐야 하는 구조였고, ver1335·1336·1337·1628 이 전부 안 고쳤다.
+    // 정본은 PAINT_PRESET_PEN_FIELDS(펜이 갖는 전부)다. 필압 곡선 두 개는 그 표에 아직 없어서
+    // (파리티 P2-10) 여기서 더한다 — P2-10 이 표에 넣으면 Set 이 중복을 먹어 저절로 맞는다.
+    // 지연 계산이다 — PAINT_PRESET_PEN_FIELDS 는 이 아래에 선언돼 있어 로드 시점에는 TDZ 다.
+    let brushPreviewKeyFields = null;
+    function brushPreviewKeyFieldList() {
+      if (!brushPreviewKeyFields) {
+        brushPreviewKeyFields = Array.from(new Set(
+          PAINT_PRESET_PEN_FIELDS.concat(['pCurvePts', 'pAlphaCurvePts'])));
+      }
+      return brushPreviewKeyFields;
+    }
     function paintBrushPreviewKey(canvasEl, brush, opts) {
       const b = brush || {}, o = opts || {};
       const dpr = Math.max(1, Math.min(3, Number(o.dpr) || window.devicePixelRatio || 1));
-      return [
+      const head = [
         Math.round(Number(o.w) || canvasEl.clientWidth || BRUSH_PREVIEW_BOX_W),
         Math.round(Number(o.h) || canvasEl.clientHeight || BRUSH_PREVIEW_BOX_H),
         dpr.toFixed(2), Number(o.sizeMul) || 1, o.color || '', Number(o.seed) || 0, o.chip === false ? 0 : 1,
-        b.tool || 'pen', b.size, b.opacity, b.pMin, b.pCurve, b.pGain, b.tipId || '', b.tipSpacing || 0,
-        b.pSize ? 1 : 0, b.pAlpha ? 1 : 0, b.blendMode || 'normal', b.binarize ? 1 : 0
-      ].join('|');
+        b.tool || 'pen'
+      ];
+      // 배열 필드(곡선점)가 있으므로 값은 JSON 으로 접는다 — undefined 는 빈 칸이 되어 옛 키와 같은 뜻이다.
+      const fields = brushPreviewKeyFieldList();
+      for (let i = 0; i < fields.length; i += 1) {
+        const v = b[fields[i]];
+        head.push(v === undefined ? '' : JSON.stringify(v));
+      }
+      return head.join('|');
     }
     function paintBrushPreviewBlit(canvasEl, bmp) {
       if (canvasEl.width !== bmp.width) canvasEl.width = bmp.width;
@@ -66140,15 +66176,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1625: 혼색을 스트로크(genga 는 세션)에 싣는다. paintAttachTip / paintAttachPaperTex 와 같은
     // 자리·같은 이유 — 값은 **획 시점에 고정**된다(저장된 벡터가 나중의 브러시 설정으로 다시 그려지면
     // 안 된다). 꺼져 있으면 필드를 아예 안 싣는다 = 기존 스트로크 레코드와 바이트 동일.
-    function paintAttachMix(stroke) {
-      if (!paintBrushGet('mixOn')) return;
+    // ver1718: 값을 어디서 읽을지만 인자로 받는다(기본 = 지금 브러시). 썸네일은 **저장된 레코드**를
+    // 읽어야 하는데, 그 매핑을 프리뷰 쪽에 다시 적으면 필드가 늘 때마다 두 곳이 갈린다 —
+    // ver1628(tipThick)이 프리뷰를 안 봐서 생긴 것이 정확히 그 사고다.
+    function paintAttachMix(stroke, get) {
+      const g = get || paintBrushGet;
+      if (!g('mixOn')) return;
       stroke.mixOn = true;
-      stroke.mixAmount = Number(paintBrushGet('mixAmount')) || 0;
-      stroke.mixExtend = Number(paintBrushGet('mixExtend')) || 0;
-      stroke.mixDensity = Number(paintBrushGet('mixDensity')) || 0;
-      if (paintBrushGet('mixAmtPressure')) {
+      stroke.mixAmount = Number(g('mixAmount')) || 0;
+      stroke.mixExtend = Number(g('mixExtend')) || 0;
+      stroke.mixDensity = Number(g('mixDensity')) || 0;
+      if (g('mixAmtPressure')) {
         stroke.mixAmtPressure = true;
-        stroke.mixAmtCurvePts = paintBrushGet('mixAmtCurvePts');
+        stroke.mixAmtCurvePts = g('mixAmtCurvePts');
       }
     }
     function paintAttachPaperTex(stroke) {
