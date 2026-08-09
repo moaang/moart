@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1726</title>
+  <title>MoArt ver1727</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -15873,6 +15873,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       { id: 'clearDrawing', category: 'edit', labelKey: 'shortcut.action.clearDrawing', default: 'backspace', scope: 'paint',
         run: function(ev, ctx) {
           if (ctx.inGenga) gengaClearDrawing(); // ver748: same path as the 消去 button (lock check, no-op safety, empty koma → delete)
+          else if (paintTargetIsMemoPage()) clearMemoPageDrawing(); // ver1727: 메모하기가 켜져 있으면 대상은 用紙
           else { clearSelectedConteLayerDrawings(); updatePaintUndoRedoButtonsOnly(); }
         } },
       // -- Edit (core, ver942 migration) — previously hardcoded on a separate handleProjectUndoRedoKeydown
@@ -20061,6 +20062,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (engine) engine.restore(payload); // ver1320: defend like applySelectionRider does — a stale engineId is "no-op", not a throw
         return;
       }
+      // ver1727: 用紙 페이지 메모 통째 편집(지금은 消去 하나). 타임라인과 무관하므로 뷰포트 복원
+      // 기계 앞에서 끝낸다. 되돌리면 지운 획이 **한 번에** 돌아온다.
+      if (command.memoPageEdit) {
+        pushOther(command);
+        const page = getMemoPageData(command.pageNo);
+        page.strokes = (payload && Array.isArray(payload.strokes)) ? payload.strokes.slice() : [];
+        page.redo = (payload && Array.isArray(payload.redo)) ? payload.redo.slice() : [];
+        redrawMemoCanvas();
+        updatePaintUndoRedoButtonsOnly();
+        scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+        return;
+      }
       const historyViewport = captureTimelineViewportForHistory();
       if (command.audioClipEdit) {
         pushOther(command);
@@ -22475,6 +22488,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1727, items: [
+        { ja: '**「メモする」が入っているときは、消去ボタンと Backspace が 用紙 のメモを消します。**これまではレイヤーの絵しか対象にできず、メモを一度描くとボタンがグレーのままでした。Ctrl+Z 一回で全部戻ります。', ko: '**「메모하기」가 켜져 있을 때는 消去 버튼과 Backspace 가 用紙 메모를 지웁니다.** 지금까지는 레이어 그림만 대상이라, 메모를 한 번 그리면 버튼이 회색인 채였습니다. Ctrl+Z 한 번에 전부 돌아옵니다.', en: '**While the memo toggle is on, the clear button and Backspace now clear the 用紙 memo.** They used to target layer drawings only, so once you drew a memo the button stayed greyed out. One Ctrl+Z brings the whole page back.' },
+      ] },
       { ver: 1726, items: [
         { ja: '**用紙 のメモが重くて描けなくなっていたのを直しました（ver1723〜1724 で入れてしまった問題です）。**ペンを動かすたびにページ全部を描き直していたのを、いま描いている一本だけにしています。それと、動かした選択では使えない 選択反転 のボタンがグレーになり、理由が出るようになりました。', ko: '**用紙 메모가 무거워서 못 그리던 것을 고쳤습니다(ver1723~1724 에서 제가 넣은 문제입니다).** 펜을 움직일 때마다 페이지 전체를 다시 그리던 것을 지금 그리는 한 획만으로 바꿨습니다. 그리고 옮긴 선택에는 쓸 수 없는 選択反転 버튼이 회색이 되고 이유가 뜹니다.', en: '**Fixed 用紙 memo drawing becoming too heavy to use — a regression from ver1723–1724.** It was redrawing the whole page on every pointer move; now only the stroke you are drawing. Also, the Invert-selection button is greyed with a reason when the selection has been moved.' },
       ] },
@@ -63688,9 +63704,34 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const hasPrimaryRedo = state.redoStack.length > 0;
       if (undoBtn) undoBtn.disabled = hasPrimaryUndo ? false : (selectedDrawing ? !layerDrawingGlobalHistoryAvailable('undo', selectedRef) : page.strokes.length === 0);
       if (redoBtn) redoBtn.disabled = hasPrimaryRedo ? false : (selectedDrawing ? !layerDrawingGlobalHistoryAvailable('redo', selectedRef) : page.redo.length === 0);
-      if (clearBtn) clearBtn.disabled = !selectedLayer;
+      // ver1727: **메모하기가 켜져 있으면 대상은 用紙다**(사용자) — 레이어 선택 여부와 무관하다.
+      // 종전에는 레이어만 봤고, 메모를 그리는 순간 beginMemoPageDraw 가 레이어 선택을 해제하므로
+      // 메모를 한 번 그리면 이 버튼이 영영 회색이었다(제보: 「그림도 못 지운다」).
+      if (clearBtn) {
+        clearBtn.disabled = paintTargetIsMemoPage()
+          ? getMemoPageData(state.project.currentPage).strokes.length === 0
+          : !selectedLayer;
+      }
     }
 
+    // ver1727: 用紙 페이지 메모를 통째로 지운다. **한 명령**이라 Ctrl+Z 한 번에 전부 돌아온다.
+    // 획 객체는 그대로 들고만 있는다(사본을 뜨지 않는다) — 커밋된 획은 더 이상 변하지 않으므로
+    // 배열만 갈무리하면 되고, undo 메모리 예산에도 가볍다.
+    function clearMemoPageDrawing() {
+      const pageNo = state.project.currentPage;
+      const page = getMemoPageData(pageNo);
+      if (!page.strokes.length) return false;
+      const before = { strokes: page.strokes.slice(), redo: page.redo.slice() };
+      page.strokes = [];
+      page.redo = [];
+      pushUndoCommand({ name: 'メモ消去', memoPageEdit: true, pageNo: pageNo,
+                        before: before, after: { strokes: [], redo: [] } });
+      state.redoStack = [];
+      redrawMemoCanvas();
+      updatePaintUndoRedoButtonsOnly();
+      scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+      return true;
+    }
     function paintHistoryAvailable(kind) {
       const selectedLayer = findConteLayerById(state.project, state.selectedConteLayerId);
       const selectedDrawing = selectedLayer && selectedLayer.layer ? getLayerDrawingData(state.project, selectedLayer.layer.drawingRef) : null;
@@ -67761,6 +67802,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         clearDrawingBtn.addEventListener('click', function(event) {
           event.preventDefault();
           event.stopPropagation();
+          // ver1727: 단축키(clearDrawing)와 **같은 대상**을 본다 — 메모하기가 켜져 있으면 用紙다.
+          // 둘이 갈리면 버튼은 되는데 Backspace 는 안 되는(또는 그 반대) 상태가 생긴다.
+          if (paintTargetIsMemoPage()) { clearMemoPageDrawing(); return; }
           clearSelectedConteLayerDrawings();
           updatePaintUndoRedoButtonsOnly();
         });
