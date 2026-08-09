@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1719</title>
+  <title>MoArt ver1720</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22429,6 +22429,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1720, items: [
+        { ja: '**原画で不透明度を下げたペンや合成モードを使うペンで描くとき、画面の作り直しが1フレームに1回になりました。**ペンが速いタブレット（iPad など）ほど軽くなります。描いた線はそのままです。', ko: '**원화에서 불투명도를 낮춘 펜이나 합성모드를 쓰는 펜으로 그릴 때, 화면 재합성이 1프레임에 한 번으로 바뀌었습니다.** 펜이 빠른 태블릿(iPad 등)일수록 가벼워집니다. 그려지는 선은 그대로입니다.', en: '**In 原画, recompositing while drawing with a reduced-opacity or blend-mode pen now happens once per frame instead of once per pointer event.** The faster your tablet reports the pen (iPad), the more it saves. The stroke itself is unchanged.' },
+      ] },
       { ver: 1719, items: [
         { ja: '**ブラシのプリセットが、筆圧カーブと傾きの設定を保存していなかったのを直しました。**グラフを引いて作ったカーブと 傾き→サイズ / 傾き→不透明度 が、これからは保存され、呼び出すと戻ります（今までのプリセットはそのままです）。', ko: '**브러시 프리셋이 필압 곡선과 기울기 설정을 저장하지 않던 것을 고쳤습니다.** 그래프를 끌어 만든 곡선과 기울기→크기 / 기울기→불투명도가 이제 저장되고, 불러오면 돌아옵니다(기존 프리셋은 그대로입니다).', en: '**Brush presets were not saving the pressure curve or the tilt settings.** A curve you drew on the graph, and Tilt→Size / Tilt→Opacity, are now stored and restored (existing presets are unchanged).' },
       ] },
@@ -81915,6 +81918,29 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (gengaDrawSession === sess) gengaShapeRedraw(sess); // 드래그가 끝났으면 버린다
       });
     }
+    // ver1720 (파리티 P2-1): 버퍼 모드 **비아웃라인 펜**의 재합성도 프레임당 1회. 형제 셋은 전부
+    // 이미 그렇다(아웃라인 펜 = ver622 outlineRaf · 도형 = 바로 위 ver1464 · 콘티 = ver622
+    // paintScheduleLiveRedraw). ver1449 가 이 자리에서 **화면 재그리기만** 접고 재합성은 이벤트마다
+    // 그대로 뒀다 — 그 판 주석의 「여기서 미루는 것은 화면 재합성뿐이다」가 그 뜻이다.
+    // 재합성은 캔버스 면적에 비례한다(base 를 통째로 그리고 buffer 를 얹는다).
+    // 세션에 매다는 것이 요점이다: 제스처와 함께 죽고, 드래그가 끝났으면 콜백이 스스로 버린다.
+    function gengaPenCompositeSchedule(sess) {
+      if (!sess || sess.penCompositeRaf) return;
+      sess.penCompositeRaf = requestAnimationFrame(function() {
+        sess.penCompositeRaf = 0;
+        if (gengaDrawSession !== sess) return; // 끝난 드래그 — 커밋 경로가 flush 로 흡수한다
+        gengaShapeComposite(sess);
+        drawGengaPreview();
+      });
+    }
+    // ver1720: **커밋 직전에 반드시 부른다.** 커밋 소스가 sess.canvas 인데 재합성을 미뤘으므로,
+    // 안 부르면 마지막 이동이 빠진 채 구워진다 — 도형이 ver1464 에서 겪은 그 사고와 같은 자리다.
+    // 재합성은 멱등이라(base+buffer 를 다시 만든다) 이미 최신이어도 결과가 같다.
+    function gengaPenCompositeFlush(sess) {
+      if (!sess || !sess.penBufMode) return;
+      if (sess.penCompositeRaf) { cancelAnimationFrame(sess.penCompositeRaf); sess.penCompositeRaf = 0; }
+      gengaShapeComposite(sess);
+    }
     // 커밋 직전에 부른다 — ver622 가 gengaPenOutlineRedraw 에 세운 것과 같은 계약(대기분을 흡수).
     function gengaShapeFlushPending(sess) {
       if (gengaShapeRedrawRaf) { cancelAnimationFrame(gengaShapeRedrawRaf); gengaShapeRedrawRaf = 0; }
@@ -82617,11 +82643,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             }
           });
         }
+      } else if (penSess.penBufMode) {
+        // ver1449 가 화면 재그리기를 접고, ver1720 이 **재합성까지** 접었다 — 아웃라인 분기가 이미
+        // 받아들인 것과 같은 계약(최대 한 프레임). 픽셀은 위에서 이미 세션 버퍼에 들어가 있다.
+        gengaPenCompositeSchedule(penSess);
       } else {
-        if (penSess.penBufMode) gengaShapeComposite(penSess);
-        // ver1449: 바로 위 아웃라인 분기는 ver622 가 rAF 로 접었는데 **같은 함수의 나머지 절반**은
-        // 이벤트마다 동기로 재합성하고 있었다. 픽셀은 위에서 이미 세션 버퍼에 들어갔고 여기서 미루는
-        // 것은 화면 재합성뿐이다 — 아웃라인 분기가 이미 받아들인 것과 같은 계약(최대 한 프레임).
+        // 버퍼가 없는 펜은 위 루프가 레이어 컨텍스트에 직접 찍었다 — 미룰 재합성이 없다.
         scheduleGengaPreviewRedraw();
       }
       ev.preventDefault();
@@ -82726,6 +82753,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const sess = gengaDrawSession;
       if (!sess) return;   // replay 중에 세션이 정리됐다면(방어) 여기서 끝낸다
       gengaDrawSession = null;
+      // ver1720: 아웃라인이 아니면 **버퍼 재합성의 대기분**을 흡수한다(위 gengaPenCompositeFlush).
+      // 버퍼 모드가 아니면 그 함수가 그 자리에서 되돌아가므로 조건을 여기 또 적지 않는다.
+      if (!sess.penOutline) gengaPenCompositeFlush(sess);
       if (sess.penOutline) {
         // ver622: flush — a batched rAF may still be pending (it will skip itself: session is null),
         // so render the final outline synchronously before committing.
