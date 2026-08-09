@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1733</title>
+  <title>MoArt ver1734</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22526,6 +22526,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1734, items: [
+        { ja: '**なげなわスタンプが選択範囲を守るようになりました。**選択しているときは、切り取るときも押すときも選択の内側だけになります。選択していないときは今までどおりです。', ko: '**올가미 스탬프가 선택영역을 지킵니다.** 선택이 있을 때는 잘라낼 때도 찍을 때도 선택 안쪽만 됩니다. 선택이 없으면 종전 그대로입니다.', en: '**The lasso stamp now respects the active selection** — both when you cut and when you stamp, it stays inside the selection. With no selection, nothing changes.' },
+      ] },
       { ver: 1733, items: [
         { ja: '**原画で 反転 のボタンがずっと押せなかったのを直しました（ver1726 で入れてしまった問題です）。**選択を作れば押せます。押せないときは、その理由がボタンの上に出ます。', ko: '**원화에서 反転 버튼이 계속 안 눌리던 것을 고쳤습니다(ver1726 에서 제가 넣은 문제입니다).** 선택을 만들면 눌립니다. 못 누를 때는 그 이유가 버튼 위에 뜹니다.', en: '**Fixed the Invert button being permanently greyed out in 原画 — a regression from ver1726.** It works once you have a selection, and when it cannot be used the reason now appears above the button.' },
       ] },
@@ -56615,6 +56618,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ver767: the active selection as a stroke clip, placed in the op canvas's space. null when nothing is
     // selected — which is what keeps every no-selection path byte-identical to before this feature existed.
+    // ver1734: **마스크 밖을 지운다.** 스탬프가 선택영역을 지키게 하는 일은 결국 이것 하나뿐이라
+    // (뜨기든 찍기든, 콘티든 원화든) 여기 한 벌만 둔다. clip 은 다른 클립 커널과 같은 모양
+    // `{ canvas, x, y }` 이고, 좌표는 **대상 캔버스 기준**이다 — 호출부가 맞춰서 넘긴다.
+    // clip 이 없으면(선택 없음) 아무 일도 안 한다 = 종전 동작.
+    function paintClipCanvasTo(canvas, clip) {
+      if (!canvas || !clip || !clip.canvas) return false;
+      const c = canvas.getContext('2d');
+      c.save();
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.globalAlpha = 1;
+      c.filter = 'none';
+      c.globalCompositeOperation = 'destination-in';
+      c.drawImage(clip.canvas, Math.round(Number(clip.x) || 0), Math.round(Number(clip.y) || 0));
+      c.restore();
+      return true;
+    }
     function paintStrokeClipForOp(op) {
       const sel = op && paintSelectionForDrawingRef(op.drawingRef);
       if (!sel || !sel.maskCanvas) return null;
@@ -60116,7 +60135,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const ctx = op.canvas.getContext('2d');
       const x = layerX - Math.round(Number(op.bitmapX) || 0) - stamp.width / 2;
       const y = layerY - Math.round(Number(op.bitmapY) || 0) - stamp.height / 2;
-      ctx.drawImage(stamp.image, x, y, stamp.width, stamp.height);
+      // ver1734: 선택영역이 있으면 그 안에만 찍는다(제보). 도장을 제 크기 스크래치에 그린 뒤
+      // 마스크 밖을 지우고 얹는다 — 대상에 직접 그리면 이미 있는 그림까지 함께 잘린다.
+      const stampClip = paintStrokeClipForOp(op);
+      if (stampClip) {
+        const sc = paintScratchCanvas(op, 'stamp', Math.max(1, Math.ceil(stamp.width)), Math.max(1, Math.ceil(stamp.height)));
+        const sctx = sc.getContext('2d');
+        sctx.drawImage(stamp.image, 0, 0, stamp.width, stamp.height);
+        // 마스크를 도장 좌표계로 옮겨 넘긴다(클립 좌표는 op.canvas 기준이다).
+        paintClipCanvasTo(sc, { canvas: stampClip.canvas, x: stampClip.x - x, y: stampClip.y - y });
+        ctx.drawImage(sc, x, y);
+      } else {
+        ctx.drawImage(stamp.image, x, y, stamp.width, stamp.height);
+      }
       op.lastStampPoint = point;
       op.stampChanged = true;
       return true;
@@ -60450,6 +60481,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       paintBinarizeCanvasAlpha(mask);                                  // ver1666: 스탬프는 하드 엣지 고정
       paintFeatherCanvasAlpha(mask, paintSelectFeatherVal());          // ver1668: 0 이면 아무 일도 안 한다
+      // ver1734: **선택영역 밖은 안 뜬다**(제보). 마스크는 bounds 크기이고 그 좌상단이 op.canvas 의
+      // (bounds.x, bounds.y) 이므로, 클립을 그만큼 옮겨 교차시킨다.
+      const liftClip = paintStrokeClipForOp(op);
+      if (liftClip) paintClipCanvasTo(mask, { canvas: liftClip.canvas, x: liftClip.x - bounds.x, y: liftClip.y - bounds.y });
       patchCtx.drawImage(op.canvas, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, bounds.w, bounds.h);
       patchCtx.globalCompositeOperation = 'destination-in';
       patchCtx.drawImage(mask, 0, 0);
@@ -82202,10 +82237,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // selection clip needs no offset"). 마칭 앤츠는 이미 어느 프레임/레이어에서든 그 스텐실을 보여
     // 주는데(ver1313/1314/1316), 붓질만 옛 레이어/프레임 모델로 클리핑을 거부하고 있었다 — 화면의
     // 점선은 "여기 안에서만 그려진다"고 약속하는데 실제 그리기는 그 약속을 무시하는 상태였다.
-    function gengaStrokeClipFor(sess) {
-      if (!gengaSel || !gengaSel.mask || !sess) return null;
-      if (gengaSel.auto) return null; // ver1201: a 変形/パース auto-selection is a transform handle, not a paint mask
+    // ver1734: 「**지금 그림에 걸린 선택 스텐실**」 — 세션과 무관한 사실이다.
+    // 아래 gengaStrokeClipFor 는 그것을 「그리는 세션이 있을 때만」으로 좁히는 껍데기다.
+    // 둘을 가른 이유: 스탬프를 **뜨는** 시점에는 아직 세션이 없어서, 세션 게이트가 달린 쪽을 부르면
+    // null 이 돌아와 **조용히 안 잘린다**(선택영역 밖이 함께 떠진다 — 제보).
+    // ver1201: 変形/パース 가 스스로 만든 자동 선택은 변형 손잡이지 페인트 마스크가 아니다.
+    function gengaSelectionClip() {
+      if (!gengaSel || !gengaSel.mask || gengaSel.auto) return null;
       return { canvas: gengaSel.mask, x: 0, y: 0 };
+    }
+    function gengaStrokeClipFor(sess) {
+      return sess ? gengaSelectionClip() : null;
     }
     // ver1464 (#14): 여기서 하던 일을 **둘로 가른다.**
     //
@@ -84755,6 +84797,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 원점 bbox(아래)는 그대로 유효 — 스무딩이 원점을 제어점으로 쓰는 2차 베지어라 곡선이 원 폴리라인의
       // convex hull 밖으로 못 나간다.
       const mask = gengaPolyMask(pw, ph, pts);
+      // ver1734: **선택영역 밖은 안 뜬다**(제보). 마스크와 선택 스텐실이 둘 다 用紙 크기라 원점이 같다.
+      // gengaPolyMask 자체는 안 건드린다 — 그 함수는 올가미 **선택**도 쓰고, 거기서 교차시키면
+      // 「새 선택」이 기존 선택 안에 갇힌다(추가·부분해제 모드가 따로 하는 일이다).
+      paintClipCanvasTo(mask, gengaSelectionClip()); // ver1734: 뜨는 시점엔 세션이 없다 — 세션 게이트 없는 쪽
       const full = document.createElement('canvas'); full.width = pw; full.height = ph;
       const fx = full.getContext('2d');
       fx.drawImage(wk.cv, 0, 0); fx.globalCompositeOperation = 'destination-in'; fx.drawImage(mask, 0, 0); fx.globalCompositeOperation = 'source-over';
@@ -84801,7 +84847,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (wk.hasContent) work.getContext('2d').drawImage(wk.cv, 0, 0);
         gengaStamp.work = work; gengaStamp.workKey = workKey;
       }
-      gengaStamp.work.getContext('2d').drawImage(gengaStamp.patch, Math.round(x - gengaStamp.w / 2), Math.round(y - gengaStamp.h / 2));
+      // ver1734: 선택영역이 있으면 그 안에만 찍는다(제보). 用紙 크기 스크래치에 도장을 놓고 마스크
+      // 밖을 지운 뒤 얹는다 — work 에 직접 그리면 이미 그려져 있던 그림까지 함께 잘린다.
+      const px = Math.round(x - gengaStamp.w / 2), py = Math.round(y - gengaStamp.h / 2);
+      const stampClip = gengaStrokeClipFor(gengaStamp);
+      if (stampClip) {
+        const sc = paintScratchCanvas(gengaStamp, 'stamp', gengaStamp.work.width, gengaStamp.work.height);
+        sc.getContext('2d').drawImage(gengaStamp.patch, px, py);
+        paintClipCanvasTo(sc, stampClip);
+        gengaStamp.work.getContext('2d').drawImage(sc, 0, 0);
+      } else {
+        gengaStamp.work.getContext('2d').drawImage(gengaStamp.patch, px, py);
+      }
     }
     // 単発(スタンプ・イン・プレース 버튼) — 1개 찍고 즉시 커밋
     function gengaPlaceStamp(layer, frame, x, y) {
