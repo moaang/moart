@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1724</title>
+  <title>MoArt ver1725</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -18566,6 +18566,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // combined total stays bounded by budget + (the newest command, which the floor protects).
     function pushUndoCommand(command, options) {
       if (!command) return;
+      // ver1725: 눈금은 **한 번만** 찍는다 — redo 로 되살아난 명령이 다시 찍히면 用紙 획과의 순서가
+      // 뒤집힌다(그 명령은 새로 생긴 것이 아니다).
+      if (command.histSeq == null) command.histSeq = paintNextHistorySeq();
       state.undoStack.push(command);
       trimCommandStack(state.undoStack, MAX_UNDO_HISTORY);
       if (!(options && options.historyTraversal)) trimUndoStackToMemoryBudget();
@@ -20203,6 +20206,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function redo() { applyHistoryCommand('redo'); }
 
+    // ver1725 (판정 q3=A): 두 히스토리(명령 스택 · 用紙 메모 스택)를 **한 줄로 세우는 눈금**.
+    // 벽시계를 바닥으로 쓰되 단조 증가시킨다 — 같은 ms 안의 두 동작도 안 겹치고, 세션을 넘겨도
+    // 비교가 성립한다. 후자가 요점이다: **用紙 획은 프로젝트에 저장되므로** 세션 카운터였다면
+    // 지난 세션의 획이 이번 세션의 첫 명령보다 커져 순서가 뒤집힌다.
+    let paintHistorySeqLast = 0;
+    function paintNextHistorySeq() {
+      const now = Date.now();
+      paintHistorySeqLast = now > paintHistorySeqLast ? now : paintHistorySeqLast + 1;
+      return paintHistorySeqLast;
+    }
+    // 用紙 메모 스택의 맨 위 눈금. 비교 대상이 아니면 null:
+    //   · 그리기 상호작용이 없을 때(종전 게이트와 같다)
+    //   · **레이어가 선택돼 있을 때** — 그때 paintUndo 는 그림 히스토리(= 같은 undoStack)로 넘기므로
+    //     두 스택이 아니라 한 스택이고, 비교 자체가 성립하지 않는다.
+    function paintMemoTopHistorySeq(kind) {
+      if (!paintInteractionActive()) return null;
+      const sel = findConteLayerById(state.project, state.selectedConteLayerId);
+      if (sel && sel.layer && sel.layer.drawingRef) return null;
+      const page = getMemoPageData(state.project.currentPage);
+      const list = kind === 'redo' ? page.redo : page.strokes;
+      const top = (list && list.length) ? list[list.length - 1] : null;
+      return top ? (Number(top.histSeq) || 0) : null;  // 옛 획(필드 없음)은 0 = 어떤 명령보다 오래됨
+    }
+    function paintCommandTopHistorySeq(kind) {
+      const stack = kind === 'redo' ? state.redoStack : state.undoStack;
+      const top = (stack && stack.length) ? stack[stack.length - 1] : null;
+      return top ? (Number(top.histSeq) || 0) : null;
+    }
     function primaryUndoShouldUsePaintHistory(kind) {
       if (!paintInteractionActive()) return false;
       const stack = kind === 'redo' ? state.redoStack : state.undoStack;
@@ -20210,7 +20241,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return paintHistoryAvailable(kind);
     }
 
+    // ver1725 (파리티 P1-4, 판정 q3=A): **가장 최근 것**을 되돌린다. 종전에는 `undoStack` 이 비었을
+    // 때만 메모 스택을 봐서, 컷을 한 번이라도 편집한 세션에서는 방금 그은 用紙 획이 Ctrl+Z 로
+    // 안 되돌아가고 **타임라인 편집이 대신 되돌아갔다.**
     function runPrimaryUndo() {
+      const memoSeq = paintMemoTopHistorySeq('undo');
+      const cmdSeq = paintCommandTopHistorySeq('undo');
+      if (memoSeq != null && (cmdSeq == null || memoSeq > cmdSeq)) { paintUndo(); return; }
       if (state.undoStack.length) {
         undo();
         return;
@@ -20219,6 +20256,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function runPrimaryRedo() {
+      // redo 는 **작은 쪽**이다 — undo 가 큰 쪽부터 걷어냈으므로 되돌리는 순서는 그 반대다.
+      const memoSeq = paintMemoTopHistorySeq('redo');
+      const cmdSeq = paintCommandTopHistorySeq('redo');
+      if (memoSeq != null && (cmdSeq == null || memoSeq < cmdSeq)) { paintRedo(); return; }
       if (state.redoStack.length) {
         redo();
         return;
@@ -22431,6 +22472,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1725, items: [
+        { ja: '**用紙 に書いたメモが Ctrl+Z で戻せるようになりました。**これまではカットを一度でも編集していると、メモではなくタイムラインの編集のほうが戻っていました。いまは**最後にやったこと**が戻ります。', ko: '**用紙에 쓴 메모를 Ctrl+Z 로 되돌릴 수 있게 됐습니다.** 지금까지는 컷을 한 번이라도 편집했으면 메모가 아니라 타임라인 편집이 되돌아갔습니다. 이제 **마지막에 한 것**이 되돌아갑니다.', en: '**Ctrl+Z now undoes 用紙 memo strokes.** Until now, if you had edited a cut at any point in the session, undo took back the timeline edit instead of the note you just wrote. It now undoes **whatever you did last.**' },
+      ] },
       { ver: 1724, items: [
         { ja: '**用紙 のメモ書きは「基本ブラシのみ」になりました。**先端画像・紙目・下地混色は乗らず、その項目はグレーになります（2値化・不透明度・筆圧はそのまま効きます）。**すでに描いてあるメモは変わりません。**', ko: '**用紙 메모가 「기본 브러시만」으로 바뀌었습니다.** 팁·종이결·밑바탕 혼색은 안 실리고 그 항목들은 회색이 됩니다(2値化·불투명도·필압은 그대로 걸립니다). **이미 그려 둔 메모는 바뀌지 않습니다.**', en: '**用紙 memo strokes are now plain-brush only.** An imported tip, paper grain and ground-colour mixing no longer apply and those rows are greyed out (hard edge, opacity and pressure still work). **Memos you already drew are unchanged.**' },
       ] },
@@ -62692,6 +62736,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         size: activePaintSize(),
         points: [{ x: Number(point.x) || 0, y: Number(point.y) || 0 }]
       };
+      stroke.histSeq = paintNextHistorySeq(); // ver1725: 명령 스택과 한 줄로 세우는 눈금
       // ver1723 (판정 q7=A): **2値化를 싣는다.** ver1345 는 用紙가 그림·출력에 안 들어간다는 이유로
       // 안 실었는데 그 근거의 절반이 거짓이었고(ver1717: drawMemoLayer 가 페이지 출력 레이어다),
       // 위 렌더 커널이 이제 그 값을 실제로 쓴다. 키는 레이어 빌더와 같은 규칙이다(도형은 도형 키).
