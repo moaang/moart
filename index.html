@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1743</title>
+  <title>MoArt ver1744</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22539,6 +22539,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1744, items: [
+        { ja: '**原画の「作業物一括書き出し」でシート画像も出るようになりました。**設定JSONだけでなく、シートの絵も同じフォルダに入ります（72コマを超えるカットは複数枚）。', ko: '**원화 「작업물 일괄출력」에서 시트 이미지도 나옵니다.** 설정 JSON 만이 아니라 시트 그림도 같은 폴더에 들어갑니다(72칸을 넘는 컷은 여러 장).', en: '**The 原画 batch export now writes the sheet image too** — not just the settings JSON. Cuts longer than 72 frames produce multiple pages.' },
+      ] },
       { ver: 1743, items: [
         { ja: '**1k 表記のとき、区間の曲線も出なくなりました。**ver1742 は文字だけ消していました。縦の直線と番号はそのままです。', ko: '**1k 표기일 때 구간 곡선도 안 나옵니다.** ver1742 는 글자만 지웠었습니다. 세로 직선과 번호는 그대로입니다.', en: '**With 1k labels the span curve is gone too** — ver1742 only removed the text. The vertical line and the numbers stay.' },
       ] },
@@ -69612,6 +69615,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       return svg;
     }
+    // ver1744: 원화 일괄출력용 시트 SVG. 콘티는 컷을 원화 타임라인 모양으로 **변환해서** 넣지만
+    // (conteCutGroupToGengaTimeline) 원화는 그 타임라인이 이미 있으므로 그대로 넘긴다 — 라이브
+    // 타임시트 창이 그리는 것과 같은 커널·같은 인자라 화면과 종이가 갈릴 자리가 없다.
+    function gengaRenderTimesheetSvg(project, pageIndex) {
+      const gt = project && project.gengaTimeline;
+      if (!gt) return null;
+      const parts = projectNameParts(project);
+      const page = Math.max(0, Math.round(Number(pageIndex) || 0));
+      const svg = document.createElementNS(GENGA_TS_NS, 'svg');
+      renderTimesheetKernel(svg, gt, {
+        nameParts: { work: parts.work, ep: parts.ep, cut: String(parts.cut || '') },
+        title: project.title, currentFrame: page * timesheetPageFramesFor(gt) + 1,
+        syncPlayhead: false, applyZoom: false
+      });
+      return svg;
+    }
+    function gengaTimesheetPageCount(project) {
+      const gt = project && project.gengaTimeline;
+      if (!gt) return 0;
+      return Math.max(1, Math.ceil((gt.totalFrames || 1) / timesheetPageFramesFor(gt)));
+    }
+
     // Shared kernel: how many コンテ撮 sheet pages this cut group needs — must be known *before* the export
     // loop calls conteRenderTimesheetSvg once per page. Fixes cuts ≥144 (or ≥72 once >10 cels) frames
     // silently losing everything past page 0 — writeCtExportGroups used to render only pageIndex 0.
@@ -73611,6 +73636,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // SAME folder, which is exactly the shape the folder-drop importer expects — so the batch output can be
       // dropped straight back into conte (or opened on the Auto Sheet site).
       let sheetName = '';
+      const sheetImageNames = []; // ver1744: 시트 그림(여러 장일 수 있다)
       if (opts.includeSheet !== false && !state.videoExportCancel) {
         try {
           sheetName = gengaSheetJsonFileName(state.project);
@@ -73618,6 +73644,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const json = JSON.stringify(gengaBuildSheetSettingsJson(state.project), null, 2);
           await writeBlobToDirectory(dirHandle, sheetName, new Blob([json], { type: 'application/json' }));
         } catch (e) { failures.push((sheetName || 'sheet.json') + '（' + (e && e.message ? e.message : e) + '）'); sheetName = ''; }
+        // ver1744 (사용자 요청): 설정 JSON 만이 아니라 **시트 그림**도 낸다 — 콘티의 컷팅소재 출력과
+        // 같은 부품이다. 72칸을 넘는 컷은 종이가 여러 장이므로 장수를 먼저 세고 돈다(콘티는 그 계산을
+        // 빠뜨려 첫 장만 나간 적이 있다). 실패해도 나머지 출력은 계속하고 사유를 모아 낸다.
+        const sheetBase = gengaSheetJsonFileName(state.project).replace(/^sheet_/, '').replace(/\.json$/i, '');
+        const sheetPages = gengaTimesheetPageCount(state.project);
+        for (let sp = 0; sp < sheetPages; sp += 1) {
+          if (state.videoExportCancel) break;
+          const imgName = sheetBase + (sp === 0 ? '.png' : ('_' + (sp + 1) + '.png'));
+          try {
+            const svgEl = gengaRenderTimesheetSvg(state.project, sp);
+            if (!svgEl) break;
+            const canvas = await conteRasterizeSvgToCanvas(svgEl);
+            if (onStatus) onStatus(t('msg.batchExport.sheetConfig', imgName), null, 0, imgName);
+            await writeBlobToDirectory(dirHandle, imgName, await canvasToBlob(canvas, 'image/png'));
+            sheetImageNames.push(imgName);
+          } catch (e) { failures.push(imgName + '（' + (e && e.message ? e.message : e) + '）'); }
+        }
       }
       // ver1028: the camera-frame 撮影指示 image. It goes in a "_camera" SUBFOLDER on purpose — the folder-drop
       // importer matches cel images by filename, and a frame image sitting beside them would be read as a cel.
@@ -73681,7 +73724,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       // ver1463: 선행 디코드에서 나온 누락을 계획 단계 경고와 **합쳐서** 낸다 — 「계속」을 고른 실행의
       // 완료 문구에 그 사실이 없으면, 폴더를 나중에 연 사람에게는 조용한 실패와 같다.
-      return { written: written, total: plan.length, failures: failures, failedItems: failedItems, warnings: preWarnings.concat(built.warnings), sheetName: sheetName, cameraImageName: cameraImageName, cameraNames: cameraNames, canceled: Boolean(state.videoExportCancel) };
+      return { written: written, total: plan.length, failures: failures, failedItems: failedItems, warnings: preWarnings.concat(built.warnings), sheetName: sheetName, sheetImageNames: sheetImageNames, cameraImageName: cameraImageName, cameraNames: cameraNames, canceled: Boolean(state.videoExportCancel) };
     }
     // Standalone: write ONLY the Auto Sheet settings JSON (no images). Uses the save picker so it can go anywhere.
     async function gengaExportSheetJsonOnly(onStatus) {
