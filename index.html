@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1764</title>
+  <title>MoArt ver1765</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -74539,10 +74539,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const n = Math.max(1, Math.round(totalFrames || 1));
       const toks = new Array(n).fill(null);
       const put = function(f, t) { if (f >= 1 && f <= n && toks[f - 1] === null) toks[f - 1] = t; };
+      // ver1765: 整列済みコマは **一本だけ**。ver1761 でここを触った時に sortedForCyc / sortedKoma / s の
+      // 三つに増えてしまい、2) は forEach のたびに並べ直してもいた。同じ配列であるだけでなく、下の numOf の
+      // 通し番号がこの並び順から出るので、片方だけずれれば同じコマに同じシート内で違う番号が付く。
+      const sorted = gengaSortedExposures(layer);
       // ver1761: コマのシート番号 — instanceValue、無ければ並び順（BG など値なしのコマ）。同じ式がこの関数内だけで
-      // 3 箇所に書き出されており、下の頭リピートで 4 箇所目になるところだった。同じコマに同じシート内で
-      // 違う番号が出るのを防ぐため、写しではなくこの一つを呼ぶ。
-      const numOf = function(sorted, e) {
+      // 3 箇所に書き出されており、頭リピートで 4 箇所目になるところだった。写しではなくこの一つを呼ぶ。
+      // ver1765: 並び順は上の sorted で一意なので引数では受けない（どれを渡したかで結果が変わる余地を消す）。
+      const numOf = function(e) {
         if (!e) return null;
         const v = e.instanceValue;
         return (v === null || v === undefined || v === '') ? String(sorted.indexOf(e) + 1) : String(v);
@@ -74569,24 +74573,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       (layer.repeats || []).forEach(function(r) {
         const end = gengaRepeatEndFrame(layer, r.startFrame, n);
         const cyc = gengaRepeatCycle(layer, r.startFrame);
-        const sortedForCyc = gengaSortedExposures(layer);
-        const headExp = cyc ? sortedForCyc.find(function(e) { return e.startFrame === cyc.start; }) : null;
+        const headExp = cyc ? sorted.find(function(e) { return e.startFrame === cyc.start; }) : null;
         if (headExp) {
-          const hv = numOf(sortedForCyc, headExp);
-          put(r.startFrame, hv);
+          put(r.startFrame, numOf(headExp));
           if (r.startFrame + 1 <= end) put(r.startFrame + 1, 'rep');
           for (let f = r.startFrame + 2; f <= end; f++) put(f, 'n');
           return;
         }
-        put(r.startFrame, 'rep'); // no cycle to name (e.g. repeat sits before any real koma) — fall back to the old bare form
+        // ver1765: サイクルが無い＝リピートより前にコマが一つも無い場合の保険。UI からは作れず
+        // （gengaToggleRepeat が alert で拒否）、インポートからも作れない（repArmed は実際の絵トークンの
+        // 後にしか立たないので、頭にコマの無い rep は repStarts に入らない）。**到達経路は見つかっていない**
+        // が、尾リピートで frames を切り詰めるインポート側の経路がこの形を作らないと証明できていないので
+        // 残す。消すなら先にそちらを確かめること。
+        put(r.startFrame, 'rep');
         for (let f = r.startFrame + 1; f <= end; f++) put(f, 'n');
       });
       // 3) ふつうのコマ: 先頭に番号、動画マークは dot、それ以外は n
-      const sortedKoma = gengaSortedExposures(layer);
-      sortedKoma.forEach(function(e) {
+      sorted.forEach(function(e) {
         // 値なしのコマ（BG など）は n では書けない — 再読み込みで絵が消える。タイムライン表示と同じ通し番号を出す。
-        const v = numOf(sortedKoma, e);
-        put(e.startFrame, v);
+        put(e.startFrame, numOf(e));
         const marks = Array.isArray(e.dougaOffsets) ? e.dougaOffsets : [];
         for (let o = 1; o < Math.max(1, e.holdFrames); o++) put(e.startFrame + o, marks.indexOf(o) >= 0 ? 'dot' : 'n');
       });
@@ -74596,14 +74601,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       //    いる（gengaRepeatCycle の先頭値 + リピート + ────）ので、ずれていたのは出力側だけだった。
       //    その番号はただの記号ではなく実フレームでもある: 13 の次のフレームは本当にセル 1 が出る。
       let stopAt = 0; // >0 ならそこで行を打ち切る
-      const s = gengaSortedExposures(layer);
-      const lastEnd = s.length ? (s[s.length - 1].startFrame + Math.max(1, s[s.length - 1].holdFrames) - 1) : 0;
+      const lastEnd = sorted.length ? (sorted[sorted.length - 1].startFrame + Math.max(1, sorted[sorted.length - 1].holdFrames) - 1) : 0;
       if (layer.postBehavior === 'repeat' && lastEnd < n) {
         const cyc = gengaRepeatCycle(layer, lastEnd + 1);
-        const head = cyc ? s.find(function(e) { return e.startFrame === cyc.start; }) : null;
+        const head = cyc ? sorted.find(function(e) { return e.startFrame === cyc.start; }) : null;
         if (head) {
-          const hv = numOf(s, head);
-          toks[lastEnd] = hv;                                   // ループの先頭セル（= このフレームに実際に出る絵）
+          toks[lastEnd] = numOf(head);                          // ループの先頭セル（= このフレームに実際に出る絵）
           if (lastEnd + 1 < n) toks[lastEnd + 1] = 'rep';       // リピート、一度だけ
           stopAt = Math.min(n, lastEnd + 2);
         }
@@ -74627,9 +74630,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       //   のでシートから消えるわけではない。
       //   ★4) より後に置く: 頭リピートがあれば尾の打ち切りより手前で行が終わるので、こちらの stopAt が
       //   勝たなければならない（両方 repeat の時に尾の表記ごと切り落とすのが正しい — 赤字の作例がそう）。
-      const preLen = s.length ? s[0].startFrame - 1 : 0;
-      if (layer.preBehavior === 'repeat' && preLen >= 1) {
-        const firstStart = s[0].startFrame, span = lastEnd - firstStart + 1;
+      // 頭リピートが書けるのは「最初のコマの手前に一フレーム以上ある」時だけ
+      if (layer.preBehavior === 'repeat' && sorted.length && sorted[0].startFrame >= 2) {
+        const firstStart = sorted[0].startFrame, span = lastEnd - firstStart + 1;
         // ver1764: リピートは **サイクル先頭が二度目に出るフレームの次**。ver1763 は「最初の実コマの次」に
         // 置いていたが、それが正しいのは頭区間がちょうど一周ぶんの時だけで、長い頭区間では何周も並べた
         // 挙句ずっと後ろに リピート が来ていた（ユーザー実測 2026-08-10: 8 が一度目・17 が二度目なので
@@ -74642,7 +74645,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           if (!e) continue; // コマ間のギャップはそのまま 5) の空きコマ規則へ（本当にそこは絵が無い）
           const off = rs.localFrame - e.startFrame;
           const marks = Array.isArray(e.dougaOffsets) ? e.dougaOffsets : [];
-          put(f, off === 0 ? numOf(s, e) : (marks.indexOf(off) >= 0 ? 'dot' : 'n'));
+          put(f, off === 0 ? numOf(e) : (marks.indexOf(off) >= 0 ? 'dot' : 'n'));
         }
         if (repAt <= n) {
           toks[repAt - 1] = 'rep';                             // 3) が書いた値ごと上書き
