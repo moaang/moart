@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1779</title>
+  <title>MoArt ver1780</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -65350,9 +65350,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1775: カスタムパレットの描画。**items の並びがそのまま画面**なので、色・区切り線・改行を
     // 順に流すだけでよい。畳まれた区切り線から次の区切り線までは出さない（TVPaint の collapsed と同じ）。
     // data-pal-idx は右クリックが「並びの何番目を触っているか」を知るための唯一の手がかり。
-    function renderPaintPaletteInto(root, pal, activeColor) {
+    // ══ ver1780: パネルの骨組み（色パレットと、これから作るカスタムパネルの共通部分）════════════════
+    // 「並びがそのまま画面」「区切り線から下を畳む」「改行で行を切る」は **中身が色でもブラシでも同じ**。
+    // ここに一本だけ置き、マス目そのもの（色見本／ブラシ）は呼び出し側の renderOne が作る。
+    // TVPaint のカスタムパネルが type 1(項目) / 2(横区切り) / 4(改行) の一つの器で色もツールも扱うのと同じ形。
+    // data-pal-idx は右クリックが「並びの何番目か」を知る唯一の手がかりなので、区切り線・改行にも必ず付く。
+    function panelItemsHtml(items, renderOne) {
       let hidden = false;
-      root.innerHTML = (pal.items || []).map(function(it, i) {
+      return (items || []).map(function(it, i) {
+        if (!it) return '';
         if (it.t === 'sep') {
           hidden = !!it.collapsed;
           const name = String(it.text || '');
@@ -65364,12 +65370,48 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         if (hidden) return '';
         if (it.t === 'br') return '<div class="paint-picker-br" data-pal-idx="' + i + '"></div>';
+        return renderOne(it, i) || '';
+      }).join('');
+    }
+    // 区切り線の矢印を押した時。edit は「編集して保存して描き直す」関数（パレットなら paintPaletteEdit）。
+    function panelToggleCollapse(idx, edit) {
+      edit(function(p) { if (p.items[idx]) p.items[idx].collapsed = !p.items[idx].collapsed; });
+    }
+    // 区切り線・改行 **そのもの** への操作。項目（色・ブラシ）への操作は呼び出し側が足す。
+    function panelStructureMenuItems(it, idx, edit) {
+      if (!it) return [];
+      if (it.t === 'sep') {
+        return [
+          { label: t('palette.sepRename'), action: function() {
+            const name = paintPalettePromptName(it.text, 'palette.sepNamePrompt');
+            if (name == null) return;
+            edit(function(p) { if (p.items[idx]) p.items[idx].text = name; });
+          } },
+          { label: t('palette.sepRemove'), action: function() { edit(function(p) { p.items.splice(idx, 1); }); } }
+        ];
+      }
+      if (it.t === 'br') {
+        return [{ label: t('palette.breakRemove'), action: function() { edit(function(p) { p.items.splice(idx, 1); }); } }];
+      }
+      return [];
+    }
+    // 「足す」側の共通分。区切り線と改行はどのパネルでも同じ言葉で足せる。
+    function panelAddMenuItems(edit) {
+      return [
+        { label: t('palette.addSep'), action: function() { edit(function(p) { p.items.push({ t: 'sep', text: '', collapsed: false }); }); } },
+        { label: t('palette.addBreak'), action: function() { edit(function(p) { p.items.push({ t: 'br' }); }); } }
+      ];
+    }
+
+    function renderPaintPaletteInto(root, pal, activeColor) {
+      root.innerHTML = panelItemsHtml(pal.items, function(it, i) {
+        if (it.t !== 'c') return '';
         const c = normalizePaintBaseColor(it.v);
-        // fixed="true" にしておくと選んでも履歴に積まれない（handlePaintPickerSwatchClick の record 判定）
+        // norecord: 自分で並べた棚から選んでも「最近の色」には積まない
         return '<button class="paint-picker-swatch' + (c === activeColor ? ' active' : '') + '" type="button"'
           + ' data-paint-picker-color="' + escapeAttr(c) + '" data-paint-picker-norecord="1" data-pal-idx="' + i + '"'
           + ' style="--paint-color:' + escapeAttr(c) + '" aria-label="' + escapeAttr(c) + '"></button>';
-      }).join('');
+      });
     }
 
     function handlePaintPickerSwatchClick(event) {
@@ -65378,7 +65420,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (caret) {
         const sep = caret.closest('.paint-picker-sep[data-pal-idx]');
         const ci = sep ? Number(sep.getAttribute('data-pal-idx')) : NaN;
-        if (Number.isFinite(ci)) paintPaletteEdit(function(p) { if (p.items[ci]) p.items[ci].collapsed = !p.items[ci].collapsed; });
+        if (Number.isFinite(ci)) panelToggleCollapse(ci, paintPaletteEdit);   // ver1780: 共通カーネル
         return;
       }
       const button = event.target && event.target.closest ? event.target.closest('.paint-picker-swatch[data-paint-picker-color]') : null;
@@ -65408,12 +65450,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const c = normalizePaintBaseColor(state.paintCustomColor || state.paintColor);
           paintPaletteEdit(function(p) { p.items.push({ t: 'c', v: c }); });
         } });
-        out.push({ label: t('palette.addSep'), action: function() {
-          paintPaletteEdit(function(p) { p.items.push({ t: 'sep', text: '', collapsed: false }); });
-        } });
-        out.push({ label: t('palette.addBreak'), action: function() {
-          paintPaletteEdit(function(p) { p.items.push({ t: 'br' }); });
-        } });
+        panelAddMenuItems(paintPaletteEdit).forEach(function(mi) { out.push(mi); });   // ver1780: 共通カーネル
         out.push({ separator: true });
       }
       out.push({ label: t('palette.newPalette'), action: function() {
@@ -65466,19 +65503,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           items.push({ label: t('palette.removeColor'), action: function() {
             paintPaletteEdit(function(p) { p.items.splice(palIdx, 1); });
           } });
-        } else if (it.t === 'sep') {
-          items.push({ label: t('palette.sepRename'), action: function() {
-            const name = paintPalettePromptName(it.text, 'palette.sepNamePrompt');
-            if (name == null) return;
-            paintPaletteEdit(function(p) { if (p.items[palIdx]) p.items[palIdx].text = name; });
-          } });
-          items.push({ label: t('palette.sepRemove'), action: function() {
-            paintPaletteEdit(function(p) { p.items.splice(palIdx, 1); });
-          } });
-        } else if (it.t === 'br') {
-          items.push({ label: t('palette.breakRemove'), action: function() {
-            paintPaletteEdit(function(p) { p.items.splice(palIdx, 1); });
-          } });
+        } else {
+          // ver1780: 区切り線・改行への操作は共通カーネル（カスタムパネルもこれを呼ぶ）
+          panelStructureMenuItems(it, palIdx, paintPaletteEdit).forEach(function(mi) { items.push(mi); });
         }
         items.push({ separator: true });
       }
