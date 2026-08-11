@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1789</title>
+  <title>MoArt ver1790</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22680,6 +22680,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1790, items: [
+        { ja: '**「止メ」が出るようになりました。**最後のコマがそのまま続いたままページをまたぐとき、次のページの頭に書きます — その絵が止まったままだという印で、Auto Sheet と同じです。', ko: '**「止メ」가 나옵니다.** 마지막 코마가 그대로 이어진 채 페이지를 넘어갈 때 다음 페이지 머리에 씁니다 — 그 그림이 멈춰 있다는 표시이고, Auto Sheet 와 같습니다.', en: '**Added the 止メ mark.** When the last drawing holds past a page break, it’s written at the head of the next page to say that picture is standing still — same as Auto Sheet.' },
+      ] },
       { ver: 1789, items: [
         { ja: '**カメラ欄の縦線が、時間が重ならなければ同じ列を使うようになりました。**カメラワークとセルFXが別の時間にあるだけで列が二つに割れていたのを、Auto Sheet と同じ規則に揃えました（重なる時はこれまでどおり分かれます）。', ko: '**카메라란 세로선이 시간이 안 겹치면 같은 줄을 씁니다.** 카메라 워크와 셀 FX 가 다른 시간에 있다는 것만으로 줄이 둘로 갈리던 것을 Auto Sheet 와 같은 규칙으로 맞췄습니다(겹칠 때는 지금까지처럼 갈립니다).', en: '**Camera-column lanes are now shared when the spans don’t overlap in time.** A camera move and a cel FX at different times used to split into two lanes; they now follow Auto Sheet’s rule (overlapping spans still split).' },
       ] },
@@ -76519,6 +76522,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 렌더 루프는 블록(72프레임)마다 도는데 런은 블록 경계를 넘으므로, 그 안에서 세면 잘린 쪽이 짧게
       // 잡혀 같은 코마가 블록에 따라 선이 있다 없다 한다.
       // #sheet 의 `blankCount`(= holdEnd - previous)와 같은 수다: 번호 칸은 안 세고 뒤따르는 hold 만 센다.
+      // ver1790 (U12): 「止メ」 — **마지막 그림이 여기서부터 그대로 멈춰 있다**는 표시.
+      // #sheet 만 찍고 있었다(getCommandLayerPreviewEndMeta → resolvePreviewEndFrames → renderPreviewEndMarkers).
+      // 조건 셋을 그대로 옮긴다:
+      //   ① 마지막 이벤트가 `x`(그림 없음)·`~`(물결)·빈 칸이 아닐 것 — 그 셋은 「멈춰 있다」가 아니다
+      //   ② 그 뒤가 **행 끝까지 전부 hold** 일 것(#sheet 의 `lastSeg.to === tokenCount`)
+      //   ③ 그 hold 가 **72칸 블록 경계를 넘을** 것 — 한 페이지 안에서 끝나면 눈으로 따라가면 되고,
+      //      페이지를 넘어가면 다음 장 첫머리에서 「이 그림이 계속되는 중」임을 말해 줘야 한다
+      //      (postBehavior=hold 의 흔한 형태가 이것이다)
+      // 반환은 **止メ 를 적을 프레임**(마지막 코마의 다음 칸) 또는 0.
+      const sheetCrossesBlockBoundary = function(from, to) {
+        if (to <= from) return false;
+        const nextBlockStart = Math.floor((from - 1) / 72) * 72 + 72 + 1;
+        return nextBlockStart <= to;
+      };
+      const sheetStopMarkFrameOf = function(g) {
+        let lastEv = -1;
+        for (let i = g.length - 1; i >= 0; i -= 1) { if (g[i] && g[i] !== 'h') { lastEv = i; break; } }
+        if (lastEv < 0) return 0;
+        const ev = g[lastEv];
+        if (ev === 'x' || ev === 'w') return 0;               // ①
+        for (let i = lastEv + 1; i < g.length; i += 1) { if (g[i] !== 'h') return 0; }   // ②
+        const holdFrom = lastEv + 1;                          // 1-based: 마지막 코마가 선 칸
+        if (!sheetCrossesBlockBoundary(holdFrom, g.length)) return 0;                    // ③
+        return holdFrom + 1;
+      };
       const holdRunLenOf = function(g) {
         const out = new Array(g.length).fill(0);
         let i = 0;
@@ -76706,6 +76734,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const g = glyphs[ci], x1 = bx + ci * cellW, mx = x1 + cellW / 2;
           const afterCross = holdAfterCrossOf(g); // ver1758
           const holdRun = holdRunLenOf(g);        // ver1786
+          const stopFrame = sheetStopMarkFrameOf(g); // ver1790: 「止メ」를 적을 프레임(없으면 0)
           for (let r = 0; r < 72; r++) {
             const f = start + r; if (f > total) break;
             const gl = g[f - 1];
@@ -76717,6 +76746,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             // moart 의 `x` 토큰은 전부 사람이 넣은 것이라 검정이 맞다 — 종전에는 무조건 빨강이었다.
             if (gl === 'x') { line(x1 + 4, y1 + 4, x1 + cellW - 4, y2 - 4, '#111', 1.6); line(x1 + cellW - 4, y1 + 4, x1 + 4, y2 - 4, '#111', 1.6); }
             // ver1758: **X 뒤의 지속선은 빨간 물결**(Auto Sheet 룰). 보통은 검은 직선.
+            // ver1790 (U12): 「止メ」 칸. **여기엔 지속선을 긋지 않는다** — 글자가 그 자리를 쓴다
+            // (#sheet 도 `!isPreviewEndFrame` 로 같은 자리에서 뺀다). hold 가지보다 먼저 와야 한다.
+            else if (stopFrame && f === stopFrame) { text(mx, my, '止メ', 8, '#111'); }
             else if (gl === 'h') {
               // ver1786: **짧은 hold 에는 긋지 않는다**(hold 4칸 이상 = 런 3칸 이상). 3코마 打ち는
               // 번호만 남는다. X 뒤 빨간 물결은 이 게이트 밖이다 — 그쪽은 「그림이 없다」는 표시라
