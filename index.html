@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1856</title>
+  <title>MoArt ver1857</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -30738,12 +30738,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return layout;
     }
 
-    // ver1320: the no-layout fallback (recomputing maxLayers from video.groups) was dead — the single
-    // caller (conteTimelineTrackHtml) always builds and passes a layout, per the ver750 comment already
-    // on conteLayerBarsHtml's matching layout.slotIndexByCutId fallback below.
-    function conteTimelineTrackHeight(layout) {
-      return layout.trackHeight;
-    }
 
     function conteCutNumberTrackHtml(video, totalFrames) {
       return '<div class="timeline-track video-track conte-cut-number-track" style="--conte-cut-number-track-height:' + CONTE_CUT_NUMBER_TRACK_HEIGHT + 'px">' +
@@ -30751,7 +30745,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         '<div class="timeline-lane">' +
           contePanelSelectionBandsHtml(video.slots, totalFrames) +
           contePanelSlotsHtml(video.slots, totalFrames, { interactive: true }) +
-          (video.groups || []).map(function(item) { return frameSpanInConteWindow(item.startFrame, item.startFrame + item.frames) ? conteCutNumberSegmentHtml(item, totalFrames) : ''; }).join('') +
+          (video.groups || []).map(function(item) { return conteCutNumberSegmentHtml(item, totalFrames); }).join('') +
           // ver1312: 여기 있던 conteGroupBoundaryHtml 은 C1 행으로 옮겼다 — CUT 행에서 컷을
           // 가르는 것은 이제 선이 아니라 컷 바 사이의 홈(--tl-notch)이다. 패널 그립은 컷 경계
           // 프레임을 건너뛴다 — 그 자리는 컷 그립이 이미 갖고 있어 겹치면 둘 다 잡기 어려워진다.
@@ -31261,10 +31255,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function conteCutNumberSegmentHtml(item, totalFrames) {
       const owner = item.group && item.group.cuts && item.group.cuts[0];
-      const clip = olClipFrameRange(owner && owner.id || '', item.startFrame, item.startFrame + item.frames);
-      if (!clip) return '';
-      const left = framePercent(clip.startFrame, totalFrames);
-      const width = Math.max(0.001, framePercent(clip.endFrame - clip.startFrame, totalFrames));
+      // ver1857: 윈도우 가드가 호출부(conteCutNumberTrackHtml)에 삼항으로 들려 있던 유일한 자리였다.
+      // 다른 빌더처럼 자기 안에서 판정하도록 들여왔다 — 같은 판정을 두 모양으로 적지 않는다.
+      // **판정 인자는 옮기기 전 그대로 `item` 범위다.** 커널의 기본 가드는 OL 클리핑 뒤 범위를 보므로,
+      // 그대로 맡기면 오버랩이 있는 컷에서 결과가 갈린다 — 위치만 옮기고 판정은 안 바꾼다.
+      if (!frameSpanInConteWindow(item.startFrame, item.startFrame + item.frames)) return '';
+      const box = conteClipBox(owner && owner.id || '', item.startFrame, item.startFrame + item.frames, totalFrames, { windowed: false });
+      if (!box) return '';
+      const clip = box.clip;
+      const left = box.left;
+      const width = box.width;
       const cutNo = item.group && item.group.cutNo || '';
       const ownerId = owner && owner.id || '';
       // ver1312: 번호는 바 안이 아니라 위로 삐져나온 탭이 든다. 탭에는 data-video-slot-cut-id 를
@@ -31300,15 +31300,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const owner = item.group && item.group.cuts && item.group.cuts[0];
         const ownerId = owner && owner.id || '';
         if (!ownerId) return '';
-        const clip = olClipFrameRange(ownerId, item.startFrame, item.startFrame + item.frames);
-        if (!clip) return '';
-        if (!frameSpanInConteWindow(clip.startFrame, clip.endFrame)) return '';
+        const box = conteClipBox(ownerId, item.startFrame, item.startFrame + item.frames, totalFrames);
+        if (!box) return '';
+        const clip = box.clip;
         const ownSlots = slots.filter(function(slot) { return cutGroupOwnerIdFromSlot(slot) === ownerId; });
         if (!ownSlots.length) return '';
         const firstPanelId = ownSlots[0].cut && ownSlots[0].cut.id || '';
         const lastPanelId = ownSlots[ownSlots.length - 1].cut && ownSlots[ownSlots.length - 1].cut.id || '';
-        const left = framePercent(clip.startFrame, totalFrames);
-        const width = Math.max(0.001, framePercent(clip.endFrame - clip.startFrame, totalFrames));
+        const left = box.left;
+        const width = box.width;
         const cutNo = item.group && item.group.cutNo || '';
         // 첫 컷에는 주고받을 앞 컷이 없다 — 동작하지 않는 그립은 보여주지 않는다(ver1297).
         const head = (groupIndex > 0 && firstPanelId)
@@ -31410,6 +31410,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 트리거가 「가장자리 0.7vw 접근」이라 **뷰포트 0.8 배마다 한 번**이고, 스크롤 경로는 이미
     // rAF 로 묶여 있으며(scheduleConteTimelineWindowRerender), 썸네일은 재생 중
     // timelineLayerThumbnailsSuspended 가 큐를 막으므로 이 재렌더에 실리지 않는다.
+    // ver1857: 콘티 트랙 빌더가 아이템 하나를 그리기 전에 늘 하는 세 가지 — **OL 클리핑 →
+    // 윈도우 가드 → 좌/폭 퍼센트** — 를 한 벌로 모았다. 같은 다섯 줄이 일곱 곳에 복사돼 있었고,
+    // 이미 갈라져 있었다: 어떤 곳은 `Math.max(1, span)` 을 쓰고 어떤 곳은 안 썼으며, 두 곳은
+    // 윈도우 가드가 아예 없었다. 갈린 부분은 지우지 않고 **인자로 남긴다** —
+    //   windowed:false — 상위 루프가 이미 그룹 단위로 걸러서 아이템마다 다시 볼 필요가 없는 곳.
+    //   minSpan:1      — 폭이 0 으로 접히지 않게 최소 한 프레임을 보장하던 곳.
+    // 반환이 null 이면 「그리지 않는다」로, 호출부는 자기 문맥에 맞게 '' 를 돌려주거나 return 한다.
+    function conteClipBox(ownerId, startFrame, endFrame, totalFrames, options) {
+      const clip = olClipFrameRange(ownerId, startFrame, endFrame);
+      if (!clip) return null;
+      const opts = options || {};
+      if (opts.windowed !== false && !frameSpanInConteWindow(clip.startFrame, clip.endFrame)) return null;
+      const span = clip.endFrame - clip.startFrame;
+      return {
+        clip: clip,
+        left: framePercent(clip.startFrame, totalFrames),
+        width: Math.max(0.001, framePercent(opts.minSpan ? Math.max(opts.minSpan, span) : span, totalFrames))
+      };
+    }
+
     function conteTimelineWindowNeedsRerender() {
       const win = state.conteRenderWindow;
       if (!win || !win.windowed) return false;
@@ -31458,7 +31478,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function conteTimelineTrackHtml(video, totalFrames) {
       const layout = createConteTimelineRenderLayout(video);
-      const height = conteTimelineTrackHeight(layout);
+      const height = layout.trackHeight; // ver1857: 한 줄 위임 함수를 걷어냈다(호출부가 여기 하나뿐이었다)
       return '<div class="timeline-track video-track conte-video-track' + (videoTrackIsHidden(state.project) ? ' video-hidden' : '') + '" style="--conte-track-height:' + height + 'px">' +
         timelineTrackLabelHtml({ id: 'video-main', type: 'video', label: 'C1 Conte', hidden: videoTrackIsHidden(state.project) }) +
         '<div class="timeline-lane" data-conte-layer-lane="true">' +
@@ -31526,11 +31546,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function conteCutShellsHtml(groups, totalFrames) {
       return (groups || []).map(function(item) {
         const owner = item.group && item.group.cuts && item.group.cuts[0];
-        const clip = olClipFrameRange(owner && owner.id || '', item.startFrame, item.startFrame + item.frames);
-        if (!clip) return '';
-        if (!frameSpanInConteWindow(clip.startFrame, clip.endFrame)) return '';
-        const left = framePercent(clip.startFrame, totalFrames);
-        const width = Math.max(0.001, framePercent(clip.endFrame - clip.startFrame, totalFrames));
+        const box = conteClipBox(owner && owner.id || '', item.startFrame, item.startFrame + item.frames, totalFrames);
+        if (!box) return '';
+        const left = box.left;
+        const width = box.width;
         return '<span class="conte-cut-shell" data-conte-owner-cut-id="' + escapeAttr(owner && owner.id || '') + '" style="--left:' + left.toFixed(4) + '%;--width:' + width.toFixed(4) + '%" title="CUT ' + escapeAttr(item.group && item.group.cutNo || '') + '"></span>';
       }).join('');
     }
@@ -31541,11 +31560,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const selectedPanels = selectedPicturePanelSet();
       return (slots || []).map(function(slot) {
         const owner = slot.group && slot.group.cuts && slot.group.cuts[0];
-        const clip = olClipFrameRange(owner && owner.id || '', slot.startFrame, slot.startFrame + slot.frames);
-        if (!clip) return '';
-        if (!frameSpanInConteWindow(clip.startFrame, clip.endFrame)) return '';
-        const left = framePercent(clip.startFrame, totalFrames);
-        const width = Math.max(0.001, framePercent(clip.endFrame - clip.startFrame, totalFrames));
+        const box = conteClipBox(owner && owner.id || '', slot.startFrame, slot.startFrame + slot.frames, totalFrames);
+        if (!box) return '';
+        const left = box.left;
+        const width = box.width;
         const cutId = slot.cut && slot.cut.id || '';
         const title = 'Panel ' + (slot.cut && slot.cut.startRow || '') + ' / CUT ' + (slot.cutNo || '');
         const selected = selectedPanels.has(cutId) ? ' selected-picture-panel' : '';
@@ -31579,10 +31597,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return ownerSlots.map(function(slot) {
             const cutId = slot.cut && slot.cut.id || '';
             if (!cutId) return '';
-            const clip = olClipFrameRange(ownerId, slot.startFrame, slot.endFrame);
-            if (!clip) return '';
-            const left = framePercent(clip.startFrame, totalFrames);
-            const width = Math.max(0.001, framePercent(Math.max(1, clip.endFrame - clip.startFrame), totalFrames));
+            // 그룹 루프가 이미 윈도우로 걸렀으므로 셀마다 다시 보지 않는다(windowed:false).
+            const box = conteClipBox(ownerId, slot.startFrame, slot.endFrame, totalFrames, { windowed: false, minSpan: 1 });
+            if (!box) return '';
+            const left = box.left;
+            const width = box.width;
             const title = displayName + ' / CUT ' + (slot.cutNo || '') + ' panel';
             const selectedCell = conteLayerRowCoordinateIsSelected(cutId, rowIndex) ? ' selected-layer-cell' : '';
             // ver1304: 그 행이 통째로 비표시면 덮는 층(빈 칸 선택 표시)도 같이 약해져야
@@ -31660,11 +31679,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const parts = [];
         bundles.forEach(function(bundle, key) {
           if (bundle.count < 2 || bundle.minLane === Infinity || bundle.maxLane < bundle.minLane) return;
-          const clip = olClipFrameRange(owner.id, bundle.startFrame, bundle.endFrame);
-          if (!clip) return;
-          if (!frameSpanInConteWindow(clip.startFrame, clip.endFrame)) return;
-          const left = framePercent(clip.startFrame, totalFrames);
-          const width = Math.max(0.001, framePercent(Math.max(1, clip.endFrame - clip.startFrame), totalFrames));
+          const box = conteClipBox(owner.id, bundle.startFrame, bundle.endFrame, totalFrames, { minSpan: 1 });
+          if (!box) return;
+          const left = box.left;
+          const width = box.width;
           const top = bundle.minLane * CONTE_LAYER_DEFAULT_HEIGHT;
           const height = (bundle.maxLane - bundle.minLane + 1) * CONTE_LAYER_DEFAULT_HEIGHT;
           parts.push('<span class="conte-layer-bundle-box" data-conte-owner-cut-id="' + escapeAttr(owner.id) + '" data-conte-bg-bundle-id="' + escapeAttr(key) + '" style="--left:' + left.toFixed(4) + '%;--width:' + width.toFixed(4) + '%;--bundle-top:' + top + 'px;--bundle-height:' + height + 'px"></span>');
@@ -31752,11 +31770,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const endFrame = endSlot ? endSlot.endFrame : item.endFrame;
           // OL: clip the bar to the owner cut's primary (active) range so an overlap region only
           // shows the active cut's layers. null => this layer is fully inside the other cut's region.
-          const clip = olClipFrameRange(owner.id, startFrame, endFrame);
-          if (!clip) return '';
-          if (!frameSpanInConteWindow(clip.startFrame, clip.endFrame)) return '';
-          const left = framePercent(clip.startFrame, totalFrames);
-          const width = Math.max(0.001, framePercent(Math.max(1, clip.endFrame - clip.startFrame), totalFrames));
+          const box = conteClipBox(owner.id, startFrame, endFrame, totalFrames, { minSpan: 1 });
+          if (!box) return '';
+          const left = box.left;
+          const width = box.width;
           const lane = laneMap.has(layer.id) ? laneMap.get(layer.id) : conteLayerLaneIndex(index);
           const top = lane * CONTE_LAYER_DEFAULT_HEIGHT;
           const selected = selectedLayerIds.has(layer.id) ? ' selected' : '';
