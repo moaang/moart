@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1873</title>
+  <title>MoArt ver1874</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -39816,6 +39816,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const activeClips = videoPreviewActiveAudioClips(state.project, state.videoPlayheadFrames, activeClipsOverride);
       const previewKey = videoPreviewKeyFor(slot, activeClips);
       if (stageEl.dataset.previewKey === previewKey) { // ver722: layer mode is always 'mixed' now (img fast-path retired)
+        try { stageEl.dataset.previewDiag = JSON.stringify({ where: 'ifchanged-samekey', n: (state.previewDiagSeq = (state.previewDiagSeq | 0) + 1), trackHidden: videoTrackIsHidden(state.project) }); } catch (e) {}
         if (cameraFrameOverlayNeedsRefresh()) renderCameraFrameOverlay(stageEl);
         else applyCameraPreviewTransform(stageEl);
         return;
@@ -39857,6 +39858,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         existing.set(key, el);
       });
       const used = new Set();
+      try {
+        stageEl.dataset.reconcileDiag = JSON.stringify({ trackHidden: videoTrackIsHidden(state.project), entries: layerEntries.length, existing: existing.size });
+      } catch (e) {}
       const orderMaps = layerStackOrderMapsForCut(state.project, cutId);
       layerEntries.forEach(function(entry) {
         const layer = entry && entry.layer || null;
@@ -40957,7 +40961,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Never rebuild the preview DOM (which recreates the layer canvas) while a memo stroke is
       // being drawn on it — the rebuild detaches/clears the canvas and the in-progress stroke
       // vanishes. Defer; endVideoPaintStroke reconciles after the stroke commits.
-      if (state.paintRasterOp) { state.videoPreviewRebuildDeferred = true; return; }
+      if (state.paintRasterOp) {
+        state.videoPreviewRebuildDeferred = true;
+        try { stageEl.dataset.previewDiag = JSON.stringify({ where: 'deferred-paintRasterOp', n: (state.previewDiagSeq = (state.previewDiagSeq | 0) + 1) }); } catch (e) {}
+        return;
+      }
       const slotPictureSrc = slot && slot.cut ? pictureSrcForCut(slot.cut) : '';
       const videoClip = !videoMediaTrackIsHidden(state.project)
         ? videoMediaClipAtFrame(state.project, state.videoPlayheadFrames, slot && slot.cut && slot.cut.id)
@@ -40965,7 +40973,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const videoClipSrc = videoClipMediaSrc(videoClip);
       const layerEntries = !videoTrackIsHidden(state.project) && slot && slot.cut ? layerDrawingEntriesForCut(state.project, slot.cut.id) : [];
       const onionHtml = onionSkinPreviewHtml(state.project, slot);
+      // ver1874 진단(임시): 상태·키·화면이 어긋나는 자리를 좁히려고 렌더가 **실제로 본 값**을 찍는다.
+      // 읽는 법: document.getElementById('conteVideoStage').dataset.previewDiag
+      const diagStamp = function(where, extra) {
+        try {
+          stageEl.dataset.previewDiag = JSON.stringify(Object.assign({
+            where: where,
+            n: (state.previewDiagSeq = (state.previewDiagSeq | 0) + 1),
+            trackHidden: videoTrackIsHidden(state.project),
+            entries: layerEntries.length,
+            paintRasterOp: Boolean(state.paintRasterOp)
+          }, extra || {}));
+        } catch (e) {}
+      };
       if (stageEl.dataset.previewKey === previewKey) { // ver722: layer mode is always 'mixed' (img fast-path retired)
+        diagStamp('forslot-samekey');
         if (cameraFrameOverlayNeedsRefresh()) renderCameraFrameOverlay(stageEl);
         else applyCameraPreviewTransform(stageEl);
         return;
@@ -41037,6 +41059,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const inOverlap = Boolean(videoOverlapAtFrame(state.project, state.videoPlayheadFrames));
       const oldScreen = stageEl.querySelector('.conte-paper');
       if (inOverlap || !oldScreen) {
+        diagStamp('sync-path');
         stageEl.innerHTML = screenHtml;
         // Insert the OL dissolve sibling BEFORE canvas-draw so its layers get the exact same canvas
         // rendering and geometry as the primary composite (prevents subtle misalignment).
@@ -41084,15 +41107,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (stageEl && stageEl.dataset.previewKey === previewKey) stageEl.dataset.previewKey = '';
       };
       const swapInPreviewScreen = function() {
-        if (buildSeq !== (state.videoPreviewBuildSeq | 0)) return;   // a newer build superseded this one
-        if (state.paintRasterOp) { dropOptimisticStamp(); return; }   // never swap out a live memo stroke
-        if (!stageEl.isConnected || !newScreen) { dropOptimisticStamp(); return; }
+        if (buildSeq !== (state.videoPreviewBuildSeq | 0)) { diagStamp('swap-superseded'); return; }
+        if (state.paintRasterOp) { diagStamp('swap-cancel-paint'); dropOptimisticStamp(); return; }
+        if (!stageEl.isConnected || !newScreen) { diagStamp('swap-cancel-detached'); dropOptimisticStamp(); return; }
         // Atomic swap via replaceChild (universally supported incl. old iPad Safari; replaceChildren is
         // Safari 14+). The old screen stays on-screen until this single op exchanges it for the ready one.
         const currentScreen = stageEl.querySelector('.conte-paper');
         if (currentScreen && currentScreen.parentNode === stageEl) stageEl.replaceChild(newScreen, currentScreen);
         else { while (stageEl.firstChild) stageEl.removeChild(stageEl.firstChild); stageEl.appendChild(newScreen); }
         finalizePreviewScreen();
+        diagStamp('swapped', { canvasInNew: newScreen.querySelectorAll('.video-preview-layer-canvas').length });
       };
 
       const pendingImgs = Array.prototype.slice.call(newScreen.querySelectorAll('img')).filter(function(img) {
