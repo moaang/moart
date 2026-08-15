@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1892</title>
+  <title>MoArt ver1894</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22932,7 +22932,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
-      { ver: 1892, items: [
+      { ver: 1894, items: [
         { ja: '**動画の取り込みが軽くなりました。**同じ8秒のクリップで、プロジェクトに入る量が 174MB から 30MB へ減っています（WebPで保存するようになりました）。取り込み中に別のタブへ移っても 止まらなくなり、コマの取りこぼしもなくなりました。', ko: '**영상 불러오기가 가벼워졌습니다.** 같은 8초 클립에서 프로젝트에 들어가는 양이 174MB 에서 30MB 로 줄었습니다(WebP 로 저장합니다). 불러오는 중에 다른 탭으로 옮겨도 멈추지 않고, 코마를 빠뜨리는 일도 없어졌습니다.', en: '**Importing video got much lighter.** The same 8-second clip now adds 30MB to the project instead of 174MB (frames are stored as WebP). Import no longer stalls when you switch tabs, and it no longer drops frames.' }
       ] },
       { ver: 1886, items: [
@@ -49744,6 +49744,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 전부 읽으면 base64 수백 MB 가 메모리에 올라온다.
     // ver1460: **사용 중인 행 수도 낸다.** 「미사용 3178건」만 보여 주면 그것이 정상인지(원화는 커밋마다
     // 새 ref 라 고아가 대부분인 게 정상이다) root 수집이 통째로 실패한 것인지 사용자가 구별할 수 없다.
+    // ver1893: 행은 문자열이거나 Blob 이다. String(blob).length 는 13(「[object Blob]」)이라
+    // 용량 표시가 통째로 틀어진다 — 크기를 묻는 자리는 이 한 벌을 쓴다.
+    function gengaStoredValueBytes(v) {
+      if (!v) return 0;
+      if (typeof v === 'string') return v.length;
+      if (typeof v.size === 'number') return v.size;
+      return String(v).length;
+    }
     async function storageUnreferencedScan(onProgress) {
       const live = await storageLiveRefsScan(onProgress);
       // ver1462: **모르면 목록을 만들지 않는다.** 호출부가 unknown 을 먼저 보지만(runStorageUnreferencedScan
@@ -49755,7 +49763,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const kept = part.kept;
       let bytes = 0;
       for (let i = 0; i < unused.length; i += 1) {
-        try { const v = await getWorkspaceDbValue(unused[i]); bytes += v ? String(v).length : 0; }
+        try { const v = await getWorkspaceDbValue(unused[i]); bytes += gengaStoredValueBytes(v); }   // ver1893
         catch (error) { console.error('[storage] size probe failed for ' + unused[i], error); }
         if (onProgress) onProgress(live.payloadCount + i + 1, live.payloadCount + unused.length);
       }
@@ -72769,6 +72777,41 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // `tlTut` 하나만 본다: autosave 설정으로 판정하면 「사용자가 자동저장을 꺼 둔 진짜 프로젝트」의
     // 그림까지 안 써져 리로드에서 사라진다 — 그것은 이 판이 고치려는 것과 정반대의 사고다.
     function gengaDrawingShouldPersist() { return !tlTut; }
+    // ver1893: **디스크에는 Blob 으로 적는다.** base64 는 원본보다 1.33배 크고, IndexedDB 에는
+    // 자동저장 버전 링 5 + 백업 3 으로 최대 8배가 쌓인다 — 영상 201장이면 그 오버헤드만 수십 MB 다.
+    // **메모리의 gengaDrawStore 는 종전대로 문자열이다.** 그쪽까지 Blob 으로 바꾸면 직렬화가
+    // 비동기가 되는데, 그 경로에는 동기여야만 하는 자리가 셋 있다(beforeunload · markProjectSavedBaseline
+    // · saveJsonDownload). 하나라도 놓치면 파일 저장이 깨져 사용자 작업물을 잃는다 — 1.33배를 위해
+    // 걸 위험이 아니다. 그래서 **경계를 디스크에만** 둔다.
+    // 변환에 실패하면 null 을 낸다 — 부르는 쪽이 문자열 그대로 적는다(옛 행과 같은 모양이라 안전).
+    function gengaDataUrlToBlob(u) {
+      const s = String(u || '');
+      if (s.slice(0, 5) !== 'data:') return null;
+      const comma = s.indexOf(',');
+      if (comma < 0) return null;
+      try {
+        const meta = s.slice(5, comma);
+        const type = meta.split(';')[0] || 'application/octet-stream';
+        if (meta.indexOf('base64') < 0) return new Blob([decodeURIComponent(s.slice(comma + 1))], { type: type });
+        const bin = atob(s.slice(comma + 1));
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i += 1) u8[i] = bin.charCodeAt(i);
+        return new Blob([u8], { type: type });
+      } catch (e) { return null; }
+    }
+    function gengaBlobToDataUrl(b) {
+      return new Promise(function(res) {
+        const rd = new FileReader();
+        rd.onload = function() { res(String(rd.result || '')); };
+        rd.onerror = function() { res(''); };
+        rd.readAsDataURL(b);
+      });
+    }
+    // 디스크에 적을 값. Blob 으로 못 바꾸면 종전 그대로 문자열이다.
+    function gengaDiskValueFor(dataUrl, blob) {
+      if (blob) return blob;
+      return gengaDataUrlToBlob(dataUrl) || String(dataUrl || '');
+    }
     function gengaDrawingUrl(d) { return d ? (d.ref ? (gengaDrawStore.get(d.ref) || null) : (typeof d.dataUrl === 'string' ? (d.dataUrl || null) : null)) : null; }
     // x,y (integer paper px, optional) = TRIMMED-bitmap placement: the bitmap is the ink's bbox crop and is drawn
     // 1:1 at (x,y) on the paper. Objects WITHOUT finite x/y are legacy full-paper bitmaps (drawn scaled to paper).
@@ -72776,7 +72819,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
       gengaDrawStore.set(ref, String(dataUrl || ''));
       if (gengaDrawingShouldPersist()) { // ver1474
-        trackPersistFailure('genga drawing', putWorkspaceDbValue('gd:' + ref, String(dataUrl || ''))); // ver1539
+        trackPersistFailure('genga drawing', putWorkspaceDbValue('gd:' + ref, gengaDiskValueFor(dataUrl))); // ver1539 / ver1893: Blob
       }
       const out = { ref: ref, w: Math.max(1, Math.round(Number(w) || 1)), h: Math.max(1, Math.round(Number(h) || 1)) };
       if (Number.isFinite(Number(x)) && Number.isFinite(Number(y))) { out.x = Math.round(Number(x)); out.y = Math.round(Number(y)); }
@@ -72809,16 +72852,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
       const entry = { canvas: canvas, layerId: meta && meta.layerId, frame: meta && meta.frame, fullCanvas: meta && meta.fullCanvas };
       gengaPendingDrawingEncode.set(ref, entry);
-      const finish = function(dataUrl) {
+      const finish = function(dataUrl, blob) {
         if (!gengaPendingDrawingEncode.has(ref)) return; // a flush already settled it synchronously
         gengaPendingDrawingEncode.delete(ref);
-        gengaSettleDrawingEncode(ref, entry, dataUrl);
+        gengaSettleDrawingEncode(ref, entry, dataUrl, blob);   // ver1893: 인코더가 만든 Blob 을 그대로
       };
       try {
         canvas.toBlob(function(blob) {
           if (!blob) { finish(canvas.toDataURL('image/png')); return; }
           const rd = new FileReader();
-          rd.onload = function() { finish(String(rd.result || '')); };
+          rd.onload = function() { finish(String(rd.result || ''), blob); };
           rd.onerror = function() { finish(canvas.toDataURL('image/png')); };
           rd.readAsDataURL(blob);
         }, 'image/png');
@@ -72830,12 +72873,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // the encode landed (async, or forced by a flush): store + persist + hand the decode-race fallback its
     // key + patch the thumbs that were skipped while pending. Layer lookups self-guard, so a project swapped
     // between commit and settle degrades to store/IDB writes only.
-    // ver1441 정정: 여기 있던 「그 고아는 기존 'gd:' GC 가 거둔다」는 **사실이 아니다** —
-    // 'gd:' 행을 지우는 코드는 파일 전체에 0곳이다(deleteWorkspaceDbValue 호출부 전수 확인:
-    // 프로젝트 페이로드·버전·오디오·'bt:' 뿐). 즉 획 하나가 영구 IndexedDB 행 하나다.
-    // 그 GC 는 **아직 없다** — 만들 때는 gengaLayerClipboard 가 ref 수집에서 빠져 있는 것부터 메울 것
-    // (gengaAddClipboardRefs). 지금은 GC 가 없어서 그 구멍이 안 터지고 있을 뿐이다.
-    function gengaSettleDrawingEncode(ref, entry, dataUrl) {
+    // ver1893 정정: 이 자리에는 ver1441 이 적은 「'gd:' 를 지우는 코드는 0곳이고 그 GC 는 아직 없다」가
+    // 남아 있었는데, **ver1458 이 무참조 정리를 만들면서 사실이 아니게 됐다**(storageUnreferencedScan →
+    // deleteWorkspaceDbValues). 낡은 주석이 조사를 오도하므로 고친다 — 지금은 저장 성공 3회 연속
+    // 무참조여야 지우고, 클립보드도 ref 수집에 들어 있다(ver1455).
+    // ver1893: blob 을 함께 받는다 — gengaPutDrawingCanvas 는 이미 toBlob 으로 만든 것을 들고 있으므로
+    // 여기서 base64 를 다시 바이트로 되돌릴 이유가 없다(획마다 도는 자리다).
+    function gengaSettleDrawingEncode(ref, entry, dataUrl, blob) {
       const url = String(dataUrl || '');
       gengaDrawStore.set(ref, url);
       // ver1448: putWorkspaceDbValue 는 async 라 이 try/catch 가 **rejection 을 못 잡는다**(쿼터 초과 ·
@@ -72843,7 +72887,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 빈 코마). 조용히 새지 않게 붙잡아 기록한다.
       if (gengaDrawingShouldPersist()) { // ver1474
         try {
-          const put = putWorkspaceDbValue('gd:' + ref, url);
+          const put = putWorkspaceDbValue('gd:' + ref, gengaDiskValueFor(url, blob));   // ver1893
           if (put && typeof put.catch === 'function') put.catch(function(err) {
             console.error('[gengaEncode] IndexedDB write failed for gd:' + ref + ' - this drawing will not survive a reload', err);
           });
@@ -73037,11 +73081,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const values = await readWorkspaceDbValues(list.map(function(ref) { return 'gd:' + ref; }), function(done, total) {
         if (total > DB_READ_CHUNK) updateLoadingOverlayProgress(done, total);
       });
+      // ver1893: 행이 Blob 일 수 있다(디스크는 Blob, 메모리는 문자열). 옛 행은 문자열 그대로 온다 —
+      // 두 모양을 다 받아야 이 판 이전에 저장한 프로젝트가 열린다.
+      const blobRefs = [];
       list.forEach(function(ref) {
         const v = values.get('gd:' + ref);
-        if (v) { gengaDrawStore.set(ref, String(v)); loaded++; }
-        else missing += 1; // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
+        if (!v) { missing += 1; return; }   // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
+        if (typeof v === 'string') { gengaDrawStore.set(ref, v); loaded++; return; }
+        if (typeof Blob !== 'undefined' && v instanceof Blob) { blobRefs.push([ref, v]); return; }
+        gengaDrawStore.set(ref, String(v)); loaded++;
       });
+      if (blobRefs.length) {
+        const urls = await Promise.all(blobRefs.map(function(pair) { return gengaBlobToDataUrl(pair[1]); }));
+        blobRefs.forEach(function(pair, i) {
+          if (urls[i]) { gengaDrawStore.set(pair[0], urls[i]); loaded++; }
+          else missing += 1;   // 조용히 넘어가지 않는다 — 아래 카운트가 말한다
+        });
+      }
       // ver1448: 종전에는 loaded 만 세고 결측은 조용히 지나갔다 — 사용자는 **원인 불명의 빈 코마**를 본다.
       // 형제인 gengaPreloadExportImages 는 같은 상황을 이미 카운트+경고한다(ver853).
       if (missing) console.error('[gengaHydrate] ' + missing + ' of ' + refs.size + ' drawing(s) had no stored data - those komas will appear blank');
