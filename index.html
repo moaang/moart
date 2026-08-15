@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1894</title>
+  <title>MoArt ver1896</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -22932,6 +22932,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1896, items: [
+        { ja: '**原画プロジェクトのZIP保存が軽くなりました。**絵と音をJSONに埋め込まず、ZIPの中に別ファイルとして入れるようにしたので、同じ内容でファイルが約1.3倍小さくなります。長い動画を取り込んだプロジェクトでも保存が詰まりにくくなりました。以前保存したZIPもそのまま開けます。', ko: '**원화 프로젝트의 ZIP 저장이 가벼워졌습니다.** 그림과 소리를 JSON 안에 넣지 않고 ZIP 안에 별도 파일로 담아, 같은 내용이 약 1.3배 작아집니다. 긴 영상을 불러온 프로젝트에서도 저장이 막히기 어려워졌습니다. 전에 저장한 ZIP도 그대로 열립니다.', en: '**Saving a genga project as ZIP got lighter.** Drawings and audio now ride as separate files inside the ZIP instead of being embedded in the JSON, so the same project is about 1.3x smaller and long video imports are far less likely to stall the save. ZIPs saved earlier still open.' }
+      ] },
       { ver: 1894, items: [
         { ja: '**動画の取り込みが軽くなりました。**同じ8秒のクリップで、プロジェクトに入る量が 174MB から 30MB へ減っています（WebPで保存するようになりました）。取り込み中に別のタブへ移っても 止まらなくなり、コマの取りこぼしもなくなりました。', ko: '**영상 불러오기가 가벼워졌습니다.** 같은 8초 클립에서 프로젝트에 들어가는 양이 174MB 에서 30MB 로 줄었습니다(WebP 로 저장합니다). 불러오는 중에 다른 탭으로 옮겨도 멈추지 않고, 코마를 빠뜨리는 일도 없어졌습니다.', en: '**Importing video got much lighter.** The same 8-second clip now adds 30MB to the project instead of 174MB (frames are stored as WebP). Import no longer stalls when you switch tabs, and it no longer drops frames.' }
       ] },
@@ -51329,17 +51332,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       copy.settings.editorUi = Object.assign({}, copy.settings.editorUi || {}, editorUiStatePayload());
       copy.settings.localWorkspace = normalizeWorkspaceSettings(Object.assign({}, copy.settings.localWorkspace, { enabled: false, name: '' }));
       if (copy.video && Array.isArray(copy.video.clips)) copy.video.clips.forEach(function(c) { c.mediaDataUrl = ''; });
-      if (copy.kind === 'genga' && copy.gengaTimeline) {
-        // genga media lives in ref stores (memory + IndexedDB 'gd:'/'ga:') — inline it here, otherwise the
-        // "self-contained" zip ships refs that only resolve in THIS browser (drawings/audio silently lost).
-        await gengaHydrateDrawStore(state.project);
-        await gengaHydrateAudioStore(state.project);
-        gengaInlineDrawings(copy.gengaTimeline);
-        gengaInlineAudio(copy.gengaTimeline);
-      }
       const media = [];
       const used = {};
       const uniqueName = function(name) { let n = name, i = 1; while (used[n.toLowerCase()]) { const dot = name.lastIndexOf('.'); n = dot > 0 ? (name.slice(0, dot) + '_' + i + name.slice(dot)) : (name + '_' + i); i += 1; } used[n.toLowerCase()] = true; return n; };
+      if (copy.kind === 'genga' && copy.gengaTimeline) {
+        // genga media lives in ref stores (memory + IndexedDB 'gd:'/'ga:'). Refs alone would only resolve in
+        // THIS browser, so the bytes must ride along — ver1895 ships them as **separate entries** instead of
+        // inlining base64 (see gengaExternalizeDrawings for why). uniqueName 은 오디오·레이어와 공유한다.
+        await gengaHydrateDrawStore(state.project);
+        await gengaHydrateAudioStore(state.project);
+        gengaExternalizeDrawings(copy.gengaTimeline, uniqueName, media);
+        gengaExternalizeAudio(copy.gengaTimeline, uniqueName, media);
+      }
       // Audio: big WAV sources (BGM, >0.8MB) get re-encoded to AAC/Opus (~10x smaller); small ones (voice) are
       // copied as-is. De-duped by source so a shared BGM is encoded once. Trim/speed/peaks stay valid (same content).
       const AUDIO_COMPRESS_MIN = 800 * 1024;
@@ -51761,6 +51765,41 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             // and keep going, so the rest of the project still loads.
             console.error('[zip-import] layer store failed:', fileName, error);
             missing.push({ kind: 'layer', name: fileName });
+          }
+        }
+        // ver1895: 원화 자산은 별도 엔트리로 실려 온다(storage 기술자). **옛 ZIP 은 dataUrl 인라인이라**
+        // **여기 안 들어온다** — restoreProject 가 이미 store 로 흡수했다. 두 모양을 다 받아야 한다.
+        if (state.project.kind === 'genga' && state.project.gengaTimeline) {
+          const gt2 = state.project.gengaTimeline;
+          const assets = [];
+          (gt2.layers || []).forEach(function(l) {
+            (l.exposures || []).forEach(function(e) { if (e && e.drawing && e.drawing.storage && e.drawing.ref) assets.push(e.drawing); });
+            if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) {
+              const d = l.sharedDrawings[k]; if (d && d.storage && d.ref) assets.push(d);
+            });
+          });
+          const audioAssets = (Array.isArray(gt2.audioClips) ? gt2.audioClips : []).filter(function(c) { return c && c.storage && c.ref; });
+          const total = assets.length + audioAssets.length;
+          for (let ai = 0; ai < total; ai += 1) {
+            const isDraw = ai < assets.length;
+            const item = isDraw ? assets[ai] : audioAssets[ai - assets.length];
+            const fileName = String(item.storage && item.storage.fileName || '');
+            const entry = fileName ? byBase[fileName.toLowerCase()] : null;
+            if (!entry) { missing.push({ kind: isDraw ? 'genga-drawing' : 'genga-audio', name: fileName || item.ref }); continue; }
+            showLoadingOverlay(t(isDraw ? 'msg.loading.extractingZipImages' : 'msg.loading.extractingZipAudio', ai + 1, total));
+            try {
+              const mime = item.storage.mime || mimeFromFileName(fileName) || (isDraw ? 'image/png' : 'audio/mpeg');
+              const blob = new Blob([entry.data], { type: mime });
+              // 메모리(문자열)와 디스크(Blob)의 경계는 ver1893 그대로다 — 여기서도 같은 모양으로 넣는다.
+              const url = await gengaBlobToDataUrl(blob);
+              if (!url) throw new Error('decode failed');
+              if (isDraw) gengaDrawStore.set(item.ref, url); else gengaAudioStore.set(item.ref, url);
+              if (preferIndexedDb) await putWorkspaceDbValue((isDraw ? 'gd:' : 'ga:') + item.ref, blob);
+              delete item.storage;
+            } catch (error) {
+              console.error('[zip-import] genga asset store failed:', fileName, error);
+              missing.push({ kind: isDraw ? 'genga-drawing' : 'genga-audio', name: fileName });
+            }
           }
         }
         const clips = state.project.audio && Array.isArray(state.project.audio.clips) ? state.project.audio.clips : [];
@@ -73143,6 +73182,71 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const list = Array.from(refs); // ver1541: 순차 → 청크 병렬(그림 쪽과 같은 커널)
       const values = await readWorkspaceDbValues(list.map(function(ref) { return 'ga:' + ref; }));
       list.forEach(function(ref) { const v = values.get('ga:' + ref); if (v) gengaAudioStore.set(ref, String(v)); });
+    }
+    // ver1895: **ZIP 용 외부화.** 인라인(위 두 함수)은 단일 JSON 저장이 쓰고, ZIP 은 이것을 쓴다.
+    // 종전에는 ZIP 도 인라인이라 두 가지가 따라왔다 — ① base64 가 원본의 1.33배인데 이 ZIP 은
+    // STORE(무압축)라 그 1.33배가 압축으로 회수되지 않고 파일 크기에 그대로 남고, ② 인라인 JSON 의
+    // ~512MB 문자열 한계를 그대로 맞는다(그 한계를 피하려고 ZIP 을 쓰는 것인데도).
+    // conte 레이어 비트맵이 이미 쓰는 규약을 그대로 따른다 — JSON 에는 { dir, fileName, mime } 기술자만,
+    // 바이트는 별도 엔트리. **ref 는 JSON 에 그대로 남긴다**: 읽는 쪽이 그 ref 로 곧장 gd:/ga: 행을
+    // 쓰면 되므로 참조를 다시 이어 붙일 필요가 없다.
+    const GENGA_ZIP_ASSET_DIR = 'assets/genga';
+    function gengaAssetMimeOf(dataUrl) {
+      const s = String(dataUrl || '');
+      if (s.slice(0, 5) !== 'data:') return '';
+      const semi = s.indexOf(';'), comma = s.indexOf(',');
+      const end = (semi >= 0 && semi < comma) ? semi : comma;
+      return end > 5 ? s.slice(5, end) : '';
+    }
+    function gengaAssetExtFor(mime) {
+      const m = String(mime || '').toLowerCase();
+      if (m === 'image/jpeg') return 'jpg';
+      if (m === 'audio/mpeg') return 'mp3';
+      const slash = m.indexOf('/');
+      const tail = slash >= 0 ? m.slice(slash + 1) : '';
+      return /^[a-z0-9]{1,5}$/.test(tail) ? tail : 'bin';
+    }
+    // media 에 담을 항목을 만들고 JSON 쪽에는 기술자를 남긴다. 바이트로 못 바꾸면 **인라인으로**
+    // **물러선다** — 자산이 조용히 빠지는 것보다 무거운 편이 낫다.
+    function gengaExternalizeAsset(store, ref, uniqueName, media) {
+      const url = store.get(ref);
+      if (!url) return null;
+      const mime = gengaAssetMimeOf(url);
+      const blob = gengaDataUrlToBlob(url);
+      if (!blob) return null;
+      const name = uniqueName(String(ref) + '.' + gengaAssetExtFor(mime));
+      media.push({ path: GENGA_ZIP_ASSET_DIR + '/' + name, url: url });
+      return { dir: GENGA_ZIP_ASSET_DIR, fileName: name, mime: mime || blob.type || '' };
+    }
+    function gengaExternalizeDrawings(gt, uniqueName, media) {
+      if (!gt) return;
+      const ext = function(d) {
+        if (!d || !d.ref) return d;
+        const storage = gengaExternalizeAsset(gengaDrawStore, d.ref, uniqueName, media);
+        if (!storage) {
+          const u = gengaDrawStore.get(d.ref);   // 바이트로 못 바꿨다 — 종전처럼 인라인
+          if (!u) return d;
+          const back = { dataUrl: u, w: d.w, h: d.h };
+          if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { back.x = d.x; back.y = d.y; }
+          return back;
+        }
+        const out = { ref: d.ref, w: d.w, h: d.h, storage: storage };
+        if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
+        return out;
+      };
+      (gt.layers || []).forEach(function(l) {
+        (l.exposures || []).forEach(function(e) { if (e.drawing) e.drawing = ext(e.drawing); });
+        if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { l.sharedDrawings[k] = ext(l.sharedDrawings[k]); });
+      });
+    }
+    function gengaExternalizeAudio(gt, uniqueName, media) {
+      if (!gt || !Array.isArray(gt.audioClips)) return;
+      gt.audioClips.forEach(function(c) {
+        if (!c || !c.ref || c.dataUrl) return;
+        const storage = gengaExternalizeAsset(gengaAudioStore, c.ref, uniqueName, media);
+        if (storage) c.storage = storage;
+        else { const u = gengaAudioStore.get(c.ref); if (u) c.dataUrl = u; }   // 물러섬
+      });
     }
     function gengaInlineAudio(gt) { // {ref}→inline dataUrl for portable serialization (operates on a clone)
       if (!gt || !Array.isArray(gt.audioClips)) return;
