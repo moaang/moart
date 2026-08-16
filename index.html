@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1934</title>
+  <title>MoArt ver1935</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23069,6 +23069,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1935, items: [
+        { ja: '**同じ絵のコマが並ぶ clip を読み込むとタブが落ちていたのを修正しました。**中身が同じコマは絵を1枚だけ持ち、タイムシートでも同じ番号として扱います（コンテ用紙フォーマットのように150コマが同じ絵のファイルで、5GB 近くを抱えて落ちていました）。', ko: '**같은 그림이 늘어선 clip 을 읽을 때 탭이 죽던 문제를 고쳤습니다.** 내용이 같은 코마는 그림을 한 장만 들고, 타임시트에서도 같은 번호로 잡습니다(콘티 용지 포맷처럼 150코마가 같은 그림인 파일에서 5GB 가까이 쥐고 있다가 죽었습니다).', en: '**Fixed the tab crashing on clip files whose komas repeat the same picture.** Komas with identical pixels now share one drawing and read as the same number on the timesheet — a conte-paper format file with 150 identical komas was holding nearly 5GB.' }
+      ] },
       { ver: 1934, items: [
         { ja: '**ブラシライブラリに、ファイルを選んで読み込む道ができました。**枠をタップするとファイル選択が開きます — これまではドロップだけだったので、タブレットでは追加する方法がありませんでした。', ko: '**브러시 라이브러리에 파일을 골라서 가져오는 길이 생겼습니다.** 칸을 누르면 파일 선택이 열립니다 — 지금까지는 드롭만 있어서 태블릿에서는 추가할 방법이 없었습니다.', en: '**The brush library can now open a file picker.** Tap the box to choose files — until now it only took drops, so there was no way to add a brush on a tablet.' },
         { ja: 'iPad などで `.tvpp` が選べなかったのを修正しました（ファイル選択で灰色のまま掴めない状態でした）。', ko: 'iPad 등에서 `.tvpp` 를 고를 수 없던 문제를 고쳤습니다(파일 선택창에서 회색으로 잠겨 있었습니다).', en: 'Fixed `.tvpp` files being unselectable on iPad and other tablets — the file picker greyed them out.' }
@@ -80172,12 +80175,39 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       toDecode += cd.looseLayers.filter(function(l) { return l.offscreenChunkId; }).length;
 
       let done = 0, failCount = 0, komaCount = 0, colorSeq = 0;
-      async function decodeToDrawing(L) {
+      // ver1935: **픽셀이 같은 코마는 그림 한 장을 함께 본다.** CSP 는 코마마다 별도 오프스크린을
+      // 만들어 chunk id 가 전부 다르므로(실측: 150 코마 = 150 chunk) id 로는 못 잡고, 디코드한
+      // 내용으로만 잡힌다. 안 접으면 2489x3496 용지의 150 코마가 **5GB** 가 되어 iPad 에서 탭이
+      // 죽는다(제보: 「このページを開けません」). 32비트 해시의 충돌은 w·h 와 바이트 길이를 키에
+      // 함께 넣어 좁힌다 — 150 장 규모에서 무시할 수 있다.
+      // 바이트마다 도는 판은 2489x3496 짜리 150 장에 5.9 초를 썼다(실측). RGBA 는 4 의 배수라
+      // 한 픽셀씩(32비트) 도는 경로를 먼저 쓴다 — 정렬이 안 맞는 버퍼만 바이트로 물러선다.
+      function clipContentKey(img) {
+        const a = img.rgba;
+        let h = 2166136261 >>> 0;
+        if ((a.byteOffset & 3) === 0 && (a.length & 3) === 0) {
+          const a32 = new Uint32Array(a.buffer, a.byteOffset, a.length >>> 2);
+          for (let i = 0; i < a32.length; i++) { h = (h ^ a32[i]) >>> 0; h = Math.imul(h, 16777619) >>> 0; }
+        } else {
+          for (let i = 0; i < a.length; i++) { h = (h ^ a[i]) >>> 0; h = Math.imul(h, 16777619) >>> 0; }
+        }
+        return img.w + 'x' + img.h + ':' + a.length + ':' + (h >>> 0).toString(36);
+      }
+      // dedupe 를 넘기면 그 안에서 접는다. **판정이 캔버스 생성 앞에 있어야** 메모리가 실제로 준다 —
+      // 뒤에서 접으면 이미 33MB 짜리 캔버스를 만든 뒤다. 호출부는 매 코마마다 `name` 을 채우고
+      // `canon` 을 읽는다(접혔으면 먼저 그 픽셀을 등록한 코마의 이름이 들어온다).
+      async function decodeToDrawing(L, dedupe) {
         if (!L.offscreenChunkId) return null;
         const img = await clipDecodeLayerBitmap(cd, L);
         done++;
         if (onProgress) onProgress(done, toDecode);
         if (!img) { failCount++; return null; }
+        let contentKey = null;
+        if (dedupe) {
+          contentKey = clipContentKey(img);
+          const hit = dedupe.map.get(contentKey);
+          if (hit) { dedupe.canon = hit.canon; return hit.drawing; }
+        }
         const cv = document.createElement('canvas'); cv.width = img.w; cv.height = img.h;
         cv.getContext('2d').putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
         // clip 레이어의 그림 크기가 캔버스와 다를 수 있다(확대 소재 등 — 실측: 같은 파일 안에
@@ -80187,6 +80217,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const trimmed = gengaTrimCanvasToDrawing(cv);
         const d = trimmed ? gengaIngestDrawing(trimmed) : null;
         if (!d) failCount++;
+        if (dedupe && d) { dedupe.map.set(contentKey, { drawing: d, canon: dedupe.name }); dedupe.canon = dedupe.name; }
         return d;
       }
 
@@ -80214,11 +80245,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
         // 코마별로 그림을 디코드(코마 이름 = 공유 key). 같은 이름의 코마가 시퀀스에서 여러 번
         // 나와도 여기서 한 번만 디코드된다 — 아래 exposure 는 instanceValue 로 이 그림을 참조한다.
+        // ver1935: 이름이 달라도 픽셀이 같으면 **먼저 등록한 코마의 이름으로 접는다.** 접힌 코마는
+        // sharedDrawings 에 자기 키를 만들지 않고, 아래 exposure 가 대표 이름을 instanceValue 로
+        // 쓴다 — 타임시트에도 「같은 원화 번호」로 잡혀 실제(같은 그림)와 맞는다.
+        const dedupeByLevel = [];
+        for (let lvl = 0; lvl < maxLayers; lvl++) dedupeByLevel.push({ map: new Map(), name: '', canon: '' });
+        const komaCanon = new Map();   // lvl + '\n' + 코마이름 → 대표 코마 이름
         for (let ki2 = 0; ki2 < cg.komas.length; ki2++) {
           const k = cg.komas[ki2];
           for (let lvl = 0; lvl < k.layers.length; lvl++) {
-            const d = await decodeToDrawing(k.layers[lvl]);
-            if (d) levelLayers[lvl].sharedDrawings[k.name] = d;
+            const dd = dedupeByLevel[lvl];
+            dd.name = k.name; dd.canon = '';
+            const d = await decodeToDrawing(k.layers[lvl], dd);
+            if (!d) continue;
+            const canon = dd.canon || k.name;
+            komaCanon.set(lvl + '\n' + k.name, canon);
+            if (canon === k.name) levelLayers[lvl].sharedDrawings[k.name] = d;
           }
           komaCount++;
         }
@@ -80233,7 +80275,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             for (let lvl = 0; lvl < maxLayers; lvl++) {
               const exp = newGengaExposure(hold);
               exp.startFrame = startF;
-              if (levelLayers[lvl].sharedDrawings[kf.komaName]) exp.instanceValue = kf.komaName;
+              const kfCanon = komaCanon.get(lvl + '\n' + kf.komaName) || kf.komaName;
+              if (levelLayers[lvl].sharedDrawings[kfCanon]) exp.instanceValue = kfCanon;
               levelLayers[lvl].exposures.push(exp);
             }
           }
@@ -80244,7 +80287,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           for (let lvl = 0; lvl < maxLayers; lvl++) {
             const exp = newGengaExposure(totalFrames);
             exp.startFrame = 1;
-            if (koma && levelLayers[lvl].sharedDrawings[koma.name]) exp.instanceValue = koma.name;
+            const komaCanonName = koma ? (komaCanon.get(lvl + '\n' + koma.name) || koma.name) : '';
+            if (komaCanonName && levelLayers[lvl].sharedDrawings[komaCanonName]) exp.instanceValue = komaCanonName;
             levelLayers[lvl].exposures.push(exp);
           }
         }
