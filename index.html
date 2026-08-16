@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1930</title>
+  <title>MoArt ver1931</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23021,6 +23021,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1931, items: [
+        { ja: '**clip の2Dカメラフォルダーのカメラワークを、レイヤーFXとして取り込むようになりました。**カメラは畳んだフォルダー単位で効くため、全体カメラではなくFXに移します。', ko: '**clip의 2D 카메라 폴더에 걸린 카메라워크를 레이어FX로 가져옵니다.** 카메라가 폴더 단위로 걸리는 구조라 전체 카메라가 아니라 FX로 옮깁니다.', en: '**Camera work on a clip 2D camera folder now imports as layer FX.** The camera is scoped per folder, so it maps to FX rather than a global camera.' }
+      ] },
       { ver: 1930, items: [
         { ja: '**clip 読み込みで、カメラ枠（撮影フレーム）を実際の設定どおりに取り込むようになりました。**これまでは用紙全体をカメラ枠にしていました。', ko: '**clip 가져오기에서 카메라 프레임(촬영 범위)을 실제 설정대로 가져옵니다.** 지금까지는 용지 전체를 카메라 프레임으로 잡고 있었습니다.', en: '**clip import now brings in the camera frame (shooting area) as actually configured.** Until now it treated the whole paper as the camera frame.' }
       ] },
@@ -79694,6 +79697,101 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     return keyframes;
   }
 
+  /* ---- 2D 카메라 폴더(TrackKind=2005) — 카메라워크 (2026-08-16)
+   * CSP 의 2D 카메라는 **폴더**다(`アニメーション > アニメーション用新規レイヤー > 2Dカメラフォルダー`).
+   * 그 폴더 안의 레이어에만 걸리므로 전역 카메라가 아니라 **레이어 FX** 로 옮긴다.
+   * 코마 노출표와 같은 "cmt 0100binc" 블롭이고 같은 ActionNodeClip/TimeClip 규칙을 따르지만,
+   * 파라미터가 축별로 갈린다: `ImagePosition`(X·Y 각각 FCurve) · `ImageScale`(%) ·
+   * `ImageRotation` · `ImageCenter`(회전·확대의 기준점, 실측 전부 프레임 정중앙) · `Opacity`.
+   * 코마 쪽과 달리 `Interp` 배열이 없다 — 호출부가 선형으로 잇는다.
+   * 반환: [{frame, posX, posY, scale, rot}] (scale 은 %, frame 은 0-based 실수) 또는 null. */
+  async function clipReadCameraKeyframes(u8, track, extaList, externalChunkRows, fps) {
+    if (!track || !track.TrackActionMixer) return null;
+    var externalId = String.fromCharCode.apply(null, track.TrackActionMixer);
+    var chunkIdx = -1;
+    for (var i = 0; i < externalChunkRows.length; i++) { if (externalChunkRows[i].ExternalID === externalId) { chunkIdx = i; break; } }
+    var exta = chunkIdx >= 0 ? extaList[chunkIdx] : null;
+    if (!exta) return null;
+    var info = clipParseExtaChunk(u8, exta.off, exta.size);
+    var raw = u8.subarray(info.binOff, info.binOff + info.binLen);
+    if (raw.length < 4) return null;
+    var header = clipParseCmtBincHeader(await clipInflateDeflate(raw.subarray(4)));
+
+    var clipOcc = clipFindNameOccurrences(header, 'ActionNodeClip', 0);
+    if (!clipOcc.length) return null;
+    var startOcc = clipFindNameOccurrences(header, 'Start', 8);
+    var endOcc = clipFindNameOccurrences(header, 'End', 8);
+    var rateOcc = clipFindNameOccurrences(header, 'Rate', 8);
+    var frameOcc = clipFindNameOccurrences(header, 'Frame', 14);
+    var valueOcc = clipFindNameOccurrences(header, 'Value', 14);
+    var posOcc = clipFindNameOccurrences(header, 'ImagePosition', 0);
+    var rotOcc = clipFindNameOccurrences(header, 'ImageRotation', 0);
+    var sclOcc = clipFindNameOccurrences(header, 'ImageScale', 0);
+
+    function inRange(list, lo, hi) {
+      var out = [];
+      for (var i2 = 0; i2 < list.length; i2++) if (list[i2] >= lo && list[i2] < hi) out.push(list[i2]);
+      return out;
+    }
+    // 파라미터 블록(lo..hi) 안의 n 번째 FCurve 를 {ticks, values} 로.
+    function curveIn(lo, hi, nth) {
+      var fs = inRange(frameOcc, lo, hi), vs = inRange(valueOcc, lo, hi);
+      if (fs.length <= nth || vs.length <= nth) return null;
+      var ticks = clipReadArrayFieldAt(header, fs[nth], 14), vals = clipReadArrayFieldAt(header, vs[nth], 14);
+      if (!ticks || !vals || ticks.length !== vals.length) return null;
+      return { ticks: ticks, values: vals };
+    }
+    // 선형 보간(끝은 유지) — 축마다 키 위치가 다를 수 있어 프레임 합집합에서 값을 뽑는다.
+    function sampleAt(curve, tick) {
+      if (!curve || !curve.ticks.length) return null;
+      var t = curve.ticks, v = curve.values;
+      if (tick <= t[0]) return v[0];
+      if (tick >= t[t.length - 1]) return v[v.length - 1];
+      for (var i3 = 1; i3 < t.length; i3++) {
+        if (tick <= t[i3]) {
+          var span = t[i3] - t[i3 - 1];
+          return span ? v[i3 - 1] + (v[i3] - v[i3 - 1]) * (tick - t[i3 - 1]) / span : v[i3 - 1];
+        }
+      }
+      return v[v.length - 1];
+    }
+
+    var keys = [];
+    for (var ci = 0; ci < clipOcc.length; ci++) {
+      var lo = clipOcc[ci], hi = (ci + 1 < clipOcc.length) ? clipOcc[ci + 1] : header.bytes.length;
+      var starts = inRange(startOcc, lo, hi), ends = inRange(endOcc, lo, hi), rates = inRange(rateOcc, lo, hi);
+      if (starts.length < 2 || ends.length < 2 || !rates.length) continue;
+      var clipStart = clipReadDoubleFieldAt(header, starts[0]), clipEnd = clipReadDoubleFieldAt(header, ends[0]);
+      var srcStart = clipReadDoubleFieldAt(header, starts[1]), srcEnd = clipReadDoubleFieldAt(header, ends[1]);
+      var rate = clipReadDoubleFieldAt(header, rates[0]);
+      if (!rate || clipStart == null || srcStart == null) continue;
+      var srcSpan = srcEnd - srcStart;
+      var scale = srcSpan ? (clipEnd - clipStart) / srcSpan : 1;
+
+      var pLo = inRange(posOcc, lo, hi)[0], rLo = inRange(rotOcc, lo, hi)[0], sLo = inRange(sclOcc, lo, hi)[0];
+      if (pLo == null) continue;
+      var posX = curveIn(pLo, rLo != null ? rLo : hi, 0);
+      var posY = curveIn(pLo, rLo != null ? rLo : hi, 1);
+      var rotC = rLo != null ? curveIn(rLo, sLo != null ? sLo : hi, 0) : null;
+      var sclC = sLo != null ? curveIn(sLo, hi, 0) : null;
+      if (!posX || !posY) continue;
+
+      var tickSet = {};
+      [posX, posY, rotC, sclC].forEach(function (c) { if (c) c.ticks.forEach(function (tk) { tickSet[tk] = true; }); });
+      Object.keys(tickSet).map(Number).sort(function (a, b) { return a - b; }).forEach(function (tk) {
+        keys.push({
+          frame: (clipStart + (tk - srcStart) * scale) * fps / rate,
+          posX: sampleAt(posX, tk), posY: sampleAt(posY, tk),
+          scale: sclC ? sampleAt(sclC, tk) : 100,
+          rot: rotC ? sampleAt(rotC, tk) : 0
+        });
+      });
+    }
+    if (!keys.length) return null;
+    keys.sort(function (a, b) { return a.frame - b.frame; });
+    return keys;
+  }
+
   function clipLayerInfoFrom(l, mipmaps, mipmapInfos, offscreens, extaChunks) {
     var chunkId = null;
     if (l.LayerRenderMipmap != null) {
@@ -79790,6 +79888,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     function info(l) { return clipLayerInfoFrom(l, mipmaps, mipmapInfos, offscreens, extaChunks); }
 
+    // 2D 카메라 폴더의 커브를 먼저 다 읽어 둔다(walk 는 동기라 안에서 await 할 수 없다).
+    var cameraKeysByMainId = {};
+    var camLayers = Object.keys(byId).map(function (k) { return byId[k]; })
+      .filter(function (l) { return l.LayerFolder && l.Camera2DResizableImageInfo; });
+    for (var cli = 0; cli < camLayers.length; cli++) {
+      var cl = camLayers[cli];
+      var camTrack = tracksByUuid[String(cl.LayerUuid || '').toLowerCase()];
+      var camKeys = await clipReadCameraKeyframes(u8, camTrack, extaList, externalChunkRows, fps);
+      if (camKeys) cameraKeysByMainId[cl.MainId] = camKeys;
+    }
+
     var cellGroupsRaw = []; // { name, layerUuid, komas:[{name, leaves:[Layer,...]}] } — 바닥부터
     var looseLeaves = []; // 셀 그룹 밖 leaf — 바닥부터
     var revisionsByCell = {}; // cellName -> [{ revisionFolderName, layer }]
@@ -79828,7 +79937,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
     }
 
-    function collectCellGroup(cellLayer) {
+    function collectCellGroup(cellLayer, cameraKeys) {
       var komas = [];
       var cur = cellLayer.LayerFirstChildIndex;
       while (cur) {
@@ -79842,10 +79951,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         cur = l.LayerNextIndex;
       }
-      return { name: cellLayer.LayerName || '', layerUuid: cellLayer.LayerUuid, komas: komas };
+      return { name: cellLayer.LayerName || '', layerUuid: cellLayer.LayerUuid, komas: komas, cameraKeys: cameraKeys || null };
     }
 
-    (function walk(mid) {
+    // cameraKeys 는 조상 2D 카메라 폴더의 것을 물려받는다(중첩이면 안쪽이 이긴다 — 실측엔 없었다).
+    (function walk(mid, cameraKeys) {
       var cur = mid;
       while (cur) {
         var l = byId[cur];
@@ -79855,16 +79965,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           if (!l.AnimationFolder && clipIsRevisionFolderName(l.LayerName)) {
             collectRevisionLeaves(l.LayerFirstChildIndex, l.LayerName, null);
           } else if (l.AnimationFolder) {
-            if (visible) cellGroupsRaw.push(collectCellGroup(l));
+            if (visible) cellGroupsRaw.push(collectCellGroup(l, cameraKeys));
           } else if (visible) {
-            walk(l.LayerFirstChildIndex);
+            walk(l.LayerFirstChildIndex, cameraKeysByMainId[l.MainId] || cameraKeys);
           }
         } else if (visible) {
-          looseLeaves.push(l);
+          looseLeaves.push({ layer: l, cameraKeys: cameraKeys || null });
         }
         cur = l.LayerNextIndex;
       }
-    })(canvas.CanvasRootFolder);
+    })(canvas.CanvasRootFolder, null);
 
     var cellGroups = [];
     for (var ci = cellGroupsRaw.length - 1; ci >= 0; ci--) {
@@ -79883,9 +79993,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
       }
       cg.keyframes = await clipReadCellKeyframes(u8, tracksByUuid, extaList, externalChunkRows, raw.layerUuid, fps);
+      cg.cameraKeys = raw.cameraKeys;
       cellGroups.push(cg);
     }
-    var looseLayers = looseLeaves.slice().reverse().map(info);
+    var looseLayers = looseLeaves.slice().reverse().map(function (e) {
+      var li = info(e.layer);
+      if (e.cameraKeys) li.cameraKeys = e.cameraKeys;
+      return li;
+    });
 
     return {
       buf: buf, u8: u8, extaChunks: extaChunks, offscreensByChunkId: offscreensByChunkId,
@@ -79947,6 +80062,34 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 수정공정 리비전은 이 함수가 아니라 gengaImportClipProjectFlow 가 붙인다 — state.project.
     // gengaTimeline 이 대입된 뒤에야 gengaSpawnCellGroupMember(진짜 커널)를 호출할 수 있어서다.
     const CLIP_DEFAULT_SECONDS = 4;
+    /* CSP 의 2D 카메라(폴더 단위) -> genga 레이어 FX.
+     * CSP 는 카메라가 움직이고 genga 의 fx 는 **그림이** 움직이므로 서로 역이다. genga 의 fx 는
+     * 用紙 중심을 피벗으로 `p' = c + R(rot)·scale·(p − c) + (x,y)` 이니(gengaFxRectCorners),
+     * 「카메라 사각형(중심 P, 배율 k)을 기본 프레임(중심 C0)에 맞추는」 변환을 그대로 fx 로 옮긴다:
+     * T(X) = R(−θ)·(X − P)/k + C0     (k = ImageScale/100, θ = ImageRotation)
+     * 계수를 맞추면
+     * scale = 1/k,  rot = −θ,  (x,y) = R(rot)·(c − P)/k + (C0 − c)
+     * 검산: 카메라가 기본 상태(P=C0, k=1)면 (x,y)=0·scale=1 로 항등이 된다(실측 129컷 첫 키가
+     * 정확히 그렇게 떨어진다). 방향은 스캔프레임 지시서와 대조해 확정했다 — 「Bセル T.U」(줌인)인
+     * 셀의 배율이 100%→91.71%(프레임이 작아짐), 「Aセル BG T.B」(줌아웃)인 셀이 100%→100.79%.
+     * CSP 카메라 커브에는 코마 쪽과 달리 Interp 가 없고, genga fx 는 선형 보간이라 그대로 잇는다. */
+    function gengaFxKeysFromClipCamera(cameraKeys, paperW, paperH, camFrame) {
+      if (!cameraKeys || !cameraKeys.length || !camFrame) return null;
+      const cx = paperW / 2, cy = paperH / 2;
+      const c0x = camFrame.x + camFrame.w / 2, c0y = camFrame.y + camFrame.h / 2;
+      return cameraKeys.map(function(k) {
+        const kk = Math.max(0.0001, (Number(k.scale) || 100) / 100);
+        const rot = -(Number(k.rot) || 0);
+        const a = rot * Math.PI / 180, cos = Math.cos(a), sin = Math.sin(a);
+        const dx = (cx - (Number(k.posX) || 0)) / kk, dy = (cy - (Number(k.posY) || 0)) / kk;
+        return {
+          frame: Math.max(1, Math.round(k.frame) + 1),
+          x: dx * cos - dy * sin + (c0x - cx),
+          y: dx * sin + dy * cos + (c0y - cy),
+          scale: 1 / kk, rot: rot
+        };
+      });
+    }
     async function gengaBuildTimelineFromClip(cd, onProgress, shouldAbort) {
       const pw = Math.max(1, cd.width), ph = Math.max(1, cd.height);
       const totalFrames = Math.max(1, (cd.timelineEndFrame - cd.timelineStartFrame) || Math.round(CLIP_DEFAULT_SECONDS * (cd.fps || 24)));
@@ -80039,6 +80182,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 그림이 하나도 없는 레벨(부모조차 그림 없음)은 버리고, tagOff/cellGroupId 를 다시 맞춘다.
         const keptLayers = levelLayers.filter(function(ll) { return Object.keys(ll.sharedDrawings).length > 0; });
         if (!keptLayers.length) continue;
+        // 이 셀을 감싸던 2D 카메라 폴더가 있으면 그 카메라워크를 레이어 FX 로(그룹 전원 같은 값).
+        const cgFxKeys = gengaFxKeysFromClipCamera(cg.cameraKeys, pw, ph, cd.cameraFrame);
+        if (cgFxKeys) keptLayers.forEach(function(ll) { ll.fx = { transform: cgFxKeys.map(function(k) { return Object.assign({}, k); }), opacity: [], blur: [] }; ll.fxEnabled = true; });
         keptLayers.forEach(function(ll, i) { ll.tagOff = i > 0; if (keptLayers.length < 2) ll.cellGroupId = ''; });
         keptLayers.forEach(function(ll) { built.push(ll); });
 
@@ -80059,13 +80205,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!d) continue;
         const exp = newGengaExposure(totalFrames);
         exp.startFrame = 1; exp.drawing = d;
-        built.push({
+        const looseFxKeys = gengaFxKeysFromClipCamera(L.cameraKeys, pw, ph, cd.cameraFrame);
+        const looseLayer = {
           id: 'genga-layer-' + Date.now().toString(36) + '-' + (colorSeq++).toString(36) + Math.random().toString(36).slice(2, 6),
           name: L.name || 'layer', color: gengaLayerColor(colorSeq),
           opacity: L.opacity, blend: L.blend,
           visible: true, locked: false, onion: false, role: 'cel',
           exposures: [exp], serifuSections: [], repeats: [], sharedDrawings: {}, postBehavior: 'none'
-        });
+        };
+        if (looseFxKeys) { looseLayer.fx = { transform: looseFxKeys, opacity: [], blur: [] }; looseLayer.fxEnabled = true; }
+        built.push(looseLayer);
       }
 
       if (!built.length) return null;
