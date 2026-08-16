@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1944</title>
+  <title>MoArt ver1945</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -61376,15 +61376,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.restore();
     }
 
-    function paintTransformBoxCorners(box) {
-      // ver945 G4b: the box is quad-only now ([[x,y]×4] kernel format) — the scalar cx/cy/w/h/rotation
-      // representation is retired; this just adapts to the {x,y} shape legacy consumers expect.
-      if (!box || !Array.isArray(box.quad) || box.quad.length !== 4) return [];
-      return box.quad.map(function(q) {
-        return { x: Number(q[0]) || 0, y: Number(q[1]) || 0 };
-      });
-    }
-
     function drawPaintOverlayHandle(ctx, point, fill, size, lineW) {
       const s = Number(size) > 0 ? Number(size) : 8; // ver651: scale-aware (constant screen size)
       ctx.save();
@@ -61401,9 +61392,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     function drawPaintTransformOverlay(ctx, box, mstyle) {
       if (!box) return;
-      const corners = paintTransformBoxCorners(box);
-      if (corners.length !== 4) return;
+      // ver1945: 모서리·변중점을 **커널 한 번**으로 받는다. 예전엔 paintTransformBoxCorners 로 모서리를
+      // 따로 펴고 퍼스펙티브 갈래에서 paintQuadHandlePoints 를 또 불러 같은 변환을 두 벌 돌렸다.
+      const quad = paintTransformBoxQuadArray(box);
+      if (quad.length !== 4) return;
       const st = mstyle || paintMarqueeStyle(1); // ver651: unified thin, constant-screen-size box + handles
+      const handles = paintQuadHandlePoints(quad, st.view || 1);
+      const corners = handles.corners;
       ctx.save();
       ctx.translate(-Math.round(Number(box.layerCanvasOffsetX) || 0), -Math.round(Number(box.layerCanvasOffsetY) || 0));
       strokePaintOverlayPath(ctx, function() {
@@ -61418,12 +61413,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       corners.forEach(function(point) { drawPaintOverlayHandle(ctx, point, null, st.handle, st.line); });
       if (box.mode === 'perspective') {
         // ver948: edge-midpoint handles — grab a whole edge and slide it (kernel 'edge' drag mode)
-        const HM = paintQuadHandlePoints(box.quad, st.view || 1).edgeMids;
-        HM.forEach(function(m) { drawPaintOverlayHandle(ctx, m, null, st.handle, st.line); });
+        handles.edgeMids.forEach(function(m) { drawPaintOverlayHandle(ctx, m, null, st.handle, st.line); });
       } else {
         // ver945 G4b / ver948: knob = shared kernel, now on the RIGHT edge (user request) — hit test
         // and overlay read the SAME kernel point (ver844 DR-1 invariant kept).
-        const armBase = { x: (corners[1].x + corners[2].x) / 2, y: (corners[1].y + corners[2].y) / 2 };
+        const armBase = handles.edgeMids[1]; // 오른쪽 변의 중점 — 커널이 이미 낸 값이다(손으로 다시 안 잰다)
         const rotateHandle = paintTransformRotateHandlePoint(box, st.view || 1);
         if (rotateHandle) {
           ctx.save();
@@ -63072,11 +63066,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       };
     }
 
-    function paintBoundsFromPoints(points) {
+    // ver1945: 입력은 quad 형식 `[[x,y]×4]` 다(이름이 형식을 말한다 — 옛 이름 paintBoundsFromPoints 는
+    // `{x,y}` 를 받아서, 넘기는 쪽이 형식을 틀려도 예외 없이 0 이 나왔다).
+    function paintBoundsFromQuad(quad) {
       const mm = paintPointsMinMax(
-        points,
-        function(point) { return Number(point && point.x) || 0; },
-        function(point) { return Number(point && point.y) || 0; }
+        quad,
+        function(point) { return Number(point && point[0]) || 0; },
+        function(point) { return Number(point && point[1]) || 0; }
       );
       return mm ? { x: mm.minX, y: mm.minY, w: mm.maxX - mm.minX, h: mm.maxY - mm.minY } : null;
     }
@@ -63270,18 +63266,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // ver768: 콘티/genga 공용 quad 커널. 두 엔진이 손복사로 유지하던 4쌍(bilinear·삼각형 워프·메시 워프·
     // 아핀 배치)을 하나로. 데이터 모델은 각자 유지 — 트랜스폼=아핀 스칼라{cx,cy,w,h,rotation}(콘티)/
-    // 평행사변형 quad(genga), 퍼스펙티브=자유 quad. paintTransformBoxCorners가 양쪽을 quad로 펴주므로
-    // 그리는 코드만 공유한다. 등가성은 픽셀 diff로 증명(scratchpad/quad_kernel_equiv.html):
+    // 평행사변형 quad(genga), 퍼스펙티브=자유 quad. 그리는 코드만 공유한다.
+    // 등가성은 픽셀 diff로 증명(scratchpad/quad_kernel_equiv.html):
     //   콘티 아핀 현행(translate+rotate+drawImage dest-rect) vs quad 경유 → 6케이스 전부 diff=0
     //   genga 워프 현행 vs 이 커널(base=항등) → n=6/12 diff=0 · 콘티 퍼스펙티브 n=24 → diff=0
-    // 아핀 박스든 quad 박스든 [[x,y]×4]로. paintTransformBoxCorners가 quad는 통과, 아핀은 4모서리로 전개.
-    // ver1944: **형식이 다르다 — 이름만으로는 안 보인다.**
-    //   paintTransformBoxCorners(box)   → [{x,y} × 4]   ← paintBoundsFromPoints 가 받는 형식
-    //   paintTransformBoxQuadArray(box) → [[x,y] × 4]   ← quad 커널(paintQuad*·paintWarpQuadMesh)이 받는 형식
-    // 섞으면 조용히 0 이 나온다(ver1942 작업 중 실제로 QuadArray 를 paintBoundsFromPoints 에 넘겨
-    // w/h 가 0 이 됐고, 메시 비례가 통째로 죽어 전부 하한으로 떨어졌다 — 게이트는 안 잡는다).
+    // ver1945: **박스의 좌표 형식은 `[[x,y]×4]` 한 벌이다.** 예전엔 `{x,y}` 로 펴 주는 어댑터
+    // (paintTransformBoxCorners)가 따로 있어 같은 변환이 두 벌이었고, 형식이 이름에 안 드러나
+    // 섞으면 **예외가 아니라 조용히 0 이 나왔다**(ver1942 때 실제로 나서 메시 비례가 통째로 죽었다).
+    // 어댑터를 없앴다 — `{x,y}` 가 필요한 자리는 paintQuadHandlePoints(quad) 가 corners/edgeMids/rotate 를
+    // 한 번에 준다. **새 소비부도 이 커널을 부른다. 모서리를 손으로 다시 펴지 말 것.**
     function paintTransformBoxQuadArray(box) {
-      return paintTransformBoxCorners(box).map(function(point) { return [point.x, point.y]; });
+      if (!box || !Array.isArray(box.quad) || box.quad.length !== 4) return [];
+      return box.quad.map(function(q) { return [Number(q && q[0]) || 0, Number(q && q[1]) || 0]; });
     }
 
     function paintQuadIsParallelogram(quad) {
@@ -63484,10 +63480,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintTransformDragMeshN(preview) {
       const op = state.paintRasterOp;
       if (!(op && op.type === 'transform-edit')) return PAINT_TRANSFORM_MESH_N;
-      // paintBoundsFromPoints 는 **{x,y} 객체 배열**을 받는다(paintTransformBoxQuadArray 의 [x,y] 가 아니라).
-      // 기존 호출부(paintTransformPatchBounds)도 corners 를 그대로 넘긴다.
-      const corners = preview && preview.box ? paintTransformBoxCorners(preview.box) : null;
-      const b = (Array.isArray(corners) && corners.length === 4) ? paintBoundsFromPoints(corners) : null;
+      const quad = preview && preview.box ? paintTransformBoxQuadArray(preview.box) : null;
+      const b = (Array.isArray(quad) && quad.length === 4) ? paintBoundsFromQuad(quad) : null;
       const span = b ? Math.max(Number(b.w) || 0, Number(b.h) || 0) : 0;
       if (!span) return PAINT_TRANSFORM_MESH_N_DRAG;
       const n = Math.ceil(span / PAINT_TRANSFORM_MESH_DRAG_CELL_PX);
@@ -63602,7 +63596,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           h: Math.max(1, Math.round(Number(preview.source.patchCanvas.height) || 1))
         };
       }
-      return paintBoundsFromPoints(paintTransformBoxCorners(preview.box)); // ver945 G4b: one shape for both modes (the perspective branch died with the scalar box)
+      return paintBoundsFromQuad(paintTransformBoxQuadArray(preview.box)); // ver945 G4b: one shape for both modes (the perspective branch died with the scalar box)
     }
 
     function paintTransformResultCanvas(op) {
