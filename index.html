@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1929</title>
+  <title>MoArt ver1930</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23021,6 +23021,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1930, items: [
+        { ja: '**clip 読み込みで、カメラ枠（撮影フレーム）を実際の設定どおりに取り込むようになりました。**これまでは用紙全体をカメラ枠にしていました。', ko: '**clip 가져오기에서 카메라 프레임(촬영 범위)을 실제 설정대로 가져옵니다.** 지금까지는 용지 전체를 카메라 프레임으로 잡고 있었습니다.', en: '**clip import now brings in the camera frame (shooting area) as actually configured.** Until now it treated the whole paper as the camera frame.' }
+      ] },
       { ver: 1929, items: [
         { ja: '**clip 読み込みで、コマ番号と空きセル（何も置かれていない区間）を正しく取り込むようになりました。**', ko: '**clip 가져오기에서 코마 번호와 빈 셀(아무것도 없는 구간)을 정확히 읽어옵니다.**', en: '**clip import now reads koma numbers and empty cells (gaps with nothing on them) correctly.**' }
       ] },
@@ -79540,10 +79543,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
    *
    * FCurve 의 배열들: `Frame`(Single[], 소스 시간축 틱) · `Tag`(String[], **코마 이름 그 자체**)
    * · `Interp`(String[], 실측 전부 "Constant" = 계단식) · Value/LeftSlope/RightSlope.
-   * **코마는 `Tag` 로 읽는다.** `Value` 는 코마 이름이 아니다 — 4코마 단순 파일에서 우연히
-   * Value=[0,1,2,3] 이 코마 1~4 와 맞아떨어져 "0-based 순번"으로 오판했었는데, 같은 코마를
-   * 다시 쓰는 파일(Tag=[1,2,3,4,3,4])에서 Value=[0,1,2,3,0,0] 로 갈라져 정체가 드러났다.
-   * Interp 가 Constant 가 아니면 가정이 깨진 것이므로 console.warn 으로 남긴다(조용한 실패 금지). */
+   * **코마는 `Tag` 로 읽는다.** Interp 가 Constant 가 아니면 가정이 깨진 것이므로 console.warn
+   * 으로 남긴다(조용한 실패 금지).
+   *
+   * `Value`(Single[])는 **읽지 않는다** — CSP 내부의 셀 인덱스 캐시인데 갱신이 안 된다.
+   * 조사 결과(2026-08-16): 한 번에 만들고 안 건드린 셀(198 컷 D, 45코마)에서는 Value 가
+   * 코마 순번 0~44 와 완전히 일치하지만, 편집 이력이 있으면 어긋난다 — 129 컷 B 는 작업자가
+   * 코마 6 을 나중에 끼워 넣은 흔적 그대로 `6→10`(나머지는 순차)이고, 뒤에 추가한 "a" 코마들은
+   * 기록 당시의 순번에 멈춰 있어 **서로 다른 코마가 같은 Value 를 갖는 충돌**까지 난다("1a"와
+   * "2" 가 둘 다 1). 그 둘의 그림을 실제로 디코드해 해시를 비교했더니 완전히 달랐다 — 즉 Value 는
+   * 그림 실체를 가리키는 참조도 아니다. 첫 판이 이 값을 "0-based 순번"으로 읽었던 것은 4코마
+   * 단순 파일에서 우연히 [0,1,2,3] 이 코마 1~4 와 맞아떨어졌기 때문이다. */
   function clipBytesToUuidStr(bytes) {
     var hex = '';
     for (var i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
@@ -79709,7 +79719,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
   }
 
   /* ---- 공개 API: parse ------------------------------------------------------
-   * 반환: { width, height, fps, timelineStartFrame, timelineEndFrame,
+   * 반환: { width, height, cameraFrame, fps, timelineStartFrame, timelineEndFrame,
    * cellGroups:[{ name, komas:[{ name, layers:[layerInfo,...] }], keyframes, revisions? }],
    * looseLayers:[layerInfo,...] }
    * cellGroups 는 AnimationFolder=1 폴더(원화의 "셀" — genga 알파벳 태그에 대응) 하나당 하나다.
@@ -79745,6 +79755,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     var canvas = (db.readTable('Canvas') || [])[0];
     if (!canvas) throw new Error('Canvas row not found');
+    /* 기본 카메라 프레임(= CSP 의 촬영/렌더링 프레임). 캔버스 전체가 아니라 그 안의 사각형이고,
+     * 2D 카메라 폴더가 없어도 항상 있다. `CropFrameInner*` 가 크기, 중심은 **캔버스 중앙에서
+     * 두 오프셋(CropFrameCropOffset* + CropFrameInnerOffset*)만큼 민 자리**다 — 실물 3파일에서
+     * 2D 카메라 레이어가 캐시해 둔 Camera2DOriginalFrameCenterX/Y 와 정확히 일치해 확정했다
+     * (198컷: 1899/2+12.5+0=962, 1359/2+5.5+63=748 = 그 캐시값). Inner 폭이 없으면 null 이고
+     * 호출부가 캔버스 전체로 물러선다. */
+    var cameraFrame = null;
+    (function () {
+      var fw = Math.round(Number(canvas.CropFrameInnerWidth) || 0);
+      var fh = Math.round(Number(canvas.CropFrameInnerHeight) || 0);
+      if (!(fw > 0 && fh > 0)) return;
+      var cx = Number(canvas.CanvasWidth) / 2 + (Number(canvas.CropFrameCropOffsetX) || 0) + (Number(canvas.CropFrameInnerOffsetX) || 0);
+      var cy = Number(canvas.CanvasHeight) / 2 + (Number(canvas.CropFrameCropOffsetY) || 0) + (Number(canvas.CropFrameInnerOffsetY) || 0);
+      cameraFrame = { x: Math.round(cx - fw / 2), y: Math.round(cy - fh / 2), w: fw, h: fh };
+    })();
     var timeline = (db.readTable('TimeLine') || [])[0];
     var fps = (timeline && Number(timeline.FrameRate)) || 24;
     var byId = {};
@@ -79865,6 +79890,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     return {
       buf: buf, u8: u8, extaChunks: extaChunks, offscreensByChunkId: offscreensByChunkId,
       width: Math.round(canvas.CanvasWidth), height: Math.round(canvas.CanvasHeight),
+      cameraFrame: cameraFrame,
       fps: fps,
       timelineStartFrame: (timeline && Number(timeline.StartFrame)) || 0,
       timelineEndFrame: (timeline && Number(timeline.EndFrame)) || 0,
@@ -80043,9 +80069,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
 
       if (!built.length) return null;
+      // 카메라(검정 고정 프레임) = CSP 의 촬영 프레임. 용지(=캔버스 전체)보다 작다 — 예전 판은
+      // 여기에 용지 전체를 넣어 「촬영 범위 = 종이 전체」로 잘못 잡고 있었다.
+      const cf = cd.cameraFrame;
+      const cam = cf ? { x: cf.x, y: cf.y, w: cf.w, h: cf.h } : { x: 0, y: 0, w: pw, h: ph };
       const gt = {
         fps: cd.fps || 24, paper: { w: pw, h: ph },
-        camera: { x: 0, y: 0, w: pw, h: ph }, output: { w: pw, h: ph },
+        camera: cam, output: { w: cam.w, h: cam.h },
         totalFrames: totalFrames, layers: built,
         audioClips: [], audioLaneVol: []
       };
