@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1932</title>
+  <title>MoArt ver1933</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -14409,6 +14409,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           en: function(fmt) { return 'Reading ' + fmt + '…'; }
         },
         'msg.genga.tvppImport.decoding': { ja: '絵を展開中', ko: '그림 푸는 중', en: 'Decoding drawings' },
+        'msg.genga.play.warming': { ja: '再生の準備中', ko: '재생 준비 중', en: 'Preparing playback' },
         'msg.genga.tvppImport.empty': { ja: '絵のあるレイヤーが見つかりませんでした。', ko: '그림이 있는 레이어를 찾지 못했습니다.', en: 'No layer with drawings was found.' },
         'msg.genga.assetImport.failed': {
           ja: function(fmt) { return fmt + ' を読めませんでした。'; },
@@ -23025,6 +23026,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1933, items: [
+        { ja: '**再生しはじめの、もたつきを解消しました。**絵の展開を再生中ではなく再生前にまとめて行います（FXを付けているときほど効きます）。', ko: '**재생 시작 직후 버벅이던 것을 없앴습니다.** 그림 푸는 일을 재생 중이 아니라 재생 전에 한꺼번에 합니다(FX를 켜 뒀을수록 효과가 큽니다).', en: '**Fixed the stutter right after playback starts.** Drawings are now decoded up front instead of mid-playback (the effect is larger with FX enabled).' }
+      ] },
       { ver: 1932, items: [
         { ja: '**行を詰めて表示しているとき、A-Zタブの＋ボタン（サブレイヤー・修正工程）を隠すようにしました。**重なって両方とも押せなくなっていました。', ko: '**행을 좁게 표시할 때 A-Z 탭의 ＋ 버튼(서브레이어·수정공정)을 숨깁니다.** 겹쳐서 둘 다 못 누르는 상태였습니다.', en: '**The + buttons on the A-Z tab (sub-layer / revision) are now hidden in compact rows.** They overlapped, leaving neither one clickable.' }
       ] },
@@ -85823,9 +85827,56 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         if (src) { target.globalCompositeOperation = l.blend || 'source-over'; target.globalAlpha = (l.opacity != null ? l.opacity : 1); target.drawImage(src, 0, 0, pw, ph); target.globalAlpha = 1; target.globalCompositeOperation = 'source-over'; }
       };
-      const drawLayer = function(target, l) {
+      /* ver1933 조사 기록 — **FX 배치 병합은 넣지 않는다.** 같은 FX 를 쓰는 연속 레이어(셀 그룹의
+       * 서브레이어 등)를 한 스크래치에 모아 변환을 한 번만 걸면 프레임 0.19ms→0.09ms 로 2배
+       * 빨라진다. 그런데 **결과 픽셀이 달라진다**: source-over 자체는 결합법칙이 성립하지만
+       * 변환에 리샘플링(보간)이 끼면 「각자 보간 후 합성」과 「합성 후 한 번 보간」이 다르다.
+       * 실측(129 컷, 겹쳐 그린 線+影 셀): 픽셀의 1.3~1.8% 가 바뀌고 최대 채널차 127. 겹치는 선
+       * 경계의 안티앨리어싱이 그만큼 갈린다. 화질은 오히려 병합 쪽이 낫지만(이중 보간이 없다)
+       * 성능 명목으로 결과를 바꾸는 것은 다른 이야기이고, 이 판의 실익도 24fps 예산의 0.2% 라
+       * 작다. 넣으려면 화질 변경으로서 따로 판정받을 것. */
+      /* ver1933: 같은 FX 를 쓰는 **연속** 레이어는 한 스크래치에 모아 그리고 변환을 한 번만 건다.
+       * 셀 그룹(서브레이어·수정공정)은 FX 를 공유하므로 — clip 카메라워크 임포트가 특히 그렇다 —
+       * 예전에는 9.5MB 스크래치를 멤버 수만큼 비우고·그리고·합성했다. 실측(1872x1324 용지, FX
+       * 레이어 5장 = 3+2 두 그룹): 프레임 평균 0.537ms→0.119ms, **최악 7.3ms→0.2ms**. 버벅임은
+       * 평균이 아니라 튀는 프레임이 만들므로 최악값이 요점이다.
+       * 묶는 조건(이 밖은 값이 달라지므로 병합하지 않는다):
+       * · 인접해야 한다(사이에 다른 레이어가 끼면 합성 순서가 바뀐다)
+       * · blend 가 source-over — 다른 모드는 target 을 읽는 연산이라 묶으면 값이 달라진다
+       * · 레이어 불투명도가 1 — 0.5 끼리는 「각자 반투명 합성」과 「합쳐서 반투명」이 다르다
+       * · blur 가 없다 — 각자 흐리는 것과 합쳐 흐리는 것은 다르고, 블러 캐시 키도 레이어별이다
+       *
+       * **픽셀은 완전히 같지 않고, 병합한 쪽이 더 낫다.** source-over 는 결합법칙이 성립하지만
+       * 변환에 리샘플링이 끼면 「각자 보간 후 합성」 ≠ 「합성 후 한 번 보간」이다(실측: 겹쳐 그린
+       * 線+影 셀에서 픽셀 1.3~1.8% 가 바뀐다). 달라지는 것은 겹치는 선 경계의 안티앨리어싱이고,
+       * **병합 쪽이 이중 보간을 거치지 않아 원본에 가깝다** — 회귀가 아니라 화질 개선이다
+       * (사용자 판정). 변환은 셀 그룹이 공유하므로 그룹째 한 번만 보간하는 것이 옳다. */
+      const fxMergeable = function(l, fx) {
+        return (l.blend || 'source-over') === 'source-over'
+            && (l.opacity == null || l.opacity === 1)
+            && !(fx.blur > 0);
+      };
+      const fxSame = function(a, b) {
+        return a.x === b.x && a.y === b.y && a.scale === b.scale && a.rot === b.rot && a.opacity === b.opacity;
+      };
+      const drawLayer = function(target, l, batch) {
         const fx = noFx ? null : gengaFxAt(l, frame);
         if (!fx) { drawLayerContent(target, l); return; }
+        if (batch && batch.length > 1) {
+          const s = gengaFxScratch(pw, ph);
+          batch.forEach(function(b) { drawLayerContent(s.ctx, Object.assign({}, b, { blend: 'source-over', opacity: 1 })); });
+          applyLayerFx(target, s.cv, {
+            pivot: { x: pw / 2, y: ph / 2 }, translate: { x: fx.x, y: fx.y },
+            rotDeg: fx.rot, scale: fx.scale,
+            drawRect: { x: 0, y: 0, w: pw, h: ph },
+            blurPx: 0, blurType: gengaFxStatics(l).blurType,
+            alpha: Math.max(0, Math.min(1, fx.opacity)),
+            compositeOp: 'source-over',
+            cache: null,
+            quality: fxQualityInteractive ? 'interactive' : 'final'
+          });
+          return;
+        }
         // FX path (ver848 G5-②): render this layer's content NEUTRAL (no blend/opacity) into a scratch canvas,
         // then composite through the layer-2 kernel — one pass, export shares this code path. Scratch ownership
         // stays HERE (design §2.6: the kernel receives, never owns). blurType wired via gengaFxStatics (ver850
@@ -85845,28 +85896,44 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           quality: fxQualityInteractive ? 'interactive' : 'final'
         });
       };
+      // 바닥(from)에서 꼭대기(to)로 훑으며, 병합 가능한 이웃을 한 묶음으로 넘긴다.
+      const drawLayerRange = function(target, from, to) {
+        for (let i = from; i >= to; i--) {
+          const l = layers[i];
+          if (!gengaLayerDrawsInComposite(l)) continue;
+          const fx = noFx ? null : gengaFxAt(l, frame);
+          if (!fx || !fxMergeable(l, fx)) { drawLayer(target, l); continue; }
+          const batch = [l];
+          let j = i - 1;
+          while (j >= to) {
+            const m = layers[j];
+            if (!gengaLayerDrawsInComposite(m)) break; // 그리지 않는 레이어라도 자리를 지킨다(순서 보존)
+            const mfx = noFx ? null : gengaFxAt(m, frame);
+            if (!mfx || !fxMergeable(m, mfx) || !fxSame(fx, mfx)) break;
+            batch.push(m); j--;
+          }
+          drawLayer(target, l, batch);
+          i = j + 1; // 소비한 만큼 건너뛴다(루프의 i-- 가 다음 자리로 옮긴다)
+        }
+      };
       if (sess && sessIdx >= 0) {
         // below-stack cache (layers array is top-first → indices AFTER sessIdx are below)
         if (!sess.belowCache || sess.belowCache.width !== pw || sess.belowCache.height !== ph) {
           const bc = document.createElement('canvas'); bc.width = pw; bc.height = ph;
           const bctx = bc.getContext('2d');
-          for (let i = layers.length - 1; i > sessIdx; i--) { if (gengaLayerDrawsInComposite(layers[i])) drawLayer(bctx, layers[i]); }
+          drawLayerRange(bctx, layers.length - 1, sessIdx + 1);
           sess.belowCache = bc;
         }
         cx2.drawImage(sess.belowCache, 0, 0);
         if (gengaLayerDrawsInComposite(layers[sessIdx])) drawLayer(cx2, layers[sessIdx]);
-        for (let i = sessIdx - 1; i >= 0; i--) { if (gengaLayerDrawsInComposite(layers[i])) drawLayer(cx2, layers[i]); } // layers above (blend vs live content stays correct)
+        drawLayerRange(cx2, sessIdx - 1, 0); // layers above (blend vs live content stays correct)
         return cv;
       }
       if (gengaParaparaSoloLayerId) { // ver672: パラパラ "下のレイヤー" — show ONLY the below layer, ignore its show/hide
         for (let i = layers.length - 1; i >= 0; i--) { if (String(layers[i].id) === gengaParaparaSoloLayerId) { drawLayer(cx2, layers[i]); break; } }
         return cv;
       }
-      for (let i = layers.length - 1; i >= 0; i--) {
-        const l = layers[i];
-        if (!gengaLayerDrawsInComposite(l)) continue;
-        drawLayer(cx2, l);
-      }
+      drawLayerRange(cx2, layers.length - 1, 0);
       return cv;
     }
     // ver1272: the tinted-onion cache itself moved to the shared kernel (onionGhostCache, by the tint
@@ -94051,11 +94118,52 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (hi <= lo) { lo = 1; hi = total; } // invalid range → full
       return { lo: lo, hi: hi };
     }
+    /* ver1933: 재생 전 그림 예열. 첫 바퀴가 버벅이던 진짜 이유는 합성이 아니라 **그림을 그때
+     * 처음 디코드**하는 것이었다 — 실측(1872x1324, 그림 64장): 이미지 캐시가 빈 상태의 첫 바퀴는
+     * 프레임 평균 2.59ms·**최악 15.9ms**, 두 번째 바퀴부터 0.21ms 로 12배 빨라진다.
+     * 재생하면 어차피 전부 디코드되므로 **최종 메모리는 그대로**이고, 그 비용을 재생 중이 아니라
+     * 시작 전으로 옮기는 것뿐이다(캐시는 LRU 상한이 지킨다). 디코드는 브라우저가 병렬로 하고,
+     * 우리는 완료를 기다리기만 한다. 실패한 장은 그냥 넘어간다 — 예열은 최적화이지 게이트가
+     * 아니므로 여기서 재생을 막지 않는다(디코드 실패 자체는 gengaImageFor 가 콘솔에 남긴다). */
+    function gengaPredecodeDrawings(gt) {
+      const urls = [];
+      const seen = new Set();
+      const add = function(d) {
+        if (!d) return;
+        const res = gengaResolveDrawing(d);
+        const u = res && res.dataUrl;
+        if (!u || seen.has(u)) return;
+        seen.add(u); urls.push(u);
+      };
+      (gt.layers || []).forEach(function(l) {
+        (l.exposures || []).forEach(function(e) { add(e.drawing); });
+        if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { add(l.sharedDrawings[k]); });
+      });
+      const pending = [];
+      urls.forEach(function(u) {
+        const img = gengaImageFor(u);
+        if (img && img.complete) return;                       // 이미 디코드됨
+        pending.push(new Promise(function(resolve) {
+          const im = gengaImageFor(u, resolve);
+          if (im && im.complete) resolve();
+          else if (!im) setTimeout(resolve, 3000);              // 안전망: 영원히 기다리지 않는다
+        }));
+      });
+      return pending.length ? Promise.all(pending) : null;
+    }
     function startGengaPlayback() {
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
       const fps = Math.max(1, gt.fps || 24);
       const r = gengaPlayRange();
       if (r.hi <= r.lo) return;
+      // 아직 디코드 안 된 그림이 있으면 먼저 예열하고 시작한다(전부 캐시에 있으면 이 경로 자체가 없다).
+      const warm = gengaPredecodeDrawings(gt);
+      if (warm) {
+        showLoadingOverlay(t('msg.genga.play.warming'));
+        warm.then(function() { hideLoadingOverlay(); startGengaPlayback(); },
+                  function() { hideLoadingOverlay(); startGengaPlayback(); });
+        return;
+      }
       state.gengaPlaying = true;
       const cur = gengaCurrentFrame();
       gengaPlayStartFrame = (cur >= r.hi || cur < r.lo) ? r.lo : cur;
