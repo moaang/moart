@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1941</title>
+  <title>MoArt ver1942</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23098,6 +23098,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1942, items: [
+        { ja: '**大きく拡大した絵をドラッグで変形しているあいだ、プレビューの形が実際と違って見えることがあったのを直しました。**分割数を結果の大きさに合わせるようにしました（小さい変形はこれまでどおりです）。', ko: '**크게 확대한 그림을 드래그로 변형하는 동안 미리보기 모양이 실제와 다르게 보이던 것을 고쳤습니다.** 분할 수를 결과 크기에 맞추도록 했습니다(작은 변형은 지금까지와 같습니다).', en: '**Fixed the drag preview showing a different shape than the result when transforming a heavily enlarged drawing.** The mesh now scales with the result size (small transforms behave exactly as before).' }
+      ] },
       { ver: 1941, items: [
         { ja: '**変形・パースに入った瞬間だけ絵の比率が崩れて見えることがあったのを直しました。**選択していないときの変形の基準（絵の範囲）が変わっても古い枠を使い回していたのが原因で、動かすか選択し直すと直っていたのはそのためです。', ko: '**변형·퍼스펙티브에 들어간 순간에만 그림 비율이 무너져 보이던 문제를 고쳤습니다.** 선택이 없을 때의 변형 기준(그림 범위)이 바뀌어도 옛 상자를 그대로 쓰던 것이 원인이라, 움직이거나 선택을 다시 하면 돌아왔던 것입니다.', en: '**Fixed the picture looking distorted for a moment right after entering Transform or Perspective.** With no selection the box is based on the artwork bounds, and a stale box was reused when those bounds changed — which is why moving or reselecting made it snap back.' }
       ] },
@@ -63436,11 +63439,32 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 화면에 남는 그림과 구워지는 픽셀은 불변 — 손가락이 움직이는 동안의 미리보기만 거칠어진다.
     const PAINT_TRANSFORM_MESH_N = 24;
     const PAINT_TRANSFORM_MESH_N_DRAG = 6;
+    // ver1942 (판정 q3=A): 분할을 **결과 크기에 비례**시킨다. 고정 분할은 큰 변형에서 셀이 커져
+    // 원근 근사가 눈에 띄게 어긋난다(셀 안은 선형이므로 「거칠다」가 아니라 **모양이 다르다**).
+    // 실측 — 2520x1781 결과, 강한 사다리꼴, 오차는 n=128 대비 픽셀 비율:
+    //   n=6  셀 420px  3.83%  0.5ms   ← 종전 드래그 값
+    //   n=12 셀 210px  1.01%  2.3ms
+    //   n=16 셀 158px  0.25%  4.3ms   ← 드래그 상한(60Hz 예산의 26%)
+    //   n=24 셀 105px  0.03%  8.5ms   ← 정지·커밋. **큰 결과에서도 이미 수렴한다**
+    //   n=32~64        0.01~0.03%  20~68ms  ← 오차는 안 줄고 비용만 는다
+    // 그래서 **정지·커밋(24)은 그대로 둔다** — 올릴 이유가 측정에 없다. 바꾸는 것은 드래그뿐이고,
+    // 작은 결과에서는 하한(6)이 걸려 종전과 같은 값이 나온다(561px 결과 → ceil(561/160)=4 → 6).
+    const PAINT_TRANSFORM_MESH_DRAG_CELL_PX = 160;
+    const PAINT_TRANSFORM_MESH_N_DRAG_MAX = 16;
 
     // 드래그 스코프 판정. paintRasterOp는 pointerdown에 서고 pointerup에서 해제되므로 정확히 제스처 동안만 참.
-    function paintTransformDragMeshN() {
+    // 크기는 **결과(quad)** 로 잰다 — 근사 오차를 만드는 것은 소스 해상도가 아니라 그려지는 넓이다.
+    function paintTransformDragMeshN(preview) {
       const op = state.paintRasterOp;
-      return op && op.type === 'transform-edit' ? PAINT_TRANSFORM_MESH_N_DRAG : PAINT_TRANSFORM_MESH_N;
+      if (!(op && op.type === 'transform-edit')) return PAINT_TRANSFORM_MESH_N;
+      // paintBoundsFromPoints 는 **{x,y} 객체 배열**을 받는다(paintTransformBoxQuadArray 의 [x,y] 가 아니라).
+      // 기존 호출부(paintTransformPatchBounds)도 corners 를 그대로 넘긴다.
+      const corners = preview && preview.box ? paintTransformBoxCorners(preview.box) : null;
+      const b = (Array.isArray(corners) && corners.length === 4) ? paintBoundsFromPoints(corners) : null;
+      const span = b ? Math.max(Number(b.w) || 0, Number(b.h) || 0) : 0;
+      if (!span) return PAINT_TRANSFORM_MESH_N_DRAG;
+      const n = Math.ceil(span / PAINT_TRANSFORM_MESH_DRAG_CELL_PX);
+      return Math.max(PAINT_TRANSFORM_MESH_N_DRAG, Math.min(PAINT_TRANSFORM_MESH_N_DRAG_MAX, n));
     }
 
     function paintWarpQuadMesh(ctx, img, iw, ih, quad, n) {
@@ -63513,7 +63537,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const sctx = scratch.getContext('2d');
         sctx.clearRect(0, 0, scratch.width, scratch.height);
         sctx.drawImage(previewBase, 0, 0);
-        drawPaintTransformPatch(sctx, preview, paintTransformDragMeshN()); // ver769: 드래그 중만 저분할
+        drawPaintTransformPatch(sctx, preview, paintTransformDragMeshN(preview)); // ver769: 드래그 중만 저분할 · ver1942: 결과 크기에 비례
         ctx.save();
         ctx.globalAlpha = 0.98;
         ctx.imageSmoothingEnabled = !crisp; // 표시 보간 = 레이어 캔버스와 같은 신호(패치 1/2에서 전달)
@@ -63527,7 +63551,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.globalAlpha = 0.98;
       ctx.translate(-Math.round(Number(preview.layerCanvasOffsetX) || 0), -Math.round(Number(preview.layerCanvasOffsetY) || 0));
       if (preview.source.baseCanvas) ctx.drawImage(preview.source.baseCanvas, 0, 0);
-      drawPaintTransformPatch(ctx, preview, paintTransformDragMeshN());
+      drawPaintTransformPatch(ctx, preview, paintTransformDragMeshN(preview)); // ver1942
       ctx.restore();
     }
 
