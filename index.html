@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1971</title>
+  <title>MoArt ver1972</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -26287,6 +26287,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return conteLayerLineIdsForOwner(project, found.ownerCut, conteLayerLineKey(found.layer));
     }
 
+    // ver1972: 선택의 형상 — { shape, rows, cols, ids }.
+    //   single(1×1) · column(행 2+ × 패널 1: **세로 = 레이어 여러 개**) ·
+    //   row(행 1 × 패널 2+: **가로 = 한 레이어 안의 코마들**) · rect(둘 다 2+)
+    // 판정 q1=A: rect 는 코마 기준으로 읽는다(결국 코마 여러 개이고, 행 단위 뜻이 필요한 것만 뺀다).
+    function conteSelectionShape(project, layerIds) {
+      const ids = (layerIds || []).map(String).filter(Boolean);
+      const rows = new Set(), cols = new Set();
+      ids.forEach(function(id) {
+        const found = findConteLayerById(project, id);
+        if (!found || !found.layer) return;
+        rows.add(conteLayerLineKey(found.layer));
+        cols.add(Math.round(Number(found.layer.panelStart) || 0));
+      });
+      const r = rows.size, c = cols.size;
+      const shape = (r <= 1 && c <= 1) ? 'single'
+                  : (c <= 1 ? 'column' : (r <= 1 ? 'row' : 'rect'));
+      return { shape: shape, rows: r, cols: c, ids: ids };
+    }
+    // 「레이어(행) 기준」의 대상 — 선택에 걸린 **행 전체**의 코마를 모은다.
+    // 판정 q3=A + 사용자 메모(「레이어 삭제는 레이어행 기준이어야 함」)의 정본이다.
+    function conteLayerRowIdsForSelection(project, layerIds) {
+      const out = [];
+      const seen = Object.create(null);
+      (layerIds || []).forEach(function(id) {
+        conteLayerRowOperationIds(project, id).forEach(function(rid) {
+          const k = String(rid);
+          if (seen[k]) return;
+          seen[k] = 1; out.push(k);
+        });
+      });
+      return out;
+    }
     function conteLayerRowOperationIds(project, layerId) {
       const found = findConteLayerById(project, layerId);
       if (!found || !found.layer || !found.ownerCut) return [];
@@ -34921,6 +34953,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (deleteIds.indexOf(deleteId) < 0) deleteIds.push(deleteId);
         });
       });
+      // ver1972: 선택의 형상을 **여기서 한 번** 잰다 — 아래 항목들이 각자 판정하지 않는다.
+      //   single  → 지금까지와 같다(전부 보인다)
+      //   column  → 세로 = 레이어(행) 여러 개 → 레이어 기준만
+      //   row/rect→ 가로/사각형 = 코마 여러 개 → 코마 기준만 (판정 q1=A)
+      const sel = conteSelectionShape(state.project, contextSelectedIds.indexOf(id) >= 0 ? contextSelectedIds : [id]);
+      const isSingle = sel.shape === 'single';
+      const isLayerScope = sel.shape === 'column';     // 레이어(행) 기준 조작이 뜻을 갖는 형상
+      const isKomaScope = sel.shape === 'row' || sel.shape === 'rect';
+      // 「레이어 기준」의 실제 대상 — 선택에 걸린 **행 전체**(판정 q3=A: 삭제는 레이어행 기준).
+      const rowIds = conteLayerRowIdsForSelection(state.project, sel.ids);
       const bgActive = conteLayersAreAllBg(state.project, targetIds);
       const expandableActive = targetIds.length > 0 && targetIds.every(function(tid) {
         const f = findConteLayerById(state.project, tid);
@@ -34943,7 +34985,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // other is not active, so a koma can never be both at once.
       openSimpleContextMenu(event, [
         // --- 種別・リンク (layer role & link; unlink sits under BG since it is the BG-side action) ---
-        { hidden: expandableActive, label: bgLabel, className: bgActive ? 'active' : '', ariaPressed: bgActive,
+        { hidden: expandableActive || !isSingle, label: bgLabel, className: bgActive ? 'active' : '', ariaPressed: bgActive,
           action: function() {
             if (!bgActive && !window.confirm(t('msg.conteLayer.bgConfirm'))) return;
             runConteLayerCutPatchCommand(bgActive ? 'Unset BG conte layers' : 'Make BG conte layers', conteLayerOwnerCutIdsForLayerIds(state.project, targetIds), function(project) {
@@ -34951,13 +34993,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               else makeConteLayersBg(project, targetIds);
             });
           } },
-        { hidden: !linkedActive, label: t('menu.conteLayer.unlink'), action: function() {
+        { hidden: !linkedActive || !isSingle, label: t('menu.conteLayer.unlink'), action: function() {
             runConteLayerCutPatchCommand('Unlink conte layers', conteLayerOwnerCutIdsForLayerIds(state.project, targetIds), function(project) {
               targetIds.forEach(function(targetId) { unlinkConteLayer(project, targetId); });
               setSelectedConteLayers(targetIds, targetIds[targetIds.length - 1]);
             });
           } },
-        { hidden: bgActive, label: expandableLabel, className: expandableActive ? 'active' : '', ariaPressed: expandableActive,
+        { hidden: bgActive || !isSingle, label: expandableLabel, className: expandableActive ? 'active' : '', ariaPressed: expandableActive,
           action: function() {
             runConteLayerCutPatchCommand(expandableActive ? 'Unset expandable koma' : 'Make expandable koma', conteLayerOwnerCutIdsForLayerIds(state.project, targetIds), function(project) {
               targetIds.forEach(function(targetId) {
@@ -34968,8 +35010,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           } },
         { separator: true },
         // --- 編集 (edit) ---
-        { label: t('menu.genga.layer.fx'), action: function() { openLayerEffectWindow(id); } },
-        { label: t('menu.conteLayer.rename'), action: function() {
+        // FX 창은 단일 대상 전용이라(state.layerEffectId 하나) 다중선택에서 뜻이 없다.
+        { hidden: !isSingle, label: t('menu.genga.layer.fx'), action: function() { openLayerEffectWindow(id); } },
+        { hidden: !isSingle, label: t('menu.conteLayer.rename'), action: function() {
             const found = findConteLayerById(state.project, id);
             if (!found) return;
             const displayMap = conteLayerDisplayNameMap(found.ownerCut.conteLayers || []);
@@ -34981,16 +35024,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               });
             });
           } },
-        { label: t('menu.conteLayer.add'), action: function() { addConteLayerToSelection('cut'); } },
+        { hidden: !isSingle, label: t('menu.conteLayer.add'), action: function() { addConteLayerToSelection('cut'); } },
         // ver1524: 삭제 둘을 아래에 따로 모으지 않고 **각자 다루는 대상 옆에** 둔다 — 위 덩어리는
-        // 「레이어 기준」(FX·이름·추가·삭제), 아래 덩어리는 「레이어 코마 기준」(복사·잘라내기·
-        // 붙여넣기·삭제). 종전에는 삭제 둘이 나란히 맨 아래라 무엇을 지우는지가 그 대상과 멀었다.
-        { label: t('menu.conteLayer.deleteLayer'), action: function() {
-            // Delete just this row's layer of the current cut (not its linked copies in other cuts).
-            const ownerCutIds = conteLayerOwnerCutIdsForLayerIds(state.project, [id]);
+        // 「레이어 기준」(FX·이름·추가·삭제·병합), 아래 덩어리는 「레이어 코마 기준」.
+        // ver1972: 이 항목은 **레이어행 기준**이다(판정 q3=A + 사용자 메모). 종전에는 다중선택
+        // 중에도 클릭한 하나만 지웠고, 바로 아래 「코마 삭제」는 선택 전부를 지워 이름과 반대였다.
+        { hidden: isKomaScope, label: t('menu.conteLayer.deleteLayer'), action: function() {
+            const targetRowIds = rowIds.length ? rowIds : conteLayerRowOperationIds(state.project, id);
+            const ownerCutIds = conteLayerOwnerCutIdsForLayerIds(state.project, targetRowIds);
             runConteLayerCutPatchCommand('Delete conte layer', ownerCutIds, function(project) {
-              const selectionContext = captureConteLayerRemovalSelectionContext(project, [id]);
-              removeConteLayersByIds(project, [id]);
+              const selectionContext = captureConteLayerRemovalSelectionContext(project, targetRowIds);
+              removeConteLayersByIds(project, targetRowIds);
               restoreConteLayerSelectionAfterRemoval(project, selectionContext);
             });
           } },
@@ -34998,12 +35042,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // --- レイヤーコマ (ver1519: 사용자 요청으로 아래로 내렸다 — 만들기·고치기와 섞여 있었다) ---
         // ver1105: copy/paste from the menu itself. On iPad there is no Ctrl+C — a long press is the only
         // way in, so without these the koma clipboard was keyboard-only and simply unreachable there.
-        { label: t('menu.conteLayer.copyKoma'), action: function() { runContextCopy(id); } },
-        { label: t('menu.conteLayer.cutKoma'), action: function() { runContextCut(id); } }, // ver1298
-        { hidden: !conteLayerClipboardHasKoma(), label: t('menu.conteLayer.pasteKoma'), action: function() { contePasteLayerClipboard(); } },
+        { hidden: isLayerScope, label: t('menu.conteLayer.copyKoma'), action: function() { runContextCopy(id); } },
+        { hidden: isLayerScope, label: t('menu.conteLayer.cutKoma'), action: function() { runContextCut(id); } }, // ver1298
+        { hidden: isLayerScope || !conteLayerClipboardHasKoma(), label: t('menu.conteLayer.pasteKoma'), action: function() { contePasteLayerClipboard(); } },
         // 코마 삭제는 클립보드 3종 **다음**이다. 「잘라내기 바로 아래」로 끼우면 복사·잘라내기·
         // 붙여넣기가 갈라진다 — 붙여넣기는 클립보드가 비면 숨으므로 그 자리가 늘 보이지도 않는다.
-        { label: t('menu.conteLayer.deleteKoma'), action: function() {
+        { hidden: isLayerScope, label: t('menu.conteLayer.deleteKoma'), action: function() {
             const targetDeleteIds = deleteIds.length ? deleteIds : [id];
             const ownerCutIds = conteLayerOwnerCutIdsForLayerIds(state.project, targetDeleteIds);
             runConteLayerCutPatchCommand('Delete conte layer koma', ownerCutIds, function(project) {
