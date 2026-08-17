@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver1972</title>
+  <title>MoArt ver1974</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -14083,6 +14083,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'genga.merge.overwrite': { ja: 'これで上書き', ko: '이걸로 덮어쓰기', en: 'Overwrite with this' },
         'genga.merge.keepExisting': { ja: '既存に合わせる', ko: '기존에 맞추기', en: 'Keep the existing one' },
         'menu.conteLayer.add': { ja: 'レイヤー追加', ko: '레이어 추가', en: 'Add layer' },
+        'menu.conteLayer.mergeLayers': {
+          ja: function(n) { return 'レイヤー合体（' + n + '行）'; },
+          ko: function(n) { return '레이어 병합 (' + n + '행)'; },
+          en: function(n) { return 'Merge layers (' + n + ' rows)'; }
+        },
         'menu.conteLayer.deleteLayer': { ja: 'レイヤー削除', ko: '레이어 삭제', en: 'Delete layer' },
         'menu.conteLayer.deleteKoma': { ja: 'レイヤーコマ削除', ko: '레이어 코마 삭제', en: 'Delete layer koma' },
         'menu.conteLayer.addKoma': { ja: 'レイヤーコマ追加', ko: '레이어 코마 추가', en: 'Add layer koma' },
@@ -15873,6 +15878,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           ja: function(n) { return n + ' 件を整理しました。'; },
           ko: function(n) { return n + '건을 정리했습니다.'; },
           en: function(n) { return 'Cleaned up ' + n + ' clip' + (n === 1 ? '' : 's') + '.'; }
+        },
+        'status.conteLayer.merged': {
+          ja: function(n) { return n + '行のレイヤーを1行に合体しました。'; },
+          ko: function(n) { return n + '행의 레이어를 한 행으로 병합했습니다.'; },
+          en: function(n) { return 'Merged ' + n + ' layer rows into one.'; }
         },
         'status.genga.conteLayer.rowVisibility': {
           ja: function(visible) { return visible ? 'コンテレイヤー行を表示しました。' : 'コンテレイヤー行を非表示にしました。'; },
@@ -20115,7 +20125,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return result;
     }
 
-    function captureConteLayerCutPatchState(project, ownerCutIds) {
+    // ver1974: drawingRefs 를 받으면 그 ref 들의 **픽셀**도 함께 담는다. cuts 스냅샷만으로는 굽는 편집
+    // (레이어 병합)의 undo 가 행 구조만 되돌리고 그림은 구워진 채로 남아 작업물이 사라졌다. 픽셀은
+    // project.layerDrawings 에 살아 cuts 밖이다 — 통로는 원화와 같은 captureLayerDrawingEditState 다.
+    // refs 를 안 넘기는 기존 호출부는 layerDrawings: null 이라 동작이 변하지 않는다.
+    function captureConteLayerCutPatchState(project, ownerCutIds, drawingRefs) {
       project = project || state.project || {};
       const wanted = new Set((ownerCutIds || []).map(function(id) { return String(id || ''); }).filter(Boolean));
       const cuts = [];
@@ -20124,8 +20138,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (cut && wanted.has(String(cut.id || ''))) cuts.push({ id: String(cut.id || ''), cut: fastClone(cut) });
         });
       }
+      const refs = Array.isArray(drawingRefs) ? drawingRefs.filter(Boolean) : [];
       return {
         cuts: cuts,
+        layerDrawings: refs.length ? captureLayerDrawingEditState(project, refs) : null,
         currentPage: Math.max(1, Math.round(Number(project.currentPage) || 1)),
         selection: captureTimelineSelectionState()
       };
@@ -20195,6 +20211,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (byId.has(id)) replaceObjectContentsInPlace(cut, byId.get(id));
         });
       }
+      // ver1974: 굽는 편집이 담아 둔 픽셀을 되돌린다(원화와 같은 통로). 안 담은 커맨드는 null 이라 건너뛴다.
+      if (payload.layerDrawings) applyLayerDrawingEditState(state.project, payload.layerDrawings);
       state.project.currentPage = Math.max(1, Math.round(Number(payload.currentPage) || state.project.currentPage || 1));
       applyTimelineSelectionState(payload.selection || {});
       clampCurrentPage();
@@ -20230,9 +20248,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         runConteLayerTimelineCommand(name, mutator, options);
         return;
       }
-      const before = captureConteLayerCutPatchState(state.project, cutIds);
+      const drawingRefs = Array.isArray(options.drawingRefs) ? options.drawingRefs.filter(Boolean) : [];
+      const before = captureConteLayerCutPatchState(state.project, cutIds, drawingRefs);
       mutator(state.project);
-      const after = captureConteLayerCutPatchState(state.project, cutIds);
+      const after = captureConteLayerCutPatchState(state.project, cutIds, drawingRefs);
       pushUndoCommand({ name: name, before: before, after: after, conteLayerCutPatchEdit: true, patchOwnerCutIds: cutIds.slice() });
       state.redoStack = [];
       clampCurrentPage();
@@ -23075,6 +23094,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 1974, items: [
+        { ja: '**コンテのレイヤーを縦に複数選ぶと、右クリックに「レイヤー合体」が出ます。**同じコマ位置で重なっている絵を下から順に焼いて1枚にし、いちばん上の行だけを残します。', ko: '**콘티 레이어를 세로로 여러 개 고르면 우클릭에 「레이어 병합」이 나옵니다.** 같은 코마 자리에 겹친 그림을 아래부터 순서대로 구워 한 장으로 만들고, 맨 위 행만 남깁니다.', en: '**Selecting several conte layers vertically adds "Merge layers" to the right-click menu** — overlapping art at each koma position is baked bottom-up into one image and only the topmost row remains.' },
+        { ja: '**右クリックメニューが選択の形に合わせて変わります。**縦に複数選べばレイヤー向けの項目だけ、横に複数選べばコマ向けの項目だけが出ます。', ko: '**우클릭 메뉴가 선택의 형태에 맞춰 바뀝니다.** 세로로 여러 개 고르면 레이어 항목만, 가로로 여러 개 고르면 코마 항목만 나옵니다.', en: '**The right-click menu now follows the shape of the selection** — a vertical selection shows layer actions, a horizontal one shows koma actions.' }
+      ] },
       { ver: 1971, items: [
         { ja: '**BG / BOOK レイヤーにもサブレイヤーと修正工程レイヤーを追加できるようになりました。**タグは緑地に「美術」を縦書きで表示します。', ko: '**BG / BOOK 레이어에도 서브레이어와 수정공정(리비전) 레이어를 추가할 수 있습니다.** 태그는 초록 바탕에 「美術」을 세로로 표시합니다.', en: '**Background (BG / BOOK) layers can now take sub-layers and revision layers.** Their tag is green with 美術 set vertically.' },
         { ja: '**レイヤータグ上側のボタンが「＋」から「修」に変わりました。**修正工程レイヤーを追加するボタンだと一目で分かります。', ko: '**레이어 태그 위쪽 버튼이 「+」에서 「修」로 바뀌었습니다.** 수정공정 레이어를 추가하는 버튼임을 한눈에 알 수 있습니다.', en: '**The upper button on a layer tag now reads 修 instead of +** — it is the one that adds a revision layer.' }
@@ -26285,6 +26308,82 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const found = findConteLayerById(project, layerId);
       if (!found || !found.layer) return [];
       return conteLayerLineIdsForOwner(project, found.ownerCut, conteLayerLineKey(found.layer));
+    }
+
+    // ver1973: 그림 한 장을 캔버스에 그린다(종이 원점 좌표 그대로). 없으면 아무것도 안 그린다.
+    function drawConteLayerBitmapOnto(ctx, drawing) {
+      return new Promise(function(resolve) {
+        const url = String(drawing && drawing.bitmapDataUrl || '');
+        if (!url) { resolve(false); return; }
+        const rect = layerDrawingBitmapRect(drawing);
+        const img = new Image();
+        img.onload = function() {
+          try { ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h); resolve(true); }
+          catch (e) { resolve(false); }
+        };
+        img.onerror = function() { resolve(false); };
+        img.src = url;
+      });
+    }
+    // 선택한 행들을 한 행으로 굽는다. 패널 자리마다 따로 구워, **그 자리에 실제로 겹친 것들만** 합친다.
+    async function mergeConteLayerRowsFromSelection(layerIds) {
+      const sel = conteSelectionShape(state.project, layerIds);
+      if (sel.shape !== 'column' || sel.rows < 2) return false;
+      const rowIds = conteLayerRowIdsForSelection(state.project, sel.ids);
+      // 화면 순서를 알아야 「아래부터 그린다」가 성립한다. order 가 **클수록 위**다
+      // — conteLayerRowsTopToBottom 이 order 내림차순으로 위→아래를 만든다.
+      const entries = rowIds.map(function(id) { return findConteLayerById(state.project, id); })
+        .filter(function(f) { return f && f.layer && f.ownerCut; });
+      if (entries.length < 2) return false;
+      // 패널 자리별로 묶는다 — 같은 칸에 겹친 것끼리만 합쳐진다.
+      const byPanel = new Map();
+      entries.forEach(function(f) {
+        const key = String(f.ownerCut.id) + '#' + Math.round(Number(f.layer.panelStart) || 0);
+        if (!byPanel.has(key)) byPanel.set(key, []);
+        byPanel.get(key).push(f);
+      });
+      // 살아남을 행 = 선택 안에서 **가장 위**(order 최대). 원화 gengaMergeResultShape 도 topmost 가
+      // 결과를 잇는다 — 양쪽 규칙을 같게 둔다.
+      const baked = [];   // { ref, canvas }
+      const dropIds = [];
+      for (const group of byPanel.values()) {
+        // 아래(order 작은 쪽)부터 그려 위엣것이 나중에 덮는다(원화 gengaMergeCompositeExposures 와 같은 규칙).
+        const bottomUp = group.slice().sort(function(a, b) { return (Number(a.layer.order) || 0) - (Number(b.layer.order) || 0); });
+        const keeper = bottomUp[bottomUp.length - 1];   // 가장 위
+        if (bottomUp.length < 2) continue;              // 그 칸에 하나뿐이면 구울 것이 없다
+        const cv = document.createElement('canvas');
+        cv.width = CONTE_PAPER_WIDTH; cv.height = CONTE_PAPER_HEIGHT;
+        const ctx = cv.getContext('2d');
+        for (let i = 0; i < bottomUp.length; i++) {
+          const ref = String(bottomUp[i].layer.drawingRef || '');
+          if (ref) flushLayerLiveBitmapDataUrl(ref, getLayerDrawingData(state.project, ref)); // 지연 인코드 먼저
+          await drawConteLayerBitmapOnto(ctx, getLayerDrawingData(state.project, ref));
+        }
+        baked.push({ ref: String(keeper.layer.drawingRef || ''), canvas: cv });
+        bottomUp.forEach(function(f) { if (f !== keeper) dropIds.push(String(f.layer.id)); });
+      }
+      if (!baked.length && !dropIds.length) return false;
+      // 여기서부터 동기 — 스냅샷 사이에 비동기가 끼지 않는다.
+      const ownerCutIds = conteLayerOwnerCutIdsForLayerIds(state.project, rowIds);
+      const bakedRefs = baked.map(function(b) { return b.ref; }).filter(Boolean);
+      runConteLayerCutPatchCommand('Merge conte layers', ownerCutIds, function(project) {
+        baked.forEach(function(b) {
+          if (!b.ref) return;
+          const d = getLayerDrawingData(project, b.ref);
+          if (d) { d.bitmapDataUrl = b.canvas.toDataURL('image/png');
+                   d.bitmapX = 0; d.bitmapY = 0;
+                   d.bitmapWidth = CONTE_PAPER_WIDTH; d.bitmapHeight = CONTE_PAPER_HEIGHT;
+                   d.bitmapStorage = null; d.version = (Number(d.version) || 0) + 1; }
+          clearLayerLiveBitmap(b.ref);   // 옛 픽셀 캐시를 버린다 — after 스냅샷이 그것을 담기 전에
+        });
+        if (dropIds.length) {
+          const selectionContext = captureConteLayerRemovalSelectionContext(project, dropIds);
+          removeConteLayersByIds(project, dropIds);
+          restoreConteLayerSelectionAfterRemoval(project, selectionContext);
+        }
+      }, { drawingRefs: bakedRefs });
+      state.timelineStatus = t('status.conteLayer.merged', sel.rows);
+      return true;
     }
 
     // ver1972: 선택의 형상 — { shape, rows, cols, ids }.
@@ -35025,6 +35124,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             });
           } },
         { hidden: !isSingle, label: t('menu.conteLayer.add'), action: function() { addConteLayerToSelection('cut'); } },
+        // ver1973: 레이어 병합 — **세로(행 여러 개) 선택에서만** 뜻이 있다(판정 q2).
+        { hidden: !isLayerScope, label: t('menu.conteLayer.mergeLayers', sel.rows), action: function() {
+            mergeConteLayerRowsFromSelection(sel.ids);
+          } },
         // ver1524: 삭제 둘을 아래에 따로 모으지 않고 **각자 다루는 대상 옆에** 둔다 — 위 덩어리는
         // 「레이어 기준」(FX·이름·추가·삭제·병합), 아래 덩어리는 「레이어 코마 기준」.
         // ver1972: 이 항목은 **레이어행 기준**이다(판정 q3=A + 사용자 메모). 종전에는 다중선택
