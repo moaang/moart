@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2028</title>
+  <title>MoArt ver2029</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -74853,6 +74853,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const q = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
           const pr = Number(p.p);
           if (Number.isFinite(pr) && pr >= 0 && pr <= 1) q.p = Math.round(pr * 100) / 100;
+          // ver2029: 그 점의 반경(px). 있으면 가변폭으로 그린다 — 앱에서 그은 획만 갖는다.
+          const w = Number(p.w);
+          if (Number.isFinite(w) && w > 0) q.w = Math.round(w * 100) / 100;
           pts.push(q);
         }
         if (!pts.length) continue;
@@ -74957,9 +74960,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const st = strokes[i];
         const pts = st && st.pts;
         if (!pts || !pts.length) continue;
-        ctx.strokeStyle = st.color || defaultColor || '#000000';
-        // 두께 = 2×반경(파이썬 참조 구현과 같은 규칙 — clip_format_notes 의 벡터 절). 필압→굵기는
-        // 표본이 전부 균일 두께라 아직 검증 불가로 남긴다(같은 절의 「남은 정밀도 한계」).
+        const color = st.color || defaultColor || '#000000';
+        // ver2029: 점마다 `w`(그 점의 반경 px)가 있으면 **가변폭**이다 — 앱에서 그은 획이 그렇다.
+        // 커널은 conte·genga 획이 이미 쓰는 것을 그대로 부른다(새로 짜지 않는다).
+        // CLIP 에서 온 스트로크는 `w` 가 없어 아래 균일선으로 가므로 **렌더가 안 바뀐다**.
+        if (pts.length > 1 && Number.isFinite(Number(pts[0].w))) {
+          const radii = new Array(pts.length);
+          for (let j = 0; j < pts.length; j++) radii[j] = Math.max(0.15, Number(pts[j].w) || 0.15);
+          ctx.beginPath();
+          paintTraceVariableWidthPath(ctx, pts, radii);
+          ctx.fillStyle = color;
+          ctx.fill();
+          continue;
+        }
+        ctx.strokeStyle = color;
+        // 두께 = 2×반경(파이썬 참조 구현과 같은 규칙 — clip_format_notes 의 벡터 절).
         ctx.lineWidth = Math.max(0.5, (Number(st.radius) || 0.5) * 2);
         ctx.beginPath();
         ctx.moveTo(pts[0].x, pts[0].y);
@@ -85467,6 +85482,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function selectGengaLayer(id, modeOrAdditive) {
       const keyId = String(id || '') || null;
+      // ver2029: 벡터 레이어를 고르면 벡터로 못 담는 효과를 그 자리에서 끈다(사용자 판정).
+      if (keyId) gengaSyncVectorBrushConstraints(keyId);
       const mode = normalizeSelectionMode(modeOrAdditive);
       const set = gengaSelectedLayerIdSet();
       if (mode === 'range' && keyId) {
@@ -90225,6 +90242,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ev.preventDefault();
         return;
       }
+      // ver2029 (A-3a): 이 레이어를 벡터로 그릴 것인가. 벡터로 못 담는 효과는 **묻지 않고 끈다**
+      // (사용자 판정) — 레이어 선택에서 이미 꺼졌지만, 선택을 거치지 않고 바로 그은 경우의 안전망.
+      const vectorDraw = gengaLayerDrawsVector(layer, frame);
+      if (vectorDraw && !eraser) gengaDisableVectorUnsupportedEffects();
       const pxStamp = paintToolBinarizeOn(eraser ? 'eraser' : 'pen') ? paintPixelStampRows(c.lineWidth) : null; // 2値化 on → hard-edged pixel stamping (ver617: eraser has its own key)
       const penOpacity = paintBrushOpacityVal(); // ver609 brush settings (shared with conte)
       const penPressure = paintStrokeWantsPressure(ev);
@@ -90332,7 +90353,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         azOn: wantAzimuth, // ver1345: 방위를 실제로 쓸 때만 샘플링한다(팁이 있고 追従=方位일 때)
         // ver1345: 첫 점도 t/a를 싣는다 — 전에는 `{x,y,p}`뿐이라 arc 상태(t:0)와 어긋났고,
         // paintVariableWidthRadii가 pts[0].t를 undefined로 읽어 첫 점만 기울기가 빠졌다.
-        pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth }] : null,
+        // ver2029: 벡터로 그릴 때는 아웃라인 모드가 아니어도 **점을 모아야 한다** — 그 배열이
+        // 곧 저장될 스트로크다. penOutline 은 렌더 방식의 이름이지 점 수집의 조건이 아니다.
+        pts: (penOutlineMode || vectorDraw) ? [{ x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth }] : null,
+        vector: vectorDraw,
+        vectorColor: eraser ? null : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
         arc: penOutlineMode ? { x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth, carry: 0, step: Math.max(1, Math.min(5, c.lineWidth * 0.35)) } : null, // ver1328 ①: resampler state — step scales with brush width, clamped so thin pens stay dense and fat pens stay cheap
         tiltSizePct: paintTiltSizeVal(), tiltAlphaPct: paintTiltAlphaVal(), smoothT: null, // ver1328 ③: captured per stroke like the pressure shape fields
         scan: scanEligible ? gengaScanSeed(seedRect) : null // ver1196
@@ -90517,7 +90542,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const emitted = paintArcResampleEmit(penSess.arc, p.x, p.y, usePressure, useTilt, useAz);
           for (let ei = 0; ei < emitted.length; ei += 1) {
             const q = emitted[ei];
-            penSess.pts.push(q);
+            penSess.pts.push(q);   // ver2029: 벡터 세션도 같은 배열을 쓴다
             gengaScanMark(penSess, q.x, q.y, (penSess.penBaseWidth || 1) / 2 + 1); // ver1196: radii cap at baseWidth/2
           }
           if (emitted.length) { penSess.lastX = p.x; penSess.lastY = p.y; drewAny = true; }
@@ -90713,6 +90738,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // (원반 스탬프는 그 둘을 표현할 수 없다) 그때는 sess.binarizeOutline 이 서서
         // gengaPenOutlineRedraw 안에서 알파를 임계화한다 — 커밋 임계화가 **여기 있다.**
         gengaPenOutlineRedraw(sess);
+      }
+      // ver2029 (A-3a): 벡터 세션은 픽셀이 아니라 **스트로크**를 커밋한다. 세션 캔버스는
+      // 화면에 보여 준 미리보기였을 뿐이라 그대로 버린다.
+      if (sess.vector) {
+        gengaCommitVectorStroke(sess.layerId, sess.frame, gengaSessionToVectorStroke(sess), '原画描画');
+        try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+        return;
       }
       gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas)); // ink-bbox trimmed + decode-race fallback; ver1196 union scan
       try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
@@ -90928,6 +90960,72 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Omit it (or pass null) and the full canvas is scanned, which is what every non-session commit does.
     // gengaLastStrokeCanvas stays keyed to the trimmed dataUrl, and the trimmed rect is still the exact ink
     // bbox, so the decode-race fallback keeps painting the same pixels in the same place.
+    // ── ver2029 (A-3a): 벡터 레이어에 벡터로 그린다 ─────────────────────────────────
+    // 「이 레이어를 벡터로 다뤄야 하는가」의 판정은 여기 한 곳이다.
+    function gengaLayerDrawsVector(layer, frame) {
+      if (!layer || !layer.vector) return false;
+      const dr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
+      return Boolean(dr && gengaDrawingStrokes(dr));
+    }
+    // 벡터로 담을 수 없는 브러시 효과 — 팁 비트맵·종이결·혼색·2値化. 스트로크 모델은
+    // {pts,color,w} 뿐이라 이것들을 실을 자리가 없다.
+    // **판정(사용자, 2026-08-20): 묻지 말고 자동으로 끈다.** 확인창으로 그리려는 손을 막는 대신,
+    // 벡터 레이어를 고르는 순간 브러시가 「벡터로 그릴 수 있는 상태」로 정리된다. 래스터로 되돌리고
+    // 싶으면 ver2025 의 「래스터로 변환」이 그 통로다.
+    function gengaDisableVectorUnsupportedEffects() {
+      let changed = false;
+      if (paintBrushGet('tipId')) { paintBrushSet('tipId', ''); changed = true; }
+      if (paintBrushGet('paperTexId')) { paintBrushSet('paperTexId', ''); changed = true; }
+      if (paintBrushGet('mixOn')) { paintBrushSet('mixOn', false); changed = true; }
+      const tk = (state.paintTool === 'eraser') ? 'eraser' : 'pen';
+      if (paintToolBinarizeOn(tk)) { setPaintToolBinarize(tk, false); changed = true; }
+      if (changed && typeof updatePaintUI === 'function') updatePaintUI();   // 화면의 스위치도 같이 내려간다
+      return changed;
+    }
+    // 지금 고른 레이어가 벡터면 위를 건다. 레이어 선택·그리기 시작 두 곳에서 부른다.
+    function gengaSyncVectorBrushConstraints(layerId) {
+      const gt = state.project && state.project.gengaTimeline; if (!gt) return;
+      const L = (gt.layers || []).find(function(x) { return String(x.id) === String(layerId || state.gengaSelectedLayerId); });
+      if (L && L.vector) gengaDisableVectorUnsupportedEffects();
+    }
+    // 세션이 모은 점을 스트로크 한 벌로. 필압이 굵기에 걸려 있으면 점마다 반경(w)을 싣는다.
+    function gengaSessionToVectorStroke(sess) {
+      const src = (sess.pts && sess.pts.length) ? sess.pts : null;
+      if (!src || !src.length) return null;
+      const base = Math.max(0.5, Number(sess.penBaseWidth) || 1);
+      // **굵기의 정본은 화면에 그린 것과 같은 커널이어야 한다.** 아웃라인 렌더(gengaPenOutlineRedraw)가
+      // 부르는 바로 그 두 함수를 그대로 부른다 — 여기서 자체 계산을 하면 「그린 것과 저장된 것」이
+      // 갈린다(ver1345 가 pen* 방언으로 겪은 사고와 같은 종류다).
+      const radii = paintVariableWidthRadii(src, base, function(p, t) {
+        return paintPressureWidthFactor(sess, p, t);
+      });
+      const pts = [];
+      for (let i = 0; i < src.length; i++) {
+        const p = src[i];
+        const q = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 };
+        if (Number.isFinite(Number(p.p))) q.p = Math.round(Number(p.p) * 100) / 100;
+        q.w = Math.round(Math.max(0.15, radii[i]) * 100) / 100;
+        pts.push(q);
+      }
+      return { pts: pts, color: sess.vectorColor || '#111111' };
+    }
+    // 획 하나를 그림의 스트로크 배열에 더한다. **캐시(dataUrl/ref)는 버린다** — 판정대로
+    // 스트로크가 정본이 되고, 그 덕에 좌표계가 하나로 통일된다.
+    function gengaCommitVectorStroke(layerId, frame, stroke, label) {
+      if (!stroke) return;
+      runCommand(label || '原画描画', function(p) {
+        const gt = p.gengaTimeline; if (!gt) return;
+        const layer = (gt.layers || []).find(function(x) { return String(x.id) === String(layerId); });
+        if (!layer) return;
+        const e = gengaExposureAt(layer, frame); if (!e) return;
+        const cur = gengaExposureDrawing(layer, e);
+        const old = cur && gengaDrawingStrokes(cur);
+        const next = (old ? old.slice() : []);
+        next.push(stroke);
+        gengaSetExposureDrawing(layer, e, { w: gt.paper.w, h: gt.paper.h, strokes: next });
+        layer.vector = true;
+      });
+    }
     function gengaCommitCanvas(layerId, frame, cv, label, scanRect, selectionRider) {
       // ver1324 (F2): trim stays sync (bounded by the ver1196 union scan window), the PNG encode does not —
       // gengaPutDrawingCanvas returns {ref,...} at once and settles store/IDB/thumbs/lastStroke async. The
