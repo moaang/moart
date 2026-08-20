@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2023</title>
+  <title>MoArt ver2024</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -75110,7 +75110,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaInlineDrawings(gt) {
       if (!gt) return;
       gengaFlushPendingDrawingEncodes(); // ver1324: portable serialization needs every ref's string NOW
-      const inl = function(d) { if (d && d.ref) { const u = gengaDrawStore.get(d.ref); if (u) { const out = { dataUrl: u, w: d.w, h: d.h }; if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; } return out; } } return d; };
+      const inl = function(d) { if (d && d.ref) { const u = gengaDrawStore.get(d.ref); if (u) { const out = { dataUrl: u, w: d.w, h: d.h }; if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; } if (d.strokes) out.strokes = d.strokes; return out; } } return d; };   // ver2024: 재구성이 벡터를 자르지 않게
       (gt.layers || []).forEach(function(l) {
         (l.exposures || []).forEach(function(e) { if (e.drawing) e.drawing = inl(e.drawing); });
         if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { l.sharedDrawings[k] = inl(l.sharedDrawings[k]); });
@@ -75192,10 +75192,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           if (!u) return d;
           const back = { dataUrl: u, w: d.w, h: d.h };
           if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { back.x = d.x; back.y = d.y; }
+          if (d.strokes) back.strokes = d.strokes;   // ver2024: 재구성이 벡터를 자르지 않게
           return back;
         }
         const out = { ref: d.ref, w: d.w, h: d.h, storage: storage };
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
+        if (d.strokes) out.strokes = d.strokes;   // ver2024: 재구성이 벡터를 자르지 않게
         return out;
       };
       (gt.layers || []).forEach(function(l) {
@@ -82076,11 +82078,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const totalFrames = Math.max(1, (cd.timelineEndFrame - cd.timelineStartFrame) || Math.round(CLIP_DEFAULT_SECONDS * (cd.fps || 24)));
 
       let toDecode = 0;
+      const hasAnyArt = function(l) { return Boolean(l.offscreenChunkId || l.vectorChunkIds); }; // ver2024: 벡터도 그림
       cd.cellGroups.forEach(function(cg) {
-        cg.komas.forEach(function(k) { toDecode += k.layers.filter(function(l) { return l.offscreenChunkId; }).length; });
-        (cg.revisions || []).forEach(function(r) { if (r.offscreenChunkId) toDecode++; });
+        cg.komas.forEach(function(k) { toDecode += k.layers.filter(hasAnyArt).length; });
+        (cg.revisions || []).forEach(function(r) { if (hasAnyArt(r)) toDecode++; });
       });
-      toDecode += cd.looseLayers.filter(function(l) { return l.offscreenChunkId; }).length;
+      toDecode += cd.looseLayers.filter(hasAnyArt).length;
 
       let done = 0, failCount = 0, komaCount = 0, colorSeq = 0;
       // ver1935: **픽셀이 같은 코마는 그림 한 장을 함께 본다.** CSP 는 코마마다 별도 오프스크린을
@@ -82105,7 +82108,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 뒤에서 접으면 이미 33MB 짜리 캔버스를 만든 뒤다. 호출부는 매 코마마다 `name` 을 채우고
       // `canon` 을 읽는다(접혔으면 먼저 그 픽셀을 등록한 코마의 이름이 들어온다).
       async function decodeToDrawing(L, dedupe) {
-        if (!L.offscreenChunkId) return null;
+        if (!L.offscreenChunkId) {
+          // ver2024: 벡터 레이어 — 스트로크를 그대로 담는다(래스터화하지 않는다, 사양 q2=A).
+          // 콘텐츠 dedupe(ver1935)는 일부러 안 지난다: 그건 코마당 33MB 픽셀 캔버스의 메모리
+          // 대책이고, 스트로크 JSON 은 그 수백분의 일 규모라 접을 이유가 없다.
+          if (L.vectorChunkIds) {
+            const v = clipDecodeLayerVector(cd, L);
+            done++;
+            if (onProgress) onProgress(done, toDecode);
+            if (!v) { failCount++; return null; }   // 표가 가리키는데 스트로크가 안 나옴 — 조용히 넘기지 않는다
+            return gengaIngestDrawing({ w: pw, h: ph, strokes: v.strokes });
+          }
+          return null;
+        }
         const img = await clipDecodeLayerBitmap(cd, L);
         done++;
         if (onProgress) onProgress(done, toDecode);
@@ -82169,6 +82184,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             dd.name = k.name; dd.canon = '';
             const d = await decodeToDrawing(k.layers[lvl], dd);
             if (!d) continue;
+            if (d.strokes) levelLayers[lvl].vector = true;   // ver2024 (q1=A)
             const canon = dd.canon || k.name;
             komaCanon.set(lvl + '\n' + k.name, canon);
             if (canon === k.name) levelLayers[lvl].sharedDrawings[k.name] = d;
@@ -82279,6 +82295,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           opacity: L.opacity, blend: L.blend,
           visible: true, locked: false, onion: false,
           role: isBg ? 'bgbook' : 'cel',
+          vector: Boolean(row.drawing && row.drawing.strokes),   // ver2024 (q1=A)
           tagOff: !isBg,                          // 셀도 미술도 아니면 태그 없음
           folderId: curFolderId,
           exposures: [exp], serifuSections: [], repeats: [], sharedDrawings: {}, postBehavior: 'none'
@@ -83602,6 +83619,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 그것이 낡은 프로젝트의 기본 상태다 — gengaLayerLabelStyle 이 해석한다.
         labelStyle: (layer.labelStyle === 'alpha' || layer.labelStyle === 'frame') ? layer.labelStyle : '',
         role: (layer.role === 'bgbook' || layer.role === 'paper' || layer.role === 'folder') ? layer.role : 'cel', // BG/BOOK sit below the cel stack; 用紙 = special frame sheet; folder = grouping row; none are lettered
+        // ver2024 (벡터 사양 q1=A): 벡터 여부는 role 과 **직교하는 별개 필드**다 — 실제 CLIP 표본의
+        // 벡터가 프레임 가이드(역할 없음)였듯 벡터인 BG 도 있을 수 있어 role 값으로 만들지 않았다.
+        // 화이트리스트라 여기 없으면 저장 뒤 로드에서 조용히 사라진다(위 instrMode 주석과 같은 이유).
+        vector: Boolean(layer.vector),
         // ver1811: 폴더 소속. 빈 문자열 = 어느 폴더에도 안 들어감. **이 화이트리스트에 없으면 저장돼도
         //   불러올 때 조용히 사라진다**(위 주석 참조) — 폴더 기능이 통째로 증발하므로 반드시 여기 있어야 한다.
         folderId: typeof layer.folderId === 'string' ? layer.folderId : '',
