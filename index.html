@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2021</title>
+  <title>MoArt ver2022</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -81204,6 +81204,107 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
   // Offscreen.Attribute 블롭. 구조는 clip_to_psd.parse_offscreen_attributes_sql_value 를 그대로 옮긴 것 —
   // 헤더 상수(16/102/42|58)가 안 맞으면 던진다: 조용히 넘어가면 잘못된 크기로 타일을 잘못 자른다.
+  /* ---- 벡터 레이어 --------------------------------------------------------
+   * 구조의 정본은 docs/clip_format_notes_2026-08-15.md 의 「벡터 레이어」 절, 참조 구현은
+   * scripts/clip_vector_probe.py(파이썬 — 이 코드와 같은 좌표를 내는지 대조하는 자다).
+   * 래스터(Offscreen.BlockData)와 같은 Exta 다리를 쓰지만, 본문은 BlockDataBeginChunk 태그도
+   * zlib 도 없이 **오브젝트 레코드가 연속**된다. 전부 빅엔디언이고, 헤더가 자기 크기를 스스로
+   * 밝혀(headerSize/pointSize) CSP 버전차를 흡수한다 — 그래서 상수를 박지 않는다. */
+  function clipParseVectorPayload(u8, start, len) {
+    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    var objs = [], pos = start, end = start + len;
+    while (pos + 24 <= end) {
+      var hdrSize = dv.getUint32(pos, false);
+      var ptSize = dv.getUint32(pos + 8, false);
+      var ptCount = dv.getUint32(pos + 16, false);
+      var flags = dv.getUint32(pos + 20, false);
+      // 자기기술 헤더의 위생 검사 — 어긋나면 그 자리에서 멈춘다(조용히 쓰레기를 그리지 않는다).
+      if (!(hdrSize >= 16 && hdrSize <= 4096 && ptSize >= 16 && ptSize <= 4096)) break;
+      if (ptCount > 1000000) break;
+      var total = hdrSize + ptCount * ptSize;
+      if (pos + total > end) break;
+      objs.push({ hdrOff: pos, hdrSize: hdrSize, ptOff: pos + hdrSize, ptSize: ptSize, ptCount: ptCount, flags: flags });
+      pos += total;
+    }
+    // trailing 이 0 이어야 완전 파싱이다(표본 6파일 99/99 레이어가 0 이었다).
+    return { objects: objs, trailing: end - pos };
+  }
+  function clipVecHex(dv, off) {
+    // 채널당 16bit 를 32bit 에 두 번 반복해 담는다 — 8bit 는 상위 바이트.
+    var v = ((dv.getUint32(off, false) >>> 24) & 0xff);
+    return v < 16 ? '0' + v.toString(16) : v.toString(16);
+  }
+  function clipVecPt(x, y, p) {
+    var q = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };  // ver2021 과 같은 양자화
+    if (isFinite(p) && p >= 0 && p <= 1) q.p = Math.round(p * 100) / 100;
+    return q;
+  }
+  /* 오브젝트 하나를 ver2021 의 스트로크 형식 { pts:[{x,y,p?}], color?, radius? } 로.
+   * 두 갈래를 여기서 가른다 — 104B 점 레코드(곡선 도구)는 +88 의 제어점으로 **2차 베지어
+   * 보간이 필수**다(점 간격 중앙값 28~94px). 88B(브러시 스트로크)는 0.65~5.5px 라 그대로 잇는다. */
+  function clipVectorObjectToStroke(u8, o) {
+    var dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    var color = '#' + clipVecHex(dv, o.hdrOff + 40) + clipVecHex(dv, o.hdrOff + 44) + clipVecHex(dv, o.hdrOff + 48);
+    var radius = dv.getFloat64(o.hdrOff + (o.hdrSize === 88 ? 76 : 80), false);
+    var i, n, k, t, mt;
+    var px = [], py = [], pp = [];
+    for (i = 0; i < o.ptCount; i++) {
+      var po = o.ptOff + i * o.ptSize;
+      px.push(dv.getFloat64(po, false));
+      py.push(dv.getFloat64(po + 8, false));
+      pp.push(dv.getFloat32(po + 76, false));
+    }
+    var pts = [];
+    if (o.ptSize < 104 || px.length < 2) {
+      for (i = 0; i < px.length; i++) pts.push(clipVecPt(px[i], py[i], pp[i]));
+    } else {
+      for (i = 0; i < px.length - 1; i++) {
+        var x0 = px[i], y0 = py[i], x1 = px[i + 1], y1 = py[i + 1];
+        var cx = dv.getFloat64(o.ptOff + i * o.ptSize + 88, false);
+        var cy = dv.getFloat64(o.ptOff + i * o.ptSize + 96, false);
+        if (cx === 0 && cy === 0) { cx = (x0 + x1) / 2; cy = (y0 + y1) / 2; }  // 제어점이 비면 직선
+        var seg = Math.sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+        n = Math.max(2, Math.min(12, Math.floor(seg / 4) + 2));
+        for (k = 0; k < n; k++) {
+          t = k / n; mt = 1 - t;
+          pts.push(clipVecPt(mt * mt * x0 + 2 * mt * t * cx + t * t * x1,
+                             mt * mt * y0 + 2 * mt * t * cy + t * t * y1,
+                             pp[i] * mt + pp[i + 1] * t));
+        }
+      }
+      pts.push(clipVecPt(px[px.length - 1], py[py.length - 1], pp[pp.length - 1]));
+    }
+    if (!pts.length) return null;
+    var out = { pts: pts, color: color };
+    if (isFinite(radius) && radius > 0) out.radius = Math.round(radius * 100) / 100;
+    return out;
+  }
+  // 한 레이어의 벡터 Exta 를 스트로크 배열로. 그림이 없으면 null.
+  function clipDecodeVectorStrokes(u8, exta) {
+    if (!exta) return null;
+    var parsed = clipParseVectorPayload(u8, exta.binOff, exta.binLen);
+    var strokes = [];
+    for (var i = 0; i < parsed.objects.length; i++) {
+      var st = clipVectorObjectToStroke(u8, parsed.objects[i]);
+      if (st) strokes.push(st);
+    }
+    if (!strokes.length) return null;
+    return { strokes: strokes, trailing: parsed.trailing, objectCount: parsed.objects.length };
+  }
+  // clipDecodeLayerBitmap 과 같은 규약의 벡터판 — 한 레이어가 Exta 를 여럿 가질 수 있어 합친다.
+  function clipDecodeLayerVector(cd, layerInfo) {
+    if (!cd || !layerInfo || !layerInfo.vectorChunkIds) return null;
+    var strokes = [], trailing = 0, objectCount = 0;
+    for (var i = 0; i < layerInfo.vectorChunkIds.length; i++) {
+      var r = clipDecodeVectorStrokes(cd.u8, cd.extaChunks[layerInfo.vectorChunkIds[i]]);
+      if (!r) continue;
+      strokes = strokes.concat(r.strokes);
+      trailing += r.trailing;
+      objectCount += r.objectCount;
+    }
+    return strokes.length ? { strokes: strokes, trailing: trailing, objectCount: objectCount } : null;
+  }
+
   function clipParseOffscreenAttribute(attr) {
     var dv = new DataView(attr.buffer, attr.byteOffset, attr.byteLength);
     var p = 0;
@@ -81576,7 +81677,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     return keys;
   }
 
-  function clipLayerInfoFrom(l, mipmaps, mipmapInfos, offscreens, extaChunks) {
+  function clipLayerInfoFrom(l, mipmaps, mipmapInfos, offscreens, extaChunks, vectorChunkIdsByLayer) {
     var chunkId = null;
     if (l.LayerRenderMipmap != null) {
       var mm = mipmaps[l.LayerRenderMipmap];
@@ -81592,8 +81693,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
     }
     var blend = clipBlendFor(l.LayerComposite);
+    // 벡터 여부의 판정은 LayerType 이 아니라 **VectorObjectList 가 이 레이어를 참조하는가**다
+    // (벡터 레이어도 LayerType=0 이라 그 컬럼으로는 못 가른다 — clip_format_notes 의 벡터 절).
+    var vecIds = (vectorChunkIdsByLayer && vectorChunkIdsByLayer[l.MainId]) || null;
     return {
       name: l.LayerName || '', offscreenChunkId: chunkId,
+      vectorChunkIds: (vecIds && vecIds.length) ? vecIds : null,
       blend: blend || 'source-over', blendUnknown: !blend,
       blendCode: l.LayerComposite,
       opacity: Math.max(0, Math.min(1, (Number(l.LayerOpacity) || 0) / 256))
@@ -81670,7 +81775,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     });
     var externalChunkRows = db.readTable('ExternalChunk') || [];
 
-    function info(l) { return clipLayerInfoFrom(l, mipmaps, mipmapInfos, offscreens, extaChunks); }
+    // 벡터 레이어의 다리: VectorObjectList.LayerId -> Layer.MainId, VectorData 는 Offscreen.BlockData
+    // 와 같은 "extrnlid"+UUID 포인터다. 이 표 자체가 없는 파일도 많다(벡터 미사용) — readTable 이
+    // null 을 내면 그대로 빈 맵이 된다.
+    var vectorChunkIdsByLayer = {};
+    (db.readTable('VectorObjectList') || []).forEach(function (v) {
+      if (!v || v.LayerId == null || !v.VectorData) return;
+      var cid = new TextDecoder('utf-8').decode(v.VectorData);
+      if (!vectorChunkIdsByLayer[v.LayerId]) vectorChunkIdsByLayer[v.LayerId] = [];
+      vectorChunkIdsByLayer[v.LayerId].push(cid);
+    });
+
+    function info(l) { return clipLayerInfoFrom(l, mipmaps, mipmapInfos, offscreens, extaChunks, vectorChunkIdsByLayer); }
 
     // 2D 카메라 폴더의 커브를 먼저 다 읽어 둔다(walk 는 동기라 안에서 await 할 수 없다).
     var cameraKeysByMainId = {};
