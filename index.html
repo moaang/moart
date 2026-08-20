@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2045</title>
+  <title>MoArt ver2046</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -44038,7 +44038,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         target.scale(opts.scale, opts.scale);
         dx = opts.drawRect.x - opts.pivot.x - pad; dy = opts.drawRect.y - opts.pivot.y - pad;
       }
-      if (drawSrc === src) target.drawImage(src, dx, dy, opts.drawRect.w, opts.drawRect.h); // unblurred / native-filter path — explicit dest rect (pad is 0 here, so dx/dy are the drawRect origin in each form's own coords)
+      if (opts.paint && drawSrc === src) {
+        // ver2046: **비트맵을 확대하지 않고 여기서 직접 그린다.** 변환은 이미 걸려 있으므로 이
+        // 자리에서 그으면 확대 배율만큼 해상도가 따라온다(벡터가 안 깨진다). drawRect 는 원본
+        // 크기 1:1 이라 원점만 옮기면 좌표계가 그대로 맞는다. 블러가 있으면 drawSrc !== src 라
+        // 이 가지에 안 온다 — 블러 커널은 소스 비트맵을 읽어야 하기 때문이다.
+        target.translate(dx, dy);
+        opts.paint(target);
+      }
+      else if (drawSrc === src) target.drawImage(src, dx, dy, opts.drawRect.w, opts.drawRect.h); // unblurred / native-filter path — explicit dest rect (pad is 0 here, so dx/dy are the drawRect origin in each form's own coords)
       else if (up === 1) target.drawImage(drawSrc, dx, dy); // full-res blurred source — NATURAL size (the ver846 {cv,pad} contract, bit-preserving vs the current sites)
       else target.drawImage(drawSrc, dx, dy, drawSrc.width * up, drawSrc.height * up); // interactive low-res — this draw doubles as the upscale (§2.4-2)
       target.restore();
@@ -88249,10 +88257,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // stays HERE (design §2.6: the kernel receives, never owns). blurType wired via gengaFxStatics (ver850
         // G6/ver854). quality rides the §5 fallback flag — interactive only while a scrub/gizmo drag is
         // live; capture, export and playback stay 'final'.
-        const s = gengaFxScratch(pw, ph);
-        drawLayerContent(s.ctx, Object.assign({}, l, { blend: 'source-over', opacity: 1 }));
+        // ver2046: **벡터 레이어를 FX 로 확대할 때는 스크래치를 건너뛴다.** 스크래치는 용지 크기라
+        // 거기 구운 뒤 확대하면 비트맵이 늘어난다 — 벡터인데 래스터처럼 깨진다. 변환이 걸린
+        // 자리에서 직접 그으면 배율만큼 해상도가 따라온다(ver2034 가 뷰 줌에 한 것과 같은 이유).
+        // 조건 셋: 블러 없음(블러 커널은 소스 비트맵을 읽는다) · 확대일 때만(등배·축소는 구운
+        // 캐시가 더 곱고 빠르다) · **합성이 중립일 때만** — drawLayerContent 는 그리면서
+        // globalAlpha/GCO 를 자기 값으로 덮고 끝에 1/source-over 로 되돌리므로, 변환 자리에서
+        // 직접 그리면 FX 가 세워 둔 알파가 지워진다. 아니면 종전 경로 그대로다.
+        const fxNeutral = (l.opacity == null || Number(l.opacity) === 1)
+          && (!l.blend || l.blend === 'source-over')
+          && Math.abs(Number(fx.opacity) - 1) < 1e-6;
+        const fxVectorPaint = (!(fx.blur > 0) && Number(fx.scale) > 1.05 && fxNeutral && gengaLayerDrawsVector(l))
+          ? function(ctx) { drawLayerContent(ctx, Object.assign({}, l, { blend: 'source-over', opacity: 1 })); }
+          : null;
+        const s = fxVectorPaint ? null : gengaFxScratch(pw, ph);
+        if (s) drawLayerContent(s.ctx, Object.assign({}, l, { blend: 'source-over', opacity: 1 }));
         const ck = gengaFxBlurPreviewKey(l, frame); // null = uncacheable (live stroke / lifted selection) — the kernel then rebuilds per tick, the ver846 degradation mode
-        applyLayerFx(target, s.cv, {
+        applyLayerFx(target, s ? s.cv : null, {
+          paint: fxVectorPaint,   // ver2046: 있으면 커널이 비트맵 대신 이것을 변환 아래에서 부른다
           pivot: { x: pw / 2, y: ph / 2 }, translate: { x: fx.x, y: fx.y }, // pivot = paper center
           rotDeg: fx.rot, scale: fx.scale,
           drawRect: { x: 0, y: 0, w: pw, h: ph },
