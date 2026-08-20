@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2033</title>
+  <title>MoArt ver2034</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -75022,6 +75022,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return Number.isFinite(x0) ? { x0: x0, y0: y0, x1: x1, y1: y1 } : null;
     }
+    // ver2034: 확대 중에 **패스를 직접 그을** 상한. 이보다 많으면 구운 캐시로 물러선다
+    // (계획문서 §3 실측: 2,000 스트로크 실시간 180ms — tldraw 도 기본 4,000 상한을 둔다).
+    const GENGA_VECTOR_DIRECT_MAX = 4000;
+    // 코마 썸네일은 <img src> 라 dataURL 이 필요하다. 썸네일 크기로 작게 구워 캐시에 얹는다
+    // (스트로크 배열이 바뀌면 WeakMap 항목째 죽으므로 무효화가 따라온다).
+    function gengaVectorThumbDataUrl(strokes, pw, ph) {
+      let e = gengaVectorBakeCache.get(strokes);
+      if (e && e.thumbUrl) return e.thumbUrl;
+      const baked = gengaVectorBakedCanvas(strokes, pw, ph);
+      const tw = 200, th = Math.max(1, Math.round(200 * ph / Math.max(1, pw)));
+      const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
+      cv.getContext('2d').drawImage(baked, 0, 0, tw, th);
+      let url = '';
+      try { url = cv.toDataURL('image/png'); } catch (err) { url = ''; }
+      e = gengaVectorBakeCache.get(strokes);
+      if (e) e.thumbUrl = url;
+      return url;
+    }
     // 어니언 고스트 등 문자열 키가 필요한 캐시용 — ref 도 dataUrl 도 없는 벡터 그림의 안정 키.
     function gengaVectorStrokesKey(strokes) {
       let e = gengaVectorBakeCache.get(strokes);
@@ -75043,7 +75061,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // placement 를 지나지 않는다(트리밍 개념이 없다). 여기서 false 를 돌려주던 것이
         // 「CLIP 벡터가 에러 없이 빈 화면」의 마지막 관문이었다.
         const strokes = gengaDrawingStrokes(dr);
-        if (strokes) { ctx.drawImage(gengaVectorBakedCanvas(strokes, pw, ph), 0, 0); return true; }
+        if (strokes) {
+          // ver2034: **확대 중이면 그 자리에서 패스를 긋는다** — 구운 비트맵을 확대하면 벡터가
+          // 래스터와 똑같이 깨진다(제보). 등배·축소는 캐시가 더 곱고 빠르므로 종전대로.
+          const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
+          const sc = m ? Math.max(Math.abs(m.a), Math.abs(m.d)) : 1;
+          if (sc > 1.05 && strokes.length <= GENGA_VECTOR_DIRECT_MAX) {
+            ctx.save();                       // 이 커널은 strokeStyle/fillStyle/lineWidth 를 바꾼다
+            gengaDrawVectorStrokes(ctx, strokes);
+            ctx.restore();
+            return true;
+          }
+          ctx.drawImage(gengaVectorBakedCanvas(strokes, pw, ph), 0, 0);
+          return true;
+        }
         return false;
       }
       const img = gengaImageFor(dr.dataUrl, onReady);
@@ -89146,12 +89177,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function gengaNearestDrawing(layer, frame) { // → resolved drawing OBJECT (placement-aware), not a bare url
       if (!layer || !Array.isArray(layer.exposures)) return null;
+      // ver2034: 벡터 그림도 「그림 있음」이다 — 안 세면 썸네일이 흰 빈칸이 된다(제보).
+      const hasArt = function(d) { return Boolean(d && (d.dataUrl || d.canvas || gengaDrawingStrokes(d))); };
       const exact = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
-      if (exact && (exact.dataUrl || exact.canvas)) return exact; // ver1324: pending-encode art counts
+      if (hasArt(exact)) return exact; // ver1324: pending-encode art counts
       let best = null, bestDist = Infinity;
       layer.exposures.forEach(function(e) {
         const dr = gengaExposureDrawing(layer, e);
-        if (dr && (dr.dataUrl || dr.canvas)) { // ver1324: pending-encode art counts
+        if (hasArt(dr)) { // ver1324: pending-encode art counts
           const d = Math.min(Math.abs(e.startFrame - frame), Math.abs(e.startFrame + e.holdFrames - 1 - frame));
           if (d < bestDist) { bestDist = d; best = dr; }
         }
@@ -89171,7 +89204,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, cv.width, cv.height);
         if (!layer) return;
         const dr = gengaNearestDrawing(layer, frame);
-        const thumbSrc = dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr.dataUrl, drawGengaLayerThumbs) : null)) : null; // ver1324: pending-encode drawings paint from their canvas, same placement law
+        // ver2034: 벡터는 구운 캔버스를 그대로 소스로 쓴다(썸네일은 작아 캐시 한 장이면 충분하다).
+        const thumbVec = dr ? gengaDrawingStrokes(dr) : null;
+        const thumbSrc = thumbVec ? gengaVectorBakedCanvas(thumbVec, Math.max(1, gt.paper.w), Math.max(1, gt.paper.h))
+                                  : (dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr.dataUrl, drawGengaLayerThumbs) : null)) : null); // ver1324: pending-encode drawings paint from their canvas, same placement law
         if (thumbSrc) {
           const gtp = state.project.gengaTimeline, pw = Math.max(1, gtp.paper.w), ph = Math.max(1, gtp.paper.h);
           // ver1470: 커널이 용지 px 로 답하고 여기서 썸네일 캔버스 px 로 옮긴다. `placed:false` 면
@@ -91245,12 +91281,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // koma thumb inner markup: the crop placed proportionally on the paper→thumb mapping (same stretch semantics
     // as the layer-head thumbs); legacy full-paper bitmaps fill the whole thumb.
     function gengaExpThumbInnerHtml(dr) {
-      if (!(dr && dr.dataUrl)) return '';
+      if (!dr) return '';
       const gt = state.project && state.project.gengaTimeline; if (!gt) return '';
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
+      // ver2034: 벡터 그림은 dataUrl 이 없다 — 썸네일용으로 작게 구운 것을 쓴다(안 하면 코마
+      // 칸이 통째로 빈칸이었다, 제보). 스트로크는 용지 좌표계라 placement 가 자연히 전체가 된다.
+      const thumbStrokes = gengaDrawingStrokes(dr);
+      const thumbUrl = dr.dataUrl || (thumbStrokes ? gengaVectorThumbDataUrl(thumbStrokes, pw, ph) : '');
+      if (!thumbUrl) return '';
       // ver1470: 같은 커널 — 여기서는 % 로 옮긴다.
       const place = gengaDrawingPlacement(dr, pw, ph);
-      return '<img class="genga-exp-thumb-img" src="' + dr.dataUrl + '" style="left:' + (place.x / pw * 100).toFixed(3) + '%;top:' + (place.y / ph * 100).toFixed(3) + '%;width:' + (place.w / pw * 100).toFixed(3) + '%;height:' + (place.h / ph * 100).toFixed(3) + '%" alt="">';
+      return '<img class="genga-exp-thumb-img" src="' + thumbUrl + '" style="left:' + (place.x / pw * 100).toFixed(3) + '%;top:' + (place.y / ph * 100).toFixed(3) + '%;width:' + (place.w / pw * 100).toFixed(3) + '%;height:' + (place.h / ph * 100).toFixed(3) + '%" alt="">';
     }
     // paper-sized working canvas seeded with the current exposure art (sync, from cache).
     // ver764: the drawing exactly as stored — no selection compositing. This is what a NOT-YET-LIFTED
