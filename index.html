@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2032</title>
+  <title>MoArt ver2033</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -86458,16 +86458,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaFlushPendingDrawingEncodes(); // ver1324: the bake reads dr.dataUrl through the image cache
       const gt = state.project && state.project.gengaTimeline; if (!gt) return null;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
-      const dr = gengaExposureDrawing(layer, exposure); if (!dr || !dr.dataUrl) return null;
-      const img = gengaImageFor(dr.dataUrl, null); if (!img) return null;
+      const dr = gengaExposureDrawing(layer, exposure); if (!dr) return null;
+      // ver2033: **벡터 그림도 굽는다.** 종전에는 dataUrl 이 없다고 null 을 돌려줬고, 그 null 이
+      // 곧 「이 코마는 건너뛰되 FX 트랙은 지운다」가 되어 FX 가 영구히 사라졌다(아래 호출부 참조).
+      // 래스터 경로는 손대지 않는다 — 벡터일 때만 앞에서 갈라진다.
+      const bakeStrokes = gengaDrawingStrokes(dr);
       const src = document.createElement('canvas'); src.width = pw; src.height = ph;
       const sctx = src.getContext('2d');
+      if (bakeStrokes) {
+        sctx.drawImage(gengaVectorBakedCanvas(bakeStrokes, pw, ph), 0, 0);   // 스트로크 좌표는 용지 좌표계
+      } else {
+      if (!dr.dataUrl) return null;
+      const img = gengaImageFor(dr.dataUrl, null); if (!img) return null;
       // ver1470: 이 세 줄은 gengaDrawDrawingInto 의 **복사본**이다. 지금은 판정만 커널로 모은다 —
       // 통째로 그 함수를 부르게 하면 dr.canvas 분기와 디코드 경합 폴백까지 딸려 와 **동작이 바뀐다**
       // (그쪽이 더 정확하긴 하다). 별건으로 남긴다 — 근거는 changelog ver1470.
       const bakePlace = gengaDrawingPlacement(dr, pw, ph);
       if (bakePlace.placed) sctx.drawImage(img, Math.round(bakePlace.x), Math.round(bakePlace.y));
       else sctx.drawImage(img, 0, 0, pw, ph);
+      }
       const out = document.createElement('canvas'); out.width = pw; out.height = ph;
       const octx = out.getContext('2d');
       const fx = gengaFxAt(layer, fxFrame, true); // ignore the master switch — rasterize always bakes the FX
@@ -86513,8 +86522,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       (layer.exposures || []).forEach(function(e) {
         if (!inRange(e)) return;
         const dr = gengaExposureDrawing(layer, e);
-        if (!dr || !dr.dataUrl) return; // empty exposure — FX bakes to nothing; leave it keyless (untouched below)
-        if (!gengaImageFor(dr.dataUrl, null)) { coldMisses += 1; return; } // cold cache; the call starts the decode, so a retry succeeds
+        if (!dr) return; // empty exposure — FX bakes to nothing; leave it keyless (untouched below)
+        // ver2033: 벡터 그림은 dataUrl 이 없다 — 여기서 걸러 버리면 굽기에서 빠진 채 아래에서 FX
+        // 트랙만 지워져 **FX 가 영구히 사라진다**(ver748 이 콜드 캐시에 대해 고친 병의 벡터판).
+        // 디코드 캐시 검사는 래스터에만 뜻이 있다.
+        const drStrokes = gengaDrawingStrokes(dr);
+        if (!drStrokes) {
+          if (!dr.dataUrl) return;
+          if (!gengaImageFor(dr.dataUrl, null)) { coldMisses += 1; return; } // cold cache; the call starts the decode, so a retry succeeds
+        }
         bakes[e.id] = gengaBakeExposureFx(layer, e, timeMode === 'frame' ? curFrame : e.startFrame, bakeTracks);
       });
       // ver748 (fix_design 1-2, atomicity): a cold image cache used to silently skip the bake while the FX
@@ -86541,6 +86557,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // so the reset is explicit now — and correctly conditional, since a transform-only 焼き込み must not
         // silently turn 玉ボケ back into ガウス.
         if (cleared.indexOf('blur') >= 0) delete L.fx.blurType;
+        // ver2033: FX 를 픽셀로 구웠으므로 그 코마들은 래스터가 됐다 — 남은 벡터 그림이 없으면
+        // 레이어의 벡터 표시를 내린다(배지가 사실과 어긋나지 않게). 굽기가 instanceValue 를
+        // null 로 만들어 sharedDrawings 에 **고아**가 남으므로, 세고 나서가 아니라 **치우고 나서**
+        // 센다 — 안 그러면 고아 때문에 벡터 배지가 계속 붙어 있는다.
+        gengaGcSharedDrawings(L);
+        L.vector = gengaVectorLayerHasStrokes(L);
       });
     }
     // ver1200: `track` (optional) scopes the run to ONE effect — the section 焼き込み passes it, so the guard,
