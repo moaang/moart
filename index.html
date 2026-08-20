@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2035</title>
+  <title>MoArt ver2036</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -75046,6 +75046,29 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!e) { e = { canvas: null, pw: 0, ph: 0, seq: ++gengaVectorBakeSeq }; gengaVectorBakeCache.set(strokes, e); }
       return 'vec:' + e.seq;
     }
+    // ver2036: 그림 하나를 **문자열로 부르는 유일한 자리**. 종전에는 「ref 아니면 dataUrl 꼬리」가
+    // 다섯 벌 흩어져 있었고 그중 어느 것도 벡터를 몰랐다(어니언 고스트만 ver2023 이 벡터를
+    // 아는 여섯 번째 사본을 따로 갖고 있었다 - 그쪽을 정본으로 삼아 나머지를 흡수한다).
+    // 순서는 gengaDrawDrawingInto 와 같다 - 키와 그림이 같은 층을 가리켜야 한다.
+    function gengaDrawingCacheKey(dr) {
+      if (!dr) return '';
+      if (dr.ref) return String(dr.ref);
+      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return dr.dataUrl.slice(-40);
+      const st = gengaDrawingStrokes(dr);
+      return st ? gengaVectorStrokesKey(st) : '';
+    }
+    // ver2036: 그림 -> **캔버스에 그릴 수 있는 소스**. 벡터는 구운 캔버스가 그 답이고(스트로크는
+    // 용지 좌표계라 placement 는 자연히 전체가 된다), 인코드 대기 중인 그림은 그 픽셀이 답이다.
+    // 래스터는 종전대로 디코드 이미지 - 아직 디코드 전이면 null 이고 호출부가 'pending' 으로 다룬다.
+    // **순서는 gengaDrawDrawingInto 와 같아야 한다** - 같은 그림이 화면과 실루엣에서 다른 소스를
+    // 쓰면 그 순간 둘이 갈린다.
+    function gengaDrawingImageSource(dr, pw, ph, onReady) {
+      if (!dr) return null;
+      if (dr.canvas) return dr.canvas;
+      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return gengaImageFor(dr.dataUrl, onReady);
+      const st = gengaDrawingStrokes(dr);
+      return st ? gengaVectorBakedCanvas(st, Math.max(1, pw), Math.max(1, ph)) : null;
+    }
     function gengaDrawDrawingInto(ctx, dr, pw, ph, onReady) {
       if (!dr) return false;
       // ver1470: 위치 판정은 커널이 한다. **크기는 계속 안 넘긴다**(3인자 = 원본 크기) — 5인자로 바꾸면
@@ -88264,7 +88287,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1470: 여기만 크기를 **이미지 자연 크기**로 잡는다(썸네일 둘은 dr.w/h). 정상 데이터면 같지만
       // 보장은 없다 — 그대로 두고 판정만 커널로 모은다(동작 불변이 먼저다).
       const dp = gengaDrawingPlacement(dr, pw, ph);
-      if (dp.placed) x.drawImage(img, dp.x * (W / pw), dp.y * (H / ph), img.naturalWidth * (W / pw), img.naturalHeight * (H / ph));
+      // ver2036: `naturalWidth` 는 <img> 에만 있다 - 캔버스 소스(벡터·인코드 대기)를 받으면 NaN 이
+      // 되어 아무것도 안 그려진다. 파일 안 20여 곳이 이미 쓰는 `naturalWidth || width` 관용구로 맞춘다.
+      const srcW = Number(img && (img.naturalWidth || img.width)) || 0;
+      const srcH = Number(img && (img.naturalHeight || img.height)) || 0;
+      if (dp.placed) x.drawImage(img, dp.x * (W / pw), dp.y * (H / ph), srcW * (W / pw), srcH * (H / ph));
       else x.drawImage(img, 0, 0, W, H);
       return c;
     }
@@ -88460,7 +88487,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const scale = Math.min(960 / pw, 720 / ph, 1);
       const W = Math.max(8, Math.round(pw * scale)), H = Math.max(8, Math.round(ph * scale));
       const seeds = gengaDougaFixSeeds(dr, W, H, pw, ph); // 診断 manual add/knock-out corrections
-      const key = (dr.ref || (dr.dataUrl ? dr.dataUrl.slice(-32) : '')) + '@' + W + 'x' + H + gengaDougaFixSig(dr);
+      const key = gengaDrawingCacheKey(dr) + '@' + W + 'x' + H + gengaDougaFixSig(dr);
       const hit = gengaDougaEnvCache.get(key);
       if (hit !== undefined) {
         gengaDougaEnvCache.delete(key); gengaDougaEnvCache.set(key, hit);
@@ -88839,7 +88866,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (B.variants[ri] === undefined) gengaDougaEnvelope(imB, drB, pw, ph, ri);
       const VA = A.variants[ri] || A.variants[A.rIdx], VB = B.variants[ri] || B.variants[B.rIdx];
       if (!VA || !VB) return null;
-      const pairKey = (drA.ref || (drA.dataUrl ? drA.dataUrl.slice(-32) : '')) + '|' + (drB.ref || (drB.dataUrl ? drB.dataUrl.slice(-32) : '')) + '|r' + ri + '@' + A.W + 'x' + A.H;
+      const pairKey = gengaDrawingCacheKey(drA) + '|' + gengaDrawingCacheKey(drB) + '|r' + ri + '@' + A.W + 'x' + A.H;
       const mid = gengaDougaMorphPts(VA, VB, t, pairKey);
       // tone classes (カゲ/面): carried through the BODY morph (ver418) then fused into ONE region (ver419) —
       // each key's tone shapes are warped by the body contour's displacement field (A rides A→mid, B rides
@@ -88880,22 +88907,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaDougaSilhouetteFor(layer, e, k, pw, ph, onReady) {
       const m = e.dougaOffsets.length;
       const t = (k + 1) / (m + 1); // equal spacing among the marks between the two drawings
-      const drA = gengaExposureDrawing(layer, e); if (!drA || !drA.dataUrl) return null;
+      // ver2036: 게이트가 `dataUrl` 을 보면 **벡터 레이어에서는 中割り 가 통째로 없는 기능이 된다**
+      // (실측: 같은 그림이 래스터에서는 실루엣이 나오고 벡터에서는 null 이었다).
+      const drA = gengaExposureDrawing(layer, e); if (!gengaDrawingHasArt(drA)) return null;
       const sorted = gengaSortedExposures(layer);
       const idx = sorted.findIndex(function(x) { return String(x.id) === String(e.id); });
       let drB = null, loop = false;
-      if (idx >= 0) for (let i = idx + 1; i < sorted.length; i++) { const d2 = gengaExposureDrawing(layer, sorted[i]); if (d2 && d2.dataUrl) { drB = d2; break; } }
+      if (idx >= 0) for (let i = idx + 1; i < sorted.length; i++) { const d2 = gengaExposureDrawing(layer, sorted[i]); if (gengaDrawingHasArt(d2)) { drB = d2; break; } }
       // repeat post-behavior: after the LAST drawing the layer loops back to the first, so a ・ mark on the last
       // koma interpolates toward the FIRST drawing (2・・ → 1). Same for the mirror pre-behavior would be first→last.
       if (!drB && idx === sorted.length - 1 && (layer.postBehavior === 'repeat') && sorted.length >= 2) {
         const d0 = gengaExposureDrawing(layer, sorted[0]);
-        if (d0 && d0.dataUrl && String(sorted[0].id) !== String(e.id)) { drB = d0; loop = true; }
+        if (gengaDrawingHasArt(d0) && String(sorted[0].id) !== String(e.id)) { drB = d0; loop = true; }
       }
       if (!drB) return null; // no next drawing → nothing to interpolate (held drawing shows instead)
-      const key = (drA.ref || drA.dataUrl.slice(-32)) + gengaDougaFixSig(drA) + '|' + (drB.ref || drB.dataUrl.slice(-32)) + gengaDougaFixSig(drB) + '|' + t.toFixed(4) + '|' + pw + 'x' + ph + (loop ? '|loop' : '');
+      const key = gengaDrawingCacheKey(drA) + gengaDougaFixSig(drA) + '|' + gengaDrawingCacheKey(drB) + gengaDougaFixSig(drB) + '|' + t.toFixed(4) + '|' + pw + 'x' + ph + (loop ? '|loop' : '');
       const hit = gengaDougaCache.get(key);
       if (hit !== undefined) { gengaDougaCache.delete(key); gengaDougaCache.set(key, hit); return hit; } // LRU touch (null cached too)
-      const imA = gengaImageFor(drA.dataUrl, onReady), imB = gengaImageFor(drB.dataUrl, onReady);
+      const imA = gengaDrawingImageSource(drA, pw, ph, onReady), imB = gengaDrawingImageSource(drB, pw, ph, onReady);
       if (!imA || !imB) return 'pending';
       const sil = gengaBuildDougaSilhouette(imA, drA, imB, drB, t, pw, ph);
       budgetedMapSet(gengaDougaCache, key, sil, 12, 'douga');
@@ -88914,7 +88943,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     const gengaEnvMaskCache = new Map();
     function gengaDougaEnvMask(img, dr, pw, ph) {
       const E = gengaDougaEnvelope(img, dr, pw, ph); if (!E) return null;
-      const mkey = (dr.ref || (dr.dataUrl ? dr.dataUrl.slice(-32) : '')) + '@' + E.W + 'x' + E.H + gengaDougaFixSig(dr);
+      const mkey = gengaDrawingCacheKey(dr) + '@' + E.W + 'x' + E.H + gengaDougaFixSig(dr);
       const cached = gengaEnvMaskCache.get(mkey);
       if (cached !== undefined) { gengaEnvMaskCache.delete(mkey); gengaEnvMaskCache.set(mkey, cached); return cached; }
       const masks = gengaDougaMasks(img, dr, E.W, E.H, pw, ph);
@@ -88929,11 +88958,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return res;
     }
     function gengaDougaEnvDebugFor(layer, e, pw, ph, onReady) { // 診断: the drawing's corrected silhouette MASK (holes + fixes visible)
-      const dr = gengaExposureDrawing(layer, e); if (!dr || !dr.dataUrl) return null;
-      const key = 'dbg|' + (dr.ref || dr.dataUrl.slice(-32)) + gengaDougaFixSig(dr) + '|' + pw + 'x' + ph;
+      const dr = gengaExposureDrawing(layer, e); if (!gengaDrawingHasArt(dr)) return null;
+      const key = 'dbg|' + gengaDrawingCacheKey(dr) + gengaDougaFixSig(dr) + '|' + pw + 'x' + ph;
       const hit = gengaDougaCache.get(key);
       if (hit !== undefined) { gengaDougaCache.delete(key); gengaDougaCache.set(key, hit); return hit; }
-      const img = gengaImageFor(dr.dataUrl, onReady);
+      const img = gengaDrawingImageSource(dr, pw, ph, onReady);
       if (!img) return 'pending';
       const M = gengaDougaEnvMask(img, dr, pw, ph);
       let out = null;
@@ -88953,11 +88982,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ignoreFix=true samples the RAW auto silhouette (no 診断 corrections) — used to tell a manual empty/fill apart
     // from an auto one, so a click can REVERT a prior fix instead of stacking an opposite one.
     function gengaSilFilledAt(layer, e, paperX, paperY, ignoreFix) {
-      const dr0 = gengaExposureDrawing(layer, e); if (!dr0 || !dr0.dataUrl) return null;
+      const dr0 = gengaExposureDrawing(layer, e); if (!gengaDrawingHasArt(dr0)) return null;
       let dr = dr0;
       if (ignoreFix && dr0.silFix) { dr = {}; for (const k in dr0) dr[k] = dr0[k]; dr.silFix = null; }
-      const img = gengaImageFor(dr.dataUrl); if (!img) return null;
       const gt = state.project.gengaTimeline;
+      // ver2036: gt 를 먼저 잡는다 - 벡터 소스는 용지 크기로 구워야 나온다.
+      const img = gengaDrawingImageSource(dr, gt.paper.w, gt.paper.h); if (!img) return null;
       const M = gengaDougaEnvMask(img, dr, gt.paper.w, gt.paper.h); if (!M) return null;
       const ax = Math.round(paperX * M.W / gt.paper.w), ay = Math.round(paperY * M.H / gt.paper.h);
       if (ax < 0 || ay < 0 || ax >= M.W || ay >= M.H) return null;
@@ -88972,7 +89002,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaSilFixClick(p) { // 診断: knock out (−, filled) / fill in (+, empty) — or REVERT a prior fix at that spot
       gengaFlushPendingDrawingEncodes(); // ver1324: a deliberate click must not be dropped for an encode window
       const cur = gengaSilCurrentExposure(); if (!cur) return;
-      const dr = gengaExposureDrawing(cur.layer, cur.e); if (!dr || !dr.dataUrl) return;
+      const dr = gengaExposureDrawing(cur.layer, cur.e); if (!gengaDrawingHasArt(dr)) return;
       const dw = Number(dr.w) || 1, dh = Number(dr.h) || 1;
       const dx = Number.isFinite(Number(dr.x)) ? dr.x : 0, dy = Number.isFinite(Number(dr.y)) ? dr.y : 0;
       const nx = (p.x - dx) / dw, ny = (p.y - dy) / dh;
@@ -89013,7 +89043,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const p = gengaPreviewPointerXY(ev), cur = gengaSilCurrentExposure();
       if (!p || !cur) { badge.style.display = 'none'; return; }
       const dr = gengaExposureDrawing(cur.layer, cur.e);
-      if (!dr || !dr.dataUrl) { badge.style.display = 'none'; return; }
+      if (!gengaDrawingHasArt(dr)) { badge.style.display = 'none'; return; }
       const dw = Number(dr.w) || 1, dh = Number(dr.h) || 1, dx = Number.isFinite(Number(dr.x)) ? dr.x : 0, dy = Number.isFinite(Number(dr.y)) ? dr.y : 0;
       const nx = (p.x - dx) / dw, ny = (p.y - dy) / dh;
       const filled = (nx >= 0 && ny >= 0 && nx <= 1 && ny <= 1) ? gengaSilFilledAt(cur.layer, cur.e, p.x, p.y) : null;
@@ -89171,7 +89201,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // shared nothing. Resolution stays in the key (onionGhostCanvas appends it) so zooming IN can
       // build a sharper ghost instead of silently reusing a softer one.
       // ver2023: 벡터 그림은 dataUrl 이 없다 — strokes 기반 안정 키로 물러선다(ref 가 있으면 종전 그대로).
-      const ghostKey = dr.ref || (dr.dataUrl ? dr.dataUrl.slice(-40) : gengaVectorStrokesKey(dr.strokes));
+      // ver2036: 그 판정이 커널이 됐다(여기가 정본이었다 — 나머지 다섯 벌이 벡터를 몰랐다).
+      const ghostKey = gengaDrawingCacheKey(dr);
       return onionGhostCanvas(ghostKey, tint, size.w, size.h, function(cx, cw, ch) {
         // the drawing places itself in PAPER coordinates (trimmed bitmaps carry their own x/y), so the
         // scale goes on the context and gengaDrawDrawingInto keeps speaking paper units.
