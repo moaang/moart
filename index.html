@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2042</title>
+  <title>MoArt ver2043</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -17241,6 +17241,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const TIMELINE_LOWER_PANEL_MAX_HEIGHT = 760;
     const AUDIO_WAVEFORM_PEAK_COUNT = 128;
     const AUDIO_SOURCE_WAVEFORM_PEAK_COUNT = 256;
+    // Waveform peaks are DERIVED display data, not project data. They live in IndexedDB under the same
+    // source identity the playback decode cache already uses (audioClipSourceKey), never in the
+    // .conte.json -- storing them there is what forced a fixed, tiny peak count in the first place
+    // (measured: 32.8% of a 476-clip project file was peak arrays). Density is fixed per SECOND rather
+    // than per clip, so a 3-second line and a 3-minute take get the same time resolution and a long clip
+    // can no longer thin out into a handful of fat bars. This is what every editor does (audiowaveform
+    // .dat, Audacity .au, Premiere .pek) -- and why there is no re-analyse button: a missing cache entry
+    // is simply rebuilt from the source.
+    const AUDIO_PEAK_BINS_PER_SECOND = 400;                 // 2.5ms per bin = 16.7 bins per frame at 24fps
+    const AUDIO_WAVEFORM_MAX_COLUMNS = 1600;                // per-clip picture; 1 column per display pixel under this
+    const AUDIO_PEAK_CACHE_PREFIX = 'audioPeaks:';          // IndexedDB key prefix (WORKSPACE_STORE_NAME)
+    const AUDIO_PEAK_MEMORY_BUDGET = 48 * 1024 * 1024;      // decoded peak bytes held in RAM before LRU eviction
     const MAX_UNDO_HISTORY = 40;
     const MAX_REDO_HISTORY = 40;
     // ver1064 (docs/memory_budget_audit_2026-07-24.md §P2 — the sheet tool's "Undo: maximum memory" model): the 40
@@ -17543,6 +17555,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       audioBufferCache: {},
       audioBufferPendingCache: {},
       audioBufferCacheOrder: [],
+      audioSourcePeaks: {},           // sourceKey -> Uint8Array of 0..255 maxima, AUDIO_PEAK_BINS_PER_SECOND per second
+      audioSourcePeaksPending: {},    // sourceKey -> in-flight build promise (one build per source, never per clip)
+      audioSourcePeaksOrder: [],      // LRU order for audioSourcePeaks
+      audioSourcePeaksFailed: {},     // sourceKey -> reason; kept so a failure is visible instead of an endless retry loop
       audioBufferUrlToSource: {},
       audioSourceBlobCache: {},
       audioSourceBlobCacheOrder: [],
@@ -33364,46 +33380,121 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         const css = audioWaveformCssValue(clip);
         if (css) node.style.setProperty('--waveform', css);
+        // No picture yet = this source has never been summarised. Queue it; the clip fills in on its own.
+        else { node.style.removeProperty('--waveform'); requestAudioSourcePeaks(clip); }
       });
     }
 
+    // How many columns this clip's picture gets = how many pixels it actually occupies. The timeline is a
+    // flat frame->pixel mapping (innerWidth = totalFrames * framePx), so the width is arithmetic -- no
+    // getBoundingClientRect, no forced layout, and it stays correct while the zoom changes.
+    function audioClipDisplayColumns(clip) {
+      const framePx = Math.max(1, Math.min(6, Math.round(Number(state.timelineFramePx) || 5)));
+      const frames = Math.max(1, Math.round(Number(clip && clip.durationFrames) || 1));
+      return Math.max(8, Math.min(AUDIO_WAVEFORM_MAX_COLUMNS, Math.round(frames * framePx)));
+    }
+
+    // ONE waveform picture kernel -- conte clips and genga audio clips both come through here. Peaks are
+    // re-summarised into exactly `columns` maxima (one per display pixel), so the picture's density is set
+    // by how wide the clip is DRAWN, never by how many numbers happen to be stored. That is the whole fix:
+    // a bar count fixed per clip is what made long clips read as a few fat bars with gaps between them.
+    // Drawn as one path of hairline vertical strokes; at 1 column per pixel they abut into a solid
+    // envelope, which is exactly what every editor's waveform is.
+    function waveformSvgUrl(peaks, fromBin, toBin, columns) {
+      const total = peaks && peaks.length ? peaks.length : 0;
+      if (!total) return '';
+      const from = Math.max(0, Math.min(total - 1, Number(fromBin) || 0));
+      const to = Math.max(from + 1, Math.min(total, Number(toBin) || total));
+      const cols = Math.max(1, Math.round(Number(columns) || 1));
+      const step = (to - from) / cols;
+      const heights = new Float64Array(cols);
+      let localMax = 0;
+      for (let index = 0; index < cols; index += 1) {
+        const binFrom = Math.max(0, Math.floor(from + step * index));
+        const binTo = Math.min(total, Math.max(binFrom + 1, Math.ceil(from + step * (index + 1))));
+        let peak = 0;
+        for (let bin = binFrom; bin < binTo; bin += 1) if (peaks[bin] > peak) peak = peaks[bin];
+        heights[index] = peak;
+        if (peak > localMax) localMax = peak;
+      }
+      // Re-gain to THIS clip's own loudest moment so a soft-spoken line still fills its lane and stays
+      // editable without listening -- matches how editors auto-scale each clip's waveform independently
+      // of the source media's overall loudness. (Capped so near-silence does not become a wall of noise.)
+      const gain = localMax > 0 ? Math.min(20, 255 / localMax) : 0;
+      let d = '';
+      for (let index = 0; index < cols; index += 1) {
+        const level = Math.min(1, heights[index] * gain / 255);
+        const half = Math.max(0.35, level * 9.3);
+        d += 'M' + index + ' ' + (10 - half).toFixed(1) + 'V' + (10 + half).toFixed(1);
+      }
+      // viewBox starts at -0.5 so a 1-wide stroke centred on integer x lands flush inside the box.
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="-0.5 0 ' + cols + ' 20" preserveAspectRatio="none">' +
+        '<path d="' + d + '" stroke="rgba(255,255,255,0.72)" stroke-width="1" fill="none"/></svg>';
+      return "url('data:image/svg+xml," + encodeURIComponent(svg) + "')";
+    }
+
     function audioWaveformCssValue(clip) {
-      const peaks = clip && Array.isArray(clip.waveformPeaks) ? clip.waveformPeaks : [];
-      if (!peaks.length) return '';
-      // Bars are laid out once, at their position within the ANALYSED window; the viewBox then crops to the
-      // slice the current trim selects (background-size:100% 100% stretches that slice over the clip box,
-      // whose width is also proportional to the trim length -- so bars/px stays constant and the picture
-      // stays pinned to the audio while trimming, instead of being rescaled to fit).
-      const range = waveformPeaksVisibleRange(clip);
-      const viewWidth = Math.max(0.0001, range.to - range.from);
-      const key = [
-        clip.id || '',
-        peaks.length,
-        range.from.toFixed(3),
-        range.to.toFixed(3),
-        peaks[0] || 0,
-        peaks[Math.floor(peaks.length / 2)] || 0,
-        peaks[peaks.length - 1] || 0
-      ].join(':');
+      const sourceKey = audioClipSourceKey(clip);
+      const peaks = audioSourcePeaksIfReady(sourceKey);
+      if (!peaks) return '';
+      const fps = Math.max(1, fpsForProject(state.project));
+      const binsPerFrame = AUDIO_PEAK_BINS_PER_SECOND / fps;
+      const trimStart = Math.max(0, Math.round(Number(clip.audioTrimStartFrames) || 0));
+      const trimDuration = Math.max(1, Math.round(Number(clip.audioTrimDurationFrames) || Number(clip.durationFrames) || 1));
+      const fromBin = trimStart * binsPerFrame;
+      const toBin = fromBin + trimDuration * binsPerFrame;
+      const columns = audioClipDisplayColumns(clip);
+      const key = [sourceKey, peaks.length, fromBin.toFixed(1), toBin.toFixed(1), columns].join(':');
       const cached = state.audioWaveformCssCache && state.audioWaveformCssCache[clip.id || key];
       if (cached && cached.key === key) return cached.css;
-      // Only the bars the viewBox can actually show are emitted (a heavily trimmed clip would otherwise carry
-      // the whole source's rects in its data: URL for nothing).
-      const firstBar = Math.max(0, Math.floor(range.from) - 1);
-      const lastBar = Math.min(peaks.length, Math.ceil(range.to) + 1);
-      let bars = '';
-      for (let index = firstBar; index < lastBar; index += 1) {
-        const peak = Math.max(0.05, Math.min(1, Number(peaks[index]) || 0));
-        const x = index + 0.18;
-        const barWidth = 0.64;
-        const height = Math.max(1, peak * 18);
-        const y = 10 - height / 2;
-        bars += '<rect x="' + x.toFixed(2) + '" y="' + y.toFixed(2) + '" width="' + barWidth + '" height="' + height.toFixed(2) + '" rx="0.18" fill="rgba(255,255,255,0.72)"/>';
-      }
-      const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + range.from.toFixed(4) + ' 0 ' + viewWidth.toFixed(4) + ' 20" preserveAspectRatio="none">' + bars + '</svg>';
-      const css = "url('data:image/svg+xml," + encodeURIComponent(svg) + "')";
+      const css = waveformSvgUrl(peaks, fromBin, toBin, columns);
       if (clip.id) state.audioWaveformCssCache[clip.id] = { key: key, css: css };
       return css;
+    }
+
+    // ---- automatic peak building (this is what replaced the 波形を再解析 button) --------------------
+    // A clip whose source has no peaks yet queues its SOURCE (not itself) for a build. Sources are built a
+    // couple at a time so a 98-source project does not fire 98 concurrent decodes, and each finished
+    // source repaints the clips that use it. Nothing to press, nothing to remember.
+    const AUDIO_PEAK_MAX_PARALLEL = 2;
+
+    function requestAudioSourcePeaks(clip) {
+      const sourceKey = audioClipSourceKey(clip);
+      if (!sourceKey) return;
+      if (state.audioSourcePeaks[sourceKey] || state.audioSourcePeaksPending[sourceKey] || state.audioSourcePeaksFailed[sourceKey]) return;
+      state.audioPeakQueue = Array.isArray(state.audioPeakQueue) ? state.audioPeakQueue : [];
+      if (state.audioPeakQueue.some(function(item) { return item.sourceKey === sourceKey; })) return;
+      state.audioPeakQueue.push({ sourceKey: sourceKey, clip: clip });
+      pumpAudioPeakQueue();
+    }
+
+    function pumpAudioPeakQueue() {
+      state.audioPeakQueue = Array.isArray(state.audioPeakQueue) ? state.audioPeakQueue : [];
+      state.audioPeakActive = Math.max(0, Number(state.audioPeakActive) || 0);
+      while (state.audioPeakActive < AUDIO_PEAK_MAX_PARALLEL && state.audioPeakQueue.length) {
+        const job = state.audioPeakQueue.shift();
+        if (state.audioSourcePeaks[job.sourceKey] || state.audioSourcePeaksPending[job.sourceKey]) continue;
+        state.audioPeakActive += 1;
+        ensureAudioSourcePeaks(job.clip).then(function(peaks) {
+          if (peaks) scheduleAudioWaveformRepaint();
+        }).catch(function(error) {
+          console.warn('[waveform] peak job failed', error);
+        }).then(function() {
+          state.audioPeakActive = Math.max(0, state.audioPeakActive - 1);
+          pumpAudioPeakQueue();
+        });
+      }
+    }
+
+    // Coalesced repaint: several sources finishing together must not each rebuild every clip's style.
+    function scheduleAudioWaveformRepaint() {
+      if (state.audioWaveformRepaintTimer) return;
+      state.audioWaveformRepaintTimer = setTimeout(function() {
+        state.audioWaveformRepaintTimer = null;
+        const timeline = document.querySelector('.video-editor-timeline');
+        if (timeline) applyAudioClipWaveformStyles(timeline);
+        if (typeof gengaApplyAudioWaveformStyles === 'function') gengaApplyAudioWaveformStyles();
+      }, 120);
     }
 
     function conteLayerContextMenuEl() {
@@ -47054,6 +47145,133 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // "voice_01.wav" from different asset dirs would otherwise share (and cross-contaminate) one buffer.
       if (name) return 'file:' + String((storage && storage.dir) || '').toLowerCase() + '/' + name;
       return 'clip:' + String(clip.id || ''); // inline recordings etc. -- genuinely per-clip content
+    }
+
+    // ---- source waveform peaks: build, cache, serve ------------------------------------------------
+    // ONE kernel, shared by conte clips and genga audio clips. Takes a decoded AudioBuffer and returns
+    // absolute-amplitude maxima at a FIXED time density; the display side decides how many of these bins
+    // to squeeze into how many pixels. Channels are folded to a single mono envelope (max across
+    // channels) exactly like audiowaveform's v1 data format does.
+    function audioPeaksFromBuffer(audioBuffer, binsPerSecond) {
+      if (!audioBuffer) return new Uint8Array(0);
+      const sampleRate = Math.max(1, Number(audioBuffer.sampleRate) || 48000);
+      const density = Math.max(1, Math.round(Number(binsPerSecond) || AUDIO_PEAK_BINS_PER_SECOND));
+      const samplesPerBin = Math.max(1, Math.round(sampleRate / density));
+      const length = Math.max(1, audioBuffer.length | 0);
+      const binCount = Math.max(1, Math.ceil(length / samplesPerBin));
+      const out = new Uint8Array(binCount);
+      const channels = Math.max(1, audioBuffer.numberOfChannels || 1);
+      for (let channel = 0; channel < channels; channel += 1) {
+        const data = audioBuffer.getChannelData(channel);
+        let cursor = 0;
+        for (let bin = 0; bin < binCount; bin += 1) {
+          const end = Math.min(length, cursor + samplesPerBin);
+          let peak = 0;
+          for (; cursor < end; cursor += 1) {
+            const value = data[cursor];
+            const magnitude = value < 0 ? -value : value;
+            if (magnitude > peak) peak = magnitude;
+          }
+          const scaled = peak >= 1 ? 255 : (peak * 255) | 0;
+          if (scaled > out[bin]) out[bin] = scaled;
+        }
+      }
+      return out;
+    }
+
+    // Cache identity = source identity + byte size. The size qualifier is the invalidation: replacing a
+    // clip's audio with a different take reuses the same file name, and stale peaks over new audio would
+    // be a silent lie about where the words are.
+    function audioPeakCacheKey(sourceKey, byteSize) {
+      return AUDIO_PEAK_CACHE_PREFIX + String(sourceKey || '') + ':' + Math.max(0, Math.round(Number(byteSize) || 0));
+    }
+
+    function rememberAudioSourcePeaks(sourceKey, peaks) {
+      if (!sourceKey || !peaks) return peaks;
+      state.audioSourcePeaks[sourceKey] = peaks;
+      touchAudioSourcePeaks(sourceKey);
+      trimAudioSourcePeaks();
+      return peaks;
+    }
+
+    function touchAudioSourcePeaks(sourceKey) {
+      if (!sourceKey) return;
+      state.audioSourcePeaksOrder = Array.isArray(state.audioSourcePeaksOrder) ? state.audioSourcePeaksOrder : [];
+      const existing = state.audioSourcePeaksOrder.indexOf(sourceKey);
+      if (existing >= 0) state.audioSourcePeaksOrder.splice(existing, 1);
+      state.audioSourcePeaksOrder.push(sourceKey);
+    }
+
+    function trimAudioSourcePeaks() {
+      let total = 0;
+      Object.keys(state.audioSourcePeaks).forEach(function(key) {
+        const value = state.audioSourcePeaks[key];
+        total += value && value.length ? value.length : 0;
+      });
+      while (total > AUDIO_PEAK_MEMORY_BUDGET && state.audioSourcePeaksOrder.length > 1) {
+        const oldest = state.audioSourcePeaksOrder.shift();
+        const dropped = state.audioSourcePeaks[oldest];
+        total -= dropped && dropped.length ? dropped.length : 0;
+        delete state.audioSourcePeaks[oldest];
+      }
+    }
+
+    // Synchronous read for the renderer: peaks if they are already in RAM, null otherwise. Never decodes
+    // -- the renderer must stay synchronous, so a miss just draws nothing this frame and
+    // ensureAudioSourcePeaks() fills it in.
+    function audioSourcePeaksIfReady(sourceKey) {
+      if (!sourceKey) return null;
+      const peaks = state.audioSourcePeaks[sourceKey];
+      if (!peaks || !peaks.length) return null;
+      touchAudioSourcePeaks(sourceKey);
+      return peaks;
+    }
+
+    // Build (or load from the IndexedDB cache) the peaks for a clip's source. Every caller of this for the
+    // same source shares one promise, so 294 clips off one recording still decode it exactly once.
+    async function ensureAudioSourcePeaks(clip) {
+      const sourceKey = audioClipSourceKey(clip);
+      if (!sourceKey) return null;
+      const ready = state.audioSourcePeaks[sourceKey];
+      if (ready && ready.length) { touchAudioSourcePeaks(sourceKey); return ready; }
+      if (state.audioSourcePeaksPending[sourceKey]) return state.audioSourcePeaksPending[sourceKey];
+      if (state.audioSourcePeaksFailed[sourceKey]) return null;
+      state.audioSourcePeaksPending[sourceKey] = (async function() {
+        try {
+          const url = await ensurePlaybackAudioUrlForClip(clip);
+          if (!url) throw new Error('no audio source');
+          // Byte size qualifies the cache entry; a HEAD-less object URL still answers a ranged fetch.
+          const blob = await (await fetch(url)).blob();
+          const cacheKey = audioPeakCacheKey(sourceKey, blob.size);
+          const cached = await getWorkspaceDbValue(cacheKey).catch(function() { return null; });
+          const cachedBytes = cached && cached.peaks;
+          if (cachedBytes && cachedBytes.byteLength) {
+            return rememberAudioSourcePeaks(sourceKey, new Uint8Array(cachedBytes));
+          }
+          const ctx = ensureAudioDecodeContext();
+          if (!ctx) throw new Error('no audio context');
+          const decoded = await audioBufferForClip(ctx, clip, url);
+          const peaks = audioPeaksFromBuffer(decoded, AUDIO_PEAK_BINS_PER_SECOND);
+          if (!peaks.length) throw new Error('empty decode');
+          rememberAudioSourcePeaks(sourceKey, peaks);
+          // Cache write is best-effort: the picture is already on screen, and a full quota is not a
+          // reason to fail the clip -- but it must not vanish silently either.
+          putWorkspaceDbValue(cacheKey, {
+            v: 1,
+            binsPerSecond: AUDIO_PEAK_BINS_PER_SECOND,
+            peaks: peaks.buffer.slice(0),
+            size: blob.size
+          }).catch(function(error) { console.warn('[waveform] peak cache write failed for ' + sourceKey, error); });
+          return peaks;
+        } catch (error) {
+          state.audioSourcePeaksFailed[sourceKey] = (error && error.message) ? error.message : String(error);
+          console.warn('[waveform] peak build failed for ' + sourceKey, error);
+          return null;
+        } finally {
+          delete state.audioSourcePeaksPending[sourceKey];
+        }
+      })();
+      return state.audioSourcePeaksPending[sourceKey];
     }
 
     async function audioBufferForClip(ctx, clip, audioUrl) {
@@ -90153,6 +90371,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver1196 과 같은 뜻 — 포인터가 아니라 **실제로 그려진 것**의 범위를 남긴다(Alt 中心から 는
         // 앵커 반대편으로 뻗으므로 포인터만 재면 모자란다). 점마다 부르지 않고 bbox 두 번이면 족하다.
         if (shapePts.length) { gengaScanMark(sess, mnx, mny, shapePad); gengaScanMark(sess, mxx, mxy, shapePad); }
+        // ver2043: **화면에 보여 준 바로 그 배열**을 들고 있는다 — 커밋이 이것을 그대로 저장하므로
+        // 미리보기와 저장된 벡터가 갈릴 수 없다(다시 계산하면 그 순간 두 벌이 된다).
+        if (sess.vector) sess.lastShapePts = shapePts;
         if ((sess.shape === 'line' || (sess.shape === 'curve' && !sess.curveChord)) && shapePts.length) sess.lastShapePt = { x: shapePts[shapePts.length - 1].x, y: shapePts[shapePts.length - 1].y };
         if (paintShapeStrokeWantsFill(sess.shape)) {
           for (let i = 0; i < shapePts.length; i += 1) { const q = shapePts[i]; if (i === 0) b.moveTo(q.x, q.y); else b.lineTo(q.x, q.y); }
@@ -90403,6 +90624,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver956 P4④: styled by the shared applyPaintStrokeStyle kernel (was an inline copy; alphaLock =
       // 透明度保護 source-atop, ver869 G0 背面描画 parity comes from stroke.mode).
       const eraser = (state.paintTool === 'eraser');
+      // ver2029 (A-3a): 이 레이어를 벡터로 그릴 것인가. 벡터로 못 담는 효과는 **묻지 않고 끈다**
+      // (사용자 판정) — 레이어 선택에서 이미 꺼졌지만, 선택을 거치지 않고 바로 그은 경우의 안전망.
+      // ver2043: 이 판정을 **버킷·도형 분기보다 위로** 올렸다. 종전에는 아래에 있어 그 둘이 판정에
+      // 닿기 전에 return 했고, 그래서 ver2038 은 커밋 자리에서 막는 수밖에 없었다. 효과 끄기도
+      // 여기가 맞다 — 바로 아래 applyPaintStrokeStyle 이 그 설정을 읽어 붓을 세운다.
+      const vectorDraw = gengaLayerDrawsVector(layer);
+      if (vectorDraw && !eraser) gengaDisableVectorUnsupportedEffects();
       applyPaintStrokeStyle(c, {
         tool: eraser ? 'eraser' : 'pen',
         size: (typeof activePaintSize === 'function' ? activePaintSize() : 4),
@@ -90428,6 +90656,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // transparent buffer each move, and cv is rebuilt = seeded base + buffer composited with the session's
       // op (eraser destination-out / alphaLock source-atop / normal). AA off binarizes the buffer at commit.
       const gengaShapeKind = paintShapeToolKind();
+      // ver2043: 벡터 레이어에서 **선으로 담을 수 없는 도형**은 여기서 끝낸다 — 올가미 채우기는
+      // 도구 자체가 채우기이고, 도형 지우개는 아직 벡터 규칙이 없다(벡터 지우개는 선 단위라 다르다).
+      // 조용히 아무 일도 안 하면 「고장」으로 보이므로 ver2038 과 같은 문구로 사유를 말한다.
+      if (gengaShapeKind && vectorDraw && (gengaShapeKind === 'lasso-fill' || eraser)) {
+        state.timelineStatus = t('status.genga.vector.rasterBlocked');
+        renderGengaView();
+        ev.preventDefault();
+        return;
+      }
       if (gengaShapeKind) {
         const shapeBase = document.createElement('canvas'); shapeBase.width = pw; shapeBase.height = ph;
         shapeBase.getContext('2d').drawImage(cv, 0, 0);
@@ -90439,6 +90676,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           layerId: layer.id, frame: frame, canvas: cv, ctx: c,
           shape: gengaShapeKind, shapeBase: shapeBase, shapeBuf: shapeBuf,
           shapeAnchor: { x: p.x, y: p.y }, shapeLassoPts: [{ x: p.x, y: p.y }], shapeMoved: false,
+          vector: vectorDraw,   // ver2043: 이 도형을 스트로크로 남길 것인가(위에서 못 담는 것은 이미 걸렀다)
           shapeEraser: eraser, shapeAlphaLock: Boolean(!eraser && layer.alphaLock),
           shapeColor: eraser ? '#000000' : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
           shapeLineWidth: c.lineWidth,
@@ -90460,10 +90698,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ev.preventDefault();
         return;
       }
-      // ver2029 (A-3a): 이 레이어를 벡터로 그릴 것인가. 벡터로 못 담는 효과는 **묻지 않고 끈다**
-      // (사용자 판정) — 레이어 선택에서 이미 꺼졌지만, 선택을 거치지 않고 바로 그은 경우의 안전망.
-      const vectorDraw = gengaLayerDrawsVector(layer);
-      if (vectorDraw && !eraser) gengaDisableVectorUnsupportedEffects();
       // ver2030 (A-3b): 벡터 레이어 + 지우개 = **선 단위 삭제**(판정). 픽셀을 파는 래스터 경로로
       // 보내면 커밋이 그림을 통째로 래스터로 바꾼다. 여기서 전용 세션으로 갈라 나간다.
       // (ver2029 는 지우개에도 sess.vector 를 세워, 지우개 획이 검은 선으로 **추가**됐다 — 그 결함도 여기서 끝난다.)
@@ -90960,6 +91194,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           return;
         }
         gengaDrawSession = null;
+        if (shapeSess.vector) {
+          // ver2043: 도형을 **스트로크로** 남긴다. 점은 미리보기가 만든 그대로, 굵기는 미리보기가
+          // 쓰는 규칙 그대로(도형은 필압이 없어 균일하다 — paintVariableWidthRadii 에 계수 1).
+          // **커밋 직전에 한 번 확정한다** — 점 열을 채우는 미리보기가 rAF 로 접혀 있어서
+          // (gengaShapeScheduleRedraw) 아주 빠른 드래그면 한 번도 안 돌 수 있다. 래스터는 그때
+          // 「마지막 이동이 빠진 채」 구워지지만 벡터는 **아무것도 안 남는다.** ver1720 이 펜에
+          // 대해 남긴 규약과 같은 자리다. shapePending 을 읽으므로 세션을 비운 뒤에도 안전하다.
+          gengaShapeRedraw(shapeSess);
+          const shapeVecPts = shapeSess.lastShapePts;
+          if (shapeSess.shapeMoved && shapeVecPts && shapeVecPts.length > 1) {
+            gengaCommitVectorStroke(shapeSess.layerId, shapeSess.frame,
+              { pts: shapeVecPts, color: shapeSess.shapeColor,
+                radius: Math.max(0.15, (Number(shapeSess.shapeLineWidth) || 2) / 2) }, '図形描画');
+          } else {
+            drawGengaPreview();   // 탭만 하고 끝났다 — 레이어는 그대로다
+          }
+          try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+          return;
+        }
         if (shapeSess.shapeMoved && !(shapeSess.shape === 'lasso-fill' && shapeSess.shapeLassoPts.length < 3)) {
           if (shapeSess.shape === 'lasso-fill') {
             // ver617: the drag only showed a dashed marquee (buffer left empty) — build the actual
@@ -91274,6 +91527,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (paintBrushGet('tipId')) { paintBrushSet('tipId', ''); changed = true; }
       if (paintBrushGet('paperTexId')) { paintBrushSet('paperTexId', ''); changed = true; }
       if (paintBrushGet('mixOn')) { paintBrushSet('mixOn', false); changed = true; }
+      // ver2043: 도형의 **채우기**도 벡터로 못 담는다(선만 남는다) — 같은 판정으로 끈다.
+      if (paintShapeFillOn()) { setPaintShapeFillOn(false); changed = true; }
       const tk = (state.paintTool === 'eraser') ? 'eraser' : 'pen';
       if (paintToolBinarizeOn(tk)) { setPaintToolBinarize(tk, false); changed = true; }
       if (changed && typeof updatePaintUI === 'function') updatePaintUI();   // 화면의 스위치도 같이 내려간다
