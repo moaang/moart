@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2029</title>
+  <title>MoArt ver2030</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -90246,6 +90246,29 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // (사용자 판정) — 레이어 선택에서 이미 꺼졌지만, 선택을 거치지 않고 바로 그은 경우의 안전망.
       const vectorDraw = gengaLayerDrawsVector(layer, frame);
       if (vectorDraw && !eraser) gengaDisableVectorUnsupportedEffects();
+      // ver2030 (A-3b): 벡터 레이어 + 지우개 = **선 단위 삭제**(판정). 픽셀을 파는 래스터 경로로
+      // 보내면 커밋이 그림을 통째로 래스터로 바꾼다. 여기서 전용 세션으로 갈라 나간다.
+      // (ver2029 는 지우개에도 sess.vector 를 세워, 지우개 획이 검은 선으로 **추가**됐다 — 그 결함도 여기서 끝난다.)
+      if (vectorDraw && eraser) {
+        const eDr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
+        const eStrokes = eDr && gengaDrawingStrokes(eDr);
+        if (eStrokes) {
+          const eRadius = Math.max(1, c.lineWidth) / 2;
+          gengaDrawSession = {
+            pointerId: ev.pointerId, layerId: layer.id, frame: frame,
+            canvas: cv, ctx: c, vectorErase: true,
+            eraseAll: eStrokes, eraseHits: new Set(), eraseRadius: eRadius,
+            lastX: p.x, lastY: p.y, scan: null
+          };
+          gengaVectorEraseHit(eStrokes, p.x, p.y, eRadius, gengaDrawSession.eraseHits);
+          gengaVectorEraseRepaint(gengaDrawSession);
+          try { ev.target.setPointerCapture(ev.pointerId); } catch (e2) {}
+          if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); }
+          drawGengaPreview();
+          ev.preventDefault();
+          return;
+        }
+      }
       const pxStamp = paintToolBinarizeOn(eraser ? 'eraser' : 'pen') ? paintPixelStampRows(c.lineWidth) : null; // 2値化 on → hard-edged pixel stamping (ver617: eraser has its own key)
       const penOpacity = paintBrushOpacityVal(); // ver609 brush settings (shared with conte)
       const penPressure = paintStrokeWantsPressure(ev);
@@ -90356,7 +90379,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver2029: 벡터로 그릴 때는 아웃라인 모드가 아니어도 **점을 모아야 한다** — 그 배열이
         // 곧 저장될 스트로크다. penOutline 은 렌더 방식의 이름이지 점 수집의 조건이 아니다.
         pts: (penOutlineMode || vectorDraw) ? [{ x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth }] : null,
-        vector: vectorDraw,
+        vector: vectorDraw && !eraser,   // ver2030: 지우개는 위에서 전용 세션으로 빠진다 — 여기 서면 지우개 획이 선으로 추가된다
         vectorColor: eraser ? null : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
         arc: penOutlineMode ? { x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth, carry: 0, step: Math.max(1, Math.min(5, c.lineWidth * 0.35)) } : null, // ver1328 ①: resampler state — step scales with brush width, clamped so thin pens stay dense and fat pens stay cheap
         tiltSizePct: paintTiltSizeVal(), tiltAlphaPct: paintTiltAlphaVal(), smoothT: null, // ver1328 ③: captured per stroke like the pressure shape fields
@@ -90496,6 +90519,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 좌표가 획에 섞였다. pointerId 가 null 이면 곡선 1단계 대기 상태이고 소유자가 없다.
       if (gengaDrawSession.pointerId !== ev.pointerId) return;
       if (gengaDrawSession.shape) { gengaShapeDragUpdate(ev); return; } // ver606
+      // ver2030: 벡터 지우개 — 지나간 자리에 닿는 스트로크를 모으고 남을 것만 다시 그린다.
+      if (gengaDrawSession.vectorErase) {
+        const es = gengaDrawSession;
+        const q = gengaPreviewPointerXY(ev);
+        if (q) {
+          const before = es.eraseHits.size;
+          // 이동이 빠르면 점 사이가 벌어진다 — 지난 자리와 이번 자리를 **선분으로** 훑어야
+          // 사이를 건너뛰지 않는다(원만 찍으면 빠른 획에서 구멍이 난다).
+          const steps = Math.max(1, Math.ceil(Math.hypot(q.x - es.lastX, q.y - es.lastY) / Math.max(1, es.eraseRadius)));
+          for (let k = 1; k <= steps; k++) {
+            const t = k / steps;
+            gengaVectorEraseHit(es.eraseAll, es.lastX + (q.x - es.lastX) * t, es.lastY + (q.y - es.lastY) * t, es.eraseRadius, es.eraseHits);
+          }
+          es.lastX = q.x; es.lastY = q.y;
+          // 드래그 중 무거운 재그리기는 스케줄러를 지난다(PERF-1) — 커널이 대기 프레임을 흡수한다.
+          if (es.eraseHits.size !== before) { gengaVectorEraseRepaint(es); scheduleGengaPreviewRedraw(); }
+        }
+        if (ev.cancelable) ev.preventDefault();
+        return;
+      }
       const penSess = gengaDrawSession;
       const target = penSess.penBufMode ? penSess.shapeBuf.getContext('2d') : penSess.ctx;
       // ver621: walk every coalesced sample (Apple Pencil samples at 240Hz vs ~60Hz pointermove) —
@@ -90738,6 +90781,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // (원반 스탬프는 그 둘을 표현할 수 없다) 그때는 sess.binarizeOutline 이 서서
         // gengaPenOutlineRedraw 안에서 알파를 임계화한다 — 커밋 임계화가 **여기 있다.**
         gengaPenOutlineRedraw(sess);
+      }
+      // ver2030 (A-3b): 벡터 지우개는 **삭제**로 끝난다.
+      if (sess.vectorErase) {
+        gengaCommitVectorErase(sess);
+        drawGengaPreview();
+        try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+        return;
       }
       // ver2029 (A-3a): 벡터 세션은 픽셀이 아니라 **스트로크**를 커밋한다. 세션 캔버스는
       // 화면에 보여 준 미리보기였을 뿐이라 그대로 버린다.
@@ -90987,6 +91037,64 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
       const L = (gt.layers || []).find(function(x) { return String(x.id) === String(layerId || state.gengaSelectedLayerId); });
       if (L && L.vector) gengaDisableVectorUnsupportedEffects();
+    }
+    // ── ver2030 (A-3b): 벡터 지우개 ────────────────────────────────────────────────
+    // 점-선분 거리의 제곱. 스트로크의 각 선분이 지우개 원에 닿는지 보는 데 쓴다(제곱으로 비교해
+    // sqrt 를 피한다 — 스트로크 수 × 점 수만큼 도는 자리다).
+    function gengaSegDistSq(ax, ay, bx, by, px, py) {
+      const dx = bx - ax, dy = by - ay;
+      const L = dx * dx + dy * dy;
+      let t = L ? ((px - ax) * dx + (py - ay) * dy) / L : 0;
+      if (t < 0) t = 0; else if (t > 1) t = 1;
+      const cx = ax + t * dx, cy = ay + t * dy;
+      return (px - cx) * (px - cx) + (py - cy) * (py - cy);
+    }
+    // 지우개 원(x,y,r)에 닿는 스트로크의 인덱스를 hits 에 더한다. 선의 제 굵기도 더해 판정한다 —
+    // 굵은 선은 중심선에서 떨어져 있어도 눈에는 닿아 보인다.
+    function gengaVectorEraseHit(strokes, x, y, r, hits) {
+      for (let i = 0; i < strokes.length; i++) {
+        if (hits.has(i)) continue;
+        const st = strokes[i], pts = st && st.pts;
+        if (!pts || !pts.length) continue;
+        const base = Number(st.radius) || 0;
+        for (let j = 0; j < pts.length; j++) {
+          const w = Number(pts[j].w) || base || 0.5;
+          const reach = r + w;
+          const rr = reach * reach;
+          if (j === 0) {
+            const dx = pts[0].x - x, dy = pts[0].y - y;
+            if (dx * dx + dy * dy <= rr) { hits.add(i); break; }
+            continue;
+          }
+          if (gengaSegDistSq(pts[j - 1].x, pts[j - 1].y, pts[j].x, pts[j].y, x, y) <= rr) { hits.add(i); break; }
+        }
+      }
+      return hits;
+    }
+    // 지우는 동안의 미리보기 — 세션 캔버스에 **남을 스트로크만** 다시 그린다. 합성기는 벡터
+    // 레이어 자리에 이 캔버스를 대신 얹으므로(gengaCompositeFrame 의 sess 분기) 사라지는 것이 바로 보인다.
+    function gengaVectorEraseRepaint(sess) {
+      const keep = [];
+      for (let i = 0; i < sess.eraseAll.length; i++) if (!sess.eraseHits.has(i)) keep.push(sess.eraseAll[i]);
+      const c = sess.ctx;
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.clearRect(0, 0, sess.canvas.width, sess.canvas.height);
+      gengaDrawVectorStrokes(c, keep);
+    }
+    function gengaCommitVectorErase(sess) {
+      if (!sess.eraseHits.size) return;
+      const layerId = sess.layerId, frame = sess.frame, hits = sess.eraseHits;
+      // 지운 뒤 남는 스트로크를 **커밋 밖에서** 정해 둔다(커널의 관례 — 커맨드 안은 대입만).
+      const keep = [];
+      for (let i = 0; i < sess.eraseAll.length; i++) if (!hits.has(i)) keep.push(sess.eraseAll[i]);
+      runCommand('ベクター消去', function(p) {
+        const gt = p.gengaTimeline; if (!gt) return;
+        const layer = (gt.layers || []).find(function(x) { return String(x.id) === String(layerId); });
+        if (!layer) return;
+        const e = gengaExposureAt(layer, frame); if (!e) return;
+        gengaSetExposureDrawing(layer, e, keep.length ? { w: gt.paper.w, h: gt.paper.h, strokes: keep } : null);
+        layer.vector = gengaVectorLayerHasStrokes(layer);
+      });
     }
     // 세션이 모은 점을 스트로크 한 벌로. 필압이 굵기에 걸려 있으면 점마다 반경(w)을 싣는다.
     function gengaSessionToVectorStroke(sess) {
