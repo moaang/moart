@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2022</title>
+  <title>MoArt ver2023</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -74933,6 +74933,49 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return { placed: false, x: 0, y: 0, w: pw, h: ph };
     }
 
+    // ── ver2023: 벡터 스트로크의 굽기 캐시 (사양 q2=A — 벡터가 정본, 비트맵은 캐시) ──
+    // 키는 strokes **배열 참조**다: 저장소(sharedDrawings)의 배열이 resolve 를 지나도 같은 참조로
+    // 오므로(ver2021), WeakMap 하나로 「스트로크가 교체되면 캐시가 자연히 죽는」 무효화가 된다.
+    // in-place 편집의 무효화 규칙은 편집 판(A-3)에서 더한다 — 이번 판은 표시·보존까지라 스트로크가
+    // 생긴 뒤 바뀌는 경로가 없다.
+    const gengaVectorBakeCache = new WeakMap();   // strokes[] -> { canvas, pw, ph, seq }
+    let gengaVectorBakeSeq = 0;
+    function gengaDrawVectorStrokes(ctx, strokes, defaultColor) {
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      for (let i = 0; i < strokes.length; i++) {
+        const st = strokes[i];
+        const pts = st && st.pts;
+        if (!pts || !pts.length) continue;
+        ctx.strokeStyle = st.color || defaultColor || '#000000';
+        // 두께 = 2×반경(파이썬 참조 구현과 같은 규칙 — clip_format_notes 의 벡터 절). 필압→굵기는
+        // 표본이 전부 균일 두께라 아직 검증 불가로 남긴다(같은 절의 「남은 정밀도 한계」).
+        ctx.lineWidth = Math.max(0.5, (Number(st.radius) || 0.5) * 2);
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        if (pts.length === 1) ctx.lineTo(pts[0].x + 0.01, pts[0].y);   // 점 하나 = 점 찍기
+        for (let j = 1; j < pts.length; j++) ctx.lineTo(pts[j].x, pts[j].y);
+        ctx.stroke();
+      }
+    }
+    // 용지 크기 1:1 로 구워 돌려준다. 재생·합성은 drawImage 한 번이 된다(실측 근거는
+    // docs/plans/vector_layer_2026-08-20.md §3 — 실시간 벡터 재렌더는 별도 프로젝트급).
+    function gengaVectorBakedCanvas(strokes, pw, ph) {
+      let e = gengaVectorBakeCache.get(strokes);
+      if (e && e.pw === pw && e.ph === ph) return e.canvas;
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, pw); cv.height = Math.max(1, ph);
+      gengaDrawVectorStrokes(cv.getContext('2d'), strokes);
+      e = { canvas: cv, pw: pw, ph: ph, seq: (e && e.seq) || (++gengaVectorBakeSeq) };
+      gengaVectorBakeCache.set(strokes, e);
+      return cv;
+    }
+    // 어니언 고스트 등 문자열 키가 필요한 캐시용 — ref 도 dataUrl 도 없는 벡터 그림의 안정 키.
+    function gengaVectorStrokesKey(strokes) {
+      let e = gengaVectorBakeCache.get(strokes);
+      if (!e) { e = { canvas: null, pw: 0, ph: 0, seq: ++gengaVectorBakeSeq }; gengaVectorBakeCache.set(strokes, e); }
+      return 'vec:' + e.seq;
+    }
     function gengaDrawDrawingInto(ctx, dr, pw, ph, onReady) {
       if (!dr) return false;
       // ver1470: 위치 판정은 커널이 한다. **크기는 계속 안 넘긴다**(3인자 = 원본 크기) — 5인자로 바꾸면
@@ -74943,7 +74986,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         else ctx.drawImage(dr.canvas, 0, 0, pw, ph);
         return true;
       }
-      if (!dr.dataUrl) return false;
+      if (!dr.dataUrl) {
+        // ver2023: 벡터 그림 — 구운 캐시를 1:1 로 얹는다. 스트로크 좌표는 이미 용지 좌표계라
+        // placement 를 지나지 않는다(트리밍 개념이 없다). 여기서 false 를 돌려주던 것이
+        // 「CLIP 벡터가 에러 없이 빈 화면」의 마지막 관문이었다.
+        const strokes = gengaDrawingStrokes(dr);
+        if (strokes) { ctx.drawImage(gengaVectorBakedCanvas(strokes, pw, ph), 0, 0); return true; }
+        return false;
+      }
       const img = gengaImageFor(dr.dataUrl, onReady);
       if (!img) {
         if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) { ctx.drawImage(gengaLastStrokeCanvas.canvas, 0, 0); return true; }
@@ -76637,7 +76687,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const memberHasDraw = function(m, startFrame) {
         const e = gengaExposureAt(m, startFrame); // synced ids across a group → same span covers startFrame
         const dr = e ? gengaExposureDrawing(m, e) : null;
-        return !!(dr && dr.dataUrl);
+        return gengaDrawingHasArt(dr);   // ver2023: 벡터도 그림
       };
       // --- cel cells: group by cellGroupId (standalone cel = a group of one), preserve top-first appearance ---
       const celGroups = []; const gidIndex = {};
@@ -76772,9 +76822,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       item.members.forEach(function(m) {
         const e = gengaExposureAt(m, item.startFrame);
         const dr = e ? gengaExposureDrawing(m, e) : null;
-        if (dr && dr.dataUrl) draws.push({ m: m, dr: dr });
+        if (gengaDrawingHasArt(dr)) draws.push({ m: m, dr: dr });   // ver2023: 벡터도 그림
       });
-      await Promise.all(draws.map(function(d) { return gengaDecodeIntoCache(d.dr.dataUrl); }));
+      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr.dataUrl) : Promise.resolve(true); }));
       compositeDrawItems(ctx, draws.map(function(d) { // ver1400: shared bracket (see compositeDrawItems)
         return { blend: d.m.blend, opacity: d.m.opacity, draw: function(c) { gengaDrawDrawingInto(c, d.dr, opts.pw, opts.ph); } };
       }));
@@ -76842,9 +76892,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!l || !gengaLayerEffVisible(l) || gengaLayerIsPaper(l) || gengaLayerIsFolder(l)) return;   // ver1811
         const e = gengaExposureAt(l, frame);
         const dr = e ? gengaExposureDrawing(l, e) : null;
-        if (dr && dr.dataUrl) draws.push({ l: l, dr: dr });
+        if (gengaDrawingHasArt(dr)) draws.push({ l: l, dr: dr });   // ver2023: 벡터도 그림
       });
-      await Promise.all(draws.map(function(d) { return gengaDecodeIntoCache(d.dr.dataUrl); }));
+      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr.dataUrl) : Promise.resolve(true); }));
       compositeDrawItems(ctx, draws.map(function(d) {
         return { blend: d.l.blend, opacity: d.l.opacity, draw: function(c) { gengaDrawDrawingInto(c, d.dr, pw, ph); } };
       }));
@@ -87860,7 +87910,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           } else {
             dr = gengaExposureDrawing(l, e);
           }
-          if (dr && (dr.dataUrl || dr.canvas)) { // ver1324: pending-encode art is drawable art — without this a second layer's stroke hid the first layer's just-committed one for the encode window
+          if (gengaDrawingHasArt(dr)) { // ver1324: pending-encode art is drawable art. ver2023: 판정을 gengaDrawingHasArt 한 곳으로 — 벡터(strokes)도 그림이다
             if (state.gengaSilDebug && !gengaSoloBypass) { // 診断: paint the computed silhouette UNDER this instance's lines
               const env = gengaDougaEnvDebugFor(l, e, pw, ph, drawGengaPreview);
               if (env && env !== 'pending') { target.globalAlpha = (l.opacity != null ? l.opacity : 1); target.drawImage(env, 0, 0, pw, ph); target.globalAlpha = 1; }
@@ -88917,7 +88967,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gt = state.project && state.project.gengaTimeline; if (!gt) return null;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       const dr = gengaExposureDrawing(layer, gengaResolveExposure(layer, frame));
-      if (!dr || !dr.dataUrl) return null; // nothing to ghost; resolving is two lookups, not worth memoizing a miss
+      if (!gengaDrawingHasArt(dr)) return null; // nothing to ghost. ver2023: 벡터(strokes)도 고스트 대상
       const size = gengaOnionCanvasSize(pw, ph, dw);
       // ver1055: keyed by the DRAWING, not by (layer, frame). A ghost depends only on (art, tint,
       // resolution) — the frame it happens to sit on is irrelevant. Frame-keying stored a byte-identical
@@ -88925,7 +88975,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // cycle (1,2,3,1,2,3) held one ghost per occurrence, and two layers referencing the same art
       // shared nothing. Resolution stays in the key (onionGhostCanvas appends it) so zooming IN can
       // build a sharper ghost instead of silently reusing a softer one.
-      return onionGhostCanvas(dr.ref || dr.dataUrl.slice(-40), tint, size.w, size.h, function(cx, cw, ch) {
+      // ver2023: 벡터 그림은 dataUrl 이 없다 — strokes 기반 안정 키로 물러선다(ref 가 있으면 종전 그대로).
+      const ghostKey = dr.ref || (dr.dataUrl ? dr.dataUrl.slice(-40) : gengaVectorStrokesKey(dr.strokes));
+      return onionGhostCanvas(ghostKey, tint, size.w, size.h, function(cx, cw, ch) {
         // the drawing places itself in PAPER coordinates (trimmed bitmaps carry their own x/y), so the
         // scale goes on the context and gengaDrawDrawingInto keeps speaking paper units.
         cx.setTransform(cw / pw, 0, 0, ch / ph, 0, 0);
@@ -89869,6 +89921,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // is exactly the silent-crop bug. null = the seed put no ink down, so the session's own ink is the union.
     function gengaDrawingSeedRect(dr, pw, ph) {
       if (!dr || !(dr.dataUrl || dr.canvas)) return null; // ver1324: a pending-encode drawing is trimmed art too — omitting it from the union seed would let the scan window crop the prior ink (the exact ver1196 premise)
+      // ver2023(판단 기록): 벡터 그림(strokes만)은 **일부러 안 연다** — null = 전체 스캔이라
+      // 최적화만 잃고 잉크는 절대 안 잘린다. 벡터의 정밀 시드는 편집 판(A-3)에서.
       // A trimmed drawing is placed 1:1 at x,y — and the decode-race fallback (gengaDrawDrawingInto paints
       // gengaLastStrokeCanvas at 0,0) is gated on the same dataUrl, whose ink bbox IS this rect, so both
       // seed paths land inside it.
@@ -90846,7 +90900,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const cv = document.createElement('canvas'); cv.width = pw; cv.height = ph;
       const c = cv.getContext('2d');
       const dr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
-      const hasContent = (dr && (dr.dataUrl || dr.canvas)) ? gengaDrawDrawingInto(c, dr, pw, ph, drawGengaPreview) : false; // placement-aware (trimmed/legacy); ver1324: a pending-encode drawing MUST seed too — a blank seed here would erase the prior stroke at the next commit
+      const hasContent = gengaDrawingHasArt(dr) ? gengaDrawDrawingInto(c, dr, pw, ph, drawGengaPreview) : false; // placement-aware; ver1324: pending-encode must seed. ver2023: 벡터도 시드 — 빈 시드는 다음 커밋에서 기존 그림을 지운다
       return { cv: cv, ctx: c, pw: pw, ph: ph, hasContent: hasContent };
     }
     function gengaWorkingCanvasFor(layer, frame) {
@@ -90991,7 +91045,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const exp = gengaExposureAt(layer, frame);
       if (!exp) { drawGengaPreview(); return true; } // no current koma → nothing to do
       const dr = gengaExposureDrawing(layer, exp);
-      if (dr && (dr.dataUrl || dr.canvas)) { // ver1324: pending-encode art has content — the else branch would take the koma with it
+      if (gengaDrawingHasArt(dr)) { // ver1324: pending-encode art has content. ver2023: 벡터도 내용 — else 로 빠지면 코마째 지워진다
         gengaCommitDrawing(layer.id, frame, null, '原画クリア'); // has content → empty the drawing (keep the koma)
       } else {
         const expId = exp.id; // already empty → remove the koma
