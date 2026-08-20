@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2027</title>
+  <title>MoArt ver2028</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -74980,6 +74980,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaVectorBakeCache.set(strokes, e);
       return cv;
     }
+    // ver2028: 스트로크가 실제로 덮는 상자(선 반경만큼 넓힌다). 커밋 스캔 창(ver1196)이 이걸
+    // 알아야 기존 잉크를 안 자른다 — 점을 훑는 비용은 픽셀 스캔의 수백분의 일이다.
+    function gengaVectorStrokesBounds(strokes) {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = 0; i < strokes.length; i++) {
+        const st = strokes[i], pts = st && st.pts;
+        if (!pts || !pts.length) continue;
+        const r = Math.max(0.5, Number(st.radius) || 0.5) + 1;   // 두께의 절반 + 안티에일리어싱 여유
+        for (let j = 0; j < pts.length; j++) {
+          const px = Number(pts[j].x), py = Number(pts[j].y);
+          if (!Number.isFinite(px) || !Number.isFinite(py)) continue;
+          if (px - r < x0) x0 = px - r;
+          if (py - r < y0) y0 = py - r;
+          if (px + r > x1) x1 = px + r;
+          if (py + r > y1) y1 = py + r;
+        }
+      }
+      return Number.isFinite(x0) ? { x0: x0, y0: y0, x1: x1, y1: y1 } : null;
+    }
     // 어니언 고스트 등 문자열 키가 필요한 캐시용 — ref 도 dataUrl 도 없는 벡터 그림의 안정 키.
     function gengaVectorStrokesKey(strokes) {
       let e = gengaVectorBakeCache.get(strokes);
@@ -89984,9 +90003,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // can be re-keyed or re-committed in between (gengaCommitSelection alone does it), and a stale footprint
     // is exactly the silent-crop bug. null = the seed put no ink down, so the session's own ink is the union.
     function gengaDrawingSeedRect(dr, pw, ph) {
+      // ver2028: **벡터 그림을 여기서 열어야 한다.** ver2023 은 「null 이면 전체 스캔이라 잉크가
+      // 안 잘린다」고 적고 벡터를 안 열었는데, 그 전제가 거짓이었다 — gengaScanSeed(null) 은
+      // 전체가 아니라 **빈 상자**를 만들고 그 뒤 그린 획만큼만 자란다. 그래서 벡터 레이어에 선을
+      // 하나 그으면 커밋 트리밍이 획 주변만 남기고 기존 그림을 통째로 잘라냈다(제보).
+      // 스트로크 좌표에서 실제 상자를 구해 용지로 클램프한다 — ver1196 의 최적화도 그대로 산다.
+      const vecStrokes = gengaDrawingStrokes(dr);
+      if (vecStrokes) {
+        const b = gengaVectorStrokesBounds(vecStrokes);
+        if (!b) return null;
+        const x = Math.max(0, Math.floor(b.x0)), y = Math.max(0, Math.floor(b.y0));
+        const x2 = Math.min(pw, Math.ceil(b.x1)), y2 = Math.min(ph, Math.ceil(b.y1));
+        return { x: x, y: y, w: Math.max(0, x2 - x), h: Math.max(0, y2 - y) };
+      }
       if (!dr || !(dr.dataUrl || dr.canvas)) return null; // ver1324: a pending-encode drawing is trimmed art too — omitting it from the union seed would let the scan window crop the prior ink (the exact ver1196 premise)
-      // ver2023(판단 기록): 벡터 그림(strokes만)은 **일부러 안 연다** — null = 전체 스캔이라
-      // 최적화만 잃고 잉크는 절대 안 잘린다. 벡터의 정밀 시드는 편집 판(A-3)에서.
       // A trimmed drawing is placed 1:1 at x,y — and the decode-race fallback (gengaDrawDrawingInto paints
       // gengaLastStrokeCanvas at 0,0) is gated on the same dataUrl, whose ink bbox IS this rect, so both
       // seed paths land inside it.
@@ -90868,6 +90898,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           layer.exposures.push(e);
         }
         gengaSetExposureDrawing(layer, e, drawing);
+        // ver2028: 그린 결과는 래스터다 — 이 레이어에 벡터 그림이 하나도 안 남았으면 표시를 내린다
+        // (남아 있으면 유지). 안 그러면 배지가 사실과 어긋난다.
+        layer.vector = gengaVectorLayerHasStrokes(layer);
       };
       // ver754 (PERF-9, the highest-frequency win): `partial` — a koma already covers this frame — is exactly
       // the "no koma added" case, so every stroke onto an existing koma takes the lean per-layer command
