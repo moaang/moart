@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2020</title>
+  <title>MoArt ver2021</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -74824,21 +74824,68 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
     }
     // canonicalize a drawing object (legacy {dataUrl,w,h} or already {ref,w,h}) → {ref,w,h[,x,y]}; null-safe.
+    // ver2021 (벡터 레이어 §2): 스트로크 배열의 **정본 형식**. 用紙 메모(memoPages)의 스트로크와
+    // 같은 모양으로 맞춘다 — 같은 것을 두 벌 만들지 않기 위해서다.
+    //   [{ pts: [{x, y, p?}], color?, radius? }]
+    // 좌표는 소수 첫째 자리에서 끊는다: 원본 float 를 그대로 실으면 파일이 3 배가 되고(실측:
+    // 200 점 11.4KB -> 3.7KB), 화면에서 0.1px 차이는 보이지 않는다.
+    function gengaNormVectorStrokes(raw) {
+      if (!Array.isArray(raw) || !raw.length) return null;
+      const out = [];
+      for (let i = 0; i < raw.length; i++) {
+        const s = raw[i];
+        if (!s || !Array.isArray(s.pts) || !s.pts.length) continue;
+        const pts = [];
+        for (let j = 0; j < s.pts.length; j++) {
+          const p = s.pts[j];
+          const x = Number(p && p.x), y = Number(p && p.y);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          const q = { x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10 };
+          const pr = Number(p.p);
+          if (Number.isFinite(pr) && pr >= 0 && pr <= 1) q.p = Math.round(pr * 100) / 100;
+          pts.push(q);
+        }
+        if (!pts.length) continue;
+        const o = { pts: pts };
+        if (typeof s.color === 'string' && s.color) o.color = s.color;
+        const r = Number(s.radius);
+        if (Number.isFinite(r) && r > 0) o.radius = Math.round(r * 100) / 100;
+        out.push(o);
+      }
+      return out.length ? out : null;
+    }
+    function gengaDrawingStrokes(d) { return (d && Array.isArray(d.strokes) && d.strokes.length) ? d.strokes : null; }
+    // ver2021: 이 함수는 저장 직전의 **화이트리스트 재구성**이다 — 여기 안 적힌 필드는 조용히
+    // 사라진다. 종전에는 ref 도 dataUrl 도 없으면 null 을 돌려줬으므로, 스트로크만 든 그림은
+    // 저장하는 순간 통째로 없어졌다. strokes 를 실어 나르고, 스트로크만 있어도 살려 보낸다.
     function gengaIngestDrawing(d) {
       if (!d || typeof d !== 'object') return null;
+      const strokes = gengaNormVectorStrokes(d.strokes);
       if (d.ref) {
         if (!gengaDrawStore.has(d.ref) && typeof d.dataUrl === 'string' && d.dataUrl) gengaDrawStore.set(d.ref, d.dataUrl);
         const out = { ref: String(d.ref), w: Math.max(1, Math.round(Number(d.w) || 1)), h: Math.max(1, Math.round(Number(d.h) || 1)) };
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = Math.round(Number(d.x)); out.y = Math.round(Number(d.y)); }
+        if (strokes) out.strokes = strokes;
         return out;
       }
-      if (typeof d.dataUrl === 'string' && d.dataUrl) return gengaPutDrawingData(d.dataUrl, d.w, d.h, d.x, d.y);
+      if (typeof d.dataUrl === 'string' && d.dataUrl) {
+        const out = gengaPutDrawingData(d.dataUrl, d.w, d.h, d.x, d.y);
+        if (out && strokes) out.strokes = strokes;
+        return out;
+      }
+      if (strokes) {   // 벡터만 있는 그림 — 구운 캐시는 아직 없다(q2=A: 벡터가 정본)
+        const out = { w: Math.max(1, Math.round(Number(d.w) || 1)), h: Math.max(1, Math.round(Number(d.h) || 1)), strokes: strokes };
+        if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = Math.round(Number(d.x)); out.y = Math.round(Number(d.y)); }
+        return out;
+      }
       return null;
     }
     // read accessor result: augment a stored drawing with its resolved dataUrl so EVERY reader keeps seeing .dataUrl.
     // ver1430: 「이 그림에 실제로 그림이 들어 있나」 — 인코드 대기 중인 픽셀(canvas)도 그림으로 친다(ver1324).
     // 충돌 판정과 공유 안내가 같은 자를 써야 해서 한 벌로 뺀다.
-    function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas)); }
+    // ver2021: 스트로크만 든 그림도 「그림 있음」이다 — 안 그러면 빈 그림으로 오판되어
+    // 공유 안내·충돌 판정이 벡터 레이어를 없는 셈 친다.
+    function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas || gengaDrawingStrokes(d))); }
     function gengaResolveDrawing(d) {
       if (!d) return null;
       const u = gengaDrawingUrl(d);
@@ -74848,7 +74895,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
         return out;
       }
-      return (typeof d.dataUrl === 'string' && d.dataUrl) ? d : null;
+      if (typeof d.dataUrl === 'string' && d.dataUrl) return d;
+      // ver2021: 구운 캐시가 아직 없는 벡터 그림. 여기서 null 을 돌려주면 호출부 전체가
+      // 「그림 없는 레이어」로 취급해 **에러 없이 조용히 사라진다** — CLIP 벡터가 지금 그렇게
+      // 사라지고 있다(docs/clip_format_notes 의 벡터 절).
+      if (gengaDrawingStrokes(d)) {
+        const out = { w: d.w, h: d.h, strokes: d.strokes };
+        if (d.ref) out.ref = d.ref;
+        if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
+        return out;
+      }
+      return null;
     }
     // draw a resolved drawing onto a paper-res context with correct placement (trimmed 1:1 at x,y / legacy scaled
     // to paper). Falls back to the kept last-stroke canvas while its freshly-committed dataUrl is still decoding —
