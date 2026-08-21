@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2101</title>
+  <title>MoArt ver2102</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23642,6 +23642,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2102, items: [
+        { ja: '**.sut ブラシの先端を「フル解像度」で読み込むようになりました。**これまでは .sut の中の'
+            + 'サムネイル（長辺 300px に切られた下見用の絵）を先端に使っていたため、ブラシを大きくすると'
+            + '拡大されてぼやけていました。本体の絵（例: 108×1284）を直接読むので、大きくしても輪郭が保たれます。',
+          ko: '**.sut 브러시의 붓끝을 「풀해상도」로 불러옵니다.** 지금까지는 .sut 안의 썸네일'
+            + '(긴 변 300px로 잘린 미리보기 그림)을 붓끝으로 써서, 브러시를 키우면 확대되어 뿌옇게 됐습니다. '
+            + '이제 원본 그림(예: 108×1284)을 직접 읽으므로 크게 해도 윤곽이 유지됩니다.',
+          en: '**.sut brush tips now load at full resolution.** Tips used to come from the .sut\'s'
+            + ' thumbnail — a preview capped at 300px on its long side — so scaling the brush up'
+            + ' blurred it. The original image (e.g. 108×1284) is now read directly, so large sizes stay crisp.',
+          zh: '**现在会以「完整分辨率」读取 .sut 笔刷的笔尖。**此前使用的是 .sut 中的缩略图'
+            + '（长边被截为 300px 的预览图），因此放大笔刷时会变模糊。现在直接读取原图（例如 108×1284），'
+            + '放大后轮廓依然清晰。' },
+      ] },
       { ver: 2101, items: [
         { ja: '**直前の2版でリボンブラシが放射状に広がっていたのを元に戻しました。**',
           ko: '**직전 두 판에서 리본 브러시가 방사형으로 퍼지던 것을 되돌렸습니다.**',
@@ -56893,6 +56907,269 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(bytes.length, i + 0x8000)));
       return 'data:image/png;base64,' + btoa(bin);
     }
+
+    // ═══ ver2102: .sut 풀해상도 붓끝 — C2F(data/*.layer) 디코더 ══════════════════════════
+    // 포맷 정본은 docs/csp_c2f_layer_format_2026-08-21.md. 요점 셋 — 하나라도 틀리면
+    // **조용히 다른 그림**이 나온다(에러가 안 난다):
+    //   · C2F 는 PNG 를 흉내낸 청크 구조인데 **정수가 리틀엔디언**이다.
+    //   · 블록 스트림 길이는 `clen` 이 아니라 **`secBE`(= clen+4)** 다.
+    //   · 스트림 중간에 4 바이트 표식 `00 00 00 XX` 가 박혀 있다 — 빼고 풀어야 한다.
+    // 못 읽으면 **null 을 돌려준다**(값을 지어내지 않는다) — 호출부가 썸네일로 폴백한다.
+    // 격자형 붓(구아슈·수채 등 planes=1)은 출력 0 바이트부터 preset dictionary 가 필요해
+    // 아직 못 푼다 — 그것들이 바로 이 null 경로다.
+    const C2F_BEGIN = (function() {   // "BlockDataBeginChunk" UTF-16LE
+      const s = 'BlockDataBeginChunk';
+      const b = new Uint8Array(s.length * 2);
+      for (let i = 0; i < s.length; i += 1) b[i * 2] = s.charCodeAt(i);
+      return b;
+    }());
+    function c2fIndexOf(hay, needle, from) {
+      for (let i = from | 0; i + needle.length <= hay.length; i += 1) {
+        let hit = true;
+        for (let j = 0; j < needle.length; j += 1) { if (hay[i + j] !== needle[j]) { hit = false; break; } }
+        if (hit) return i;
+      }
+      return -1;
+    }
+    function c2fChunks(u8) {
+      const out = [];
+      const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      let off = 8;
+      while (off + 8 <= u8.length) {
+        const len = dv.getUint32(off, true);   // ★ 리틀엔디언
+        const type = String.fromCharCode(u8[off + 4], u8[off + 5], u8[off + 6], u8[off + 7]);
+        const end = off + 8 + len;
+        if (len > u8.length || end + 4 > u8.length) break;
+        out.push({ type: type, body: u8.subarray(off + 8, end) });
+        off = end + 4;
+      }
+      return out;
+    }
+    // planes 는 상수 5 가 아니라 **플레인 수**다(1=알파만, 5=알파+BGRA). 5 로 거르면
+    // 1 플레인 붓이 통째로 「블록 없음」이 된다.
+    function c2fBlocks(body) {
+      const out = [];
+      const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+      let pos = 0;
+      for (;;) {
+        const j = c2fIndexOf(body, C2F_BEGIN, pos);
+        if (j < 0) return out;
+        pos = j + 2;
+        const p = j + C2F_BEGIN.length;
+        if (p + 40 > body.length) return out;
+        const idx = dv.getUint16(p + 2, true);
+        const planes = dv.getUint32(p + 4, true);
+        const w = dv.getUint32(p + 8, true);
+        const h = dv.getUint32(p + 12, true);
+        const plane = dv.getUint32(p + 16, true);
+        if (!(planes >= 1 && planes <= 8) || !plane || !w || !h) continue;
+        const sec = dv.getUint32(p + 19, false);   // ★ 여기만 BE. 스트림 실길이
+        out.push({ idx: idx, w: w, h: h, stream: body.subarray(p + 27, p + 27 + sec) });
+      }
+    }
+    // 이미지 실크기는 **추정하지 않는다** — 같은 chunk 안 프리뷰 PNG 의 IHDR 이 정본이다
+    // (썸네일 비율로 유도하면 108x1284 대신 128x1536 이 나온다).
+    function c2fImageSize(body) {
+      const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+      let best = null;
+      for (let q = 0; q + 24 <= body.length; q += 1) {
+        if (body[q] !== 0x89 || body[q + 1] !== 0x50 || body[q + 2] !== 0x4e || body[q + 3] !== 0x47) continue;
+        if (body[q + 12] !== 0x49 || body[q + 13] !== 0x48 || body[q + 14] !== 0x44 || body[q + 15] !== 0x52) continue;
+        const w = dv.getUint32(q + 16, false);
+        const h = dv.getUint32(q + 20, false);
+        if (w > 0 && h > 0 && (!best || w * h > best.w * best.h)) best = { w: w, h: h };
+      }
+      return best;
+    }
+    // raw deflate. **중간에 끊겨도 그때까지의 출력을 돌려준다** — 원본이 0 패딩으로 끊긴
+    // 타일이 있고(멍청펜 셀0 은 1,998 바이트에서 끝나고 3,397 바이트가 0 이다), 그 앞은 정상이다.
+    async function c2fInflatePartial(u8) {
+      const raw = (u8.length >= 2 && ((u8[0] << 8) | u8[1]) % 31 === 0) ? u8.subarray(2) : u8;
+      const ds = new DecompressionStream('deflate-raw');
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      const parts = [];
+      let total = 0;
+      const pump = (async function() {
+        try {
+          for (;;) {
+            const r = await reader.read();
+            if (r.done) break;
+            parts.push(r.value);
+            total += r.value.length;
+          }
+        } catch (e) { /* 끊긴 지점까지만 쓴다 */ }
+      }());
+      try { await writer.write(raw); await writer.close(); }
+      catch (e) { /* 스트림이 안 끝나면 close 가 던진다 */ }
+      await pump;
+      const out = new Uint8Array(total);
+      let o = 0;
+      for (let i = 0; i < parts.length; i += 1) { out.set(parts[i], o); o += parts[i].length; }
+      return out;
+    }
+    function c2fRealLen(u8) {   // 0 패딩을 뺀 실 데이터 길이
+      for (let i = u8.length - 1; i >= 0; i -= 1) { if (u8[i]) return i + 1; }
+      return 0;
+    }
+    function c2fRefSpans(ref, w, h) {   // 참조 알파 -> 행별 [시작x, 끝x]
+      const out = new Array(h);
+      for (let y = 0; y < h; y += 1) {
+        let lo = -1, hi = -1;
+        for (let x = 0; x < w; x += 1) { if (ref[y * w + x] > 32) { if (lo < 0) lo = x; hi = x; } }
+        out[y] = (lo >= 0) ? [lo, hi] : null;
+      }
+      return out;
+    }
+    // 표식 후보를 고르는 **판정자**. 구멍 수만으로는 모자라다 — 구멍 0 을 만드는 X 가 여럿이라
+    // 엉뚱한 것을 고른다(실측: 그 기준만 쓰면 파이썬 판과 200 행이 갈렸다). 그래서 **같은 파일 안
+    // 썸네일과 잉크 시작·끝 위치를 대조**한다. 모양이 아니라 **위치**를 보는 지표라야 안 속는다.
+    function c2fScore(alpha, bw, bh, width, spans, cy) {
+      let holes = 0, tot = 0, n = 0;
+      for (let r = 0; r < bh; r += 1) {
+        const base = r * bw;
+        let lo = -1, hi = -1, cnt = 0;
+        for (let x = 0; x < width; x += 1) {
+          if (alpha[base + x] > 32) { if (lo < 0) lo = x; hi = x; cnt += 1; }
+        }
+        if (lo >= 0 && (hi - lo + 1) !== cnt) holes += 1;
+        if (!spans) continue;
+        const rr = spans[cy + r];
+        if (!rr) continue;
+        n += 1;
+        if (lo < 0) { tot += width; continue; }   // 있어야 할 잉크가 통째로 없다
+        tot += Math.abs(lo - rr[0]) + Math.abs(hi - rr[1]);
+      }
+      return [holes, n ? tot / n : 0];
+    }
+    // layer 바이트 -> { width, height, alpha, truncated:[idx] } 또는 null
+    //   refAlpha: 이미지 실크기로 리샘플한 썸네일 알파(선택). 넘기면 표식 선택이 정확해진다.
+    async function c2fDecodeTip(layerBytes, refAlpha) {
+      const chunks = c2fChunks(layerBytes);
+      let body = null;
+      for (let i = 0; i < chunks.length; i += 1) {
+        if (chunks[i].type === 'dATA' && chunks[i].body.length > 20000) body = chunks[i].body;
+      }
+      if (!body) return null;
+      const size = c2fImageSize(body);
+      const blocks = c2fBlocks(body);
+      if (!size || !blocks.length) return null;
+      const bw = blocks[0].w, bh = blocks[0].h;
+      const cols = Math.max(1, Math.ceil(size.w / bw));
+      const rows = Math.max(1, Math.ceil(size.h / bh));
+      const stride = cols * bw;
+      const canvas = new Uint8Array(stride * rows * bh);
+      const truncated = [];
+      const spans = (refAlpha && refAlpha.length >= size.w * size.h)
+        ? c2fRefSpans(refAlpha, size.w, size.h) : null;
+      const vw = Math.min(bw, size.w);
+      const pad = function(u8) {
+        if (u8.length >= bw * bh) return u8;
+        const p = new Uint8Array(bw * bh);
+        p.set(u8.subarray(0, Math.min(u8.length, bw * bh)));
+        return p;
+      };
+      for (let i = 0; i < blocks.length; i += 1) {
+        const b = blocks[i];
+        if (b.w !== bw || b.h !== bh) continue;
+        let s = b.stream;
+        const real = c2fRealLen(s);
+        if (real < s.length - 8) { truncated.push(b.idx); s = s.subarray(0, real); }
+        const cy = Math.floor(b.idx / cols) * bh;
+        const raw0 = await c2fInflatePartial(s);
+        if (!raw0.length) continue;
+        let best = pad(raw0), bestLen = raw0.length;
+        let bestSc = c2fScore(best, bw, bh, vw, spans, cy);
+        // 표식 `00 00 00 XX` 자리만 시험한다 — 전수는 지표를 속이는 제거를 부른다
+        for (let X = 2; X + 4 <= s.length; X += 1) {
+          if (s[X] || s[X + 1] || s[X + 2]) continue;
+          const cand = new Uint8Array(s.length - 4);
+          cand.set(s.subarray(0, X));
+          cand.set(s.subarray(X + 4), X);
+          const got = await c2fInflatePartial(cand);
+          if (!got.length) continue;
+          const arr = pad(got);
+          const sc = c2fScore(arr, bw, bh, vw, spans, cy);
+          const better = (sc[0] < bestSc[0])
+            || (sc[0] === bestSc[0] && spans && sc[1] < bestSc[1] - 0.005)
+            || (sc[0] === bestSc[0] && !spans && got.length > bestLen);
+          if (better) { bestSc = sc; best = arr; bestLen = got.length; }
+        }
+        // 데이터가 끊긴 타일은 **해제된 행까지만** 남기고 비운다(지어내지 않는다)
+        if (truncated.indexOf(b.idx) >= 0) {
+          const cut = Math.floor(bestLen / bw);
+          if (cut < bh) best.fill(0, cut * bw, bw * bh);
+        }
+        const cx = (b.idx % cols) * bw;
+        for (let r = 0; r < bh; r += 1) {
+          canvas.set(best.subarray(r * bw, r * bw + bw), (cy + r) * stride + cx);
+        }
+      }
+      const alpha = new Uint8Array(size.w * size.h);
+      for (let r = 0; r < size.h; r += 1) {
+        alpha.set(canvas.subarray(r * stride, r * stride + size.w), r * size.w);
+      }
+      let ink = 0;
+      for (let i = 0; i < alpha.length; i += 1) { if (alpha[i] > 32) ink += 1; }
+      if (!ink) return null;
+      return { width: size.w, height: size.h, alpha: alpha, truncated: truncated };
+    }
+    // 썸네일 dataUrl -> 주어진 크기로 리샘플한 알파(표식 판정의 참조). 못 만들면 null.
+    function brushLibraryAlphaFromDataUrl(dataUrl, w, h) {
+      return new Promise(function(resolve) {
+        const img = new Image();
+        img.onload = function() {
+          try {
+            const cv = document.createElement('canvas');
+            cv.width = w; cv.height = h;
+            const cx = cv.getContext('2d');
+            cx.drawImage(img, 0, 0, w, h);
+            const d = cx.getImageData(0, 0, w, h).data;
+            const a = new Uint8Array(w * h);
+            for (let i = 0; i < a.length; i += 1) a[i] = d[i * 4 + 3];
+            resolve(a);
+          } catch (e) { resolve(null); }
+        };
+        img.onerror = function() { resolve(null); };
+        img.src = dataUrl;
+      });
+    }
+    // 알파 -> PNG dataUrl. 썸네일과 **같은 형식**으로 만든다(RGB=0, 모양은 알파에).
+    function brushLibraryAlphaToPngDataUrl(alpha, w, h) {
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const cx = cv.getContext('2d');
+      const id = cx.createImageData(w, h);
+      for (let i = 0; i < w * h; i += 1) id.data[i * 4 + 3] = alpha[i];
+      cx.putImageData(id, 0, 0);
+      return cv.toDataURL('image/png');
+    }
+    // .layer -> 풀해상도 팁 dataUrl. 실패하면 null(호출부가 썸네일을 쓴다).
+    async function brushLibraryFullTipFromLayer(layerBytes, thumbDataUrl) {
+      if (!layerBytes || !layerBytes.length || typeof DecompressionStream === 'undefined') return null;
+      try {
+        const probe = c2fImageSize2(layerBytes);
+        let ref = null;
+        if (probe && thumbDataUrl) ref = await brushLibraryAlphaFromDataUrl(thumbDataUrl, probe.w, probe.h);
+        const got = await c2fDecodeTip(layerBytes, ref);
+        if (!got) return null;
+        return {
+          dataUrl: brushLibraryAlphaToPngDataUrl(got.alpha, got.width, got.height),
+          width: got.width, height: got.height, truncated: got.truncated
+        };
+      } catch (e) {
+        console.error('[brushLibrary] 풀해상도 붓끝 해독 실패 — 썸네일로 폴백한다', e);
+        return null;
+      }
+    }
+    // 참조 알파를 만들려면 크기를 **먼저** 알아야 한다 — 그래서 크기만 따로 구한다.
+    function c2fImageSize2(layerBytes) {
+      const chunks = c2fChunks(layerBytes);
+      for (let i = chunks.length - 1; i >= 0; i -= 1) {
+        if (chunks[i].type === 'dATA' && chunks[i].body.length > 20000) return c2fImageSize(chunks[i].body);
+      }
+      return null;
+    }
     // ver2064: 등록이 실패한 참조를 엔트리에서 걷어낸다. `.sut` 는 한 파일이 여러 툴을 담고
     // 그것들이 팁 하나를 공유하므로 ref 로 훑는다(PNG 경로는 엔트리가 하나라 콜백 안에서 끝난다).
     // 조용히 두면 **존재하지 않는 팁을 가리키는 엔트리**가 저장되고, 증상은 「임포트가 가끔
@@ -57105,7 +57382,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 조인은 Variant.VariantID===Node.NodeVariantID(2번째 Variant 행은 전부 NULL — 인덱스로 집지 말 것),
     // 스키마는 파일마다 컬럼이 다르므로 반드시 컬럼명으로, 역할은 tar 멤버 icedata/layerData.xml의
     // systemtag(BrushPattern=팁 / PaperTexture=종이 — 종이는 렌더 경로가 없어 이번 범위 밖 D3),
-    // 픽셀은 thumbnail/thumbnail.png만(풀해상도는 IDAT CRC 깨짐 — 추적 금지 D4).
+    // ver2102 정정: 「풀해상도는 IDAT CRC 깨짐 — 추적 금지 D4」는 **틀렸다**. 빅엔디언으로 읽은
+    // 오독이었다 — C2F 는 PNG 를 흉내낸 청크 구조인데 정수가 리틀엔디언이라, 그렇게 읽으면 CRC 가
+    // 전부 맞는다(docs/csp_c2f_layer_format_2026-08-21.md). 이제 data/*.layer 에서 풀해상도를
+    // 꺼내고, 못 꺼내면 thumbnail.png 로 폴백한다.
     async function brushLibraryImportSutBytes(bytes, fileName) {
       const db = sqliteLoadDatabase(bytes);
       const schema = sqliteGetSchema(db);
@@ -57129,6 +57409,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const xmlMember = members.find(function(en) { return /(^|\/)layerData\.xml$/i.test(en.name); });
         const xmlText = xmlMember ? utf8.decode(xmlMember.data) : '';
         const thumb = members.find(function(en) { return /(^|\/)thumbnail\.png$/i.test(en.name); });
+        const layerMem = members.find(function(en) { return /\.layer$/i.test(en.name); });   // ver2102
         if (xmlText.indexOf('PaperTexture') >= 0) {
           sawPaperTexture = true;
           if (thumb && !paperDataUrl) paperDataUrl = brushLibraryPngBytesToDataUrl(thumb.data);
@@ -57139,11 +57420,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 썸네일은 300px 캡이라 종횡비가 원본과 다를 수 있어(25:300) 그 비율로 폭을 정하면 어긋난다.
         const msc = /key="scaling"[\s\S]{0,80}?<data>\s*([0-9.]+)\s*<\/data>/.exec(xmlText);
         const scal = msc ? Number(msc[1]) : 0;
-        if (thumb) candidates.push({ isTagged: xmlText.indexOf('BrushPattern') >= 0, thumb: thumb, scaling: (Number.isFinite(scal) && scal > 0) ? scal : 0 });
+        if (thumb) candidates.push({ isTagged: xmlText.indexOf('BrushPattern') >= 0, thumb: thumb, layer: layerMem, scaling: (Number.isFinite(scal) && scal > 0) ? scal : 0 });
       });
       const pick = candidates.find(function(c) { return c.isTagged; }) || (candidates.length === 1 ? candidates[0] : null);
       let tipScaling = 0;   // ver2080
-      if (pick) { tipDataUrl = brushLibraryPngBytesToDataUrl(pick.thumb.data); tipScaling = pick.scaling || 0; }
+      let fullTipNote = '';   // ver2102
+      if (pick) {
+        tipDataUrl = brushLibraryPngBytesToDataUrl(pick.thumb.data);
+        tipScaling = pick.scaling || 0;
+        // ver2102: 풀해상도를 먼저 시도한다. 성공하면 **tipScaling 을 끈다** — 그 보정은
+        // 「썸네일이 길이 방향으로 잘려 있다」를 메우는 것이라(ver2080), 안 잘린 그림에
+        // 또 걸면 리본 주기가 그 배수만큼 이중으로 늘어난다.
+        const full = pick.layer ? await brushLibraryFullTipFromLayer(pick.layer.data, tipDataUrl) : null;
+        if (full) {
+          tipDataUrl = full.dataUrl;
+          tipScaling = 0;
+          fullTipNote = '붓끝 풀해상도 ' + full.width + '×' + full.height + ' (썸네일 대신 data/*.layer 를 해독)'
+            + (full.truncated && full.truncated.length
+               ? ' — 타일 ' + full.truncated.join(',') + ' 은 원본 데이터가 끊겨 그 뒤가 비어 있다'
+               : '');
+        }
+      }
       // 브러시 노드: NodeVariantID가 실제 Variant 행과 조인되는 것만
       const tools = [];
       nodes.forEach(function(node) {
@@ -57187,6 +57484,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           brush.tipScaling = tipScaling;
           notes.push('소재 scaling=' + tipScaling + ' → 리본 주기를 그 배수로 늘린다(썸네일이 길이 방향으로 잘려 있다)');
         }
+        if (fullTipNote) notes.push(fullTipNote);   // ver2102
         if (sawPaperTexture) notes.push(paperRef ? 'PaperTexture 적용 (ver1337)' : 'PaperTexture material 존재 — thumbnail.png 없어 미적용');
         console.info('[brushLibrary] .sut variant 파라미터(미매핑 전체 — D5 기록): ', fileName, v);
         lib.entries.push({
