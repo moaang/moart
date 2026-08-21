@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2095</title>
+  <title>MoArt ver2096</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23642,6 +23642,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2096, items: [
+        { ja: '**カーブでリボンブラシの筆先が扇状にはみ出していたのを直しました。**隣り合う断片が同じ境界線を共有するようになり、重なりが消えます。',
+          ko: '**곡선에서 리본 브러시 붓끝이 부채꼴로 삐져나오던 것을 고쳤습니다.** 이웃한 조각이 같은 경계선을 쓰게 되어 겹침이 사라집니다.',
+          en: '**Fixed ribbon brush tips fanning out on curves.** Neighbouring pieces now share the same boundary, so they no longer overlap.',
+          zh: '**修复了丝带笔刷在曲线处笔尖呈扇形外溢的问题。**相邻笔迹片段现在共用同一条边界，重叠消失。' }
+      ] },
       { ver: 2094, items: [
         { ja: '**リボンブラシの模様がぼやけて崩れていたのを直しました。**カーブが急なほど、ブラシが太いほど強く出ていた症状です。',
           ko: '**리본 브러시의 무늬가 뿌옇게 뭉개지던 것을 고쳤습니다.** 곡선이 급할수록, 브러시가 굵을수록 심하게 나타나던 증상입니다.',
@@ -58448,6 +58454,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 커널을 둘로 나눈 이유: **소비자가 둘**이다(모양 스탬퍼 · 잉크 장). 둘이 같은 걷기를 써야
     // 자리가 어긋나지 않는다 — paintWalkTipDabs 가 dab 을 방출하는 것과 같은 규격이고, 이 함수도
     // 아무것도 그리지 않는다.
+    // ver2096: 조각을 **이웃과 공유하는 법선**으로 자른다. 직사각형 조각은 곡선 안쪽에서
+    // 서로 겹치고 바깥에서 벌어져 부채살로 보인다 — 세분으로는 겹침이 안 없어진다.
+    // 기울기 한계: 급커브에서 tan 이 폭주하므로 묶는다(약 58°).
+    const PAINT_RIBBON_MITER_MAX = 1.6;
+    function paintRibbonAngLerp(a, b, t) {
+      let d = b - a;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      return a + d * t;
+    }
+    // 조각 좌표계(가로 = 조각 방향)에서 앞뒤 경계선으로 자른다. 직선이면 아무것도 안 한다.
+    function paintRibbonMiterClip(ctx, ang, n0, n1, len, w) {
+      const sk = function(nn) {
+        let d = nn - ang;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d < -Math.PI) d += 2 * Math.PI;
+        const t = Math.tan(d);
+        if (!Number.isFinite(t)) return 0;
+        return Math.max(-PAINT_RIBBON_MITER_MAX, Math.min(PAINT_RIBBON_MITER_MAX, t));
+      };
+      const k0 = sk(n0), k1 = sk(n1);
+      if (Math.abs(k0) < 1e-4 && Math.abs(k1) < 1e-4) return;   // 직선 — 비용을 안 낸다
+      const h = w / 2;
+      ctx.beginPath();
+      ctx.moveTo(k0 * h, -h);
+      ctx.lineTo(len + k1 * h, -h);
+      ctx.lineTo(len - k1 * h, h);
+      ctx.lineTo(-k0 * h, h);
+      ctx.closePath();
+      ctx.clip();
+    }
     // ver2094: 팁 앞뒤에 붙이는 wrap 여백(px). 조각이 짧을수록 필요한 소스 확장이 커진다
     // — srcSeam = seam × srcLen / L 이고 L 은 선 폭에 비례하므로 가는 선에서 가장 크다.
     const PAINT_RIBBON_SRC_PAD = 8;
@@ -58580,7 +58617,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
         }
       }
-      return { pts: sp, radii: sr, srcI: si, srcT0: st0, srcT1: st1, n: sp.length };
+      // ver2096: 점마다의 **접선각**. 중앙차분이라 이웃 조각이 같은 값을 읽는다 —
+      // 그래서 두 조각의 경계선이 정확히 하나로 겹친다(miter).
+      const tg = [];
+      for (let k = 0; k < sp.length; k += 1) {
+        const a = sp[k > 0 ? k - 1 : 0], b = sp[k + 1 < sp.length ? k + 1 : sp.length - 1];
+        tg.push((a === b) ? 0 : Math.atan2(b.y - a.y, b.x - a.x));
+      }
+      return { pts: sp, radii: sr, srcI: si, srcT0: st0, srcT1: st1, tan: tg, n: sp.length };
     }
     function paintWalkRibbonPieces(pts, radii, tip, srcLen, srcWide, cb, resume) {
       let n = pts.length;
@@ -58613,7 +58657,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver2090: 곡률이 급한 세그먼트를 곡선으로 세분한 **작업용 경로**로 갈아탄다.
       // 원본 pts/radii 는 다른 브러시·직선툴과 공유하는 데이터라 건드리지 않는다.
       const sub = paintRibbonSubdivPath(pts, radii, n, Boolean(resume && resume.live));
-      const srcI = sub.srcI, srcT0 = sub.srcT0, srcT1 = sub.srcT1;
+      const srcI = sub.srcI, srcT0 = sub.srcT0, srcT1 = sub.srcT1, subTan = sub.tan;
       pts = sub.pts; radii = sub.radii; n = sub.n;
       let start = 0;
       while (start < srcI.length && srcI[start] < seg0) start += 1;   // resume 은 원본 인덱스다
@@ -58657,8 +58701,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const tipIdx = Math.floor(u);
           // ver2090: 소비자는 **원본** 경로로 필압을 읽는다(paintDabPressure) — 작업용 인덱스가
           // 아니라 원본 세그먼트와 그 안의 위치로 되짚어 넘긴다.
+          // ver2096: 조각 양끝의 **경로 접선**. 이웃 조각과 같은 점의 값을 읽으므로
+          // 두 조각의 경계선이 하나로 겹친다.
+          const fEnd = (done + take) / seg;
+          const n0 = paintRibbonAngLerp(subTan[i], subTan[i + 1], f);
+          const n1 = paintRibbonAngLerp(subTan[i], subTan[i + 1], fEnd);
           cb(phase, phase + takeU, a.x + dx * f, a.y + dy * f, ang, w, take, srcI[i],
-            srcT0[i] + (srcT1[i] - srcT0[i]) * f, PAINT_RIBBON_SEAM, tipIdx);
+            srcT0[i] + (srcT1[i] - srcT0[i]) * f, PAINT_RIBBON_SEAM, tipIdx, n0, n1);
           emitted = true;
           u += takeU;
           done += take;
@@ -58688,12 +58737,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const alt = Boolean(tip && tip.ribbonAlt);   // ver2076
           const prevSmooth = ctx.imageSmoothingQuality;
           ctx.imageSmoothingQuality = 'high';   // ver2076: 25px 팁을 몇 px 로 줄여 그린다 — 기본 리샘플링은 뭉갠다
-          const okRib = paintWalkRibbonPieces(pts, radii, tip, rs.len, rs.wide, function(u0, u1, px, py, ang, w, len, i, t, seam, tipIdx) {
+          const okRib = paintWalkRibbonPieces(pts, radii, tip, rs.len, rs.wide, function(u0, u1, px, py, ang, w, len, i, t, seam, tipIdx, n0, n1) {
             const ma = flowCurve ? fl * paintCurveEvalPts(flowCurve, paintDabPressure(pts, i, t)) : fl;
             if (ma !== 1) ctx.globalAlpha = baseAlpha * ma;
             ctx.save();
             ctx.translate(px, py);
             ctx.rotate(ang);
+            paintRibbonMiterClip(ctx, ang, n0, n1, len, w);   // ver2096: 이웃과 공유하는 경계로 자른다
             if (alt && (tipIdx & 1)) ctx.scale(1, -1);   // ver2076: 折り返し時に反転
             const rr = paintRibbonSrcRect(rs, u0, u1, len, seam);   // ver2094
             ctx.drawImage(rs.src, rr.sx, 0, rr.sw, rs.wide, rr.dx, -w / 2, rr.dw, w);
@@ -58820,7 +58870,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const alt = Boolean(tip && tip.ribbonAlt);   // ver2076
           fctx.imageSmoothingQuality = 'high';   // ver2076
           if (cctx) cctx.imageSmoothingQuality = 'high';
-          const okR = paintWalkRibbonPieces(pts, radii, tip, rs.len, rs.wide, function(u0, u1, px, py, ang, w, len, i, t, seam, tipIdx) {
+          const okR = paintWalkRibbonPieces(pts, radii, tip, rs.len, rs.wide, function(u0, u1, px, py, ang, w, len, i, t, seam, tipIdx, n0, n1) {
             const a0 = av[i] != null ? av[i] : 1;
             const a1 = av[i + 1] != null ? av[i + 1] : a0;
             let a = Math.max(0, Math.min(1, a0 + (a1 - a0) * t));
@@ -58839,6 +58889,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             fctx.save();
             fctx.translate(px, py);
             fctx.rotate(ang);
+            paintRibbonMiterClip(fctx, ang, n0, n1, len, w);   // ver2096
             if (alt && (tipIdx & 1)) fctx.scale(1, -1);   // ver2076
             const rr = paintRibbonSrcRect(rs, u0, u1, len, seam);   // ver2094
             fctx.drawImage(paintInkDabScratch, rr.sx, 0, rr.sw, rs.wide, rr.dx, -w / 2, rr.dw, w);
@@ -58847,6 +58898,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               cctx.save();
               cctx.translate(px, py);
               cctx.rotate(ang);
+              paintRibbonMiterClip(cctx, ang, n0, n1, len, w);   // ver2096
               if (alt && (tipIdx & 1)) cctx.scale(1, -1);   // ver2076
               cctx.drawImage(rs.src, rr.sx, 0, rr.sw, rs.wide, rr.dx, -w / 2, rr.dw, w);   // ver2094: 같은 사각형
               cctx.restore();
