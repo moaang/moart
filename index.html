@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2057</title>
+  <title>MoArt ver2058</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -17540,6 +17540,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       audioBufferCache: {},
       audioBufferPendingCache: {},
       audioBufferCacheOrder: [],
+      cameraTimelineSlotsCache: null,     // { video, slots } -- keyed on the video timeline object
+      cameraTimelineSlotMapsCache: null,  // { slots, maps }  -- keyed on that slot array
       audioSourcePeaks: {},           // sourceKey -> Uint8Array of 0..255 maxima, AUDIO_PEAK_BINS_PER_SECOND per second
       audioSourcePeaksPending: {},    // sourceKey -> in-flight build promise (one build per source, never per clip)
       audioSourcePeaksOrder: [],      // LRU order for audioSourcePeaks
@@ -21492,8 +21494,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return 'camera-key-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
     }
 
+    // ver2058: cached on the video timeline object it is derived from. buildVideoTimelineCached is
+    // signature-keyed, so a new video object IS the invalidation -- there is no second rule to keep in
+    // sync. Was rebuilt on every call: 551 calls in one render of a 394-cut project, each mapping the
+    // whole group list. Every consumer only reads (forEach / map / filter / binary search), so handing
+    // out the same array is safe.
     function cameraTimelineSlots(project) {
       const video = buildVideoTimelineCached(project);
+      const cache = state.cameraTimelineSlotsCache;
+      if (cache && cache.video === video) return cache.slots;
+      const slots = cameraTimelineSlotsBuild(video);
+      state.cameraTimelineSlotsCache = { video: video, slots: slots };
+      return slots;
+    }
+
+    function cameraTimelineSlotsBuild(video) {
       return (video.groups || []).map(function(item) {
         const group = item && item.group;
         const cuts = group && Array.isArray(group.cuts) ? group.cuts : [];
@@ -21511,8 +21526,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }).filter(Boolean);
     }
 
+    // ver2058: same idea one level up -- keyed on the slot array identity, which the cache above makes
+    // stable. 547 calls per render, each walking every slot to rebuild two Maps.
     function cameraTimelineSlotMaps(project) {
       const slots = cameraTimelineSlots(project);
+      const cached = state.cameraTimelineSlotMapsCache;
+      if (cached && cached.slots === slots) return cached.maps;
       const byOwnerCutId = new Map();
       const byPanelCutId = new Map();
       slots.forEach(function(slot) {
@@ -21522,7 +21541,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (cutId) byPanelCutId.set(cutId, slot);
         });
       });
-      return { slots: slots, byOwnerCutId: byOwnerCutId, byPanelCutId: byPanelCutId };
+      const maps = { slots: slots, byOwnerCutId: byOwnerCutId, byPanelCutId: byPanelCutId };
+      state.cameraTimelineSlotMapsCache = { slots: slots, maps: maps };
+      return maps;
     }
 
     // ---- Undo/redo history window (履歴) ----
@@ -32273,8 +32294,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 한 컷의 키들을 run 으로 묶는다. 병합 규칙은 원화와 같다 — 같은 커널을 부른다.
     // ver1883: 이 레인은 표기 선택이 없다 — 라벨도 병합도 **같은 null** 을 넘긴다(= 알파벳). 두 자리에
     // 같은 값을 주므로 나중에 표기를 붙이더라도 한쪽만 바뀌는 일이 없다.
-    function conteCameraRunsForCut(project, cutId) {
-      const keys = cameraKeyframesForCut(project, cutId)
+    function conteCameraRunsForCut(project, cutId, keysByOwnerCut) {
+      const keys = cameraKeyframesForCut(project, cutId, keysByOwnerCut)
         .map(conteCamKeyAsRect)
         .sort(function(a, b) { return a.frame - b.frame; });
       if (keys.length < 2) return [];
@@ -32301,11 +32322,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function conteCameraRunsHtml(project, totalFrames) {
       const total = Math.max(1, Math.round(Number(totalFrames) || 1));
       const laneW = Math.max(1, Math.round(Number(state.timelineInnerWidth) || 1));
+      const keysByOwnerCut = cameraKeyframesByOwnerCut(project); // ver2058: one normalize for the whole lane
       return cameraTimelineSlots(project).map(function(slot) {
         const cut = slot && slot.cut;
         if (!cut) return '';
         const slotStart = Math.max(0, Math.round(Number(slot.startFrame) || 0));
-        return conteCameraRunsForCut(project, cut.id).map(function(run) {
+        return conteCameraRunsForCut(project, cut.id, keysByOwnerCut).map(function(run) {
           const from = slotStart + run.from, to = slotStart + run.to;
           const clip = olClipFrameRange(cut.id, from, to);
           if (!clip) return '';
@@ -32327,6 +32349,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }).filter(Boolean));
       if (!keyframeCutIds.size) return '';
       const total = Math.max(1, Math.round(Number(totalFrames) || 1));
+      const keysByOwnerCut = cameraKeyframesByOwnerCut(project); // ver2058: one normalize, not one per cut
       return cameraTimelineSlots(project).filter(function(slot) {
         return slot && slot.cut && keyframeCutIds.has(String(slot.cut.id || ''));
       }).map(function(slot) {
@@ -32336,7 +32359,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 키가 하나뿐이면 구간이 없으므로 띠를 그리지 않는다 — 원화도 `kf1 > kf0` 일 때만 그린다.
         const slotStart = Math.max(0, Math.round(Number(slot.startFrame) || 0));
         const slotEnd = Math.max(slotStart + 1, Math.round(Number(slot.endFrame) || slotStart + 1));
-        const cutKfs = cameraKeyframesForCut(project, slot.cut && slot.cut.id || '');
+        const cutKfs = cameraKeyframesForCut(project, slot.cut && slot.cut.id || '', keysByOwnerCut);
         if (cutKfs.length < 2) return '';
         let kfMin = Infinity, kfMax = -Infinity;
         cutKfs.forEach(function(kf) {
@@ -32357,11 +32380,36 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }).join('');
     }
 
-    function cameraKeyframesForCut(project, cutId) {
+    // Every keyframe grouped by its owning cut, in the same order cameraKeyframesForCut returns.
+    // Exists because that function LOOKS like a read but is not: cameraKeyframesForProject runs
+    // normalizeCameraTrack, which rebuilds the cut-id set, the slot maps and every keyframe's derived
+    // coordinates. Calling it once per cut turns an O(keyframes) pass into O(cuts x keyframes) --
+    // measured at 146ms of a 169ms camera lane on a 394-cut project. Build the groups once, hand them
+    // to the loop.
+    function cameraKeyframesByOwnerCut(project) {
+      const map = new Map();
+      cameraKeyframesForProject(project).forEach(function(item) {
+        const key = String(item && item.cutId || '');
+        if (!key) return;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(item);
+      });
+      map.forEach(function(list) {
+        list.sort(function(left, right) {
+          return left.frame - right.frame || String(left.id).localeCompare(String(right.id));
+        });
+      });
+      return map;
+    }
+
+    // keysByOwnerCut is optional: pass it from a loop over cuts so the normalize pass happens once.
+    // Without it the behaviour is exactly what it always was.
+    function cameraKeyframesForCut(project, cutId, keysByOwnerCut) {
       const targetId = String(cutId || '');
       if (!targetId) return [];
       const slot = cameraSlotByCutId(project, targetId);
       const ownerCutId = String(slot && slot.cut && slot.cut.id || targetId);
+      if (keysByOwnerCut) return keysByOwnerCut.get(ownerCutId) || [];
       return cameraKeyframesForProject(project).filter(function(item) {
         return String(item.cutId || '') === ownerCutId;
       }).sort(function(left, right) {
