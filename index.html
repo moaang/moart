@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2187</title>
+  <title>MoArt ver2188</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -19982,9 +19982,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver1725: 눈금은 **한 번만** 찍는다 — redo 로 되살아난 명령이 다시 찍히면 用紙 획과의 순서가
       // 뒤집힌다(그 명령은 새로 생긴 것이 아니다).
       if (command.histSeq == null) command.histSeq = paintNextHistorySeq();
+      const lenBeforePush = state.undoStack.length;
       state.undoStack.push(command);
       trimCommandStack(state.undoStack, MAX_UNDO_HISTORY);
       if (!(options && options.historyTraversal)) trimUndoStackToMemoryBudget();
+      // ver2188: 그림을 붙잡던 스냅샷이 사라지는 두 경우에만 회수를 예약한다. ① push 로 +1 했는데
+      // 길이가 안 늘었다 = 상한이나 예산이 최소 하나를 밀어냈다. ② redo 스택이 차 있다 = 이 편집이
+      // 곧 그것을 통째로 버린다(호출부가 바로 다음 줄에서 비운다). **이동(historyTraversal)은 아니다** —
+      // 그때 redo 는 버려지는 게 아니라 undo 로 옮겨 가는 중이다.
+      const droppedFromStack = state.undoStack.length <= lenBeforePush;
+      const redoAboutToBeDropped = !(options && options.historyTraversal) && state.redoStack.length > 0;
+      if (droppedFromStack || redoAboutToBeDropped) scheduleGengaStorePrune();
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
       syncUndoHistoryWindow(); // no-op unless the 履歴 window is open (debounced past this command's redo-clear)
     }
@@ -20134,10 +20142,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { total: total, perCommand: perCommand, capped: capped };
     }
 
-    // Genga base64 that ONLY history still reaches. REPORTED, never budgeted: a gengaLayerPatchEdit snapshot
-    // holds {ref,w,h}, not pixels, and trimming it does NOT free the store entry (gengaDrawStore.delete happens
-    // only inside gengaPruneRuntimeStoresToProject, at project-load boundaries). Budgeting bytes whose eviction
-    // releases nothing would evict undo steps for no memory at all. Window-sync only - never called from a push.
+    // Genga base64 that ONLY history still reaches. REPORTED, never budgeted. Window-sync only - never
+    // called from a push.
+    // ver2188 정정: 여기 있던 「트림해도 store 가 안 줄어드니 예산에 넣어 봤자 헛일」이라는 **근거가
+    // 사라졌다** — scheduleGengaStorePrune 이 밀려난 스냅샷의 그림을 실제로 회수한다. 그런데도 예산에
+    // 안 넣는 것은 이제 다른 이유다: 이 바이트를 예산에 더하면 원화 세션의 **undo 단계 수가 줄어든다**
+    // (사용자가 겪는 변화라 따로 판정받을 일이다). 그때까지 이 값은 정직한 관측으로 남는다 —
+    // 회수가 돌기 시작했으므로 이 수치도 이제 실제로 내려간다.
     function historyGengaPinnedBytes() {
       if (!(gengaDrawStore instanceof Map) || !gengaDrawStore.size) return 0;
       const liveRefs = new Set();
@@ -78258,11 +78269,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // released instead of merely reported by historyGengaPinnedBytes). That was unsafe before: trimming is
     // frequent, whereas the five existing call sites are rare project-load boundaries, so a cut-then-edit
     // session would have hit the blank-paste bug on nearly every trim.
-    // ver1455 정정 둘: ① 그 「안전하다」는 **레이어 클립보드가 빠져 있어서 사실이 아니었다**(이번 판이
-    // 메웠다). ② 그리고 트림은 **지금도 이 함수를 안 부른다** — 호출부는 여전히 다섯 곳의 로드 경계뿐이다.
-    // 즉 위 문단은 「하려면 할 수 있다」이지 「하고 있다」가 아니다. 실제로 붙이려면 그때 다시 판단할 것.
-    function gengaPruneRuntimeStoresToProject(project) {
-      gengaFlushPendingDrawingEncodes(); // ver1324: settle before the sweep so pending refs are normal store rows
+    // ver1455 정정 둘: ① 그 「안전하다」는 **레이어 클립보드가 빠져 있어서 사실이 아니었다**(ver1455 가
+    // 메웠다). ② 그리고 트림은 그때까지 이 함수를 안 불렀다 — 호출부가 다섯 곳의 로드 경계뿐이었다.
+    // **ver2188 이 그 판단을 했다**: 히스토리에서 밀려난 그림을 실제로 거둔다(scheduleGengaStorePrune).
+    // opts.keepPendingEncodes — 그 경로 전용이다. 첫 줄의 flush 는 ver1324 가 hot path 에서 뺀 PNG 인코드를
+    // 동기로 되돌리므로 **획마다 도는 자리에서 부르면 안 된다.** 건너뛰어도 안전한 이유는 프로젝트가
+    // 안 바뀌기 때문이다: 인코드 대기 ref 는 아직 gengaDrawStore 에 없어 sweep 이 지울 수 없고, 나중에
+    // 오는 settle 이 같은 프로젝트의 ref 로 정상 등록한다. **로드 경계는 프로젝트가 바뀌므로 flush 가
+    // 필요하다** — 그쪽 다섯 곳은 옵션 없이 부른다.
+    function gengaPruneRuntimeStoresToProject(project, opts) {
+      if (!(opts && opts.keepPendingEncodes)) gengaFlushPendingDrawingEncodes(); // ver1324: settle before the sweep so pending refs are normal store rows
       // (ver1441 정정: 여기 있던 「고아는 기존 'gd:' GC 로 간다」도 사실이 아니다 — 위 주석 참고.)
       const drawRefs = new Set();
       const audioRefs = new Set();
@@ -78275,9 +78291,36 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           if (command.after) gengaAddCommandRefs(command.after, drawRefs, audioRefs);
         });
       });
-      gengaDrawStore.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaDrawStore.delete(ref); });
+      // ver2188: **얼마나 거뒀는지 돌려준다.** 히스토리 경로는 이 수치가 유일한 신호다 —
+      // 화면에 아무 변화가 없는 작업이라, 안 세면 「돌고 있다」와 「아무것도 못 거둔다」를 구분할 수 없다.
+      let freedDrawings = 0, freedBytes = 0;
+      gengaDrawStore.forEach(function(v, ref) {
+        if (drawRefs.has(ref)) return;
+        freedDrawings += 1;
+        freedBytes += (typeof v === 'string') ? v.length : 0;
+        gengaDrawStore.delete(ref);
+      });
       gengaAudioStore.forEach(function(_v, ref) { if (!audioRefs.has(ref)) gengaAudioStore.delete(ref); });
       gengaAudioBuf.forEach(function(_v, ref) { if (!audioRefs.has(ref)) gengaAudioBuf.delete(ref); });
+      return { drawings: freedDrawings, bytes: freedBytes };
+    }
+    // ver2188: 히스토리에서 밀려난 그림을 거두는 유일한 자리. **디바운스가 설계의 요점이다** —
+    // 40 단계를 넘긴 뒤로는 획마다 한 스텝이 밀려나므로, 즉시 부르면 프로젝트 전체 훑기가 획마다 돈다.
+    // 미루면 값이 하나 더 붙는다: redo 스택은 pushUndoCommand **뒤에** 비워지므로(호출부 스물셋의 공통
+    // 모양), 지연 후에 돌아야 그 그림들까지 거둔다.
+    const GENGA_STORE_PRUNE_DELAY_MS = 4000;
+    let gengaStorePruneTimer = 0;
+    function scheduleGengaStorePrune() {
+      if (gengaStorePruneTimer) return;                      // 이미 예약됨 — 앞선 예약이 최신 상태를 본다
+      if (!(gengaDrawStore instanceof Map) || !gengaDrawStore.size) return;
+      gengaStorePruneTimer = setTimeout(function() {
+        gengaStorePruneTimer = 0;
+        const freed = gengaPruneRuntimeStoresToProject(state.project, { keepPendingEncodes: true });
+        if (freed && freed.drawings) {
+          console.info('[gengaStore] reclaimed ' + freed.drawings + ' drawing(s) dropped from history - '
+            + (freed.bytes / 1048576).toFixed(1) + 'MB, ' + gengaDrawStore.size + ' left');
+        }
+      }, GENGA_STORE_PRUNE_DELAY_MS);
     }
     function gengaEnsureAudioCtx() {
       if (!gengaAudioCtx) { const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; gengaAudioCtx = new AC(); }
