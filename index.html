@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2186</title>
+  <title>MoArt ver2187</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -77653,7 +77653,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         } catch (e) { console.error('[gengaEncode] IndexedDB write threw for gd:' + ref, e); }
       }
       gengaLastStrokeCanvas = { dataUrl: url, canvas: entry.fullCanvas || entry.canvas };
-      gengaImageFor(url, drawGengaPreview); // start the decode now, off the stroke
+      gengaImageFor({ ref: ref, dataUrl: url }, drawGengaPreview); // start the decode now, off the stroke
       if (entry.layerId != null && state.project && state.project.kind === 'genga') {
         gengaUpdateExpDom(entry.layerId, entry.frame);
         drawGengaLayerThumbs([entry.layerId]);
@@ -77906,6 +77906,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const st = gengaDrawingStrokes(dr);
       return st ? gengaVectorStrokesKey(st) : '';
     }
+    // ver2187: **래스터 픽셀 캐시(gengaImageCache · gengaDrawnBoundsCache)의 키는 여기서만 나온다.**
+    // gengaImageFor 와 gengaDecodeIntoCache 가 각자 판정하면 갈리고, 갈리는 순간 예열해 둔 그림을
+    // 소비처가 못 찾아 **내보내기에 빈 레이어**가 나온다(ver1448 이 고친 병의 재발 경로다).
+    // dataUrl 검사가 키 계산보다 **먼저**인 것이 요점이다 — 위 커널의 벡터 분기는 gengaVectorBakeCache
+    // 에 엔트리를 만드는 부작용이 있고, 디코드 대상은 래스터뿐이다. 키가 비면 그 그림은 디코드 대상이 아니다.
+    function gengaRasterCacheKey(dr) {
+      return (dr && typeof dr.dataUrl === 'string' && dr.dataUrl) ? gengaDrawingCacheKey(dr) : '';
+    }
     // ver2036: 그림 -> **캔버스에 그릴 수 있는 소스**. 벡터는 구운 캔버스가 그 답이고(스트로크는
     // 용지 좌표계라 placement 는 자연히 전체가 된다), 인코드 대기 중인 그림은 그 픽셀이 답이다.
     // 래스터는 종전대로 디코드 이미지 - 아직 디코드 전이면 null 이고 호출부가 'pending' 으로 다룬다.
@@ -77914,7 +77922,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaDrawingImageSource(dr, pw, ph, onReady) {
       if (!dr) return null;
       if (dr.canvas) return dr.canvas;
-      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return gengaImageFor(dr.dataUrl, onReady);
+      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return gengaImageFor(dr, onReady);
       const st = gengaDrawingStrokes(dr);
       return st ? gengaVectorBakedCanvas(st, Math.max(1, pw), Math.max(1, ph)) : null;
     }
@@ -77949,7 +77957,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         return false;
       }
-      const img = gengaImageFor(dr.dataUrl, onReady);
+      const img = gengaImageFor(dr, onReady);
       if (!img) {
         if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) { ctx.drawImage(gengaLastStrokeCanvas.canvas, 0, 0); return true; }
         return false;
@@ -78858,10 +78866,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     async function gengaPreloadExportImages(onStatus) {
       gengaFlushPendingDrawingEncodes(); // ver1324: export decodes by URL — settle stragglers first (no-op when idle)
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
-      const urls = new Set();
+      const byKey = new Map();   // ver2187: 중복 판정을 캐시 키로 — 디코드 한 번이 캐시 한 칸이다
+      const addDrawing = function(d) { const k = gengaRasterCacheKey(d); if (k) byKey.set(k, d); };
       (gt.layers || []).forEach(function(l) {
-        (l.exposures || []).forEach(function(e) { const d = gengaExposureDrawing(l, e); if (d && d.dataUrl) urls.add(d.dataUrl); });
-        if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { const d = gengaResolveDrawing(l.sharedDrawings[k]); if (d && d.dataUrl) urls.add(d.dataUrl); });
+        (l.exposures || []).forEach(function(e) { addDrawing(gengaExposureDrawing(l, e)); });
+        if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { addDrawing(gengaResolveDrawing(l.sharedDrawings[k])); });
       });
       // ver853: was onerror===onload (a decode failure counted as loaded), so an undecodable drawing dropped
       // silently out of the export with zero signal — conte's preloadVideoExportBitmaps counts+warns for the
@@ -78873,7 +78882,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 있던 것이 이 계열의 뿌리다 — 한 벌로 만든다.
       // 덤으로 판정이 정확해진다: 옛 루프는 `img.complete` 면 무조건 성공으로 셌지만, **이전에 실패해
       // 캐시에 남은 이미지**(complete=true, naturalWidth=0)가 바로 그 경우다. 공용 디코더는 그것을 실패로 센다.
-      const decoded = await Promise.all(Array.from(urls).map(function(u) { return gengaDecodeIntoCache(u); }));
+      const decoded = await Promise.all(Array.from(byKey.values()).map(function(d) { return gengaDecodeIntoCache(d); }));
       let failed = decoded.filter(function(ok) { return !ok; }).length;
       // ver1111: with every drawing decoded, build the in-between silhouettes NOW if this export wants
       // them. gengaDougaSilhouetteFor returns 'pending' while a source image is still decoding and the
@@ -79764,10 +79773,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 실패를 세고 콘솔·상태줄에 낸다; 일괄 이미지 계열만 그 수정을 못 받았다.
     // 이번 판은 **기록과 반환값**까지 한다(조용한 실패 금지). 「몇 장 빠졌으니 중단」의 사용자 알림은
     // 호출부마다 판단이 달라 별건으로 남긴다 — 근거는 changelog ver1448.
-    function gengaDecodeIntoCache(dataUrl) {
+    // ver2187: 키는 gengaImageFor 와 **같은 커널**에서 온다 — 갈리면 같은 그림이 캐시에 두 칸을
+    // 차지하고, 「전부 디코드해 두었다」는 이 함수의 전제가 소비처에서 조용히 깨진다.
+    function gengaDecodeIntoCache(dr) {
       return new Promise(function(res) {
-        if (!dataUrl) { res(false); return; }
-        const cached = gengaImageCache.get(dataUrl);
+        const key = gengaRasterCacheKey(dr);
+        if (!key) { res(false); return; }
+        const cached = gengaImageCache.get(key);
         if (cached && cached.complete) { res(Boolean(cached.naturalWidth)); return; }
         const img = new Image();
         img.onload = function() { res(true); };
@@ -79775,8 +79787,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           console.error('[gengaDecode] image decode failed - anything composited from it will be missing this layer');
           res(false);
         };
-        img.src = dataUrl;
-        gengaImageCache.set(dataUrl, img);
+        img.src = dr.dataUrl;
+        gengaImageCache.set(key, img);
       });
     }
     // Render ONE cell×instance to a Blob: paper-size canvas, optional white paper base, then the visible members
@@ -79809,7 +79821,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const dr = e ? gengaExposureDrawing(m, e) : null;
         if (gengaDrawingHasArt(dr)) draws.push({ m: m, dr: dr });   // ver2023: 벡터도 그림
       });
-      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr.dataUrl) : Promise.resolve(true); }));
+      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr) : Promise.resolve(true); }));
       compositeDrawItems(ctx, draws.map(function(d) { // ver1400: shared bracket (see compositeDrawItems)
         return { blend: d.m.blend, opacity: d.m.opacity, draw: function(c) { gengaDrawDrawingInto(c, d.dr, opts.pw, opts.ph); } };
       }));
@@ -79827,7 +79839,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2035: 벡터 用紙 도 그림이다 — 여기서 null 을 돌려주면 **모든 내보내기에서 用紙 가
       // 사라진다**. 디코드는 래스터에만 뜻이 있다(벡터는 그릴 때 커널이 굽는다).
       if (!gengaDrawingHasArt(dr)) return null;
-      if (dr.dataUrl) await gengaDecodeIntoCache(dr.dataUrl);
+      if (dr.dataUrl) await gengaDecodeIntoCache(dr);
       return { dr: dr, blend: p.blend || 'source-over', opacity: (p.opacity != null ? p.opacity : 1), side: (p.paperSide === 'bottom' ? 'bottom' : 'top') };
     }
     // ---- ver1028: camera-frame instruction image (撮影指示) ------------------------------------------
@@ -79881,7 +79893,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const dr = e ? gengaExposureDrawing(l, e) : null;
         if (gengaDrawingHasArt(dr)) draws.push({ l: l, dr: dr });   // ver2023: 벡터도 그림
       });
-      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr.dataUrl) : Promise.resolve(true); }));
+      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr) : Promise.resolve(true); }));
       compositeDrawItems(ctx, draws.map(function(d) {
         return { blend: d.l.blend, opacity: d.l.opacity, draw: function(c) { gengaDrawDrawingInto(c, d.dr, pw, ph); } };
       }));
@@ -80412,11 +80424,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1036: the drawn box of one drawing, in paper px, memoised on the decode cache's own key. The scan is a
     // full-canvas alpha pass, so it must never run per repaint — a drawing is immutable under its dataUrl, so one
     // scan per drawing is enough and a stroke that edits it produces a new url and therefore a new entry.
+    // ver2187: 그 「decode cache's own key」가 이제 gengaRasterCacheKey 다. 여기만 base64 를 키로
+    // 남기면 그 문자열을 이 맵이 계속 붙잡아(delete 도 clear 도 없는 맵이다) 저쪽의 회수가 무효가 된다.
     const gengaDrawnBoundsCache = new Map();
     function gengaDrawnBounds(dr, pw, ph) {
-      if (!dr || !dr.dataUrl) return null;
-      if (gengaDrawnBoundsCache.has(dr.dataUrl)) return gengaDrawnBoundsCache.get(dr.dataUrl);
-      const img = gengaImageCache.get(dr.dataUrl);
+      const key = gengaRasterCacheKey(dr);
+      if (!key) return null;
+      if (gengaDrawnBoundsCache.has(key)) return gengaDrawnBoundsCache.get(key);
+      const img = gengaImageCache.get(key);
       if (!img || !img.complete || !img.naturalWidth) return null; // not decoded yet — retry later, cache nothing
       let out = null;
       try {
@@ -80425,7 +80440,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaDrawDrawingInto(cv.getContext('2d'), dr, cv.width, cv.height);
         out = gengaAlphaBounds(cv);
       } catch (e) { out = null; }
-      gengaDrawnBoundsCache.set(dr.dataUrl, out);
+      gengaDrawnBoundsCache.set(key, out);
       return out;
     }
     // The drawn box of whatever this layer shows at a frame — the shape the FX gizmo hugs and the box the
@@ -80442,7 +80457,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const e = gengaExposureAt(layer, frame);
       const dr = e ? gengaExposureDrawing(layer, e) : null;
       if (!dr || !dr.dataUrl) return null;
-      await gengaDecodeIntoCache(dr.dataUrl);
+      await gengaDecodeIntoCache(dr);
       const cv = document.createElement('canvas'); cv.width = pw; cv.height = ph;
       const cx = cv.getContext('2d');
       try { gengaDrawDrawingInto(cx, dr, pw, ph); } catch (err) { return null; }
@@ -89216,11 +89231,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     let gengaPreviewXform = null;
     let gengaDrawSession = null;
     let gengaStrokeSeq = 0;   // ver1356: 스트로크 신원 카운터(잉크 세션의 strokeKey)
-    function gengaImageFor(dataUrl, onReady) {
-      if (!dataUrl) return null;
-      let img = gengaImageCache.get(dataUrl);
+    // ver2187: **키는 그림의 base64 가 아니라 gengaRasterCacheKey 다.** 종전에는 이 맵이 그림의
+    // base64 문자열 **전체**를 키로 쥐고 있어서, gengaPruneRuntimeStoresToProject 가 gengaDrawStore
+    // 에서 고아 ref 를 지워도 그 문자열이 여기 키로 살아남아 회수되지 않았다 — 디코드 캐시와 원본이
+    // 용접돼 **따로 못 버리는** 상태였고, 예산이 이미지를 버려도 base64 는 남았다.
+    function gengaImageFor(dr, onReady) {
+      const key = gengaRasterCacheKey(dr);
+      if (!key) return null;
+      let img = gengaImageCache.get(key);
       if (img) {
-        gengaImageCache.delete(dataUrl); gengaImageCache.set(dataUrl, img); // LRU touch
+        gengaImageCache.delete(key); gengaImageCache.set(key, img); // LRU touch
         if (img.complete) return img;
         // still decoding → STACK this caller's callback too. (This used to drop it, so whoever asked second —
         // typically the preview after the thumb — never got redrawn until something else forced a redraw.)
@@ -89236,9 +89256,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       img.addEventListener('error', function() {
         console.error('[gengaImage] decode failed - draws from this ref will silently produce nothing');
       }, { once: true });
-      retrimBudgetedMapOnDecode(gengaImageCache, img, dataUrl, GENGA_IMAGE_CACHE_MAX, 'image');
-      img.src = dataUrl;
-      budgetedMapSet(gengaImageCache, dataUrl, img, GENGA_IMAGE_CACHE_MAX, 'image'); // ver1055: LRU by BYTES (item cap is the backstop)
+      retrimBudgetedMapOnDecode(gengaImageCache, img, key, GENGA_IMAGE_CACHE_MAX, 'image');
+      img.src = dr.dataUrl;
+      budgetedMapSet(gengaImageCache, key, img, GENGA_IMAGE_CACHE_MAX, 'image'); // ver1055: LRU by BYTES (item cap is the backstop)
       return img.complete ? img : null;
     }
     function gengaExposureAt(layer, frame) {
@@ -89720,7 +89740,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         sctx.drawImage(gengaVectorBakedCanvas(bakeStrokes, pw, ph), 0, 0);   // 스트로크 좌표는 용지 좌표계
       } else {
       if (!dr.dataUrl) return null;
-      const img = gengaImageFor(dr.dataUrl, null); if (!img) return null;
+      const img = gengaImageFor(dr, null); if (!img) return null;
       // ver1470: 이 세 줄은 gengaDrawDrawingInto 의 **복사본**이다. 지금은 판정만 커널로 모은다 —
       // 통째로 그 함수를 부르게 하면 dr.canvas 분기와 디코드 경합 폴백까지 딸려 와 **동작이 바뀐다**
       // (그쪽이 더 정확하긴 하다). 별건으로 남긴다 — 근거는 changelog ver1470.
@@ -89780,7 +89800,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const drStrokes = gengaDrawingStrokes(dr);
         if (!drStrokes) {
           if (!dr.dataUrl) return;
-          if (!gengaImageFor(dr.dataUrl, null)) { coldMisses += 1; return; } // cold cache; the call starts the decode, so a retry succeeds
+          if (!gengaImageFor(dr, null)) { coldMisses += 1; return; } // cold cache; the call starts the decode, so a retry succeeds
         }
         bakes[e.id] = gengaBakeExposureFx(layer, e, timeMode === 'frame' ? curFrame : e.startFrame, bakeTracks);
       });
@@ -92449,7 +92469,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver2034: 벡터는 구운 캔버스를 그대로 소스로 쓴다(썸네일은 작아 캐시 한 장이면 충분하다).
         const thumbVec = dr ? gengaDrawingStrokes(dr) : null;
         const thumbSrc = thumbVec ? gengaVectorBakedCanvas(thumbVec, Math.max(1, gt.paper.w), Math.max(1, gt.paper.h))
-                                  : (dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr.dataUrl, drawGengaLayerThumbs) : null)) : null); // ver1324: pending-encode drawings paint from their canvas, same placement law
+                                  : (dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr, drawGengaLayerThumbs) : null)) : null); // ver1324: pending-encode drawings paint from their canvas, same placement law
         if (thumbSrc) {
           const gtp = state.project.gengaTimeline, pw = Math.max(1, gtp.paper.w), ph = Math.max(1, gtp.paper.h);
           // ver1470: 커널이 용지 px 로 답하고 여기서 썸네일 캔버스 px 로 옮긴다. `placed:false` 면
@@ -97709,8 +97729,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const dr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
       if (!dr || !dr.dataUrl) return true; // no bitmap → nothing to wait for
       if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) return true; // sync fallback covers it
-      let img = gengaImageCache.get(dr.dataUrl);
-      if (!img) { gengaImageFor(dr.dataUrl, null); img = gengaImageCache.get(dr.dataUrl); }
+      const readyKey = gengaRasterCacheKey(dr);
+      let img = gengaImageCache.get(readyKey);
+      if (!img) { gengaImageFor(dr, null); img = gengaImageCache.get(readyKey); }
       if (!img) return true; // request failed outright → let the op no-op
       if (img.complete) return true;
       // ver750 (fix_design P3-B): the retry ran inside a silent catch — self-defeating for a function whose
@@ -100163,25 +100184,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
      * 우리는 완료를 기다리기만 한다. 실패한 장은 그냥 넘어간다 — 예열은 최적화이지 게이트가
      * 아니므로 여기서 재생을 막지 않는다(디코드 실패 자체는 gengaImageFor 가 콘솔에 남긴다). */
     function gengaPredecodeDrawings(gt) {
-      const urls = [];
+      const drawings = [];
       const seen = new Set();
       const add = function(d) {
         if (!d) return;
         const res = gengaResolveDrawing(d);
-        const u = res && res.dataUrl;
-        if (!u || seen.has(u)) return;
-        seen.add(u); urls.push(u);
+        const k = gengaRasterCacheKey(res);    // ver2187: 중복 판정도 캐시 키로 — 예열 한 번이 캐시 한 칸이어야 한다
+        if (!k || seen.has(k)) return;
+        seen.add(k); drawings.push(res);
       };
       (gt.layers || []).forEach(function(l) {
         (l.exposures || []).forEach(function(e) { add(e.drawing); });
         if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { add(l.sharedDrawings[k]); });
       });
       const pending = [];
-      urls.forEach(function(u) {
-        const img = gengaImageFor(u);
+      drawings.forEach(function(dr) {
+        const img = gengaImageFor(dr);
         if (img && img.complete) return;                       // 이미 디코드됨
         pending.push(new Promise(function(resolve) {
-          const im = gengaImageFor(u, resolve);
+          const im = gengaImageFor(dr, resolve);
           if (im && im.complete) resolve();
           else if (!im) setTimeout(resolve, 3000);              // 안전망: 영원히 기다리지 않는다
         }));
