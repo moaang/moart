@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2189</title>
+  <title>MoArt ver2190</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -14991,7 +14991,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver1358: 「〜で見る」を落とした。ボタン幅は76px固定なので長い文字列は溢れるだけで、
         // 隣の줌 클러스터와 함께 좁은 화면에서 헤더를 2~3줄に折り返させていた（そのバーは1行が絶対条件）。
         'mode.paperView': { ja: 'コンテ用紙', ko: '콘티 용지', en: 'Paper view', zh: '分镜画纸' },
-        // ---- msg.* (221) ----
+        // ---- msg.* (222) ----
         'msg.voicevox.generating': { ja: '音声生成中: ', ko: '음성 생성 중: ', en: 'Generating audio: ', zh: '正在生成语音: ' },
         'msg.voicevox.generateFailed': { ja: '音声生成失敗: ', ko: '음성 생성 실패: ', en: 'Audio generation failed: ', zh: '语音生成失败: ' },
         'msg.voicevox.notCachedForPlay': { ja: 'VOICEVOX の音声が再生用にキャッシュされていません。再生前に「音声生成」を押してください。', ko: 'VOICEVOX 음성이 재생용으로 캐시되지 않았습니다. 재생 전에 「음성 생성」을 누르세요.', en: 'VOICEVOX audio is not cached for playback. Press "Generate audio" before playing.', zh: 'VOICEVOX 语音尚未缓存到播放用。播放前请先按「生成语音」。' },
@@ -15349,6 +15349,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           zh: function(name, frame) { return '已将 ' + name + ' 放在第 ' + frame + ' 格。'; }
         },
         'msg.genga.tvppImport.decoding': { ja: '絵を展開中', ko: '그림 푸는 중', en: 'Decoding drawings', zh: '正在解码画稿' },
+        // ver2190: 「遅い」ではなく「粗くなる」— ver2189 以降、予算不足は速度ではなく表示の精細さに出る
+        'msg.genga.heavyPaper': {
+          ja: function(need, budget) { return '用紙が大きい作品です（1コマ ' + need + 'MB / 表示用の上限 ' + budget + 'MB）。表示は縮小した絵で描かれるので、拡大するとやや粗く見えます。'; },
+          ko: function(need, budget) { return '용지가 큰 작품입니다(한 코마 ' + need + 'MB / 표시용 상한 ' + budget + 'MB). 표시는 축소한 그림으로 그려지므로 확대하면 다소 거칠게 보입니다.'; },
+          en: function(need, budget) { return 'This project has large paper (' + need + 'MB per frame vs a ' + budget + 'MB display budget). Drawings are shown from downscaled copies, so zooming in looks softer.'; },
+          zh: function(need, budget) { return '此项目画布较大（每帧 ' + need + 'MB，显示预算 ' + budget + 'MB）。显示使用缩小后的副本，放大时会略显粗糙。'; } },
         'msg.genga.tvppImport.empty': { ja: '絵のあるレイヤーが見つかりませんでした。', ko: '그림이 있는 레이어를 찾지 못했습니다.', en: 'No layer with drawings was found.', zh: '未找到含有画的图层。' },
         'msg.idb.deleteFailedFor': {
           ja: function(key) { return 'IndexedDBからの削除に失敗しました: ' + key; },
@@ -23661,6 +23667,42 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver1946: 창 복원은 **프로젝트가 선 뒤** 한 번이다. 시작 화면에서 되살리면 아직 열지도 않은
       // 프로젝트 위로 도구창이 뜨고, 프로젝트 종류(conte/genga)를 몰라 없는 창까지 켜려 든다.
       if (state.projectActive) { try { restoreOpenWindowsOnce(); } catch (error) { console.warn('[window] 복원 진입 실패', error); } }
+      if (state.projectActive) { try { gengaNoticeHeavyPaper(); } catch (error) {} } // ver2190
+    }
+    // ver2190: **한 프레임이 디코드 예산에 안 들면 그 사실을 말한다.** ver2189 이후 그런 프로젝트는
+    // 느려지는 대신 **표시가 축소본으로 바뀌어 확대할 때 거칠어진다** — 조용히 흐려지면 사용자는
+    // 이유를 모른다(조용한 실패 금지). 제보 파일이 정확히 그 경우였다: 용지 3508×2480 · 레이어 8 ·
+    // 한 프레임 118MB 대 예산 20.5~82MB.
+    // 무게는 **레이어마다 가장 큰 그림**의 합이다 — 어느 프레임이 최악인지 전부 훑지 않고도 그 상한을 준다.
+    let gengaHeavyPaperNoticedFor = '';
+    function gengaProjectFrameWeightBytes(gt) {
+      let bytes = 0, layers = 0;
+      (gt && gt.layers || []).forEach(function(l) {
+        if (!gengaLayerDrawsInComposite(l)) return;
+        let big = 0;
+        (l.exposures || []).forEach(function(e) {
+          const dr = gengaExposureDrawing(l, e);
+          if (!dr) return;
+          const w = Math.max(0, Number(dr.w) || 0), h = Math.max(0, Number(dr.h) || 0);
+          if (w * h * 4 > big) big = w * h * 4;
+        });
+        if (big > 0) { bytes += big; layers += 1; }
+      });
+      return { bytes: bytes, layers: layers };
+    }
+    function gengaNoticeHeavyPaper() {
+      const p = state.project;
+      if (!p || p.kind !== 'genga' || !p.gengaTimeline) return;
+      const id = String(p.projectId || p.title || '');
+      if (id && id === gengaHeavyPaperNoticedFor) return;   // 프로젝트당 한 번
+      const w = gengaProjectFrameWeightBytes(p.gengaTimeline);
+      const budget = bitmapCacheShareBytes('image');
+      if (!w.bytes || w.bytes <= budget) return;
+      gengaHeavyPaperNoticedFor = id;
+      const needMb = Math.round(w.bytes / 1048576), budMb = Math.round(budget / 1048576);
+      console.warn('[paperWeight] one frame needs ' + needMb + 'MB of decoded pixels but the image cache budget is '
+        + budMb + 'MB - display falls back to downscaled copies (sharpness, not speed)');
+      showToast(t('msg.genga.heavyPaper', needMb, budMb));
     }
 
     // ver573: show the entry screen ON TOP of an already-open project (boot always lands here now, even
@@ -24069,6 +24111,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2190, items: [
+        { ja: '**表示に使えるメモリの上限を引き上げました。** 用紙の大きい作品でも拡大したときの粗さが減ります。'
+            + 'それでも収まらない作品を開いたときは、開いた直後にその旨をお知らせします。',
+          ko: '**표시에 쓸 수 있는 메모리 상한을 올렸습니다.** 용지가 큰 작품에서 확대했을 때의 거칠음이 줄어듭니다. '
+            + '그래도 다 담기지 않는 작품을 열면 연 직후에 그 사실을 알려 드립니다.',
+          en: '**Raised the memory ceiling for on-screen drawings.** Zooming into large-paper projects looks sharper. '
+            + 'If a project still does not fit, you are told so right after opening it.',
+          zh: '**提高了显示用内存上限。** 大画布项目放大时更清晰。'
+            + '若项目仍然超出上限，打开后会立即提示。' }
+      ] },
       { ver: 2189, items: [
         { ja: '**大きな用紙のプロジェクトが軽くなりました。** 画面に映すときは表示サイズに合わせて焼いた絵を使うようにしたので、'
             + 'レイヤーが多くて解像度の高いファイルでも、再生バーを動かすたびに全レイヤーを読み直すことがなくなります。'
@@ -101839,11 +101891,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // Total pixel-cache budget for the device, split into per-cache shares below. deviceMemory is a
     // coarse GB hint (absent on some engines → assume a modest 4GB machine rather than a generous one).
+    // ver2190: 상한을 올렸다(사용자 판정). 종전 값은 **두 군데가 죽어 있었다**:
+    // ① `deviceMemory` 는 스펙상 **8 로 클램프**되므로 데스크톱의 512 는 어떤 기기에서도 안 나왔다
+    //    (32GB 머신도 8GB 머신도 똑같이 256MB) — 도달 불가한 클램프였다.
+    // ② `deviceMemory` 는 **Safari 전 버전에 없다.** 아이패드는 늘 4 로 폴백해 64MB 였다 —
+    //    실기가 8~16GB 여도 그렇다. 그래서 **하한**을 올려야 그 폴백이 덜 아프다.
+    // ★ver2189 이후 이 값의 뜻이 바뀌었다: 예산이 모자라도 **느려지지 않고**(사본이 작아진다)
+    //  **흐려질** 뿐이다. 그러므로 올려서 얻는 것은 속도가 아니라 **화질**이고, 무는 것은
+    //  상주 바이트다 — gengaScaledDrawBudgetWidth 가 이 값에서 사본 크기를 계산하므로
+    //  올린 만큼 그대로 상주에 반영된다(예산은 상한이자 실제 사용량의 천장이다).
+    // 참고 수치: Pencil2D 는 기본 1GB(클램프 100MB~16GB), Krita 는 RAM 의 50% + 스왑 4096MiB.
+    // 네이티브보다 보수적으로 잡는다 — 브라우저 탭은 OOM 이 곧 작업 손실이다.
     function bitmapCacheBudgetBytes() {
       const gb = Number(navigator.deviceMemory) || 4;
       const mb = mobileOrTabletRuntime()
-        ? Math.max(64, Math.min(160, gb * 16))
-        : Math.max(160, Math.min(512, gb * 32));
+        ? Math.max(128, Math.min(384, gb * 48))
+        : Math.max(256, Math.min(1024, gb * 64));
       return mb * 1024 * 1024;
     }
     // Shares must sum to 1. Sized from the measured live working sets: source drawings are requested
