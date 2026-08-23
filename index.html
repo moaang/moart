@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2185</title>
+  <title>MoArt ver2186</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23533,7 +23533,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       invalidateVideoTimelineCache();
     }
 
-    function resetProjectForNewProject() {
+    // ver2186: `opts.deferGengaPrune` — 임포트 플로우는 **방금 디코드한 그림을 이미 스토어에 넣어 둔
+    // 채** 이 함수를 부르고, 그것을 가리키는 참조(`gengaTimeline`)는 이 함수가 끝난 **다음 줄**에서
+    // 붙는다. 그 순서에서 아래 prune 이 돌면 「살아 있는 참조가 하나도 없는」 순간을 보고 방금 만든
+    // 것을 전부 버리고, 그 그림들은 곧 IndexedDB 에서 도로 읽혀 온다 — 하필 메모리 피크 직후에
+    // 왕복이 한 번 더 얹힌다. 그 호출부 셋은 참조를 붙인 **뒤에** 스스로 prune 한다.
+    function resetProjectForNewProject(opts) {
       try { stopActiveAudioRecording(); } catch (error) {} // ver1167 (audit F5.3): a new project must not leave the mic recording into the old one (finalize discards on the projectId mismatch)
       teardownProjectFloatingWindows();
       resetProjectTransientRuntime();
@@ -23548,7 +23553,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       resetProjectRuntimeSelection();
       state.undoStack = [];
       state.redoStack = [];
-      gengaPruneRuntimeStoresToProject(state.project); // new (conte) project → free any prior genga project's stores (ver750 P3-A: cannot-throw callee, catch removed)
+      if (!(opts && opts.deferGengaPrune)) gengaPruneRuntimeStoresToProject(state.project); // new (conte) project → free any prior genga project's stores (ver750 P3-A: cannot-throw callee, catch removed)
       state.conteLayerClipboard = null;
       state.selectedAudioClipId = '';
       state.selectedVideoClipId = '';
@@ -24053,6 +24058,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2186, items: [
+        { ja: '**`.clip` / `.tvpp` の読み込みが軽くなりました。** レイヤーごとに使い終わったキャンバスを'
+            + 'その場で解放するようにしたので、レイヤーの多いファイルでもメモリが積み上がりません。'
+            + 'iPad で大きなファイルを開くと落ちていたのはこれが原因です。',
+          ko: '**`.clip` / `.tvpp` 불러오기가 가벼워졌습니다.** 레이어마다 다 쓴 캔버스를 그 자리에서 '
+            + '돌려주도록 고쳐, 레이어가 많은 파일에서도 메모리가 쌓이지 않습니다. '
+            + 'iPad 에서 큰 파일을 열면 튕기던 것이 이 때문이었습니다.',
+          en: '**Importing `.clip` / `.tvpp` is lighter.** Each layer now releases its working canvas as soon '
+            + 'as it is done, so memory no longer piles up on files with many layers. '
+            + 'This is what was killing the app on iPad with large files.',
+          zh: '**导入 `.clip` / `.tvpp` 更轻快了。** 每个图层用完的画布会立即释放，'
+            + '图层多的文件也不会让内存不断堆积。'
+            + 'iPad 上打开大文件会闪退，原因就在这里。' }
+      ] },
       { ver: 2185, items: [
         { ja: '**ペンの追従が速くなりました。** 対応する環境（Chromium 系のデスクトップと Android）では、'
             + 'OS が線の先端を直接描くようになり、ペンと画面のずれが縮みます。'
@@ -77963,13 +77982,30 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // (1752×1238 · 201장이면 PNG 로 540MB, JPEG 면 그 1/7 이다).
     // **인자를 안 주면 종전 그대로 PNG 다** — 획·용지·TVPP·ZIP 등 다른 일곱 호출부는 알파가
     // 필요하므로 손대지 않았다.
+    // ver2186: 다 쓴 캔버스의 백킹을 **그 자리에서** 돌려준다. 캔버스 픽셀은 JS 힙 밖이라 GC 가
+    // 늦고 `performance.memory` 에도 안 잡히는데, iOS 는 2023 년(Safari 17)에 캔버스 총량 상한을
+    // 없앤 대신 넘치면 페이지가 「망가지는」 게 아니라 **프로세스가 통째로 죽는다**(jetsam).
+    // ★ `canvas.width = canvas.width` 로는 **해제되지 않는다** — WebKit 은 크기가 실제로 **바뀔 때만**
+    //   버퍼를 놓는다(`didUpdateCanvasSizeProperties(sizeChanged)`). 0 을 넣어야 즉시 동기 해제된다.
+    // ★ 해제해도 iOS 는 IOSurfacePool 에 최대 64MB/2초 물고 있으므로, 빡빡한 루프에서는 여전히 겹친다.
+    function paintReleaseCanvas(cv) {
+      if (!cv || typeof cv.width !== 'number') return;
+      try { cv.width = 0; cv.height = 0; } catch (err) {}
+    }
     function gengaTrimCanvasToDrawing(cv, scanRect, deferEncode, mime, quality) {
       const b = gengaCanvasInkBounds(cv, scanRect); if (!b) return null;
       const t = document.createElement('canvas'); t.width = b.w; t.height = b.h;
       const tx = t.getContext('2d');
       tx.drawImage(cv, b.x, b.y, b.w, b.h, 0, 0, b.w, b.h);
       if (deferEncode) return { canvas: t, w: b.w, h: b.h, x: b.x, y: b.y }; // ver1324 (F2): the stroke path encodes later; every non-session caller keeps the sync string
-      if (mime !== 'image/jpeg' && mime !== 'image/webp') return { dataUrl: t.toDataURL('image/png'), w: b.w, h: b.h, x: b.x, y: b.y };
+      // ver2186: 인코드가 끝나면 나가는 것은 **문자열뿐**이라 트림 캔버스는 여기서 돌려준다.
+      // 이 한 자리를 고치면 호출부 열 곳이 전부 상속한다 — `.clip`/`.tvpp` 임포트처럼 레이어마다
+      // 이 함수를 부르는 경로에서 그 백킹이 통째로 쌓이고 있었다(40MB 짜리 `.clip` 하나에 3.5GB).
+      if (mime !== 'image/jpeg' && mime !== 'image/webp') {
+        const png = { dataUrl: t.toDataURL('image/png'), w: b.w, h: b.h, x: b.x, y: b.y };
+        paintReleaseCanvas(t);
+        return png;
+      }
       // ver1889: **알파를 잃는 것은 JPEG 뿐이다.** 그때만 흰 배경을 뒤에 깐다(destination-over 라
       // 이미 그린 그림은 그대로다) — 안 깔면 투명한 자리가 검게 굳는다. 영상 프레임 자체는
       // 불투명이지만 용지에 맞추며 축소할 때 반투명 가장자리가 생기고, 그것이 검은 테두리가 된다.
@@ -77981,7 +78017,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         tx.globalCompositeOperation = 'source-over';
       }
       const q = Number(quality) > 0 ? Number(quality) : GENGA_VIDEO_JPEG_QUALITY;
-      return { dataUrl: t.toDataURL(mime, q), w: b.w, h: b.h, x: b.x, y: b.y };
+      const lossy = { dataUrl: t.toDataURL(mime, q), w: b.w, h: b.h, x: b.x, y: b.y };
+      paintReleaseCanvas(t); // ver2186: 위 PNG 가지와 같은 이유
+      return lossy;
     }
     // pull any {ref} drawings whose base64 isn't in memory yet from IndexedDB, then re-render (load/restore).
     // ver1541: 저장된 값 여러 개를 **묶어서 병렬로** 읽는다. 종전에는 참조 하나당 트랜잭션 하나를
@@ -83897,12 +83935,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (json) parts = { work: String(header.title || 'genga').trim() || 'genga', ep: String(header.episode || '').trim(), cut: String(header.cutNo || '').trim(), suffix: '' };
       else { const b = String((sheet.csv && sheet.csv.path) || 'genga').split('/').pop().replace(/\.[^.]+$/, ''); parts = { work: b, ep: '', cut: '', suffix: '' }; }
       const title = [parts.work, parts.ep, parts.cut].filter(Boolean).join('_') || 'genga_sheet';
-      resetProjectForNewProject();
+      resetProjectForNewProject({ deferGengaPrune: true }); // ver2186: 참조를 붙인 뒤에 prune 한다(아래)
       state.project.title = title;
       state.project.projectId = generateProjectId();
       state.project.kind = 'genga';
       try { state.project.nameParts = normalizeNameParts(parts); } catch (e) {}
       state.project.gengaTimeline = built.gt;
+      gengaPruneRuntimeStoresToProject(state.project); // ver2186: 이제 참조가 있다 — 옛 프로젝트 것만 버린다
       state.project.settings = state.project.settings || {};
       state.project.settings.indexedDbAutosaveEnabled = true;
       // ver1936: 수정공정 리비전은 커널로 붙인다(clip 임포트와 같은 경로) — `gengaTimeline` 이 대입된
@@ -85270,7 +85309,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 1872x1324 캔버스에 2048x1536 레이어가 섞여 있었다). 원화 용지는 프로젝트 캔버스
         // 크기로 고정하고, 레이어 그림은 좌상단(0,0) 기준으로 그 위에 얹는다 — clip 의 오프스크린
         // 오프셋 필드는 이번 조사에서 못 봤다(전부 0,0 이었다); 어긋난 파일이 나오면 그때 보완.
-        const trimmed = gengaTrimCanvasToDrawing(cv);
+        // ver2186: **벡터가 있으면 트림하지 않는다.** 아래 ver2032 판정대로 벡터 레이어는 래스터
+        // 캐시를 버리는데, 종전에는 버릴 것을 먼저 트림했다 — 트림 한 번이 캔버스 전체
+        // `getImageData` 리드백 + 트림 캔버스 한 장이라 벡터 레이어마다 그 두 벌이 헛돌았다.
+        // `emptyLayer` 판정도 `!vec` 라 벡터일 때는 이 값을 보지 않는다(동작 불변).
+        const trimmed = vec ? null : gengaTrimCanvasToDrawing(cv);
+        // 트림이 픽셀을 자기 캔버스로 복사해 갔으므로 원본은 여기서 끝이다. 이 한 줄이 없어서
+        // 레이어 수만큼 레이어 크기 백킹이 쌓였다(조사 B: 484KB 파일 하나에 51.6MB 할당).
+        paintReleaseCanvas(cv);
         // ver2032: **하이브리드를 만들지 않는다**(사용자 판정) — 벡터가 있으면 그것만 남기고
         // 래스터 캐시는 버린다. ver2027 은 둘을 함께 실었는데, 그러면 resolve 가 캐시를 우선해
         // 「벡터 레이어인데 벡터로 안 그어지는」 통제 안 된 상태가 됐다. 캐시를 버려도 그림은
@@ -85597,11 +85643,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (canceled) { hideLoadingOverlay(); return false; }
         if (!built) { hideLoadingOverlay(); alert(t('msg.genga.tvppImport.empty')); return false; }
         const title = String(file.name || 'clip').replace(/\.clip$/i, '') || 'clip';
-        resetProjectForNewProject();
+        resetProjectForNewProject({ deferGengaPrune: true }); // ver2186: 참조를 붙인 뒤에 prune 한다(아래)
         state.project.title = title;
         state.project.projectId = generateProjectId();
         state.project.kind = 'genga';
         state.project.gengaTimeline = built.gt;
+        gengaPruneRuntimeStoresToProject(state.project); // ver2186: 이제 참조가 있다 — 옛 프로젝트 것만 버린다
         state.project.settings = state.project.settings || {};
         state.project.settings.indexedDbAutosaveEnabled = true;
         // ver2: 수정공정 리비전은 gengaSpawnCelGroupMember(진짜 커널, addGengaRevisionLayer 와
@@ -86118,11 +86165,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (canceled) { hideLoadingOverlay(); return false; }
         if (!built) { hideLoadingOverlay(); alert(t('msg.genga.tvppImport.empty')); return false; }
         const title = String(file.name || 'tvpp').replace(/\.tvpp$/i, '') || 'tvpp';
-        resetProjectForNewProject();
+        resetProjectForNewProject({ deferGengaPrune: true }); // ver2186: 참조를 붙인 뒤에 prune 한다(아래)
         state.project.title = title;
         state.project.projectId = generateProjectId();
         state.project.kind = 'genga';
         state.project.gengaTimeline = built.gt;
+        gengaPruneRuntimeStoresToProject(state.project); // ver2186: 이제 참조가 있다 — 옛 프로젝트 것만 버린다
         state.project.settings = state.project.settings || {};
         state.project.settings.indexedDbAutosaveEnabled = true;
         normalizeProject(state.project);
@@ -86472,6 +86520,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaKeyOutWhiteImageData(dat, strength);
       cx.putImageData(dat, 0, 0);
       const trimmed = gengaTrimCanvasToDrawing(cv);
+      paintReleaseCanvas(cv); // ver2186: 용지 크기 캔버스 한 장 — trim 이 복사해 갔으므로 여기서 끝이다
       return trimmed ? gengaIngestDrawing(trimmed) : null;
     }
     function gengaMakePaperLayerObject(drawing, blend, side) {
