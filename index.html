@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2190</title>
+  <title>MoArt ver2191</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -84995,7 +84995,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       var cy = Number(canvas.CanvasHeight) / 2 + (Number(canvas.CropFrameCropOffsetY) || 0) + (Number(canvas.CropFrameInnerOffsetY) || 0);
       cameraFrame = { x: Math.round(cx - fw / 2), y: Math.round(cy - fh / 2), w: fw, h: fh };
     })();
-    var timeline = (db.readTable('TimeLine') || [])[0];
+    /* ver2191: **활성 타임라인을 고른다 — 「첫 행」이 아니다.**
+     * 한 `.clip` 에 `TimeLine` 이 여럿 있을 수 있고(제보 파일은 셋: 본편 120F · 144F · 「閲覧用」),
+     * 활성은 `AnimationCutBank.CurrentIndex` 가 `FirstTimeLine`→`NextTimeLine` 연결 리스트에서
+     * 가리키는 것이다. 표본 하나(`BW_ED_002A_LO`)는 `CurrentIndex=3` 이라 **첫 행이 아니다** —
+     * 「첫 타임라인을 쓴다」로 고치면 그 파일이 퇴행한다(가설 반증 완료).
+     * 이 한 줄이 세 곳을 함께 고친다: 아래 Track 체인(노출표) · 카메라 커브 · 총 길이. */
+    var timelineRows = db.readTable('TimeLine') || [];
+    var timelinesById = {};
+    timelineRows.forEach(function (t) { if (t && t.MainId != null) timelinesById[t.MainId] = t; });
+    var timeline = (function () {
+      var bank = (db.readTable('AnimationCutBank') || [])[0];
+      if (!bank || bank.FirstTimeLine == null) return timelineRows[0] || null;
+      var chain = [], mid = bank.FirstTimeLine, guard = 0;
+      while (mid != null && timelinesById[mid] && guard++ < 256) { chain.push(timelinesById[mid]); mid = timelinesById[mid].NextTimeLine; }
+      if (!chain.length) return timelineRows[0] || null;
+      var idx = Math.round(Number(bank.CurrentIndex) || 0);
+      return chain[Math.max(0, Math.min(chain.length - 1, idx))];
+    })();
     var fps = (timeline && Number(timeline.FrameRate)) || 24;
     var byId = {};
     (db.readTable('Layer') || []).forEach(function (l) { byId[l.MainId] = l; });
@@ -85006,11 +85023,33 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       offscreens[o.MainId] = o;
       if (o.BlockData) offscreensByChunkId[new TextDecoder('utf-8').decode(o.BlockData)] = o;
     });
+    /* ver2191: **한 레이어는 타임라인 수만큼 Track 행을 갖는다.** 종전에는 표 전체를 훑어
+     * last-write-wins 로 담았고, 그러면 표 순서상 마지막 것이 이긴다 — 그것은 대개 **빈 껍데기**다
+     * (실측: 노출 데이터를 가진 것은 활성 타임라인 것뿐이고, 나머지는 타입 이름과 버전 헤더만 든
+     * 41000B 짜리였다. 활성 것은 55302B). 그래서 `clipReadCelKeyframes` 가 `ActionNodeClip` 을
+     * 못 찾아 null 을 냈고, 빌더는 그것을 「애니메이션 트랙 없음」으로 읽어 **첫 코마 하나를 전 구간
+     * 유지**로 깔았다 — 제보의 「타임라인이 다 한 인스턴스」가 이것이다.
+     * 이제 **활성 타임라인의 Track 체인만** 담는다(`FirstTrack`→`TrackNextIndex`). */
+    var tracksById = {};
+    (db.readTable('Track') || []).forEach(function (t) { if (t && t.MainId != null) tracksById[t.MainId] = t; });
     var tracksByUuid = {};
-    (db.readTable('Track') || []).forEach(function (t) {
-      if (!t.LayerUuidWithTrack) return;
-      tracksByUuid[clipBytesToUuidStr(t.LayerUuidWithTrack).toLowerCase()] = t;
-    });
+    (function () {
+      var mid = timeline ? timeline.FirstTrack : null, guard = 0;
+      while (mid != null && tracksById[mid] && guard++ < 100000) {
+        var t = tracksById[mid];
+        if (t.LayerUuidWithTrack) tracksByUuid[clipBytesToUuidStr(t.LayerUuidWithTrack).toLowerCase()] = t;
+        mid = t.TrackNextIndex;
+      }
+      // 체인이 비었다(FirstTrack 없음 · 끊긴 링크). 종전 방식으로 물러서되 **조용히 넘어가지 않는다** —
+      // 이 자리가 조용했던 것이 이번 결함이 오래 안 잡힌 이유다.
+      if (!Object.keys(tracksByUuid).length && (db.readTable('Track') || []).length) {
+        console.warn('[clip] active timeline has no track chain - falling back to a flat Track scan (exposures may come from the wrong timeline)');
+        (db.readTable('Track') || []).forEach(function (t) {
+          if (!t.LayerUuidWithTrack) return;
+          tracksByUuid[clipBytesToUuidStr(t.LayerUuidWithTrack).toLowerCase()] = t;
+        });
+      }
+    })();
     var externalChunkRows = db.readTable('ExternalChunk') || [];
 
     // 벡터 레이어의 다리: VectorObjectList.LayerId -> Layer.MainId, VectorData 는 Offscreen.BlockData
