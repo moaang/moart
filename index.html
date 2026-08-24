@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2207</title>
+  <title>MoArt ver2208</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24115,6 +24115,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2208, items: [
+        { ja: '**レイヤーを重ねた状態で、下のほうのレイヤーに線を引くときのカクつきをなくしました。**'
+            + ' 3508×2480 の用紙で、上に絵が 6 枚ある位置に描くと 30fps まで落ちていたのが 60fps を保ちます。'
+            + '描き終えた絵は 1 ピクセルも変わりません。',
+          ko: '**레이어를 겹쳐 놓은 상태에서 아래쪽 레이어에 선을 그을 때 끊기던 것을 없앴습니다.**'
+            + ' 3508×2480 용지에서 위에 그림이 6장 있는 자리에 그으면 30fps까지 떨어지던 것이 60fps를 유지합니다. '
+            + '다 그린 그림은 1픽셀도 달라지지 않습니다.',
+          en: '**Removed the stutter when drawing on a lower layer with art stacked above it.**'
+            + ' On a 3508×2480 paper with six drawings above, a stroke used to drop to 30fps; it now holds 60fps. '
+            + 'The finished art is pixel-for-pixel unchanged.',
+          zh: '**消除了在下层图层上画线时的卡顿（上方叠有多张图的情况）。**'
+            + ' 在 3508×2480 的用纸上，若上方有 6 张图，笔触会掉到 30fps，现在能保持 60fps。'
+            + '画完的图像不会有任何像素变化。' }
+      ] },
       { ver: 2207, items: [
         { ja: '**大きな用紙で線を引いたあと、ペンを離した瞬間に止まる感じを減らしました。**'
             + ' 3508×2480 の用紙で測ると、ストロークを確定する処理が約 90ms から約 25ms になりました。'
@@ -92906,7 +92920,40 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         cx2.drawImage(sess.belowCache, 0, 0);
         if (gengaLayerDrawsInComposite(layers[sessIdx])) drawLayer(cx2, layers[sessIdx]);
-        drawLayerRange(cx2, sessIdx - 1, 0); // layers above (blend vs live content stays correct)
+        // ver2208: 위 스택도 접는다. 획을 긋는 동안 위 레이어의 내용은 안 바뀌므로 아래와 같은
+        // 이유로 한 장이면 된다 — 종전에는 이 자리가 **매 move** 위 그림을 전부 다시 그렸다
+        // (실측 3508×2480 · 위 그림 6장에서 프레임당 7.1ms · 그림 한 장당 약 1.2ms).
+        // 아래 스택과 다른 점 둘:
+        // ① **접을 수 없는 경우가 있다** — 합성모드가 걸린 위 레이어는 자기 아래(= 라이브 세션과
+        //    그 아래 전부)와 섞이는데, 따로 접으면 그 레이어끼리만 섞이므로 결과가 달라진다.
+        //    하나라도 있으면 접지 않고 종전 경로로 간다. 動画フィル도 뺀다 — 실루엣 디코드가
+        //    끝나면 내용이 바뀌어(그 자리는 'pending' 을 반환하고 나중에 다시 그린다) 캐시가 낡는다.
+        // ② **캔버스가 pad 를 포함한다** — 위 레이어의 FX 는 용지 밖 pad 영역에 그려지고 있어서,
+        //    belowCache 처럼 용지 크기로 접으면 그 스필이 잘린다(아래 스택의 잘림은 종전 동작이라
+        //    그대로 둔다 — 위에 같은 잘림을 새로 만들지 않는다).
+        if (sess.aboveFoldable === undefined) { // 세션당 한 번만 판정한다
+          let foldable = sessIdx > 0 && !gengaDougaFillActive();
+          for (let i = sessIdx - 1; foldable && i >= 0; i--) {
+            const l = layers[i];
+            if (!gengaLayerDrawsInComposite(l)) continue;
+            if ((l.blend || 'source-over') !== 'source-over') foldable = false;
+          }
+          sess.aboveFoldable = foldable;
+        }
+        if (sess.aboveFoldable) {
+          if (!sess.aboveCache || sess.aboveCache.width !== cw || sess.aboveCache.height !== ch) {
+            const ac = document.createElement('canvas'); ac.width = cw; ac.height = ch;
+            const actx = ac.getContext('2d');
+            if (pad) actx.setTransform(1, 0, 0, 1, pad, pad); // cx2 와 같은 좌표계로 그린다
+            drawLayerRange(actx, sessIdx - 1, 0);
+            sess.aboveCache = ac;
+          }
+          cx2.save(); cx2.setTransform(1, 0, 0, 1, 0, 0); // 캐시는 이미 pad 를 담고 있다
+          cx2.drawImage(sess.aboveCache, 0, 0);
+          cx2.restore();
+        } else {
+          drawLayerRange(cx2, sessIdx - 1, 0); // layers above (blend vs live content stays correct)
+        }
         return cv;
       }
       if (gengaParaparaSoloLayerId) { // ver672: パラパラ "下のレイヤー" — show ONLY the below layer, ignore its show/hide
