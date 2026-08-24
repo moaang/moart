@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2198</title>
+  <title>MoArt ver2199</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24115,6 +24115,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2199, items: [
+        { ja: '**読み込んだ作品の再生・再生バーが軽くなります。** 取り込んだ絵は今までひと塊の'
+            + 'ままで、コマが替わる瞬間に毎回デコードし直すことがありました（サンプル実測で最大 '
+            + '158ms のつっかかり）。開いたあと裏で少しずつ、描いた絵と同じタイル形式に変換する'
+            + 'ようにしました。変換は画素が一致する場合だけ保存されます。',
+          ko: '**불러온 작품의 재생·재생바가 가벼워집니다.** 임포트한 그림은 지금까지 한 덩어리 '
+            + '그대로라, 코마가 바뀌는 순간마다 다시 디코드되는 일이 있었습니다(샘플 실측 최대 '
+            + '158ms 걸림). 연 뒤에 뒤에서 조금씩, 그린 그림과 같은 타일 형식으로 변환하도록 '
+            + '했습니다. 변환은 픽셀이 일치할 때만 저장됩니다.',
+          en: '**Playback and scrubbing get lighter on imported projects.** Imported drawings stayed '
+            + 'one whole bitmap, which could re-decode on every drawing change (measured hitches up '
+            + 'to 158ms). After opening, they are now converted in the background to the same tile '
+            + 'format as drawn art. A conversion is saved only when the pixels match.',
+          zh: '**导入作品的播放和拖动播放条更流畅了。** 导入的图像此前一直是整块位图，换格时'
+            + '可能每次都重新解码（实测最大卡顿 158ms）。现在打开后会在后台逐张转换为与手绘'
+            + '相同的分块格式。仅在像素一致时才保存转换结果。' }
+      ] },
       { ver: 2198, items: [
         { ja: '**線を引いたあとの確定が数倍軽くなりました。** ペンを離した瞬間に、線が触れたタイルの'
             + '空白判定とPNG圧縮をその場で全部行っていました。判定の読み出しを1回にまとめ、圧縮は'
@@ -54331,7 +54348,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               // 메모리(문자열)와 디스크(Blob)의 경계는 ver1893 그대로다 — 여기서도 같은 모양으로 넣는다.
               const url = await gengaBlobToDataUrl(blob);
               if (!url) throw new Error('decode failed');
-              if (isDraw) gengaDrawStore.set(item.ref, url); else gengaAudioStore.set(item.ref, url);
+              if (isDraw) { gengaDrawStore.set(item.ref, url); gengaScheduleWholeRasterConvert(item.ref); } else gengaAudioStore.set(item.ref, url);
               // ver2197: gengaMarkPersisted 로 감싼다 — 안 감싸면 디스크에 있는데도 축출 후보가 못 되어
               // ver2192 의 예산 회수가 임포트 그림에는 영영 안 듣는다.
               if (preferIndexedDb) await gengaMarkPersisted(isDraw ? item.ref : '', putWorkspaceDbValue((isDraw ? 'gd:' : 'ga:') + item.ref, blob));
@@ -77892,6 +77909,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           if (!url) { console.error('[gengaStore] fault-in decode failed for gd:' + ref); return false; }
           gengaDrawStore.set(ref, url);
           gengaPersistedRefs.add(ref);
+          gengaScheduleWholeRasterConvert(ref);   // ver2199: 통짜는 칸으로 — 1회 변환
           return true;
         } catch (err) {
           console.error('[gengaStore] fault-in threw for gd:' + ref, err);
@@ -78422,6 +78440,111 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts);
         else console.error('[gengaTile] flush left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
       });
+    }
+    // ── ver2199: 통짜 래스터를 칸으로 — 1회 변환 (판정 2026-08-24: ver2193 q3=A 「옛 그림은
+    // 손대지 않는다」를 뒤집는다. 당시엔 통짜의 재디코드 잭이 알려지지 않았다) ──────────────
+    // 임포트·옛 저장이 남긴 통짜(dataUrl) 그림은 픽셀이 브라우저의 이미지 디코드 캐시 소관이라,
+    // 거기서 밀려나면 재생·스크럽의 노출 전환마다 drawImage 가 동기 재디코드를 문다(실측은
+    // changelog ver2199). 칸 그림은 decoded 조각을 앱이 쥐고 잉크 칸만 상주하므로 이 잭이
+    // 구조적으로 없다 — 커밋이 만드는 그림과 같은 모양으로 **저장까지** 바꾼다(인코드 펌프가
+    // gd: 행을 MTIL1 로 재저장한다). 로드는 막지 않는다 — 인코드 펌프와 같은 setTimeout 체인.
+    // ★디스크를 덮으므로 등가가 먼저다: 변환본을 실제 소비 경로(gengaDrawTileSetInto)로 재렌더해
+    //   원본 배치와 픽셀이 완전히 같을 때만 교체한다. 다르면 통짜 유지 + 로그 — 그림을 잃는 쪽이
+    //   항상 더 나쁘다. strokes 를 겸장한 하이브리드(ver2032 이전 저장물)도 변환하지 않는다 —
+    //   벡터 판정 경로가 dataUrl 유무를 읽는 자리를 이 판에서 전수하지 않았다.
+    const gengaWholeRasterQueue = [];
+    const gengaWholeRasterSkip = new Set();   // 등가 실패·예외 ref — 재시도하면 실패 루프가 된다
+    let gengaWholeRasterTimer = 0;
+    function gengaScheduleWholeRasterConvert(ref) {
+      if (!ref || gengaWholeRasterSkip.has(String(ref))) return;
+      gengaWholeRasterQueue.push(String(ref));
+      if (!gengaWholeRasterTimer) gengaWholeRasterTimer = setTimeout(gengaWholeRasterConvertPump, 0);
+    }
+    function gengaWholeRasterConvertPump() {
+      gengaWholeRasterTimer = 0;
+      const ref = gengaWholeRasterQueue.shift();
+      if (ref == null) return;
+      gengaConvertWholeRasterToTiles(ref).catch(function(e) {
+        gengaWholeRasterSkip.add(ref);
+        console.error('[gengaTile] whole-raster convert threw for ' + ref + ' - keeping the whole bitmap', e);
+      }).then(function() {
+        if (gengaWholeRasterQueue.length && !gengaWholeRasterTimer) gengaWholeRasterTimer = setTimeout(gengaWholeRasterConvertPump, 0);
+      });
+    }
+    // 이 ref 를 가리키는 그림 메타({ref,w,h,x,y[,strokes]}) — 배치 규약의 입력이다. 없으면 고아라
+    // 변환할 이유도 없다(prune 이 걷는다).
+    function gengaFindDrawingMetaByRef(ref) {
+      const gt = state.project && state.project.gengaTimeline; if (!gt) return null;
+      const want = String(ref);
+      const layers = gt.layers || [];
+      for (let i = 0; i < layers.length; i++) {
+        const l = layers[i];
+        const exps = l.exposures || [];
+        for (let j = 0; j < exps.length; j++) {
+          const d = exps[j] && exps[j].drawing;
+          if (d && String(d.ref) === want) return d;
+        }
+        if (l.sharedDrawings) {
+          const keys = Object.keys(l.sharedDrawings);
+          for (let j = 0; j < keys.length; j++) {
+            const d = l.sharedDrawings[keys[j]];
+            if (d && String(d.ref) === want) return d;
+          }
+        }
+      }
+      return null;
+    }
+    // ★칸 격자는 **그림(트림 상자) 좌표계**로 자른다 — 용지 좌표로 자르면 ts.x(64px 칸 스냅)가
+    //   메타 x(픽셀 정밀)와 어긋나, 표시(dx = place.x - ts.x)·직렬화(합성본 + 메타 x/y 조합)가
+    //   전부 스냅 차만큼 밀린다(첫 구현이 실제로 그렇게 전 장 MISMATCH 를 냈다). 그림 좌표계면
+    //   배치 정본이 계속 메타라서 프로젝트 JSON·gd: 어느 쪽이 먼저 저장돼도 일관된다.
+    //   배치 없는(placed=false) 전면 스트레치 그림은 대상이 아니다 — 커밋·임포트가 더는 만들지
+    //   않는 형태고, 스트레치와 칸 격자는 좌표계가 안 맞는다.
+    async function gengaConvertWholeRasterToTiles(ref) {
+      const url = gengaDrawStore.get(ref);
+      if (typeof url !== 'string' || url.slice(0, 5) !== 'data:') return;   // 스왑됐거나 이미 칸이다
+      const meta = gengaFindDrawingMetaByRef(ref);
+      if (!meta || gengaDrawingStrokes(meta)) return;
+      if (!(Number.isFinite(Number(meta.x)) && Number.isFinite(Number(meta.y)))) return;   // 전면 스트레치 — 비대상
+      const img = await new Promise(function(res) {
+        const im = new Image();
+        im.onload = function() { res(im); };
+        im.onerror = function() { res(null); };
+        im.src = url;
+      });
+      if (!img || !img.naturalWidth) { gengaWholeRasterSkip.add(String(ref)); console.error('[gengaTile] whole-raster decode failed for ' + ref + ' - keeping the whole bitmap'); return; }
+      if (gengaDrawStore.get(ref) !== url) return;   // await 사이에 바뀌었다(획 커밋·스왑)
+      const w = img.naturalWidth, h = img.naturalHeight;   // placed 그림은 1:1 — 그리기 커널과 같은 규약
+      const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+      const cx = cv.getContext('2d', { willReadFrequently: true });
+      cx.drawImage(img, 0, 0);
+      const ts = gengaTileSetFromCanvas(cv, null, null);
+      if (!ts) { paintReleaseCanvas(cv); return; }   // 빈 그림 — 통짜로 둔다(어차피 그릴 것이 없다)
+      // 등가: 실제 소비 경로(낱장 그리기)로 그림 좌표계에 재렌더해 원본과 비교 — 다르면 변환하지 않는다.
+      // 기준은 **알파 완전 일치 + 색 채널 차 ≤1** 이다. 반투명 픽셀은 캔버스의 premultiplied 왕복이
+      // 색을 ±1 흔들 수 있고(실측: 983×1996 에서 2 픽셀, 알파 불변·색 차 1) 그것은 어떤 방법으로도
+      // 0 이 되지 않는다. 잉크 소실(빈 칸 오판)은 알파가 통째로 갈리므로 이 기준이 여전히 잡는다.
+      const chk = document.createElement('canvas'); chk.width = w; chk.height = h;
+      const chkCtx = chk.getContext('2d', { willReadFrequently: true });
+      gengaDrawTileSetInto(chkCtx, ts, { placed: true, x: 0, y: 0, w: w, h: h }, w, h);
+      const a = cx.getImageData(0, 0, w, h).data;
+      const b = chkCtx.getImageData(0, 0, w, h).data;
+      let same = a.length === b.length;
+      if (same) {
+        for (let i = 0; i < a.length; i += 4) {
+          if (a[i + 3] !== b[i + 3]
+              || Math.abs(a[i] - b[i]) > 1 || Math.abs(a[i + 1] - b[i + 1]) > 1 || Math.abs(a[i + 2] - b[i + 2]) > 1) { same = false; break; }
+        }
+      }
+      paintReleaseCanvas(chk); paintReleaseCanvas(cv);
+      if (!same) {
+        gengaWholeRasterSkip.add(String(ref));
+        console.error('[gengaTile] whole-raster convert MISMATCH for ' + ref + ' - keeping the whole bitmap (nothing was written)');
+        return;
+      }
+      if (gengaDrawStore.get(ref) !== url) return;   // 마지막 관문 — 그동안 획이 덮었으면 버린다
+      gengaDrawStore.set(ref, ts);
+      gengaScheduleTileEncode(ref, ts);   // Blob 확정 → gengaPersistTileSet 이 gd: 를 칸으로 재저장
     }
     // 칸 묶음을 새 ref 로 등록한다 — 종전 gengaPutDrawingCanvas 와 **같은 계약**의 그림 객체를 낸다
     // (`tiles` 가 붙는 것만 다르다). ver2197: 인코드·gd: 쓰기는 pump 가 커밋 밖에서 한다.
@@ -79009,9 +79132,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       list.forEach(function(ref) {
         const v = values.get('gd:' + ref);
         if (!v) { missing += 1; return; }   // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
-        if (typeof v === 'string') { gengaDrawStore.set(ref, v); gengaPersistedRefs.add(ref); loaded++; return; }
+        if (typeof v === 'string') { gengaDrawStore.set(ref, v); gengaPersistedRefs.add(ref); loaded++; gengaScheduleWholeRasterConvert(ref); return; }
         if (typeof Blob !== 'undefined' && v instanceof Blob) { blobRefs.push([ref, v]); return; }
-        gengaDrawStore.set(ref, String(v)); gengaPersistedRefs.add(ref); loaded++;
+        gengaDrawStore.set(ref, String(v)); gengaPersistedRefs.add(ref); loaded++; gengaScheduleWholeRasterConvert(ref);
       });
       if (blobRefs.length) {
         // ver2193: 행이 통짜 PNG 인지 칸 묶음인지는 **매직으로** 갈린다(q3=A 라 한 파일에 섞인다).
@@ -79025,7 +79148,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         await Promise.all(tiles.map(function(ts) { return ts ? gengaTileSetDecode(ts) : null; }));
         blobRefs.forEach(function(pair, i) {
           const val = kinds[i] ? tiles[i] : urls[i];
-          if (val) { gengaDrawStore.set(pair[0], val); gengaPersistedRefs.add(pair[0]); loaded++; }
+          if (val) { gengaDrawStore.set(pair[0], val); gengaPersistedRefs.add(pair[0]); loaded++; if (!kinds[i]) gengaScheduleWholeRasterConvert(pair[0]); }   // ver2199: 통짜만 변환 큐로
           else missing += 1;   // 조용히 넘어가지 않는다 — 아래 카운트가 말한다
         });
       }
