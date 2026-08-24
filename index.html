@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2194</title>
+  <title>MoArt ver2195</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24110,6 +24110,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2195, items: [
+        { ja: '**原画の絵が使うメモリを減らしました。** これまでは絵ごとにインク範囲全体のピクセルを持っていましたが、'
+            + 'インクのあるタイルだけを持つようにしました。用紙が大きい作品ほど軽くなり、'
+            + '大きな作品での再生・スクラブの詰まりも減ります。見た目と描き心地は変わりません。',
+          ko: '**원화 그림이 쓰는 메모리를 줄였습니다.** 종전에는 그림마다 잉크 범위 전체의 픽셀을 들고 있었는데, '
+            + '잉크가 있는 칸만 들도록 고쳤습니다. 용지가 큰 작품일수록 가벼워지고, '
+            + '큰 작품에서 재생·스크럽이 막히던 것도 줄어듭니다. 화면과 그리는 감각은 그대로입니다.',
+          en: '**Genga drawings now use less memory.** Each drawing used to keep pixels for its whole ink box; '
+            + 'now only the tiles that actually contain ink stay decoded. The larger the paper, the bigger the saving, '
+            + 'and playback/scrubbing on heavy projects stutters less. Looks and feels exactly the same.',
+          zh: '**原画占用的内存减少了。** 以前每幅画都保留整个墨迹范围的像素，'
+            + '现在只保留有墨迹的图块。画布越大越省，大型作品的播放和拖动也更顺畅。画面和手感不变。' }
+      ] },
       { ver: 2194, items: [
         { ja: '**画面の線が元の解像度で表示されるようになりました。** ver2189 で入れた「表示サイズに合わせて焼いた絵」をやめました。'
             + '筆を離した瞬間に線がぼやける現象がなくなります。',
@@ -53789,6 +53802,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // inlining base64 (see gengaExternalizeDrawings for why). uniqueName 은 오디오·레이어와 공유한다.
         await gengaHydrateDrawStore(state.project);
         await gengaHydrateAudioStore(state.project);
+        await gengaEnsureTilesDecoded(state.project); // ver2195: 아래 외부화가 동기로 통짜를 굽는다 — 미완 칸이 있으면 그 그림이 조용히 빠진다
         gengaExternalizeDrawings(copy.gengaTimeline, uniqueName, media);
         gengaExternalizeAudio(copy.gengaTimeline, uniqueName, media);
       }
@@ -64791,6 +64805,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (started) {
         const drop = [];
         gengaDrawStore.forEach(function(_v, k) { if (!started.has(k)) drop.push(k); });
+        // ver2195: 칸 그림의 GPU 비트맵 즉시 회수(gengaReleaseTileDecodes)는 여기서 안 부른다 —
+        // 서비스가 엔진을 부르지 않는다(모듈 규칙). delete 로 참조가 끊기면 GC 가 회수하고,
+        // 연습에서 그은 몇 장에 즉시 회수의 실익이 없다. 예산 축출·고아 회수(엔진 내부)는 부른다.
         drop.forEach(function(k) { gengaDrawStore.delete(k); });
       }
       const s = tlTut.saved; tlTut = null;
@@ -77691,6 +77708,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!gengaPersistedRefs.has(ref)) continue;          // ★디스크에 없는 것은 절대 안 버린다
         const v = gengaDrawStore.get(ref);
         total -= gengaDrawStoreEntryBytes(v);
+        gengaReleaseTileDecodes(v);                          // ver2195: GPU 비트맵은 그 자리에서 돌려준다
         gengaDrawStore.delete(ref);
         freed += 1;
       }
@@ -77761,14 +77779,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver2193: **저장소 값 → 통짜 dataUrl.** 파일로 나가는 세 자리(인라인 직렬화 · ZIP 외부화 ·
     // 그 폴백)가 종전에는 `gengaDrawStore.get()` 을 문자열로 **전제**했다 — 칸 그림이 그대로 새면
     // `{dataUrl:{...}}` 이 파일에 박힌다. 파일 형식은 이 판에서 안 바꾼다(칸은 IndexedDB 안에서만
-    // 산다) — 그래서 나갈 때 합성본을 굽는다.
+    // 산다) — 그래서 나갈 때 통짜 한 장을 그 자리에서 굽는다(ver2195: 상주 합성본이 사라졌으므로
+    // 디코드된 칸에서 동기로 합친다 — 이 함수는 동기 계약이라 여기서 디코드를 기다릴 수 없고,
+    // 저장 경로는 gengaEnsureTilesDecoded 가 앞에서 전량을 채워 둔다).
     // ★못 구우면 **빈 문자열이 아니라 빈 문자열 + 로그**다. 부르는 쪽은 이미 「없으면 종전 그림을
     //   그대로 둔다」로 되어 있어, 조용히 빈 그림을 적는 ver1448 의 병을 되풀이하지 않는다.
+    //   미완(디코드 안 된 칸이 있음)도 같은 답이다 — 부분 그림을 파일에 적느니 종전 그림이 낫다.
     function gengaStoreValueUrl(v) {
       if (typeof v === 'string') return v;
       if (!gengaIsTileSet(v)) return '';
-      if (!v.composite) { console.error('[gengaTile] no composite to serialize - this drawing cannot be written out'); return ''; }
-      try { return v.composite.toDataURL('image/png'); }
+      if (!gengaTileSetDecodedComplete(v)) { console.error('[gengaTile] undecoded cell(s) at serialize time - this drawing cannot be written out'); return ''; }
+      try { return gengaTileSetComposeCanvas(v).toDataURL('image/png'); }
       catch (e) { console.error('[gengaTile] composite encode failed - this drawing cannot be written out', e); return ''; }
     }
     /* ver2192: **축출된 그림을 디스크에서 도로 데려온다.** `gengaDrawingUrl` 은 동기라 미스에 답을
@@ -77788,12 +77809,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             console.error('[gengaStore] fault-in miss for gd:' + ref + ' - this drawing is not on disk either');
             return false;
           }
-          // ver2193: 행이 칸 묶음일 수 있다. 매직으로 갈라서 칸이면 합성까지 끝내 놓는다 —
-          // 돌아온 그림을 화면과 저장이 **동기로** 요구하므로, 여기서 안 만들면 그 자리가 빈다.
+          // ver2193: 행이 칸 묶음일 수 있다. 매직으로 갈라서 칸이면 디코드까지 끝내 놓는다 —
+          // 돌아온 그림을 시드와 저장이 **동기로** 요구하므로, 여기서 안 채우면 그 자리가 빈다
+          // (ver2195 불변식: store 에 있는 칸 그림은 decoded 가 완비다).
           if (await gengaBlobIsTileSet(v)) {
             const ts = await gengaTileSetFromBlob(v);
             if (!ts) { console.error('[gengaStore] fault-in tile parse failed for gd:' + ref); return false; }
-            await gengaTileSetBuildComposite(ts);
+            await gengaTileSetDecode(ts);
             gengaDrawStore.set(ref, ts);
             gengaPersistedRefs.add(ref);
             return true;
@@ -77825,9 +77847,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const d = l.sharedDrawings[k]; if (d && d.ref && !gengaDrawStore.has(d.ref)) want.add(d.ref);
         });
       });
-      if (!want.size) return 0;
-      await Promise.all(Array.from(want).map(function(ref) { return gengaDrawStoreFaultIn(ref, null); }));
+      if (want.size) await Promise.all(Array.from(want).map(function(ref) { return gengaDrawStoreFaultIn(ref, null); }));
+      await gengaEnsureTilesDecoded(project); // ver2195: 이미 store 에 있던 그림의 미완 디코드까지 마저 채운다
       return want.size;
+    }
+    // ver2195: **직렬화가 동기로 요구하는 픽셀을 앞에서 전부 채운다.** gengaStoreValueUrl 은 동기라
+    // 디코드를 기다릴 수 없다 — 저장·내보내기 경로는 이 함수를 await 한 뒤 직렬화한다.
+    // gengaRehydrateAll(없는 ref 를 디스크에서)과 상보적이다: 이쪽은 「store 에는 있는데 디코드가
+    // 안 끝난」 칸 그림만 본다. store 진입 세 경로(커밋·hydrate·fault-in)가 전부 디코드까지 마치므로
+    // 평소에는 no-op 이고, 그 불변식이 깨졌을 때 저장이 그림을 조용히 빠뜨리지 않게 하는 그물이다.
+    async function gengaEnsureTilesDecoded(project) {
+      const gt = project && project.gengaTimeline; if (!gt) return 0;
+      const jobs = [];
+      const seen = new Set();
+      const add = function(d) {
+        if (!d || !d.ref || seen.has(d.ref)) return;
+        seen.add(d.ref);
+        const v = gengaDrawStore.get(d.ref);
+        if (gengaIsTileSet(v) && !gengaTileSetDecodedComplete(v)) jobs.push(gengaTileSetDecode(v));
+      };
+      (gt.layers || []).forEach(function(l) {
+        (l.exposures || []).forEach(function(e) { add(e.drawing); });
+        if (l.sharedDrawings) Object.keys(l.sharedDrawings).forEach(function(k) { add(l.sharedDrawings[k]); });
+      });
+      if (jobs.length) await Promise.all(jobs);
+      return jobs.length;
     }
     // ---- ver2193: 획이 닿은 칸만 다시 굽는다 (docs/genga_growth_rate_2026-08-24.md · q1=A · q2=64px · q3=A) ----
     // 종전에는 획 하나에 **그림 전체**가 새 PNG 로 다시 만들어졌다(제보 파일 실측: 그림 한 장 평균
@@ -77850,21 +77894,59 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     //   계약을 넓히지 않는다. 넓혔다면 「지금 문자열이 필요한」 15 개 호출부가 전부 칸을 알아야 했다.
     const GENGA_TILE_PX = 64;
     const GENGA_TILE_MAGIC = 'MTIL1\n';
-    // GengaTileSet = { tile, gw, gh, pw, ph, cells: Map<gridIndex, Blob>, composite, x, y, w, h }
-    // `composite` = 잉크 상자(x,y,w,h) 크기의 캔버스. 표시와 **동기 문자열 요구**가 둘 다 이것을 쓴다
-    // (칸을 그때그때 디코드해 합치면 동기일 수가 없다 — 그러면 저장 경로가 빈 그림을 쓴다, ver1448).
+    // GengaTileSet = { tile, gw, gh, pw, ph, cells: Map<gridIndex, Blob>, decoded: Map<gridIndex, bitmap>,
+    //                  thumbCanvas, thumbUrl, x, y, w, h }
+    // ver2195: 잉크 상자 크기 합성본(composite)은 **없다** — 그것이 상주의 나머지 절반이었다
+    // (잉크 상자 안의 빈 공간까지 RGBA 로 들었다). `cells`(압축 Blob)가 정본이고 `decoded` 는
+    // 칸별 디코드 캐시다. **store 에 들어가는 칸 그림은 decoded 가 완비다** — 커밋·hydrate·fault-in
+    // 세 진입로가 전부 채워서 넣는다. 시드(획 시작)와 저장 문자열이 이 불변식 위에서 동기로 돈다.
+    // 통짜 한 장이 꼭 필요한 자리(직렬화·실루엣 소스·스케일 그리기)는 gengaTileSetComposeCanvas 로
+    // **그때 만들어 그때 버린다** — 상주로 캐시하는 순간 이 판이 없앤 것이 도로 생긴다.
     function gengaIsTileSet(v) { return Boolean(v && typeof v === 'object' && v.cells instanceof Map); }
+    function gengaTileSetDecodedComplete(ts) {
+      if (ts.decoded.size < ts.cells.size) return false;
+      let ok = true;
+      ts.cells.forEach(function(_b, idx) { if (!ts.decoded.has(idx)) ok = false; });
+      return ok;
+    }
+    // 잉크 상자(x,y,w,h) 크기의 통짜 캔버스를 **디코드된 칸에서 동기로** 합친다. 미완 칸은 빠진 채
+    // 나가므로(로그만 남긴다) 완비가 필요한 호출부는 gengaTileSetDecodedComplete 를 먼저 물어야 한다.
+    function gengaTileSetComposeCanvas(ts) {
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, ts.w); cv.height = Math.max(1, ts.h);
+      const cx = cv.getContext('2d');
+      let missing = 0;
+      ts.cells.forEach(function(_b, idx) {
+        const bm = ts.decoded.get(idx);
+        if (!bm) { missing += 1; return; }
+        const r = gengaTileRect(idx, ts);
+        cx.drawImage(bm, r.x - ts.x, r.y - ts.y);
+      });
+      if (missing) console.error('[gengaTile] ' + missing + ' undecoded cell(s) missing from the composed canvas');
+      return cv;
+    }
+    // 축출·고아 회수에서 디코드 캐시를 그 자리에서 돌려준다(ImageBitmap 은 GPU 메모리를 쥔다).
+    // cells(Blob)가 정본이라 잃는 것이 없다 — 다시 필요하면 디스크 fault-in 이 도로 디코드한다.
+    function gengaReleaseTileDecodes(v) {
+      if (!gengaIsTileSet(v)) return;
+      v.decoded.forEach(function(bm) { if (bm && typeof bm.close === 'function') bm.close(); });
+      v.decoded.clear();
+      if (v.thumbCanvas) { paintReleaseCanvas(v.thumbCanvas); v.thumbCanvas = null; }
+    }
     function gengaTileGrid(pw, ph) {
       return { gw: Math.max(1, Math.ceil(Math.max(1, pw) / GENGA_TILE_PX)), gh: Math.max(1, Math.ceil(Math.max(1, ph) / GENGA_TILE_PX)) };
     }
-    // 이 맵의 무게. 문자열 그림은 `.length`, 칸 그림은 **칸 바이트 + 합성 캔버스의 RGBA** 다
+    // 이 맵의 무게. 문자열 그림은 `.length`, 칸 그림은 **칸 바이트 + 디코드된 칸의 RGBA** 다
     // (gengaTrimDrawStore 가 두 모양을 같은 자로 재야 예산이 한쪽만 세는 일이 없다).
+    // ver2195: 합성본(잉크 상자 전체 RGBA)이 사라지고 디코드된 칸만 재므로, 잉크 상자 안의
+    // 빈 공간만큼 이 수치 자체가 준다 — 표시 칸화의 상주 이득이 나오는 자리가 여기다.
     function gengaDrawStoreEntryBytes(v) {
       if (typeof v === 'string') return v.length;
       if (!gengaIsTileSet(v)) return 0;
       let n = 0;
       v.cells.forEach(function(b) { n += (b && b.size) || 0; });
-      if (v.composite) n += Math.max(1, v.w) * Math.max(1, v.h) * 4;
+      v.decoded.forEach(function(bm) { n += Math.max(1, bm.width) * Math.max(1, bm.height) * 4; });
+      if (v.thumbCanvas) n += v.thumbCanvas.width * v.thumbCanvas.height * 4;
       return n;
     }
     // 칸 하나가 덮는 용지 사각형(용지 밖은 잘라 낸다 — 오른쪽·아래 끝 칸은 64 보다 작다).
@@ -77931,7 +78013,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       if (!head || !Array.isArray(head.cells)) { console.error('[gengaTile] container header has no cell index'); return null; }
       const ts = { tile: Number(head.tile) || GENGA_TILE_PX, gw: Number(head.gw) || 1, gh: Number(head.gh) || 1,
-                   pw: Number(head.pw) || 1, ph: Number(head.ph) || 1, cells: new Map(), composite: null, x: 0, y: 0, w: 1, h: 1 };
+                   pw: Number(head.pw) || 1, ph: Number(head.ph) || 1, cells: new Map(), decoded: new Map(), x: 0, y: 0, w: 1, h: 1 };
       let off = nl + 1;
       for (let i = 0; i < head.cells.length; i++) {
         const idx = Number(head.cells[i][0]), len = Number(head.cells[i][1]);
@@ -77948,30 +78030,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ts.x = bd.x; ts.y = bd.y; ts.w = bd.w; ts.h = bd.h;
       return ts;
     }
-    // 칸들을 디코드해 잉크 상자 크기 캔버스 하나로 합친다. **화면·문자열 요구가 둘 다 이 결과를 쓴다.**
-    async function gengaTileSetBuildComposite(ts) {
+    // 아직 안 디코드된 칸 전부를 `decoded` 에 채운다. 비트맵을 **버리지 않고 든다** — 화면이 칸을
+    // 직접 그리고(ver2195), 통짜가 필요한 자리는 gengaTileSetComposeCanvas 가 여기서 합친다.
+    async function gengaTileSetDecode(ts) {
       if (!gengaIsTileSet(ts)) return null;
-      if (ts.composite) return ts.composite;
       const entries = [];
-      ts.cells.forEach(function(b, idx) { entries.push([idx, b]); });
+      ts.cells.forEach(function(b, idx) { if (!ts.decoded.has(idx)) entries.push([idx, b]); });
+      if (!entries.length) return ts;
       const bitmaps = await Promise.all(entries.map(function(e) {
         if (typeof createImageBitmap !== 'function') return gengaTileImgFromBlob(e[1]);
         return createImageBitmap(e[1]).catch(function() { return gengaTileImgFromBlob(e[1]); });
       }));
-      const cv = document.createElement('canvas');
-      cv.width = Math.max(1, ts.w); cv.height = Math.max(1, ts.h);
-      const cx = cv.getContext('2d');
-      let drawn = 0;
+      let failed = 0;
       entries.forEach(function(e, k) {
         const bm = bitmaps[k];
-        if (!bm) return;
-        const r = gengaTileRect(e[0], ts);
-        try { cx.drawImage(bm, r.x - ts.x, r.y - ts.y); drawn += 1; } catch (err) {}
-        if (bm.close) bm.close();
+        if (bm) ts.decoded.set(e[0], bm);
+        else failed += 1;
       });
-      if (drawn < entries.length) console.error('[gengaTile] ' + (entries.length - drawn) + ' of ' + entries.length + ' cell(s) failed to decode - this drawing is incomplete');
-      ts.composite = cv;
-      return cv;
+      if (failed) console.error('[gengaTile] ' + failed + ' of ' + entries.length + ' cell(s) failed to decode - this drawing is incomplete');
+      return ts;
     }
     // createImageBitmap 이 없거나 거부한 칸의 폴백. blob: URL 은 쓰고 바로 되돌린다.
     function gengaTileImgFromBlob(b) {
@@ -77983,18 +78060,30 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         img.src = url;
       });
     }
-    // 코마 썸네일은 `<img src>` 라 문자열이 있어야 한다. 합성본을 **작게** 구워 묶음에 얹는다 —
+    // 썸네일용 200px 캔버스. 레이어 헤드(canvas drawImage)와 코마 <img>(아래 dataUrl)가 같은 것을
+    // 본다. 잉크 상자를 한 번 합쳐서 줄인다 — 칸을 축소 배율로 낱장씩 그리면 칸 경계의
+    // 안티에일리어싱이 이음매 줄로 남는다(ver2195 의 스케일 그리기 규칙과 같은 이유).
+    function gengaTileThumbCanvas(ts) {
+      if (!gengaIsTileSet(ts) || !gengaTileSetDecodedComplete(ts)) return null;
+      if (ts.thumbCanvas) return ts.thumbCanvas;
+      const full = gengaTileSetComposeCanvas(ts);
+      const tw = 200, th = Math.max(1, Math.round(200 * Math.max(1, ts.h) / Math.max(1, ts.w)));
+      const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
+      cv.getContext('2d').drawImage(full, 0, 0, tw, th);
+      paintReleaseCanvas(full);
+      ts.thumbCanvas = cv;
+      return cv;
+    }
+    // 코마 썸네일은 `<img src>` 라 문자열이 있어야 한다. 위 캔버스를 구워 묶음에 얹는다 —
     // 벡터의 `gengaVectorThumbDataUrl` 과 같은 계약이고, 묶음이 교체되면 함께 죽는다.
     // 여기서 빈 문자열이 나가면 코마 칸이 통째로 빈다(ver2034 가 벡터에서 겪은 그 자리다).
     function gengaTileThumbDataUrl(ts) {
-      if (!gengaIsTileSet(ts) || !ts.composite) return '';
+      if (!gengaIsTileSet(ts)) return '';
       if (ts.thumbUrl) return ts.thumbUrl;
-      const tw = 200, th = Math.max(1, Math.round(200 * Math.max(1, ts.h) / Math.max(1, ts.w)));
-      const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
-      cv.getContext('2d').drawImage(ts.composite, 0, 0, tw, th);
+      const cv = gengaTileThumbCanvas(ts);
+      if (!cv) return '';
       let url = '';
       try { url = cv.toDataURL('image/png'); } catch (e) { console.error('[gengaTile] thumb encode failed', e); }
-      paintReleaseCanvas(cv);
       ts.thumbUrl = url;
       return url;
     }
@@ -78021,7 +78110,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const pw = Math.max(1, cv.width), ph = Math.max(1, cv.height);
       const g = gengaTileGrid(pw, ph);
       const base = (gengaIsTileSet(prev) && prev.gw === g.gw && prev.gh === g.gh && prev.tile === GENGA_TILE_PX) ? prev : null;
-      const ts = { tile: GENGA_TILE_PX, gw: g.gw, gh: g.gh, pw: pw, ph: ph, cells: new Map(), composite: null, x: 0, y: 0, w: 1, h: 1 };
+      const ts = { tile: GENGA_TILE_PX, gw: g.gw, gh: g.gh, pw: pw, ph: ph, cells: new Map(), decoded: new Map(), x: 0, y: 0, w: 1, h: 1 };
       // ★dirty 는 `scanRect` 가 아니라 **`scanRect.ink`** 다. `scanRect` 는 ver1196 의 트리밍 창이라
       //   기존 그림의 상자를 시드로 갖고 있어서 그림이 클수록 통째로 커진다 — 그것으로 재면
       //   **매번 전 칸이 dirty** 가 되어 이 판이 아무것도 아끼지 못한다(실측으로 그렇게 나왔다).
@@ -78059,10 +78148,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!ts.cells.size) return null;                   // 빈 그림 — 종전 gengaTrimCanvasToDrawing 과 같은 답
       const bd = gengaTileSetBounds(ts);
       ts.x = bd.x; ts.y = bd.y; ts.w = bd.w; ts.h = bd.h;
-      const comp = document.createElement('canvas');     // 합성은 **지금 손에 있는 통짜에서** 잘라 낸다(디코드 0)
-      comp.width = Math.max(1, ts.w); comp.height = Math.max(1, ts.h);
-      comp.getContext('2d').drawImage(cv, ts.x, ts.y, ts.w, ts.h, 0, 0, ts.w, ts.h);
-      ts.composite = comp;
+      // 디코드 캐시는 **지금 손에 있는 통짜에서** 전 칸을 잘라 채운다(디코드 0 — 물려받은 칸의
+      // 픽셀도 세션 캔버스에 이미 있다). base 의 비트맵을 나눠 갖지 않는 것이 요점이다 — 옛 ref 가
+      // 회수될 때 gengaReleaseTileDecodes 가 close 하므로, 나눠 가지면 새 그림의 칸이 함께 죽는다.
+      ts.cells.forEach(function(_b, idx) {
+        const r = gengaTileRect(idx, ts);
+        const t = document.createElement('canvas');
+        t.width = Math.max(1, r.w); t.height = Math.max(1, r.h);
+        t.getContext('2d').drawImage(cv, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+        ts.decoded.set(idx, t);
+      });
       return ts;
     }
     // 칸 묶음을 새 ref 로 등록한다 — 종전 gengaPutDrawingCanvas 와 **같은 계약**의 그림 객체를 낸다
@@ -78266,7 +78361,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 공유 안내·충돌 판정이 벡터 레이어를 없는 셈 친다.
     // ver2192: `evicted` 도 **그림 있음**이다 — 픽셀이 잠시 자리를 비웠을 뿐 디스크에 있다.
     // 여기서 false 를 내면 그 코마가 「빈 칸」으로 취급돼 다음 커밋이 기존 그림을 덮어쓴다.
-    function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas || d.evicted || gengaDrawingStrokes(d))); }
+    function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas || d.tileSet || d.evicted || gengaDrawingStrokes(d))); } // ver2195: 칸 그림은 tileSet 으로 온다
     function gengaResolveDrawing(d) {
       if (!d) return null;
       const u = gengaDrawingUrl(d);
@@ -78275,15 +78370,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 가는 「헛그어짐」의 정체다. 하이브리드는 ver2032 부터 안 만들지만, 이미 저장된 파일이
       // 있으므로 읽는 쪽도 함께 고친다.
       if (u) { const out = { ref: d.ref, w: d.w, h: d.h, dataUrl: u }; if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; } if (d.strokes) out.strokes = d.strokes; return out; }
-      // ver2193: **칸 그림**(q1=A). 소비처에는 종전 `canvas` 계약으로 나간다 — ver1324 가 인코드
-      // 대기 그림을 위해 만든 그 길이고, 픽셀을 읽는 자리는 이미 전부 그 분기를 갖고 있다.
-      // 합성본이 없으면 「없다」가 아니라 **「아직 없다」**다(축출과 같은 취급) — 여기서 빈 그림을
-      // 내면 그 코마 위에 그리는 순간 빈 시드가 기존 그림을 덮어쓴다.
+      // ver2193→ver2195: **칸 그림**(q1=A). 소비처에는 `tileSet`(칸 묶음 그대로)으로 나간다 —
+      // 종전에는 잉크 상자 합성본을 `canvas` 로 실었는데, 그 상주가 이 판이 없앤 것이다.
+      // 그리는 커널(gengaDrawDrawingInto)이 칸을 직접 그리고, 통짜 한 장이 필요한 자리는
+      // gengaTileSetComposeCanvas 로 그때 합친다. 디코드가 덜 끝났어도 「없다」가 아니라
+      // **「아직 없다」**다 — 여기서 빈 그림을 내면 그 코마 위에 그리는 순간 빈 시드가 덮어쓴다.
       const tiles = gengaDrawingTiles(d);
       if (tiles) {
-        const out = { ref: d.ref, w: d.w, h: d.h, tiles: tiles.tile };
-        if (tiles.composite) out.canvas = tiles.composite;
-        else { out.evicted = true; gengaTileSetBuildComposite(tiles).then(function() { drawGengaPreview(); }); }
+        const out = { ref: d.ref, w: d.w, h: d.h, tileSet: tiles };
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
         if (d.strokes) out.strokes = d.strokes;
         return out;
@@ -78461,6 +78555,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaDrawingImageSource(dr, pw, ph, onReady) {
       if (!dr) return null;
       if (dr.canvas) return dr.canvas;
+      // ver2195: 칸 그림 — 통짜 한 장을 그때 합쳐 준다(호출부는 전부 결과를 자기 캐시에 넣는
+      // 저빈도 자리다: 실루엣·진단·FX 베이크). 디코드가 덜 끝났으면 래스터의 「디코드 전」과
+      // 같은 계약으로 null 을 내고 onReady 로 다시 부르게 한다.
+      if (dr.tileSet) {
+        if (gengaTileSetDecodedComplete(dr.tileSet)) return gengaTileSetComposeCanvas(dr.tileSet);
+        const p = gengaTileSetDecode(dr.tileSet);
+        if (onReady) p.then(function() { onReady(); });
+        return null;
+      }
       if (typeof dr.dataUrl === 'string' && dr.dataUrl) return gengaImageFor(dr, onReady);
       const st = gengaDrawingStrokes(dr);
       return st ? gengaVectorBakedCanvas(st, Math.max(1, pw), Math.max(1, ph)) : null;
@@ -78470,6 +78573,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1470: 위치 판정은 커널이 한다. **크기는 계속 안 넘긴다**(3인자 = 원본 크기) — 5인자로 바꾸면
       // dr.w/h 가 이미지 자연 크기와 어긋나는 그림에서 픽셀이 달라진다. 동작 불변이 먼저다.
       const place = gengaDrawingPlacement(dr, pw, ph);
+      if (dr.tileSet) return gengaDrawTileSetInto(ctx, dr.tileSet, place, pw, ph, onReady); // ver2195
       if (dr.canvas) { // ver1324: pending-encode drawing — draw the pixels directly (no decode round-trip)
         if (place.placed) ctx.drawImage(dr.canvas, Math.round(place.x), Math.round(place.y));
         else ctx.drawImage(dr.canvas, 0, 0, pw, ph);
@@ -78504,6 +78608,35 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (place.placed) ctx.drawImage(img, Math.round(place.x), Math.round(place.y));
       else ctx.drawImage(img, 0, 0, pw, ph);
       return true;
+    }
+    // ver2195: 칸 그림을 그리는 커널. **ctx 변환이 항등(평행이동은 무방)일 때만 칸을 낱장으로
+    // 그린다** — 스케일·회전이 걸린 ctx 에 낱장을 그리면 칸마다 가장자리 안티에일리어싱이 따로
+    // 생겨 경계가 줄로 남는다(어니언 고스트가 정확히 그 ctx 다). 그때는 통짜 한 장을 합쳐 한 번에
+    // 그린다. 디코드가 덜 끝났으면 있는 칸만 그리고 마저 디코드를 예약한다 — false 를 돌려주므로
+    // 어니언 캐시는 빈 고스트를 박제하지 않고, onReady 가 끝난 그림으로 다시 그린다.
+    function gengaDrawTileSetInto(ctx, ts, place, pw, ph, onReady) {
+      const complete = gengaTileSetDecodedComplete(ts);
+      if (!complete) {
+        const p = gengaTileSetDecode(ts);
+        if (onReady) p.then(function() { onReady(); });
+      }
+      const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
+      const identityScale = !m || (m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1);
+      if (!identityScale || !place.placed) {
+        if (!complete) return false;
+        const comp = gengaTileSetComposeCanvas(ts);
+        if (place.placed) ctx.drawImage(comp, Math.round(place.x), Math.round(place.y));
+        else ctx.drawImage(comp, 0, 0, pw, ph); // placed 아님 = 전면 스트레치라는 종전 계약 그대로
+        return true;
+      }
+      const dx = Math.round(place.x) - ts.x, dy = Math.round(place.y) - ts.y;
+      ts.cells.forEach(function(_b, idx) {
+        const bm = ts.decoded.get(idx);
+        if (!bm) return;
+        const r = gengaTileRect(idx, ts);
+        ctx.drawImage(bm, r.x + dx, r.y + dy);
+      });
+      return complete;
     }
     // ink bbox of a canvas (alpha>0), or null when fully transparent. Edge-scan: rows top/bottom for y-bounds,
     // then columns within them for x-bounds.
@@ -78624,7 +78757,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const tiles = await Promise.all(blobRefs.map(function(pair, i) {
           return kinds[i] ? gengaTileSetFromBlob(pair[1]) : Promise.resolve(null);
         }));
-        await Promise.all(tiles.map(function(ts) { return ts ? gengaTileSetBuildComposite(ts) : null; }));
+        await Promise.all(tiles.map(function(ts) { return ts ? gengaTileSetDecode(ts) : null; }));
         blobRefs.forEach(function(pair, i) {
           const val = kinds[i] ? tiles[i] : urls[i];
           if (val) { gengaDrawStore.set(pair[0], val); gengaPersistedRefs.add(pair[0]); loaded++; }
@@ -78834,7 +78967,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaDrawStore.forEach(function(v, ref) {
         if (drawRefs.has(ref)) return;
         freedDrawings += 1;
-        freedBytes += (typeof v === 'string') ? v.length : 0;
+        freedBytes += gengaDrawStoreEntryBytes(v); // ver2195: 칸 그림(문자열 아님)의 회수가 0 으로 잡히지 않게 — 예산과 같은 자
+        gengaReleaseTileDecodes(v);
         gengaDrawStore.delete(ref);
       });
       gengaAudioStore.forEach(function(_v, ref) { if (!audioRefs.has(ref)) gengaAudioStore.delete(ref); });
@@ -81013,10 +81147,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 종전 키(래스터 전용)로는 빈 키가 나와 여기서 null 이 됐고, 그러면 FX 기즈모와 目盛り 원점이
     // 그 그림의 상자를 못 찾는다. 벡터는 종전대로 빈 키다 — 이 판에서 넓히지 않는다.
     function gengaDrawnBounds(dr, pw, ph) {
-      const key = gengaRasterCacheKey(dr) || ((dr && dr.canvas && dr.ref) ? String(dr.ref) : '');
+      const key = gengaRasterCacheKey(dr) || ((dr && (dr.canvas || dr.tileSet) && dr.ref) ? String(dr.ref) : ''); // ver2195: 칸 그림도 픽셀을 들고 있다
       if (!key) return null;
       if (gengaDrawnBoundsCache.has(key)) return gengaDrawnBoundsCache.get(key);
-      if (!dr.canvas) {
+      if (!dr.canvas && !dr.tileSet) {
         const img = gengaImageCache.get(key);
         if (!img || !img.complete || !img.naturalWidth) return null; // not decoded yet — retry later, cache nothing
       }
@@ -90427,10 +90561,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 디코드 캐시 검사는 래스터에만 뜻이 있다.
         const drStrokes = gengaDrawingStrokes(dr);
         if (!drStrokes) {
-          // ver2193: 칸 그림은 dataUrl 이 없고 픽셀은 합성본에 있다 — 종전 문에 걸리면 그 노출이
+          // ver2193: 칸 그림은 dataUrl 이 없고 픽셀은 디코드된 칸에 있다(ver2195) — 종전 문에 걸리면 그 노출이
           // 굽기에서 빠진 채 아래에서 FX 트랙만 지워져 **FX 가 영구히 사라진다**(ver748·ver2033 과 같은 병).
-          if (!dr.dataUrl && !dr.canvas) return;
-          if (!dr.canvas && !gengaImageFor(dr, null)) { coldMisses += 1; return; } // cold cache; the call starts the decode, so a retry succeeds
+          if (!dr.dataUrl && !dr.canvas && !dr.tileSet) return;
+          if (!dr.canvas && !dr.tileSet && !gengaImageFor(dr, null)) { coldMisses += 1; return; } // cold cache; the call starts the decode, so a retry succeeds
+          // ver2195: 미완 칸 그림도 콜드 캐시와 같은 원자성으로 다룬다 — 여기서 안 거르면 아래
+          // bake 가 null 을 내고 FX 트랙만 지워진다(ver748 이 막은 바로 그 손실).
+          if (dr.tileSet && !gengaTileSetDecodedComplete(dr.tileSet)) { coldMisses += 1; gengaTileSetDecode(dr.tileSet); return; }
         }
         bakes[e.id] = gengaBakeExposureFx(layer, e, timeMode === 'frame' ? curFrame : e.startFrame, bakeTracks);
       });
@@ -93070,7 +93207,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaNearestDrawing(layer, frame) { // → resolved drawing OBJECT (placement-aware), not a bare url
       if (!layer || !Array.isArray(layer.exposures)) return null;
       // ver2034: 벡터 그림도 「그림 있음」이다 — 안 세면 썸네일이 흰 빈칸이 된다(제보).
-      const hasArt = function(d) { return Boolean(d && (d.dataUrl || d.canvas || gengaDrawingStrokes(d))); };
+      const hasArt = function(d) { return Boolean(d && (d.dataUrl || d.canvas || d.tileSet || gengaDrawingStrokes(d))); }; // ver2195: 칸 그림도 소스가 된다
       const exact = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
       if (hasArt(exact)) return exact; // ver1324: pending-encode art counts
       let best = null, bestDist = Infinity;
@@ -93099,7 +93236,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver2034: 벡터는 구운 캔버스를 그대로 소스로 쓴다(썸네일은 작아 캐시 한 장이면 충분하다).
         const thumbVec = dr ? gengaDrawingStrokes(dr) : null;
         const thumbSrc = thumbVec ? gengaVectorBakedCanvas(thumbVec, Math.max(1, gt.paper.w), Math.max(1, gt.paper.h))
-                                  : (dr ? (dr.canvas || (dr.dataUrl ? gengaImageFor(dr, drawGengaLayerThumbs) : null)) : null); // ver1324: pending-encode drawings paint from their canvas, same placement law
+                                  : (dr ? (dr.canvas || (dr.tileSet ? gengaTileThumbCanvas(dr.tileSet) : null) || (dr.dataUrl ? gengaImageFor(dr, drawGengaLayerThumbs) : null)) : null); // ver1324: pending-encode drawings paint from their canvas, same placement law. ver2195: 칸 그림은 200px 썸 캐시로 — 매 렌더 잉크 상자 합성은 상주를 되살린다
         if (thumbSrc) {
           const gtp = state.project.gengaTimeline, pw = Math.max(1, gtp.paper.w), ph = Math.max(1, gtp.paper.h);
           // ver1470: 커널이 용지 px 로 답하고 여기서 썸네일 캔버스 px 로 옮긴다. `placed:false` 면
@@ -94021,7 +94158,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const x2 = Math.min(pw, Math.ceil(b.x1)), y2 = Math.min(ph, Math.ceil(b.y1));
         return { x: x, y: y, w: Math.max(0, x2 - x), h: Math.max(0, y2 - y) };
       }
-      if (!dr || !(dr.dataUrl || dr.canvas)) return null; // ver1324: a pending-encode drawing is trimmed art too — omitting it from the union seed would let the scan window crop the prior ink (the exact ver1196 premise)
+      if (!dr || !(dr.dataUrl || dr.canvas || dr.tileSet)) return null; // ver1324: a pending-encode drawing is trimmed art too — omitting it from the union seed would let the scan window crop the prior ink (the exact ver1196 premise). ver2195: 칸 그림도 트림된 그림이다 — 빼면 커밋 트리밍이 기존 잉크를 자른다
       // A trimmed drawing is placed 1:1 at x,y — and the decode-race fallback (gengaDrawDrawingInto paints
       // gengaLastStrokeCanvas at 0,0) is gated on the same dataUrl, whose ink bbox IS this rect, so both
       // seed paths land inside it.
@@ -95265,9 +95402,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1324: a pending-encode drawing has pixels but no URL string yet — the <img> patch would blank the
       // thumb for the encode window. Skip; gengaSettleDrawingEncode re-calls this once the string exists.
       const resolved = gengaExposureDrawing(layer, e);
-      // ver2193: 칸 그림도 canvas 로 오지만 **대기가 아니다** — 여기서 건너뛰면 코마 칸이 옛 그림에
-      // 머문 채 아무도 다시 안 부른다(대기 그림은 settle 이 다시 부르지만 칸에는 그 자리가 없다).
-      if (resolved && resolved.canvas && !resolved.dataUrl && !resolved.tiles) return;
+      // ver2193→ver2195: 칸 그림은 tileSet 으로 오므로 이 문에 안 걸린다 — 인코드 대기(canvas 만
+      // 있고 문자열이 아직 없는 그림)만 건너뛴다(settle 이 다시 부른다).
+      if (resolved && resolved.canvas && !resolved.dataUrl) return;
       const key = gengaValueKey(e.instanceValue);
       const targets = (key === null) ? [e] : (layer.exposures || []).filter(function(x) { return gengaValueKey(x.instanceValue) === key; });
       // ver1920: 수정공정 리비전 레이어는 그림을 그려도 화면(흐림 클래스)이 안 바뀌었다 --
@@ -98409,6 +98546,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2192: 축출된 그림은 **디스크에서 돌아올 때까지 그리기를 막는다.** 여기서 통과시키면
       // 빈 시드 위에 그려 그 코마의 기존 그림이 사라진다 — 이 판에서 가장 위험한 자리다.
       if (dr && dr.evicted && dr.ref) { gengaDrawStoreFaultIn(dr.ref, retry); return false; }
+      // ver2195 그물: store 진입 세 경로가 디코드까지 마치므로 여기 걸리면 그 불변식이 깨진 것이다 —
+      // 그래도 통과시키면 빈 시드가 기존 그림을 덮어쓰므로(위 evicted 와 같은 병) 막고 소리 낸다.
+      if (dr && dr.tileSet && !gengaTileSetDecodedComplete(dr.tileSet)) {
+        console.error('[gengaTile] undecoded cell(s) at edit entry - the store invariant is broken');
+        gengaTileSetDecode(dr.tileSet).then(function() { retry(); });
+        return false;
+      }
       if (!dr || !dr.dataUrl) return true; // no bitmap → nothing to wait for
       if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) return true; // sync fallback covers it
       const readyKey = gengaRasterCacheKey(dr);
@@ -98935,8 +99079,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaKomaClipboard = { span: (selE - selS + 1), komas: slices.map(function(k) { return { rel: k.rel, holdFrames: k.holdFrames, instanceValue: k.instanceValue, drawing: k.drawing }; }) };
       gengaClipTouch('koma'); // ver1396
       // mirror to the OS clipboard (marker + first drawn slice's bitmap)
-      // ver2193: 칸 그림은 dataUrl 이 없다 — 합성본을 굽는다(안 그러면 OS 클립보드만 조용히 빈다).
-      const firstDrawn = slices.map(function(k) { return k._dr; }).find(function(d) { return d && (d.dataUrl || d.canvas); });
+      // ver2193: 칸 그림은 dataUrl 이 없다 — 통짜를 그때 굽는다(안 그러면 OS 클립보드만 조용히 빈다).
+      const firstDrawn = slices.map(function(k) { return k._dr; }).find(function(d) { return d && (d.dataUrl || d.canvas || d.tileSet); });
       const firstUrl = firstDrawn ? (firstDrawn.dataUrl || gengaStoreValueUrl(gengaDrawStore.get(firstDrawn.ref))) : '';
       gengaWriteKomaToClipboard(firstUrl || null);
       if (cut) {
