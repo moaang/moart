@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2201</title>
+  <title>MoArt ver2202</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24115,6 +24115,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2202, items: [
+        { ja: '**線を引いたあとのコマサムネイル更新が軽くなりました。** これまでは一筆ごとに'
+            + 'サムネイル画像の圧縮をその場で行っていて、連続で描くと細かな引っかかりの原因に'
+            + 'なっていました。圧縮を画面の外に移し、サムネイルは出来上がり次第（一瞬あと）'
+            + '差し替わります。',
+          ko: '**선을 그은 뒤 코마 썸네일 갱신이 가벼워졌습니다.** 지금까지는 획마다 썸네일 '
+            + '이미지 압축을 그 자리에서 해서, 연달아 그릴 때 잔걸림의 원인이 됐습니다. 압축을 '
+            + '화면 밖으로 옮겨, 썸네일은 완성되는 대로(한순간 뒤) 바뀝니다.',
+          en: '**Koma thumbnail updates after a stroke are lighter.** Each stroke used to compress '
+            + 'the thumbnail image on the spot, causing small hitches during rapid drawing. The '
+            + 'compression now runs off-screen and the thumbnail swaps in a moment later.',
+          zh: '**画完一笔后的分格缩略图更新变轻了。** 以前每一笔都会当场压缩缩略图图片，连续'
+            + '作画时会造成细小的卡顿。现在压缩移到画面外进行，缩略图完成后（片刻之后）即会替换。' }
+      ] },
       { ver: 2199, items: [
         { ja: '**読み込んだ作品の再生・再生バーが軽くなります。** 取り込んだ絵は今までひと塊の'
             + 'ままで、コマが替わる瞬間に毎回デコードし直すことがありました（サンプル実測で最大 '
@@ -78223,6 +78237,37 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
       } catch (e) { console.warn('[gengaThumb] IndexedDB write threw for gt:' + ref, e); }
     }
+    // ver2202: 칸 커밋의 코마 썸 — 손에 든 통짜 캔버스에서 절단(동기, 0.2ms급)하고 PNG 인코드는
+    // toBlob 로 화면 밖. cv 의 (ts.x, ts.y, ts.w, ts.h) 절단은 gengaTileSetComposeCanvas(ts) 와
+    // 같은 픽셀이다(칸 조각이 방금 그 cv 에서 잘려 나왔다 — 픽셀 diff 0 실측). 대기 동안의
+    // gengaUpdateExpDom 은 이 Set 을 보고 스킵하고(옛 썸 유지 — 빈 칸이 아니다), 완료가 반드시
+    // 재호출한다. 그래서 통짜 bake 의 gengaThumbBakePending 과 Set 을 **가르지 않으면 안 된다** —
+    // 그쪽은 완료가 재호출하지 않는 계약이라, 한 Set 이면 통짜 미스의 패치가 영영 안 온다.
+    // 실패는 warn + 재호출 — 미스 경로(gengaTileThumbDataUrl)가 그 자리에서 동기로 받는다.
+    let gengaThumbCommitBakePending = new Set();
+    function gengaThumbBakeFromCommitCanvas(ref, cv, ts, layerId, frame) {
+      if (!ref || gengaThumbCache.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
+      let tcv = null;
+      try { tcv = gengaThumbCanvasFrom(cv, ts.w, ts.h, ts.x, ts.y); }
+      catch (e) { console.warn('[gengaThumb] commit-canvas thumb crop failed - miss path rebuilds on render', e); return; }
+      gengaThumbCommitBakePending.add(ref);
+      const done = function(url) {
+        gengaThumbCommitBakePending.delete(ref);
+        paintReleaseCanvas(tcv);
+        if (url) gengaThumbPersist(ref, url);
+        else console.warn('[gengaThumb] commit-canvas thumb encode failed for ' + ref + ' - miss path rebuilds on render');
+        gengaUpdateExpDom(layerId, frame);
+      };
+      try {
+        tcv.toBlob(function(blob) {
+          if (!blob) { done(''); return; }
+          const fr = new FileReader();
+          fr.onload = function() { done(String(fr.result || '')); };
+          fr.onerror = function() { done(''); };
+          fr.readAsDataURL(blob);
+        }, 'image/png');
+      } catch (e) { done(''); }
+    }
     // 통짜 base64 그림의 썸을 화면 밖에서 굽는다(그동안의 표시는 원본 그대로 — 현행과 같아 퇴행이 없다).
     function gengaThumbBakeFromDataUrl(ref, dataUrl) {
       if (!ref || !dataUrl || gengaThumbCache.has(ref) || gengaThumbBakePending.has(ref)) return;
@@ -95837,12 +95882,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ★칸 경로가 **던지면 통짜로 물러선다.** 그림을 잃느니 종전 비용을 치르는 편이 낫다.
       let drawing = null;
       let tiled = false;
+      let committedTs = null;
       try {
         const liveLayer = gengaLayerById(layerId);
         const liveExp = liveLayer && gengaExposureAt(liveLayer, frame);
         const prevTiles = liveExp ? gengaDrawingTiles(gengaExposureDrawing(liveLayer, liveExp)) : null;
         const ts = gengaTileSetFromCanvas(cv, scanRect, prevTiles);
         drawing = ts ? gengaPutDrawingTiles(ts) : null;   // null = 빈 그림(종전 트림이 내던 답과 같다)
+        committedTs = ts;
         tiled = true;
       } catch (e) {
         console.error('[gengaTile] commit failed - falling back to the whole-drawing encode', e);
@@ -95852,6 +95899,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         drawing = trimmed
           ? gengaPutDrawingCanvas(trimmed.canvas, trimmed.w, trimmed.h, trimmed.x, trimmed.y, { layerId: layerId, frame: frame, fullCanvas: cv })
           : null;
+      }
+      // ver2202: 코마 썸 인코드를 획의 동기 구간 밖으로. 종전에는 gengaCommitDrawing 안 lean 경로의
+      // gengaUpdateExpDom → gengaThumbUrlFor 가 새 ref 미스로 「그림 상자 합성 + PNG 인코드」를
+      // 동기로 물었다(획마다 12~13ms — 커밋의 1/4~1/3, BW 실기 실측의 본체). **인코드를 커밋
+      // 시점의 동기 선굽기로 옮기는 것은 답이 아니었다** — toDataURL(readback + PNG)이 지배라
+      // 커밋 총시간이 그대로였다(실기 A/B 로 확인). 그래서 절단(0.2ms)만 동기로 하고 인코드는
+      // toBlob(화면 밖)으로 — 대기 중인 gengaUpdateExpDom 은 스킵되고 완료 콜백이 재호출한다.
+      if (tiled && drawing && drawing.ref && committedTs) {
+        gengaThumbBakeFromCommitCanvas(drawing.ref, cv, committedTs, layerId, frame);
       }
       gengaCommitDrawing(layerId, frame, drawing, label, selectionRider); // ver1314: 선택을 같은 undo 스텝에 태울 때만 전달
       // ver2193: 칸 경로에는 **대기 상태가 없다**(인코드가 동기다). 그래서 종전에 인코드가 끝난 뒤
@@ -95876,6 +95932,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2193→ver2195: 칸 그림은 tileSet 으로 오므로 이 문에 안 걸린다 — 인코드 대기(canvas 만
       // 있고 문자열이 아직 없는 그림)만 건너뛴다(settle 이 다시 부른다).
       if (resolved && resolved.canvas && !resolved.dataUrl) return;
+      // ver2202: 커밋의 코마 썸 인코드(toBlob) 대기 — 같은 계약이다: 스킵하면 옛 썸이 잠시 남고,
+      // 완료 콜백이 반드시 재호출한다. 여기서 스킵 없이 gengaThumbUrlFor 로 가면 미스 경로가
+      // 「합성 + 동기 PNG 인코드」를 물어 인코드를 밖으로 뺀 뜻이 없어진다.
+      if (resolved && resolved.ref && gengaThumbCommitBakePending.has(resolved.ref)) return;
       const key = gengaValueKey(e.instanceValue);
       const targets = (key === null) ? [e] : (layer.exposures || []).filter(function(x) { return gengaValueKey(x.instanceValue) === key; });
       // ver1920: 수정공정 리비전 레이어는 그림을 그려도 화면(흐림 클래스)이 안 바뀌었다 --
