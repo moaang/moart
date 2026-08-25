@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2209</title>
+  <title>MoArt ver2210</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21683,7 +21683,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (command.gengaLayerPatchEdit) { // ver754: genga per-layer light undo/redo (drawing / FX)
         pushOther(command);
-        applyGengaLayerPatchHistoryState(payload);
+        applyGengaLayerPatchHistoryState(payload, { gengaStrokeCommit: Boolean(command.gengaStrokeCommit) }); // ver2210: 획 커밋 표시를 넘긴다 — 캐시 keep 판정(a1)
         return;
       }
       if (command.timelineStructureEdit) {
@@ -24118,6 +24118,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2210, items: [
+        { ja: '**線を引いたあとの「元に戻す／やり直し」が軽くなりました。**'
+            + ' ストロークの取り消しでもレイヤー合成のキャッシュを保つようになり、大きな用紙で'
+            + ' 1 回ごとに約 50ms かかっていた合成のやり直しがなくなります。絵は変わりません。',
+          ko: '**선을 그은 뒤의 「되돌리기/다시하기」가 가벼워졌습니다.**'
+            + ' 획을 되돌릴 때도 레이어 합성 캐시를 유지해, 큰 용지에서 한 번마다 약 50ms 들던'
+            + ' 합성 다시 하기가 사라집니다. 그림은 달라지지 않습니다.',
+          en: '**Undo/redo of a stroke is now lighter.**'
+            + ' The layer-composite cache survives stroke undo/redo as well, removing about 50ms of'
+            + ' re-compositing per step on large papers. The art itself is unchanged.',
+          zh: '**画线后的「撤销／重做」变得更轻快了。**'
+            + ' 撤销笔画时也会保留图层合成缓存，大尺寸用纸上每次约 50ms 的重新合成不再发生。'
+            + '图像不会改变。' }
+      ] },
       { ver: 2209, items: [
         { ja: '**続けて線を引くとき、ストロークの合間に入っていた引っかかりを減らしました。**'
             + ' レイヤー合成のキャッシュがストロークをまたいで生きるようになり、大きな用紙では'
@@ -92747,6 +92761,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     let gengaFrameStack = null; // { frame, layerId(중심), fxOpen, belowCache(용지 크기), aboveCache(pad 포함), aboveFoldable }
     let gengaHydrateInFlight = false; // ver2209: gengaHydrateDrawStore 진행 중 — 이 동안은 캐시를 쓰지도 굽지도 않는다(미수화 스택이 박제된다). 완료가 무효화+재렌더로 닫는다
     function gengaFrameStackInvalidate() { gengaFrameStack = null; }
+    // ver2210: 획 커밋과 그 undo/redo 가 공유하는 keep 판정식 한 벌(컬링 재판정 a1) — 대상 레이어
+    // 전부가 캐시 중심 레이어면 below/above 캐시는 정의상 유효하다(중심 레이어는 어느 캐시에도 없다).
+    function gengaFrameStackStrokeKeepOk(layerIds) {
+      return Boolean(gengaFrameStack && layerIds && layerIds.length
+        && layerIds.every(function(id) { return String(id) === gengaFrameStack.layerId; }));
+    }
     // 캐시 구축 중 디코드 미완 그림(칸 fault-in · 이미지 미스)을 만나면 onReady 가 이것을 부른다 —
     // 부분만 담긴 캐시를 버리고 완전한 그림으로 다시 굽는다. 미완이면 onReady 는 반드시 온다
     // (gengaDrawTileSetInto 가 디코드를 예약하고, gengaImageFor 미스도 onReady 를 예약한다).
@@ -98748,9 +98768,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (byId.has(id)) replaceObjectContentsInPlace(l, byId.get(id)); // keep the identity gt.layers holds
       });
       onionClearGhostCache();                 // tinted onion frames cache pixels that just changed
-      gengaFrameStackInvalidate();            // ver2209: lean undo/redo 도 명령 경계다(q2=A) — 대상 레이어가 스택 안이면 캐시가 낡는다
-      gengaReliftSelectionAfterHistory();     // a pristine floating selection's base/patch cache is now stale
       const layerIds = Array.from(byId.keys());
+      // ver2210(컬링 재판정 a1): 획 커밋의 undo/redo 만 프레임 캐시를 유지한다 — 커밋 strokeKeep 과
+      // 같은 판정식·같은 논거(중심 레이어는 below/above 어느 캐시에도 없다). 그 밖의 lean 명령
+      // (표시·불투명도·blend·FX·노출…)은 ver2209 q2=A 보수 원칙대로 통째로 버린다.
+      const strokeKeep = Boolean(options && options.gengaStrokeCommit) && gengaFrameStackStrokeKeepOk(layerIds);
+      if (!strokeKeep) gengaFrameStackInvalidate();
+      gengaReliftSelectionAfterHistory();     // a pristine floating selection's base/patch cache is now stale
       // ver1234: same FX-label-sequence escalation runGengaLayerPatchCommand does — undoing/redoing a key
       // that adds or removes a run shifts every higher layer's labels too, which a keyed-row patch can't repaint.
       const fxSeqShifted = gengaFxRunCountShifted(layerIds.map(function(id) {
@@ -98794,8 +98818,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2209: 그리기 커밋(gengaStrokeCommit)이 캐시의 중심 레이어만 바꿀 때만 프레임 캐시가 산다 —
       // 중심 레이어는 below/above 어느 캐시에도 없으므로 정의상 유효(연타가 벽 없이 이어지는 핵심).
       // 그 밖의 lean 명령(표시·불투명도·blend·FX·노출…)은 q2=A 보수 원칙대로 통째로 버린다.
-      const strokeKeep = refreshOptions && refreshOptions.gengaStrokeCommit && gengaFrameStack
-        && ids.length && ids.every(function(id) { return id === gengaFrameStack.layerId; });
+      const isStrokeCommit = Boolean(refreshOptions && refreshOptions.gengaStrokeCommit);
+      const strokeKeep = isStrokeCommit && gengaFrameStackStrokeKeepOk(ids);
       if (!strokeKeep) gengaFrameStackInvalidate();
       const beforeById = new Map(before.layers.map(function(item) { return [String(item.id), item.layer]; }));
       const fxSeqShifted = gengaFxRunCountShifted(after.layers.map(function(item) {
@@ -98804,7 +98828,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gengaRenderPlan = fxSeqShifted
         ? { scope: 'all', reason: 'fx-label-seq' }
         : { scope: 'partial', layerIds: ids, audio: false };
-      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaLayerPatchEdit: true, gengaRenderPlan: gengaRenderPlan }, refreshOptions && refreshOptions.selectionRider)); // ver1314: 선택 라이더
+      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaLayerPatchEdit: true, gengaStrokeCommit: isStrokeCommit, gengaRenderPlan: gengaRenderPlan }, refreshOptions && refreshOptions.selectionRider)); // ver1314: 선택 라이더 · ver2210: 획 커밋 표시 — undo/redo 의 캐시 keep 판정(a1)이 읽는다
       if (tlTut) { try { tlTutOnCommand(name); } catch (e) {} } // ver1148: layer-patch ops (post/preBehavior, onion, eye…) are detectable too
       state.redoStack = [];
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
