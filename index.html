@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2212</title>
+  <title>MoArt ver2213</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -20032,6 +20032,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const droppedFromStack = state.undoStack.length <= lenBeforePush;
       const redoAboutToBeDropped = !(options && options.historyTraversal) && state.redoStack.length > 0;
       if (droppedFromStack || redoAboutToBeDropped) scheduleGengaStorePrune();
+      flushPendingBudgetTrims(); // ver2213 (축출 순서 ②): 커밋 = 확실한 획 끝 — 획 중 미룬 캐시 트림을 여기서 거둔다
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
       syncUndoHistoryWindow(); // no-op unless the 履歴 window is open (debounced past this command's redo-clear)
     }
@@ -20214,10 +20215,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // drawing, runCommand.before the whole project). Remove a MIDDLE command and undoing past the hole applies a
     // state that never contained the removed edit - it silently vanishes while the history window still lists
     // the steps around it. Only the far end can truthfully say "everything past here is unreachable".
+    // ver2213 (축출 순서 ①): 픽셀 캐시가 예산을 넘보는 압력 상태에서는 undo 예산을 절반으로 조인다
+    // (D 1-D — 그림이 이력보다 비싸다). 바닥 MIN_UNDO_HISTORY_STEPS 는 불변이고, 조인 값은
+    // historyTrimNotice.budgetBytes 와 콘솔 warn 에 그대로 실려 이력 창에 드러난다.
+    const HISTORY_PRESSURE_FACTOR = 0.5;
     function trimUndoStackToMemoryBudget() {
       const stack = state.undoStack;
       if (!Array.isArray(stack) || stack.length <= MIN_UNDO_HISTORY_STEPS) return;
-      const budget = historyMemoryBudgetBytes();
+      const budget = Math.round(historyMemoryBudgetBytes() * (pixelCachePressure() ? HISTORY_PRESSURE_FACTOR : 1));
       let total = historyStacksBytes([stack]).total;
       if (total <= budget) return;
       const startTotal = total;
@@ -24145,6 +24150,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2213, items: [
+        { ja: '**メモリが逼迫したときの整理順序を整えました。**'
+            + ' 描いている最中はキャッシュを整理せず（ペンを離してから）、画面に見えている'
+            + 'オニオンスキンは整理対象から外し、それでも足りないときは取り消し履歴から'
+            + '先に縮めます（履歴ウィンドウにその印が出ます）。',
+          ko: '**메모리가 부족할 때의 정리 순서를 세웠습니다.**'
+            + ' 그리는 도중에는 캐시를 정리하지 않고(펜을 뗀 뒤에), 화면에 보이는 어니언'
+            + ' 스킨은 정리 대상에서 빼며, 그래도 모자라면 되돌리기 이력부터 줄입니다'
+            + '(이력 창에 그 표시가 남습니다).',
+          en: '**Ordered how caches are reclaimed under memory pressure.**'
+            + ' Nothing is trimmed mid-stroke (it waits until the pen lifts), onion-skin ghosts'
+            + ' currently on screen are kept resident, and when memory is still tight the undo'
+            + ' history is tightened first (the history window marks the cut).',
+          zh: '**整理了内存吃紧时的清理顺序。**'
+            + ' 绘制过程中不清理缓存（抬笔后再清理），画面上正在显示的洋葱皮不参与清理，'
+            + ' 若仍不足则优先收紧撤销历史（历史窗口会显示裁剪标记）。' }
+      ] },
       { ver: 2212, items: [
         { ja: '**再生・シークバー移動中はオニオンスキンを表示しないようにしました。**'
             + ' オニオンスキンは停止中の作画用の補助です。今までは、コンテでオニオンスキンを'
@@ -45893,6 +45915,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // The cache is genga's (LRU, byte-budgeted), now serving both: conte had NONE and re-decoded the
     // PNG plus re-ran this pixel loop for every ghost on every preview rebuild.
     const onionGhostCache = new Map();
+    // ver2213 (축출 순서 ③): 마지막 렌더 패스가 실제로 그린 고스트 수 — 원화는 drawGengaPreview 의
+    // 어니언 루프, 콘티는 onionSkinPreviewHtml 이 갱신한다. trimBudgetedMap 의 minKeep(맵 꼬리
+    // 최소 상주)과 onionProtectedBytes(압력 판정의 제외분)가 읽는다. 같은 그림을 여러 이웃이
+    // 공유하면 캐시 항목 수보다 클 수 있다 — 보호가 넉넉해지는 방향이라 무해하고, 상한은 여전히
+    // 화면 범위 규모다(「딱 그 범위만」 — 설정 이론치가 아니라 실제 그린 수).
+    let onionVisibleGhostCount = 0;
     function onionClearGhostCache() { onionGhostCache.clear(); }
     function onionGhostTintInPlace(ctx, w, h, tint) {
       let imageData = null;
@@ -45942,7 +45970,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const cx = cv.getContext('2d');
       if (paint(cx, cw, ch) === false) return null;
       if (!onionGhostTintInPlace(cx, cw, ch, tint)) return null;
-      budgetedMapSet(onionGhostCache, key, cv, 48, 'onion');
+      budgetedMapSet(onionGhostCache, key, cv, 48, 'onion', onionVisibleGhostCount); // ver2213: 화면 범위는 예산 밖 상주
       return cv;
     }
     // ver1273: ONE iteration for both modes — which distance bars are on, in what ORDER, at what
@@ -46352,13 +46380,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function onionSkinPreviewHtml(project, slot) {
-      if (!state.videoEditMode || !onionSkinEnabled(project) || !slot || !slot.cut) return '';
+      if (!state.videoEditMode || !onionSkinEnabled(project) || !slot || !slot.cut) { onionVisibleGhostCount = 0; return ''; }
       const parts = [];
       onionSkinForEachGhostSlot(project, slot, function(ghost) {
         onionSkinEntriesForSlot(project, ghost.item).forEach(function(entry) {
-          parts.push(onionSkinLayerHtml(entry, ghost.direction, ghost.opacity));
+          const html = onionSkinLayerHtml(entry, ghost.direction, ghost.opacity);
+          if (html) parts.push(html); // 빈 문자열(그림 없는 이웃)은 고스트가 아니다 — 세지 않는다
         });
       });
+      onionVisibleGhostCount = parts.length; // ver2213: 화면 고스트 수 — 캐시 floor 와 압력 제외분의 자
       return parts.join('');
     }
 
@@ -52635,19 +52665,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ['settings.memory.row.mask', memoryUsageMapBytes(gengaEnvMaskCache)],
         ['settings.memory.row.live', liveBytes]
       ];
-      let pixelTotal = 0;
       rows.innerHTML = '';
       pixelRows.forEach(function(pair) {
-        pixelTotal += pair[1];
         rows.appendChild(storageUsageRow(t(pair[0]), inspectBytesLabel(pair[1])));
       });
+      // ver2213 (축출 순서 ①): 합계·경고의 정본은 pixelCacheTotalBytes/pixelCachePressure — 압력
+      // 판정(undo 조이기)과 같은 함수다. 경고 잣대는 어니언 최소 상주분을 뺀다: ③이 허가한 상주를
+      // 「예산 초과」로 읽으면 어니언을 쓰는 것만으로 경고가 상시 점등된다. 그래서 합계 행(실제
+      // 총합)이 예산을 넘는데 경고가 없는 상태가 있을 수 있다 — 그 차이가 곧 어니언 허가분이다.
       rows.appendChild(storageUsageRow(t('settings.memory.row.pixelTotal'),
-        t('settings.memory.ofBudget', inspectBytesLabel(pixelTotal), inspectBytesLabel(bitmapCacheBudgetBytes()))));
+        t('settings.memory.ofBudget', inspectBytesLabel(pixelCacheTotalBytes()), inspectBytesLabel(bitmapCacheBudgetBytes()))));
       rows.appendChild(storageUsageRow(t('settings.memory.row.preload'), inspectBytesLabel(memoryUsageMapBytes(state.videoPreloadedLayerImages))));
       rows.appendChild(storageUsageRow(t('settings.memory.row.drawStore'), inspectBytesLabel(storeBytes)));
       rows.appendChild(storageUsageRow(t('settings.memory.row.history'),
         t('settings.memory.ofBudget', inspectBytesLabel(history.total), inspectBytesLabel(historyMemoryBudgetBytes()))));
-      if (status) status.textContent = pixelTotal > bitmapCacheBudgetBytes() ? t('settings.memory.warnOver') : '';
+      if (status) status.textContent = pixelCachePressure() ? t('settings.memory.warnOver') : '';
     }
     // 창(storage 탭)이 보이는 동안만 도는 갱신 타이머 — 탭 이탈·창 닫힘은 다음 tick 이 스스로
     // 감지해 내린다(닫힘 훅을 따로 심지 않는다 — 훅이 늘면 안 걸린 경로가 조용히 샌다).
@@ -94111,8 +94143,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
     }
     function gengaDrawLayerOnion(ctx, layer, frame, ox, oy, dw, dh, opacity, tint) {
-      const t = gengaLayerOnionCanvas(layer, frame, tint, dw); if (!t) return;
+      const t = gengaLayerOnionCanvas(layer, frame, tint, dw); if (!t) return false;
       ctx.globalAlpha = opacity; ctx.drawImage(t, ox, oy, dw, dh); ctx.globalAlpha = 1;
+      return true; // ver2213: 실제로 그렸다 — onionVisibleGhostCount 가 이것을 센다
     }
     function gengaNearestDrawing(layer, frame) { // → resolved drawing OBJECT (placement-aware), not a bare url
       if (!layer || !Array.isArray(layer.exposures)) return null;
@@ -94299,6 +94332,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const onion = state.onionSkin;
       const gPrev = (onion && onion.gengaPrev) || [], gNext = (onion && onion.gengaNext) || [];
       const anyPrev = gPrev.some(function(x) { return x && x.on; }), anyNext = gNext.some(function(x) { return x && x.on; });
+      let drawnGhosts = 0; // ver2213: 이번 프레임에 실제로 그린 고스트 수 — 안 그리는 프레임은 0 으로 되돌린다
       if (onionShow && onion && (anyPrev || anyNext)) {
         const oLayers = (gt.layers || []);
         for (let li = oLayers.length - 1; li >= 0; li--) {
@@ -94307,10 +94341,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // ver1273: order, opacity (incl. 全体) and tint all come from the shared kernel — this loop
           // used to restate them next to conte's copy, kept in step by a comment (ver951's "conte parity")
           onionForEachGhost(onion, gengaOnionInstanceFrames(oLayer, frame, 5), function(ghost) {
-            gengaDrawLayerOnion(ctx, oLayer, ghost.item, ox, oy, dw, dh, ghost.opacity, ghost.tint);
+            if (gengaDrawLayerOnion(ctx, oLayer, ghost.item, ox, oy, dw, dh, ghost.opacity, ghost.tint)) drawnGhosts += 1;
           });
         }
       }
+      onionVisibleGhostCount = drawnGhosts;
       // pad only as far as the viewport can actually SHOW around the paper — keeps the composite canvas small
       // even mid-stroke (the pad now stays on during drawing so the live line is visible in the margin too)
       const visPad = Math.ceil(Math.max(0, ox, oy, W - (ox + dw), H - (oy + dh)) / Math.max(1e-4, scale));
@@ -103504,14 +103539,43 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return Math.round(bitmapCacheBudgetBytes() * (BITMAP_CACHE_SHARE[which] || 0.1));
     }
 
-    function trimBudgetedMap(map, maxItems, share, protectKey) {
-      if (map.size <= 1) return;
+    // ver2213 (축출 순서 ③, genga_eviction_order_2026-08-25.md): 획 중(펜이 눌린 동안)에는 아무것도
+    // 버리지 않는다 — 화면이 지금 쓰는 항목을 버리면 획 중 렌더가 미스 연쇄(동기 재디코드)를 만든다.
+    // 「획 중」은 **포인터 소유** 기준이다: 곡선 phase-1 pending(손을 뗀 채 구부리기 대기)은 무기한
+    // 지속되고 그동안 스크럽·프레임 이동이 허용되므로, 세션/op 존재로 판정하면 유예가 무기한이 된다.
+    // 「pending 은 어떤 포인터도 소유하지 않는다」(ver1712)가 그 경계의 정본이다.
+    function strokeInProgress() {
+      if (gengaDrawSession && gengaDrawSession.pointerId != null) return true;
+      return Boolean(state.paintRasterOp && state.paintPointerId != null);
+    }
+    // 획 중에 미룬 트림. flush 는 두 자리 — 획이 아닌 다음 trimBudgetedMap 호출(어떤 캐시 활동이든)
+    // 과 pushUndoCommand 꼬리(커밋 = 확실한 획 끝). 취소된 획(커밋 없음)의 pending 은 앞의 것이
+    // 다음 캐시 활동에서 거둔다 — 그동안 남는 것은 「트림 한 번 미뤄짐」이지 데이터가 아니다.
+    const pendingBudgetTrims = new Map(); // map → [maxItems, share, protectKey, minKeep]
+    function flushPendingBudgetTrims() {
+      if (!pendingBudgetTrims.size || strokeInProgress()) return;
+      const entries = Array.from(pendingBudgetTrims.entries());
+      pendingBudgetTrims.clear();
+      entries.forEach(function(e) { trimBudgetedMapNow(e[0], e[1][0], e[1][1], e[1][2], e[1][3]); });
+    }
+    function trimBudgetedMap(map, maxItems, share, protectKey, minKeep) {
+      if (strokeInProgress()) { pendingBudgetTrims.set(map, [maxItems, share, protectKey, minKeep]); return; }
+      flushPendingBudgetTrims();
+      trimBudgetedMapNow(map, maxItems, share, protectKey, minKeep);
+    }
+    // ver2213 (축출 순서 ③): minKeep = 「맵 꼬리(최신)에서 이 개수는 예산과 무관하게 남긴다」.
+    // 어니언 삽입만 넘긴다(값 = 마지막 렌더가 실제로 그린 고스트 수) — 히트의 LRU touch 가 화면
+    // 고스트를 맵 꼬리에 두므로 「최신 N 보호」 = 「화면 범위 보호」다(Pencil2D 의 mMinFrameCount).
+    // 생략하면 floor 1 로 종전과 완전히 같다.
+    function trimBudgetedMapNow(map, maxItems, share, protectKey, minKeep) {
+      const floor = Math.max(1, Math.round(Number(minKeep) || 0));
+      if (map.size <= floor) return;
       const budget = bitmapCacheShareBytes(share);
       let total = 0;
       map.forEach(function(v) { total += bitmapEntryBytes(v); });
       const it = map.keys();
       let step = it.next();
-      while (!step.done && map.size > 1 && (map.size > maxItems || total > budget)) {
+      while (!step.done && map.size > floor && (map.size > maxItems || total > budget)) {
         const k = step.value;
         step = it.next(); // advance BEFORE deleting so the iterator never sits on a removed entry
         if (k === protectKey) continue; // never the entry this pass exists to keep
@@ -103519,9 +103583,38 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         map.delete(k);
       }
     }
-    function budgetedMapSet(map, key, value, maxItems, share) {
+    function budgetedMapSet(map, key, value, maxItems, share, minKeep) {
       map.set(key, value);
-      trimBudgetedMap(map, maxItems, share, key);
+      trimBudgetedMap(map, maxItems, share, key, minKeep);
+    }
+    // ver2213 (축출 순서 ①): 픽셀 캐시 6종의 합 — BITMAP_CACHE_SHARE(합=1)가 다스리는 그 여섯이다.
+    // ver2211 메모리 패널의 합계와 압력 판정이 같은 자를 쓴다(다른 자로 재면 예산과 표시가 갈린다).
+    function pixelCacheTotalBytes() {
+      let total = memoryUsageMapBytes(gengaImageCache)
+        + memoryUsageMapBytes(onionGhostCache)
+        + memoryUsageMapBytes(layerPreviewImageCacheMap())
+        + memoryUsageMapBytes(gengaDougaCache)
+        + memoryUsageMapBytes(gengaEnvMaskCache);
+      layerLiveBitmapMap().forEach(function(entry) { total += layerLiveBitmapEntryBytes(entry); });
+      return total;
+    }
+    // ③이 허가한 어니언 최소 상주분(맵 꼬리 onionVisibleGhostCount 개). 압력 판정은 이것을 빼고
+    // 잰다 — 안 빼면 설계가 의도한 상주가 undo 반감(비가역)의 트리거가 되는 자기모순이 된다.
+    function onionProtectedBytes() {
+      const keep = Math.max(0, Math.round(Number(onionVisibleGhostCount) || 0));
+      if (!keep || !onionGhostCache.size) return 0;
+      let skip = Math.max(0, onionGhostCache.size - keep);
+      let bytes = 0;
+      onionGhostCache.forEach(function(v) {
+        if (skip > 0) { skip -= 1; return; }
+        bytes += bitmapEntryBytes(v);
+      });
+      return bytes;
+    }
+    // ver2213 (축출 순서 ①): 압력 = 예산이 다스리는 몫이 예산을 넘는다. 압력이 서면 undo 예산을
+    // 먼저 조인다(D 1-D — 사용자가 보고 있는 그림보다 히스토리가 싸다. Krita 의 soft/hard 2단).
+    function pixelCachePressure() {
+      return pixelCacheTotalBytes() - onionProtectedBytes() > bitmapCacheBudgetBytes();
     }
     // A decoding Image reports naturalWidth 0, so at insert time it prices as FREE. During a fast scrub
     // or playback every request lands before any decode finishes — precisely when the budget matters —
