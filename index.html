@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2248</title>
+  <title>MoArt ver2249</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -16527,7 +16527,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'start.feedback.title': { ja: 'お問い合わせ', ko: '문의', en: 'Contact', zh: '联系我们' },
         // ver1079: entry-screen guide + contact box
         'start.share': { ja: 'X で共有', ko: 'X에 공유', en: 'Share on X', zh: '在 X 上分享' },
-        // ---- status.* (71) ----
+        // ---- status.* (72) ----
         // ver1528: 재생 중 소리를 못 낸 클립이 있으면 멈출 때 알린다(종전에는 흔적 없이 사라졌다).
         'status.audio.playbackMissed': {
           ja: function(count, detail) { return '音声 ' + count + ' クリップが再生されませんでした（' + detail + '）。もう一度再生すると鳴ります。'; },
@@ -16601,6 +16601,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           en: function(fileName, why) { return 'Could not extract audio: ' + fileName + (why ? ' (' + why + ')' : ''); },
           zh: function(fileName, why) { return '无法提取音频: ' + fileName + (why ? '（' + why + '）' : ''); }
         },
+        'status.genga.strip.scaleNoRoom': { ja: 'これ以上縮められません（コマは最低 1 フレーム必要です）。', ko: '더 줄일 수 없습니다 (코마는 최소 1 프레임이 필요합니다).', en: 'Cannot shrink further — each koma needs at least 1 frame.', zh: '无法再缩短（每格至少需要 1 帧）。' },
         'status.genga.audioLane.removed': {
           ja: function(lane, n) { return n ? ('A' + lane + ' を削除しました（クリップ ' + n + ' 件）') : ('A' + lane + ' を削除しました'); },
           ko: function(lane, n) { return n ? ('A' + lane + ' 를 삭제했습니다 (클립 ' + n + '건)') : ('A' + lane + ' 를 삭제했습니다'); },
@@ -24158,6 +24159,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2249, items: [
+        { ja: '**コマを縮められないときに、何も起きないまま「元に戻す」だけが増えていたのを直しました。**'
+            + ' これ以上縮められない理由をその場でお知らせします。',
+          ko: '**코마를 더 줄일 수 없을 때, 아무 일도 안 일어난 채 「되돌리기」만 쌓이던 것을 고쳤습니다.**'
+            + ' 더 줄일 수 없는 이유를 그 자리에서 알려 드립니다.',
+          en: '**Fixed shrink adding an undo step while doing nothing when the komas cannot be packed tighter.**'
+            + ' It now says why it cannot shrink further.',
+          zh: '**修复了无法再压缩格子时什么都没发生却仍增加一次「撤销」的问题。**'
+            + ' 现在会当场说明无法继续压缩的原因。' },
+      ] },
       { ver: 2248, items: [
         { ja: '**ロックしたレイヤーの FX キーが削除・移動できてしまっていたのを直しました。**'
             + ' あわせて、原画で新しいベクターレイヤーを足したあとも複数選択が前のレイヤーを掴んだままで、'
@@ -101297,8 +101308,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ];
       openSimpleContextMenu(menuEv, items, { width: 170, height: 118 });
     }
+    // ver2249: 스케일(ストレッチ/シュリンク)이 만들 새 구간. **담을 수 없으면 null** — 코마마다 최소
+    // 1 프레임이 필요하다. 이 한 벌을 **판정(runCommand 밖)과 실행(mutator 안)이 함께 본다.**
+    function gengaStripScalePlan(L, side, n, extend) {
+      const s = ((L && L.exposures) || []).slice().sort(function(a, b) { return a.startFrame - b.startFrame; });
+      if (!s.length) return null;
+      const first = s[0].startFrame;
+      const last = s[s.length - 1].startFrame + s[s.length - 1].holdFrames - 1;
+      const span = last - first + 1;
+      const newFirst = side === 'head' ? (extend ? Math.max(1, first - n) : first + n) : first;
+      const newSpan = extend ? (span + (side === 'head' ? (first - newFirst) : n)) : (span - n);
+      if (newSpan < s.length) return null; // can't fit every koma at ≥1 frame
+      return { s: s, first: first, span: span, newFirst: newFirst, newSpan: newSpan };
+    }
     function gengaStripApply(layerId, side, n, extend, mode) {
       const label = mode === 'empty' ? '空コマ追加' : (mode === 'delete' ? 'コマ削除' : (extend ? 'ストレッチ' : 'シュリンク'));
+      // ver2249: **담을 수 없으면 명령을 아예 시작하지 않는다.** 종전에는 이 판정이 mutator 안에 있었고
+      // `runCommand` 는 결과와 무관하게 undo 를 쌓는다 — 화면은 그대로인데 **undo 스텝만 하나 생겼고**
+      // 상태줄·콘솔 어디에도 안 나왔다(실측: exposures 불변, undoStack +1, status 빈 문자열).
+      // 조용히 지나가지 않는다 — 왜 안 되는지 그 자리에서 말한다.
+      if (mode !== 'empty' && mode !== 'delete') {
+        const target = ((state.project && state.project.gengaTimeline && state.project.gengaTimeline.layers) || [])
+          .find(function(x) { return String(x.id) === String(layerId); });
+        if (!target) return;
+        if (!gengaStripScalePlan(target, side, n, extend)) { gengaShowStatus(t('status.genga.strip.scaleNoRoom'), { warn: true }); return; }
+      }
       runCommand(label, function(proj) {
         const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); }); if (!L) return;
         const s = (L.exposures || []).slice().sort(function(a, b) { return a.startFrame - b.startFrame; }); if (!s.length) return;
@@ -101321,17 +101355,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           return;
         }
         // scale (stretch / shrink): proportional retime of the whole region to the new span
-        const newFirst = side === 'head' ? (extend ? Math.max(1, first - n) : first + n) : first;
-        const newSpan = extend ? (span + (side === 'head' ? (first - newFirst) : n)) : (span - n);
-        if (newSpan < s.length) return; // can't fit every koma at ≥1 frame
-        const k = newSpan / span;
-        const ids = s.map(function(e) { return String(e.id); });
+        const plan = gengaStripScalePlan(L, side, n, extend); // ver2249: 위 게이트와 같은 한 벌
+        if (!plan) return;
+        const newFirst = plan.newFirst, newSpan = plan.newSpan;
+        const k = newSpan / plan.span;
+        const ids = plan.s.map(function(e) { return String(e.id); });
         let prevEnd = newFirst - 1;
         const regionEnd = newFirst + newSpan - 1;
         ids.forEach(function(id, i) {
           const e = (L.exposures || []).find(function(x) { return String(x.id) === id; }); if (!e) return;
-          const src = s[i];
-          let ns = newFirst + Math.round((src.startFrame - first) * k);
+          const src = plan.s[i];
+          let ns = newFirst + Math.round((src.startFrame - plan.first) * k);
           let nh = Math.max(1, Math.round(src.holdFrames * k));
           if (ns <= prevEnd) ns = prevEnd + 1;                        // keep order, no overlap
           if (ns > regionEnd) ns = regionEnd;                          // clamp into the region
