@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2261</title>
+  <title>MoArt ver2262</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -86761,16 +86761,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     return dv.getFloat64(nameOff + 8, true);
   }
 
-  /* 셀(AnimationFolder=1 폴더) 하나의 코마 노출표: [{frame, endFrame, komaName}, ...]
-   * (프레임은 fps 기준 실수·0-based, 오름차순). 항목 사이가 떨어져 있으면 그 사이가 **빈 셀**
-   * 이다 — 호출부는 그 구간에 아무 것도 놓지 않아야 한다. 애니메이션 트랙이 없으면(코마 전환
-   * 없이 고정인 셀도 실측에 있었다 — 카메라·BG 등) null 이고, 호출부가 폴백한다.
-   *
-   * ActionNodeClip 하나 = 연속 구간 하나라, 클립 단위로 끊어 읽는다(위 서문의 배치 설명 참고).
-   * 클립 경계는 "ActionNodeClip" 이름이 나오는 위치들로 자른다 — 트리의 중첩 규칙을 다 풀지
-   * 않아도 각 구간 안의 TimeClip 2개·FCurve 1개를 순서대로 집으면 되기 때문이다. */
-  async function clipReadCelKeyframes(u8, tracksByUuid, extaList, externalChunkRows, layerUuid, fps) {
-    var track = tracksByUuid[String(layerUuid || '').toLowerCase()];
+  /* ---- 커브 청크를 읽는 두 임포터의 공용 부분 (ver2262)
+   * 코마 노출표(clipReadCelKeyframes)와 카메라워크(clipReadCameraKeyframes)는 같은 배치를 읽는다 —
+   * 트랙 → Exta → inflate → cmt binc → ActionNodeClip 구간 → TimeClip 둘로 소스 tick → 프레임.
+   * 두 벌로 두었더니 가드가 갈렸다(카메라 쪽만 clipEnd·srcEnd 를 안 봤다). 한 벌로 모은다. */
+
+  // 트랙이 가리키는 커브 청크를 cmt binc 헤더로. 트랙·청크가 없으면 null(호출부가 폴백한다).
+  async function clipTrackCurveHeader(u8, track, extaList, externalChunkRows) {
     if (!track || !track.TrackActionMixer) return null;
     var externalId = String.fromCharCode.apply(null, track.TrackActionMixer);
     var chunkIdx = -1;
@@ -86780,8 +86777,49 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     var info = clipParseExtaChunk(u8, exta.off, exta.size);
     var raw = u8.subarray(info.binOff, info.binOff + info.binLen);
     if (raw.length < 4) return null;
-    var inflated = await clipInflateDeflate(raw.subarray(4));
-    var header = clipParseCmtBincHeader(inflated);
+    return clipParseCmtBincHeader(await clipInflateDeflate(raw.subarray(4)));
+  }
+
+  // 위치 목록에서 [lo, hi) 구간 안의 것만.
+  function clipOccInRange(list, lo, hi) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) if (list[i] >= lo && list[i] < hi) out.push(list[i]);
+    return out;
+  }
+
+  /* ActionNodeClip 구간 [lo, hi) 의 TimeClip 둘(앞 = 타임라인 구간, 뒤 = 소스 구간)과 Rate 로
+   * 소스 tick → 타임라인 프레임 변환을 세운다. 못 세우면 null — 호출부는 그 구간을 건너뛴다.
+   * ★ null 가드는 지금 **도달 불가**다: Start/End/Rate 의 위치는 clipFindNameOccurrences 가
+   * 타입 8 로 걸러 주므로 clipReadDoubleFieldAt 이 그 자리에서 null 을 못 낸다(타입이 다르면
+   * 그 위치가 목록에 아예 안 든다 — 합성 바이트로 확인). 그래도 남겨 둔다: 걸러지지 않은 위치를
+   * 넘기는 호출부가 생기면 프레임이 조용히 어긋나는 대신 그 구간이 버려져야 한다. */
+  function clipTimeClipMapAt(header, startOcc, endOcc, rateOcc, lo, hi, fps) {
+    var starts = clipOccInRange(startOcc, lo, hi), ends = clipOccInRange(endOcc, lo, hi), rates = clipOccInRange(rateOcc, lo, hi);
+    if (starts.length < 2 || ends.length < 2 || !rates.length) return null;
+    var clipStart = clipReadDoubleFieldAt(header, starts[0]), clipEnd = clipReadDoubleFieldAt(header, ends[0]);
+    var srcStart = clipReadDoubleFieldAt(header, starts[1]), srcEnd = clipReadDoubleFieldAt(header, ends[1]);
+    var rate = clipReadDoubleFieldAt(header, rates[0]);
+    if (!rate || clipStart == null || clipEnd == null || srcStart == null || srcEnd == null) return null;
+    var srcSpan = srcEnd - srcStart;
+    var scale = srcSpan ? (clipEnd - clipStart) / srcSpan : 1;
+    return {
+      toFrame: function (tick) { return (clipStart + (tick - srcStart) * scale) * fps / rate; },
+      clipEndFrame: clipEnd * fps / rate
+    };
+  }
+
+  /* 셀(AnimationFolder=1 폴더) 하나의 코마 노출표: [{frame, endFrame, komaName}, ...]
+   * (프레임은 fps 기준 실수·0-based, 오름차순). 항목 사이가 떨어져 있으면 그 사이가 **빈 셀**
+   * 이다 — 호출부는 그 구간에 아무 것도 놓지 않아야 한다. 애니메이션 트랙이 없으면(코마 전환
+   * 없이 고정인 셀도 실측에 있었다 — 카메라·BG 등) null 이고, 호출부가 폴백한다.
+   *
+   * ActionNodeClip 하나 = 연속 구간 하나라, 클립 단위로 끊어 읽는다(위 서문의 배치 설명 참고).
+   * 클립 경계는 "ActionNodeClip" 이름이 나오는 위치들로 자른다 — 트리의 중첩 규칙을 다 풀지
+   * 않아도 각 구간 안의 TimeClip 2개·FCurve 1개를 순서대로 집으면 되기 때문이다. */
+  async function clipReadCelKeyframes(u8, tracksByUuid, extaList, externalChunkRows, layerUuid, fps) {
+    var header = await clipTrackCurveHeader(u8, tracksByUuid[String(layerUuid || '').toLowerCase()],
+                                            extaList, externalChunkRows);
+    if (!header) return null;
 
     var clipOcc = clipFindNameOccurrences(header, 'ActionNodeClip', 0);
     if (!clipOcc.length) return null;
@@ -86792,11 +86830,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     var tagOcc = clipFindNameOccurrences(header, 'Tag', 17);
     var interpOcc = clipFindNameOccurrences(header, 'Interp', 17);
 
-    function inRange(list, lo, hi) {
-      var out = [];
-      for (var i2 = 0; i2 < list.length; i2++) if (list[i2] >= lo && list[i2] < hi) out.push(list[i2]);
-      return out;
-    }
     // 같은 FCurve 에 속한 앞쪽 배열의 자리 — 목록에서 off 보다 앞선 마지막 것.
     function lastBefore(list, off) {
       var r = -1;
@@ -86808,17 +86841,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     for (var ci = 0; ci < clipOcc.length; ci++) {
       var lo = clipOcc[ci];
       var hi = (ci + 1 < clipOcc.length) ? clipOcc[ci + 1] : header.bytes.length;
-      var starts = inRange(startOcc, lo, hi), ends = inRange(endOcc, lo, hi), rates = inRange(rateOcc, lo, hi);
-      var frames = inRange(frameOcc, lo, hi), tags = inRange(tagOcc, lo, hi);
-      // 앞 TimeClip = 타임라인 구간, 뒤 TimeClip = 소스(모션) 구간.
-      if (starts.length < 2 || ends.length < 2 || !rates.length || !frames.length || !tags.length) continue;
-      var clipStart = clipReadDoubleFieldAt(header, starts[0]), clipEnd = clipReadDoubleFieldAt(header, ends[0]);
-      var srcStart = clipReadDoubleFieldAt(header, starts[1]), srcEnd = clipReadDoubleFieldAt(header, ends[1]);
-      var rate = clipReadDoubleFieldAt(header, rates[0]);
-      if (!rate || clipStart == null || clipEnd == null || srcStart == null || srcEnd == null) continue;
-      var srcSpan = srcEnd - srcStart;
-      var scale = srcSpan ? (clipEnd - clipStart) / srcSpan : 1;
-      var toFrame = function (tick) { return (clipStart + (tick - srcStart) * scale) * fps / rate; };
+      var frames = clipOccInRange(frameOcc, lo, hi), tags = clipOccInRange(tagOcc, lo, hi);
+      if (!frames.length || !tags.length) continue;
+      var span = clipTimeClipMapAt(header, startOcc, endOcc, rateOcc, lo, hi, fps);
+      if (!span) continue;
+      var toFrame = span.toFrame;
 
       // ver1954: 코마표는 `ImageCelName` 파라미터의 FCurve 하나인데, **한 ActionNodeClip 안에
       // FCurve 는 여럿**이다 — 셀 폴더에 2D 변형이 걸려 있으면 ImageAspectScale/ImageCenter/
@@ -86837,12 +86864,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
                      ticks && ticks.length, names && names.length);
         continue;
       }
-      var interpOff = lastBefore(inRange(interpOcc, lo, hi), tagOff);
+      var interpOff = lastBefore(clipOccInRange(interpOcc, lo, hi), tagOff);
       var interps = interpOff >= 0 ? clipReadArrayFieldAt(header, interpOff, 17) : null;
       if (interps && interps.some(function (v) { return v !== 'Constant'; })) {
         console.warn('[clip import] FCurve interp 가 Constant 가 아님 — 계단식 취급으로 근사됨', interps);
       }
-      var clipEndFrame = clipEnd * fps / rate;
+      var clipEndFrame = span.clipEndFrame;
       for (var ki = 0; ki < ticks.length; ki++) {
         var f = toFrame(ticks[ki]);
         var nextF = (ki + 1 < ticks.length) ? toFrame(ticks[ki + 1]) : clipEndFrame;
@@ -86863,16 +86890,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
    * 코마 쪽과 달리 `Interp` 배열이 없다 — 호출부가 선형으로 잇는다.
    * 반환: [{frame, posX, posY, scale, rot}] (scale 은 %, frame 은 0-based 실수) 또는 null. */
   async function clipReadCameraKeyframes(u8, track, extaList, externalChunkRows, fps) {
-    if (!track || !track.TrackActionMixer) return null;
-    var externalId = String.fromCharCode.apply(null, track.TrackActionMixer);
-    var chunkIdx = -1;
-    for (var i = 0; i < externalChunkRows.length; i++) { if (externalChunkRows[i].ExternalID === externalId) { chunkIdx = i; break; } }
-    var exta = chunkIdx >= 0 ? extaList[chunkIdx] : null;
-    if (!exta) return null;
-    var info = clipParseExtaChunk(u8, exta.off, exta.size);
-    var raw = u8.subarray(info.binOff, info.binOff + info.binLen);
-    if (raw.length < 4) return null;
-    var header = clipParseCmtBincHeader(await clipInflateDeflate(raw.subarray(4)));
+    var header = await clipTrackCurveHeader(u8, track, extaList, externalChunkRows);
+    if (!header) return null;
 
     var clipOcc = clipFindNameOccurrences(header, 'ActionNodeClip', 0);
     if (!clipOcc.length) return null;
@@ -86885,14 +86904,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     var rotOcc = clipFindNameOccurrences(header, 'ImageRotation', 0);
     var sclOcc = clipFindNameOccurrences(header, 'ImageScale', 0);
 
-    function inRange(list, lo, hi) {
-      var out = [];
-      for (var i2 = 0; i2 < list.length; i2++) if (list[i2] >= lo && list[i2] < hi) out.push(list[i2]);
-      return out;
-    }
     // 파라미터 블록(lo..hi) 안의 n 번째 FCurve 를 {ticks, values} 로.
     function curveIn(lo, hi, nth) {
-      var fs = inRange(frameOcc, lo, hi), vs = inRange(valueOcc, lo, hi);
+      var fs = clipOccInRange(frameOcc, lo, hi), vs = clipOccInRange(valueOcc, lo, hi);
       if (fs.length <= nth || vs.length <= nth) return null;
       var ticks = clipReadArrayFieldAt(header, fs[nth], 14), vals = clipReadArrayFieldAt(header, vs[nth], 14);
       if (!ticks || !vals || ticks.length !== vals.length) return null;
@@ -86916,16 +86930,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     var keys = [];
     for (var ci = 0; ci < clipOcc.length; ci++) {
       var lo = clipOcc[ci], hi = (ci + 1 < clipOcc.length) ? clipOcc[ci + 1] : header.bytes.length;
-      var starts = inRange(startOcc, lo, hi), ends = inRange(endOcc, lo, hi), rates = inRange(rateOcc, lo, hi);
-      if (starts.length < 2 || ends.length < 2 || !rates.length) continue;
-      var clipStart = clipReadDoubleFieldAt(header, starts[0]), clipEnd = clipReadDoubleFieldAt(header, ends[0]);
-      var srcStart = clipReadDoubleFieldAt(header, starts[1]), srcEnd = clipReadDoubleFieldAt(header, ends[1]);
-      var rate = clipReadDoubleFieldAt(header, rates[0]);
-      if (!rate || clipStart == null || srcStart == null) continue;
-      var srcSpan = srcEnd - srcStart;
-      var scale = srcSpan ? (clipEnd - clipStart) / srcSpan : 1;
+      var span = clipTimeClipMapAt(header, startOcc, endOcc, rateOcc, lo, hi, fps);
+      if (!span) continue;
 
-      var pLo = inRange(posOcc, lo, hi)[0], rLo = inRange(rotOcc, lo, hi)[0], sLo = inRange(sclOcc, lo, hi)[0];
+      var pLo = clipOccInRange(posOcc, lo, hi)[0], rLo = clipOccInRange(rotOcc, lo, hi)[0], sLo = clipOccInRange(sclOcc, lo, hi)[0];
       if (pLo == null) continue;
       var posX = curveIn(pLo, rLo != null ? rLo : hi, 0);
       var posY = curveIn(pLo, rLo != null ? rLo : hi, 1);
@@ -86937,7 +86945,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       [posX, posY, rotC, sclC].forEach(function (c) { if (c) c.ticks.forEach(function (tk) { tickSet[tk] = true; }); });
       Object.keys(tickSet).map(Number).sort(function (a, b) { return a - b; }).forEach(function (tk) {
         keys.push({
-          frame: (clipStart + (tk - srcStart) * scale) * fps / rate,
+          frame: span.toFrame(tk),
           posX: sampleAt(posX, tk), posY: sampleAt(posY, tk),
           scale: sclC ? sampleAt(sclC, tk) : 100,
           rot: rotC ? sampleAt(rotC, tk) : 0
