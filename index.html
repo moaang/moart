@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2268</title>
+  <title>MoArt ver2269</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -37013,7 +37013,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver847 U1-b: shared body — fxFieldText computes the text (isRot → ±359 remainder + 回 badge),
       // fxWriteFieldText does the write-if-changed store (the ver845 Q1-E guard, now kernel-wide: this
       // runs for all 6 fields every preview tick — drag/scrub/playback).
-      fxWriteFieldText(win.querySelector('[data-le-num="' + d.prop + '"]'), win.querySelector('[data-le-turn="' + d.prop + '"]'), fxFieldText(!!d.isRot, val));
+      fxSetFieldDisplay(win, 'data-le-num', 'data-le-turn', d.prop, fxFieldText(!!d.isRot, val));
     }
     let leFxScrub = null; // scrub-in-progress state (kernel-owned via the host accessors below; external readers unchanged)
     // ver847 U1-a: conte adapter for the shared fxScrub kernel (fxScrubDown/Move/Up, defined next to
@@ -77108,8 +77108,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // are transient per-file races (AV/cloud-sync briefly touching a just-created file, a stale File
     // System Access handle, etc.) rather than something wrong with that specific cut's render, so simply
     // retrying tends to succeed without re-encoding the 80+ cuts that already wrote fine.
-    async function retryFailedCutExports() {
-      const retry = state.lastCutExportRetry;
+    // ver2268: 「실패분만 재시도」가 컷 영상과 CT 소재에 한 벌씩 있었다. 갈림값은 재시도 상태를 담는
+    // state 필드 · 쓰기 함수(인자 차례가 서로 다르다) · 남은 실패를 다시 담을 때 `opts` 를 물고 가는가뿐이다.
+    async function retryFailedExportGroups(retryField, run, keepOpts) {
+      const retry = state[retryField];
       if (!retry || !retry.groups || !retry.groups.length) return;
       try {
         if (!await ensureWorkspacePermission(retry.dirHandle, true)) {
@@ -77118,14 +77120,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         state.videoExportCancel = false;
         setExportDialogBusy(true, t('export.video.status.retryPreparing'));
-        const r = await writeCutExportGroups(retry.dirHandle, retry.groups, retry.opts, function(msg) { setExportDialogBusy(true, msg); });
-        state.lastCutExportRetry = r.failedGroups.length ? { dirHandle: retry.dirHandle, groups: r.failedGroups, opts: retry.opts } : null;
+        const r = await run(retry, function(msg) { setExportDialogBusy(true, msg); });
+        const next = { dirHandle: retry.dirHandle, groups: r.failedGroups };
+        if (keepOpts) next.opts = retry.opts;
+        state[retryField] = r.failedGroups.length ? next : null;
         updateExportRetryButtonVisibility();
         const tail = r.failures.length ? ('  ' + t('export.video.status.failuresTailPrefix') + r.failures.length + t('export.video.unit.items') + ': ' + r.failures.slice(0, 3).join(' / ')) : '';
         setExportDialogBusy(false, (r.canceled ? t('export.video.status.retryCanceled') : t('export.video.status.retryDone')) + ' ' + r.written + '/' + r.total + ' ' + t('export.video.unit.films') + tail);
       } catch (error) {
         setExportDialogBusy(false, t('export.video.err.retryFailedPrefix') + (error && error.message ? error.message : error));
       }
+    }
+    async function retryFailedCutExports() {
+      await retryFailedExportGroups('lastCutExportRetry', function(retry, onMsg) {
+        return writeCutExportGroups(retry.dirHandle, retry.groups, retry.opts, onMsg);
+      }, true);
     }
 
     // ---- コンテ撮 (conte cutting-material sheet) export ----
@@ -77630,20 +77639,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // "失敗分のみ再試行" (CT素材) — mirrors retryFailedCutExports(), independent retry state (see
     // updateExportRetryButtonVisibility's comment for why the two batch kinds never share one).
     async function retryFailedCtExports() {
-      const retry = state.lastCtExportRetry;
-      if (!retry || !retry.groups || !retry.groups.length) return;
-      try {
-        if (!await ensureWorkspacePermission(retry.dirHandle, true)) { alert(t('export.video.err.retryPermission')); return; }
-        state.videoExportCancel = false;
-        setExportDialogBusy(true, t('export.video.status.retryPreparing'));
-        const r = await writeCtMaterialExportGroups(state.project, retry.groups, retry.dirHandle, function(msg) { setExportDialogBusy(true, msg); });
-        state.lastCtExportRetry = r.failedGroups.length ? { dirHandle: retry.dirHandle, groups: r.failedGroups } : null;
-        updateExportRetryButtonVisibility();
-        const tail = r.failures.length ? ('  ' + t('export.video.status.failuresTailPrefix') + r.failures.length + t('export.video.unit.items') + ': ' + r.failures.slice(0, 3).join(' / ')) : '';
-        setExportDialogBusy(false, (r.canceled ? t('export.video.status.retryCanceled') : t('export.video.status.retryDone')) + ' ' + r.written + '/' + r.total + ' ' + t('export.video.unit.films') + tail);
-      } catch (error) {
-        setExportDialogBusy(false, t('export.video.err.retryFailedPrefix') + (error && error.message ? error.message : error));
-      }
+      await retryFailedExportGroups('lastCtExportRetry', function(retry, onMsg) {
+        return writeCtMaterialExportGroups(state.project, retry.groups, retry.dirHandle, onMsg);
+      }, false);
     }
 
     // ver1554: 실패 보고에 붙일 환경 요약. 「어느 기능이 있고 무엇이 잡혔나」가 없으면 제보를 받아도
@@ -90086,54 +90084,47 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ver2032: 벡터 레이어를 만든다. 지금까지는 CLIP 임포트만이 유일한 길이었다(사용자 지적).
     // 셀 레이어와 같은 뼈대에 vector 표식만 세운다 — 그림은 첫 획이 만든다.
-    function addGengaVectorLayer() {
-      if (!state.project || state.project.kind !== 'genga' || !state.project.gengaTimeline) return;
-      if (gengaTaggableLayerCount(state.project.gengaTimeline) >= 26) { alert(t('msg.genga.layer.limitReached')); return; }
+    // ver2268: 셀 레이어와 벡터 레이어를 만드는 몸이 두 벌이었다. 갈림값은 이름 접두와 `vector` 플래그뿐이다
+    // (벡터 쪽이 뒤에 부르는 브러시 제약 갱신은 그 함수에 남는다 — **명령까지 갔을 때만** 부른다.
+    // 조기 반환에서도 부르면 사본과 갈린다. 그래서 여기가 그 사실을 돌려준다.)
+    function addGengaLayerOfKind(namePrefix, vector) {
+      if (!state.project || state.project.kind !== 'genga' || !state.project.gengaTimeline) return false;
+      if (gengaTaggableLayerCount(state.project.gengaTimeline) >= 26) { alert(t('msg.genga.layer.limitReached')); return false; }
       runCommand('原画レイヤー追加', function(p) {
         const gt = p.gengaTimeline; if (!gt) return;
         gt.layers = Array.isArray(gt.layers) ? gt.layers : [];
         const n = gt.layers.length;
         const newId = 'genga-layer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-        gt.layers.unshift({
+        // ver579: short default (was 'Layer N')
+        const layer = {
           id: newId,
-          name: 'V' + (n + 1),
+          name: namePrefix + (n + 1),
           color: gengaLayerColor(n),
           opacity: 1, visible: true, locked: false, onion: false,
-          role: 'cel', vector: true,
-          exposures: [newGengaExposure(1)]
-        });
-        state.gengaSelectedLayerId = newId;
-        // ver2248: 형제 넷(`addGengaLayer` 포함)은 전부 다중선택 집합을 함께 비우는데 여기만 빠져 있었다 —
-        // 새 레이어를 만든 뒤에도 **옛 집합이 남아** 합체·삭제가 그것을 본다.
-        if (state.gengaSelectedLayerIds) state.gengaSelectedLayerIds.clear();
-      });
-      gengaUpdateVectorBrushConstraints(state.gengaSelectedLayerId);   // 벡터로 못 담는 효과를 바로 끈다
-    }
-    function addGengaLayer() {
-      if (!state.project || state.project.kind !== 'genga' || !state.project.gengaTimeline) return;
-      if (gengaTaggableLayerCount(state.project.gengaTimeline) >= 26) { alert(t('msg.genga.layer.limitReached')); return; }
-      runCommand('原画レイヤー追加', function(p) {
-        const gt = p.gengaTimeline; if (!gt) return;
-        gt.layers = Array.isArray(gt.layers) ? gt.layers : [];
-        const n = gt.layers.length;
-        const newId = 'genga-layer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+          role: 'cel'
+        };
+        if (vector) layer.vector = true;   // 키 차례를 사본과 같게 두려고 여기서 붙인다(저장 파일이 그 차례로 나간다)
+        // ver1431: 새 프로젝트의 첫 레이어(newGengaProject)는 처음부터 1프레임째 1코마를 갖고 있었는데
+        // 레이어 추가만 빈 채로 만들고 있었다 — 같은 규칙을 여기서도 따른다.
+        layer.exposures = [newGengaExposure(1)];
         // new cel layers go to the TOP of the stack (front of the top-first array) — was appended at the bottom
-        gt.layers.unshift({
-          id: newId,
-          name: 'L' + (n + 1), // ver579: short default (was 'Layer N')
-          color: gengaLayerColor(n),
-          opacity: 1, visible: true, locked: false, onion: false,
-          role: 'cel',
-          // ver1431: 새 프로젝트의 첫 레이어(newGengaProject)는 처음부터 1프레임째 1코마를 갖고 있었는데
-          // 레이어 추가만 빈 채로 만들고 있었다 — 같은 규칙을 여기서도 따른다.
-          exposures: [newGengaExposure(1)]
-        });
+        gt.layers.unshift(layer);
         // ver1094: select what was just created. addGengaCelSubLayer already did this; the other two add
         // paths did not, so a new layer appeared while the selection — and therefore the next stroke — stayed
         // on the previous one.
         state.gengaSelectedLayerId = newId;
+        // ver2248: 형제 넷은 전부 다중선택 집합을 함께 비운다 — 안 비우면 새 레이어를 만든 뒤에도
+        // **옛 집합이 남아** 합체·삭제가 그것을 본다.
         if (state.gengaSelectedLayerIds) state.gengaSelectedLayerIds.clear();
       });
+      return true;
+    }
+    function addGengaVectorLayer() {
+      if (!addGengaLayerOfKind('V', true)) return;
+      gengaUpdateVectorBrushConstraints(state.gengaSelectedLayerId);   // 벡터로 못 담는 효과를 바로 끈다
+    }
+    function addGengaLayer() {
+      addGengaLayerOfKind('L', false);
     }
     // BG/BOOK levels live BELOW every cel layer, never lettered A-Z. The first one created (nothing below it
     // yet) is named "BG"; every later one is inserted just above the existing bg/book block (so the true
@@ -92453,7 +92444,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // instead of an ever-growing raw number. Non-rotation fields show decimals when typed (fxFormatNumber).
     function gengaFxFieldText(d, val) { return fxFieldText(d.field === 'rot', val); } // ver847 U1-b: shared body — see fxFieldText
     function gengaFxSetFieldDisplay(root, d, val) {
-      fxWriteFieldText(root.querySelector('[data-gfx-val="' + d.field + '"]'), root.querySelector('[data-gfx-turn="' + d.field + '"]'), gengaFxFieldText(d, val)); // ver847 U1-b: write-if-changed via kernel (ver845 Q1-E, now on every FX window)
+      fxSetFieldDisplay(root, 'data-gfx-val', 'data-gfx-turn', d.field, gengaFxFieldText(d, val)); // ver847 U1-b: write-if-changed via kernel (ver845 Q1-E, now on every FX window)
     }
     function gengaFxCurrent(layer, frame) { // window display values (identity when no keys)
       return gengaFxAt(layer, frame) || { x: 0, y: 0, scale: 1, rot: 0, opacity: 1, blur: 0 };
@@ -92655,6 +92646,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function fxWriteFieldText(numEl, turnEl, t) {
       if (numEl && numEl.textContent !== t.num) numEl.textContent = t.num;
       if (turnEl && turnEl.textContent !== t.turn) turnEl.textContent = t.turn;
+    }
+    // ver2268: 세 FX 창(레이어FX·원화FX·카메라FX)이 값 칸과 回 배지를 찾는 셀렉터를 한 벌씩 조립하고 있었다.
+    // 속성 이름이 창마다 다르므로(`data-le-num` 만 `num` 이다) 둘 다 인자로 받는다.
+    function fxSetFieldDisplay(root, valAttr, turnAttr, key, text) {
+      fxWriteFieldText(root.querySelector('[' + valAttr + '="' + key + '"]'), root.querySelector('[' + turnAttr + '="' + key + '"]'), text);
     }
     // click-to-type direct entry (decimals allowed). Replaces the field's number spans with an <input> until
     // Enter/blur (commit) or Escape (cancel). Shared by the camera FX window and the layer レイヤーFX window.
@@ -93246,7 +93242,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       };
     }
     function cameraFxSetFieldDisplay(root, field, val) {
-      fxWriteFieldText(root.querySelector('[data-camfx-val="' + field + '"]'), root.querySelector('[data-camfx-turn="' + field + '"]'), cameraFxFieldText(field, val)); // ver847 U1-b: write-if-changed via kernel (ver845 Q1-E, now on every FX window)
+      fxSetFieldDisplay(root, 'data-camfx-val', 'data-camfx-turn', field, cameraFxFieldText(field, val)); // ver847 U1-b: write-if-changed via kernel (ver845 Q1-E, now on every FX window)
     }
     // ver1128: put the camera back to the base frame — centred, full size, unrotated. For genga this keys the
     // identity at the current frame (like any camera edit); for conte it sets the committed transform.
