@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2266</title>
+  <title>MoArt ver2267</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -49061,22 +49061,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // blips, not continuous playback) -- matches the sheet tool's own documented Scrub behavior and is the only
     // latency-safe option without building a full live audio mixer for the drag gesture.
     const SCRUB_AUDIO_BLIP_SEC = 0.09;
-    let scrubAudioSources = [];
-    let scrubAudioLastFrame = null;
+    // ver2267 (dup cleanup 2 절): 스크럽 오디오의 멈춤은 두 엔진이 같은 몸을 갖고 있었는데 **상태의
+    // 모양이 달라서**(콘티는 소스 배열, 원화는 단일) 인자화가 안 됐다. 상태를 객체 한 벌로 묶고
+    // 원화도 배열을 쓴다 — 원화는 여전히 한 개만 넣으므로 동작은 그대로다.
+    function makeScrubAudioState() {
+      return { sources: [], lastFrame: null };
+    }
     // Stops only the currently-playing blip nodes -- used when swapping in the NEXT blip mid-drag, where the
-    // dedup memory (scrubAudioLastFrame) must survive. stopScrubAudio() (below) is the real "drag is over/left
-    // the clip" stop and clears that memory too.
-    function stopScrubAudioSource() {
-      if (!scrubAudioSources.length) return;
-      for (let index = 0; index < scrubAudioSources.length; index += 1) {
-        try { scrubAudioSources[index].stop(); } catch (error) {}
-        try { scrubAudioSources[index].disconnect(); } catch (error) {}
+    // dedup memory (st.lastFrame) must survive. scrubAudioStopAll() is the real "drag is over/left the clip"
+    // stop and clears that memory too.
+    function scrubAudioStopSources(st) {
+      if (!st.sources.length) return;
+      for (let index = 0; index < st.sources.length; index += 1) {
+        try { st.sources[index].stop(); } catch (error) {}
+        try { st.sources[index].disconnect(); } catch (error) {}
       }
-      scrubAudioSources = [];
+      st.sources = [];
+    }
+    function scrubAudioStopAll(st) {
+      st.lastFrame = null;
+      scrubAudioStopSources(st);
+    }
+
+    const scrubAudioState = makeScrubAudioState();
+    function stopScrubAudioSource() {
+      scrubAudioStopSources(scrubAudioState);
     }
     function stopScrubAudio() {
-      scrubAudioLastFrame = null;
-      stopScrubAudioSource();
+      scrubAudioStopAll(scrubAudioState);
     }
     // "Dialogue" for scrub purposes: anything on the A1 dialogue track, or carrying dialogue identity
     // (a speaker name / a link to a paper dialog block -- covers dialogue that overflowed onto A2+ when
@@ -49088,8 +49100,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function playScrubAudioAtFrame(project, frame) {
       frame = Math.round(Number(frame) || 0);
-      if (scrubAudioLastFrame === frame) return; // pointer jitter within the same frame -- don't retrigger
-      scrubAudioLastFrame = frame;
+      if (scrubAudioState.lastFrame === frame) return; // pointer jitter within the same frame -- don't retrigger
+      scrubAudioState.lastFrame = frame;
       const ctx = state.playbackAudioContext;
       if (!ctx || ctx.state !== 'running') return; // context not warmed up yet (see pointerdown hook) -- stay silent rather than block the seek on an async resume
       const clips = activeAudioClipsAt(project, frame);
@@ -49129,7 +49141,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gain.connect(ctx.destination);
         const dur = Math.min(SCRUB_AUDIO_BLIP_SEC * item.speed, item.buffer.duration - item.offsetSec);
         if (dur <= 0.005) continue;
-        try { src.start(0, item.offsetSec, dur); scrubAudioSources.push(src); } catch (error) {}
+        try { src.start(0, item.offsetSec, dur); scrubAudioState.sources.push(src); } catch (error) {}
       }
     }
 
@@ -80474,17 +80486,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaStopAudio() { gengaAudioPlayGeneration += 1; gengaAudioSources.forEach(function(s) { try { s.stop(); } catch (e) {} try { s.disconnect(); } catch (e) {} }); gengaAudioSources = []; }
     // ---- Scrub audio, genga side -- mirrors playScrubAudioAtFrame/stopScrubAudio (conte side) but reads
     // genga's own separate audio subsystem (gt.audioClips / gengaAudioBuf / gengaAudioCtx) instead.
-    let gengaScrubAudioSource = null;
-    let gengaScrubAudioLastFrame = null;
+    // ver2267: 콘티와 같은 상태 모양(makeScrubAudioState). 원화는 블립을 **하나만** 넣는다 —
+    // 배열이 된 것은 멈춤 커널을 공유하기 위해서지 동시에 여러 개를 울리려는 것이 아니다.
+    const gengaScrubAudioState = makeScrubAudioState();
     function stopGengaScrubAudioSource() {
-      if (!gengaScrubAudioSource) return;
-      try { gengaScrubAudioSource.stop(); } catch (e) {}
-      try { gengaScrubAudioSource.disconnect(); } catch (e) {}
-      gengaScrubAudioSource = null;
+      scrubAudioStopSources(gengaScrubAudioState);
     }
     function stopGengaScrubAudio() {
-      gengaScrubAudioLastFrame = null;
-      stopGengaScrubAudioSource();
+      scrubAudioStopAll(gengaScrubAudioState);
     }
     // ver842: drag-start warm-up — conte's warmScrubAudioBuffers ported onto genga's own cache. Scrub
     // deliberately never awaits a decode (playGengaScrubAudioAtFrame stays silent for the tick), and genga's
@@ -80519,8 +80528,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function playGengaScrubAudioAtFrame(frame) {
       frame = Math.round(Number(frame) || 1);
-      if (gengaScrubAudioLastFrame === frame) return; // pointer jitter within the same frame -- don't retrigger
-      gengaScrubAudioLastFrame = frame;
+      if (gengaScrubAudioState.lastFrame === frame) return; // pointer jitter within the same frame -- don't retrigger
+      gengaScrubAudioState.lastFrame = frame;
       const gt = state.project && state.project.gengaTimeline;
       if (!gt || !(gt.audioClips || []).length) return;
       const ctx = gengaAudioCtx;
@@ -80552,7 +80561,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       src.connect(gain); gain.connect(ctx.destination);
       const dur = Math.min(SCRUB_AUDIO_BLIP_SEC, buf.duration - offset);
       if (dur <= 0.005) return;
-      try { src.start(0, offset, dur); gengaScrubAudioSource = src; } catch (e) {}
+      try { src.start(0, offset, dur); gengaScrubAudioState.sources = [src]; } catch (e) {}
     }
     // schedule every clip via WebAudio relative to the playhead start frame (frame-accurate, survives rAF jitter)
     async function gengaStartAudioPlayback(startFrame) {
