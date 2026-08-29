@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2299</title>
+  <title>MoArt ver2300</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -63219,6 +63219,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       targetCtx.save();
       targetCtx.setTransform(1, 0, 0, 1, 0, 0);
       targetCtx.globalCompositeOperation = 'source-over';
+      // ver2300 (F4): rect 가 오면 그 창만 다시 합성한다 — 창 밖은 버퍼가 한 번도 안 그린 자리라
+      // (호출부가 「모든 붓질이 마크됐다」를 보증한다) 이전 합성 결과 = base 그대로로 동일하다.
+      // rect 없는 호출은 종전 전체 경로 그대로다(동작 불변).
+      const rect = options.rect;
+      if (rect && rect.w > 0 && rect.h > 0) {
+        targetCtx.clearRect(rect.x, rect.y, rect.w, rect.h);
+        targetCtx.drawImage(baseCanvas, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
+        targetCtx.globalCompositeOperation = options.gco || 'source-over';
+        targetCtx.globalAlpha = options.alpha == null ? 1 : Math.max(0, Math.min(1, Number(options.alpha)));
+        targetCtx.drawImage(src, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
+        targetCtx.restore();
+        return;
+      }
       targetCtx.clearRect(0, 0, w, h);
       targetCtx.drawImage(baseCanvas, 0, 0);            // pre-stroke content
       targetCtx.globalCompositeOperation = options.gco || 'source-over';
@@ -94104,6 +94117,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // FX 평가값도 — 축 전수는 docs/genga_scrub_key_commit_cut_2026-08-25.md 2절). 프레임 무관 축
     // (표시·불투명도·blend·순서·용지)은 종전대로 명령 경계·라이브 게이지의 무효화 담당이다.
     let gengaFrameStack = null; // { layerId(중심), fxOpen, belowSig, aboveSig, belowCache(용지 크기), aboveCache(pad 포함), aboveFoldable }
+    // ver2300 (F4): 더티 클립의 구성 서명 — 세션 전체 합성이 끝날 때만 세워지고, 전체 경로를 탄
+    // 모든 합성 호출이 무효화한다(스크래치 내용이 바뀌므로). 동일성은 전부 **객체 참조**로 본다 —
+    // 캐시가 다시 구워지면 참조가 갈리므로 값 비교가 필요 없다.
+    let gengaCompositeClipSig = null;
+    function gengaCompositeClipCheck(cv, cw, ch, pad, frame, sess) {
+      const sig = gengaCompositeClipSig;
+      if (!sig || !sig.eligible) return null;
+      if (sig.cv !== cv || sig.cw !== cw || sig.ch !== ch || sig.pad !== pad || sig.frame !== frame) return null;
+      if (!sess || sig.sessCanvas !== sess.canvas || sig.centerId !== String(sess.layerId)) return null;
+      if (sess.shape || sess.vectorErase || !(sess.penOutline || sess.penBufMode)) return null;
+      const store = sig.store;
+      if (!store || store.belowCache !== sig.below || store.aboveCache !== sig.above || store.aboveFoldable !== true) return null;
+      if (store === gengaFrameStack || store === sess) { /* 살아 있는 컨테이너 */ } else return null;
+      return gengaScanClamp(sess.inkScan, sess.canvas);
+    }
     let gengaHydrateInFlight = false; // ver2209: gengaHydrateDrawStore 진행 중 — 이 동안은 캐시를 쓰지도 굽지도 않는다(미수화 스택이 박제된다). 완료가 무효화+재렌더로 닫는다
     function gengaFrameStackInvalidate() { gengaFrameStack = null; }
     // ver2214: 벡터 그림(ref 없음)의 서명 식별자 — strokes 배열 참조에 일련번호를 발급한다
@@ -94204,9 +94232,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       cv._pad = pad;
       const cx2 = cv.getContext('2d');
-      cx2.setTransform(1, 0, 0, 1, 0, 0); cx2.clearRect(0, 0, cw, ch); // reused canvas retains prior content (fresh one is a no-op clear)
-      if (pad) cx2.setTransform(1, 0, 0, 1, pad, pad); // draw everything in paper coords; the pad frames it
       const sessIdx = sess ? layers.findIndex(function(l) { return String(l.id) === String(sess.layerId); }) : -1;
+      // ver2300 (F4): 획 중 더티 클립 — 직전 합성과 **같은 구성**(같은 스크래치·프레임·pad·세션
+      // 캔버스·얼어 있는 below/above 캐시)이면 이번 획의 누적 상자(inkScan)만 다시 그린다.
+      // 창 밖이 프레임 사이에 불변인 근거: 중심은 sess.canvas 인데 펜 경로의 모든 붓질이
+      // gengaScanMark 를 지나 창 안이고(누적이라 「지난 프레임에 그렸던 것의 소거」도 창 안),
+      // 나머지 전 레이어는 캐시 두 장에서 오므로(자격 조건 — aboveFoldable 필수) 획 중 디코드
+      // 도착이 창 밖에만 반영되는 찢김이 구조적으로 없다. 구성이 하나라도 갈리면 종전 전체 경로.
+      const clipInk = gengaCompositeClipCheck(cv, cw, ch, pad, frame, sess);
+      if (!clipInk) gengaCompositeClipSig = null; // 이 호출이 스크래치를 전체 경로로 덮는다 — 세션 전체 합성만이 아래에서 다시 세운다
+      cx2.setTransform(1, 0, 0, 1, 0, 0);
+      if (!clipInk) cx2.clearRect(0, 0, cw, ch); // reused canvas retains prior content (fresh one is a no-op clear)
+      if (pad) cx2.setTransform(1, 0, 0, 1, pad, pad); // draw everything in paper coords; the pad frames it
       const drawLayerContent = function(target, l) {
         let src = null;
         if (sess && String(l.id) === String(sess.layerId)) {
@@ -94377,6 +94414,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           i = j + 1; // 소비한 만큼 건너뛴다(루프의 i-- 가 다음 자리로 옮긴다)
         }
       };
+      // ver2300 (F4): 더티 클립 빠른 길 — 자격은 gengaCompositeClipCheck 가 이미 봤다(구성 동일성
+      // 전부 객체 참조 대조). 아래·중심·위를 같은 순서로, 누적 상자 안만 다시 그린다.
+      if (clipInk) {
+        const cs = gengaCompositeClipSig;
+        cx2.save();
+        cx2.beginPath(); cx2.rect(clipInk.x, clipInk.y, clipInk.w, clipInk.h); cx2.clip();
+        cx2.clearRect(clipInk.x, clipInk.y, clipInk.w, clipInk.h);
+        cx2.drawImage(cs.store.belowCache, 0, 0);
+        if (gengaLayerDrawsInComposite(layers[cs.centerIdx])) drawLayer(cx2, layers[cs.centerIdx]);
+        cx2.setTransform(1, 0, 0, 1, 0, 0); // aboveCache 는 pad 를 담고 있다 — 클립은 디바이스 공간에 이미 서 있다
+        cx2.drawImage(cs.store.aboveCache, 0, 0);
+        cx2.restore();
+        return cv;
+      }
       // ver2209: 스택 캐시의 중심 = 세션 레이어, 세션 밖에서는 **선택 레이어** — 획은 선택 레이어에서
       // 시작되므로 커밋 직후 재렌더와 다음 획 첫 렌더가 같은 캐시를 히트한다(연타 벽 제거의 본체).
       // 문맥이 캐시 불가(gengaFrameStackUsable=false)면: 세션 중엔 종전대로 세션 로컬에 굽고(수명이
@@ -94465,6 +94516,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           cx2.restore();
         } else {
           drawLayerRange(cx2, centerIdx - 1, 0); // layers above (blend vs live content stays correct)
+        }
+        // ver2300 (F4): 다음 프레임의 더티 클립 자격을 세운다 — **비중심이 전부 얼어 있는 캐시 두
+        // 장에서 왔을 때만**(aboveFoldable 필수 · 획 중 디코드 도착이 창 밖에 새는 찢김 방지) ·
+        // 펜 세션 · FX/動画フィル/실루엣 진단/뜬 선택 없음. 조건 밖이면 서명 없음 = 늘 전체 경로.
+        gengaCompositeClipSig = null;
+        if (sess && (sess.penOutline || sess.penBufMode) && !sess.shape && !sess.vectorErase
+            && store.aboveFoldable === true && store.belowCache && store.aboveCache
+            && !gengaDougaFillActive() && !state.gengaSilDebug && !gengaSelLifted(gengaSel)) {
+          let fxFree = true;
+          for (let i = 0; i < layers.length && fxFree; i++) {
+            if (gengaLayerDrawsInComposite(layers[i]) && gengaFxAt(layers[i], frame)) fxFree = false;
+          }
+          if (fxFree) {
+            gengaCompositeClipSig = { eligible: true, cv: cv, cw: cw, ch: ch, pad: pad, frame: frame,
+              sessCanvas: sess.canvas, centerId: String(sess.layerId), centerIdx: centerIdx, store: store,
+              below: store.belowCache, above: store.aboveCache };
+          }
         }
         return cv;
       }
@@ -96237,7 +96305,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 透明度保護(alphaLock) still win, exactly like conte's twin of this composite).
         gco: sess.shapeEraser ? 'destination-out' : (sess.shapeAlphaLock ? 'source-atop' : paintBrushModeCompositeOp(paintBrushModeVal())),
         alpha: sess.shapeOpacity, // ver609
-        clip: gengaStrokeClipFor(sess)
+        clip: gengaStrokeClipFor(sess),
+        // ver2300 (F4): 펜 세션은 이번 획의 누적 상자(inkScan)만 다시 합성한다 — 펜 경로의 모든
+        // 붓질(세그먼트 양끝·아웃라인 방출점·Shift 직선 끝점)이 gengaScanMark 를 지나므로 창 밖
+        // 버퍼는 늘 비어 있고, 델타가 아니라 **누적**이라 Shift 전환 같은 「지난 프레임에 그렸던
+        // 것의 소거」도 창 안이다. 도형·라쏘 세션(sess.shape)은 종전 전체 경로 그대로.
+        rect: (!sess.shape && (sess.penOutline || sess.penBufMode)) ? gengaScanClamp(sess.inkScan, sess.canvas) : null
       });
     }
     // ver767: an active selection over this session's layer/frame confines the stroke to its inside (the paint tool /
