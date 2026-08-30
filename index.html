@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2312</title>
+  <title>MoArt ver2313</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24225,6 +24225,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2313, items: [
+        { ja: '**筆圧カーブの点と点が、なめらかにつながるようになりました。**'
+            + 'これまでは点を直線で結んでいたのでグラフが折れ線になり、描き味もそこで角張っていました。CLIP STUDIO と同じように曲線でつながります。'
+            + '打った点は必ずその高さを通り、**強く押したのに細くなる**区間は出ません。`.sut` から読み込んだブラシも含め、これまでのカーブがすべてなめらかになります。',
+          ko: '**필압 곡선의 점과 점이 부드럽게 이어집니다.**'
+            + ' 지금까지는 점을 직선으로 이어서 그래프가 꺾은선이었고 그리는 느낌도 그 자리에서 각졌습니다. CLIP STUDIO 처럼 곡선으로 이어집니다.'
+            + ' 찍은 점은 반드시 그 높이를 지나고, **더 세게 눌렀는데 가늘어지는** 구간은 생기지 않습니다. `.sut` 로 불러온 브러시를 포함해 지금까지의 곡선이 전부 부드러워집니다.',
+          en: '**Pressure curve points now connect smoothly.**'
+            + ' Points used to be joined by straight lines, so the graph was a polyline and the stroke turned a corner there too. They now join as a curve, like CLIP STUDIO.'
+            + ' Every point you place is still passed through exactly, and no stretch ever gets **thinner as you press harder**. All existing curves, including ones imported from `.sut`, become smooth.',
+          zh: '**笔压曲线的控制点之间现在平滑连接。**'
+            + '此前控制点以直线相连，图表呈折线，笔触也会在那里出现棱角。现在会像 CLIP STUDIO 一样以曲线相连。'
+            + '所打的点必定经过其高度，也不会出现**用力更大反而变细**的区间。包括从 `.sut` 导入的笔刷在内，此前的曲线全部变得平滑。' },
+      ] },
       { ver: 2312, items: [
         { ja: '**ブラシを切り替えると、そのブラシの筆圧設定に切り替わります。**'
             + '`.sut` で読み込んだブラシの筆圧カーブ・不透明度・手ブレ補正が、基本ペンや消しゴムに残ってしまう問題を直しました。',
@@ -58640,8 +58654,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 단계(감마)로만 표현했다 — 임포트한 브러시의 곡선이 「(0,0) (0.18,0) (0.60,0.81) (1,1)」처럼
     // 감마 하나로는 못 그리는 모양이면 그 성격이 통째로 사라졌다(연필이 초반에 안 나오는 그 느낌).
     // 배열이 있으면 그것으로 평가하고 **없으면 감마 그대로** — 기존 브러시는 한 픽셀도 안 바뀐다.
-    // 점 사이는 선형 보간이다. CSP 편집기는 더 부드럽게 잇지만, 점이 3~4 개인 실제 브러시에서는
-    // 차이가 작고 **모르는 스플라인을 흉내 내다 틀리는 것보다 정직하다**(brushLib notes 에 적는다).
+    // ver2313: 점 사이를 **monotone cubic**(Fritsch–Carlson)으로 잇는다 — CSP 편집기가 같은 점을
+    // 부드럽게 잇는 것을 따라갔다. 그 알고리즘은 공개돼 있지 않으므로 근거는 「CSP 와 같다」가 아니라
+    // 「부드러우면서 필압에 안전하다」다: Catmull-Rom·natural cubic 은 제어점을 넘어 튀어 **더 눌렀는데
+    // 얇아지는 구간**을 만든다. **단조 보존이 이 함수의 불변식**이고 그것이 보간을 고르는 기준이었다.
+    // 제어점 위에서는 그 y 를 그대로 지난다 — 그래프에 찍은 점이 곧 그 필압의 값이다.
     function paintCurveEvalPts(pts, x) {
       if (!Array.isArray(pts) || pts.length < 2) return null;
       const v = Math.max(0, Math.min(1, Number(x) || 0));
@@ -58649,15 +58666,47 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (v <= pts[0].x) return cl(pts[0].y);
       const last = pts[pts.length - 1];
       if (v >= last.x) return cl(last.y);
+      const m = paintCurveTangents(pts);
       for (let i = 1; i < pts.length; i += 1) {
         const a = pts[i - 1], b = pts[i];
         if (v <= b.x) {
-          const span = b.x - a.x;
-          const t = span > 1e-9 ? (v - a.x) / span : 0;
-          return cl(a.y + (b.y - a.y) * t);
+          const h = b.x - a.x;
+          if (!(h > 1e-9)) return cl(a.y);
+          const t = (v - a.x) / h, t2 = t * t, t3 = t2 * t;
+          return cl((2 * t3 - 3 * t2 + 1) * a.y + (t3 - 2 * t2 + t) * h * m[i - 1]
+                  + (-2 * t3 + 3 * t2) * b.y + (t3 - t2) * h * m[i]);
         }
       }
       return cl(last.y);
+    }
+    // 제어점마다의 기울기 — 중앙차분으로 잡고 **단조를 깨지 않는 최대치로 깎는다**(방향이 뒤집히는
+    // 쪽은 0, α²+β²>9 면 3/√ 배로 줄인다 — Fritsch–Carlson 1980 의 조건). 평평한 구간은 양 끝을 0 으로
+    // 눌러 「올라갔다 내려오는」 혹을 없앤다. **캐시하지 않는다** — 점이 몇 개뿐이라 계산이 싸고,
+    // 캐시는 편집기가 점 배열을 제자리에서 고칠 때 낡은 기울기를 조용히 내놓는다.
+    function paintCurveTangents(pts) {
+      const n = pts.length;
+      const d = new Array(n - 1);
+      for (let i = 0; i < n - 1; i += 1) {
+        const h = pts[i + 1].x - pts[i].x;
+        d[i] = h > 1e-9 ? (pts[i + 1].y - pts[i].y) / h : 0;
+      }
+      const m = new Array(n);
+      m[0] = d[0];
+      m[n - 1] = d[n - 2];
+      for (let i = 1; i < n - 1; i += 1) m[i] = (d[i - 1] + d[i]) / 2;
+      for (let i = 0; i < n - 1; i += 1) {
+        if (d[i] === 0) { m[i] = 0; m[i + 1] = 0; continue; }
+        const a = m[i] / d[i], b = m[i + 1] / d[i];
+        if (a < 0) m[i] = 0;
+        if (b < 0) m[i + 1] = 0;
+        const s = a * a + b * b;
+        if (s > 9) {
+          const tau = 3 / Math.sqrt(s);
+          m[i] = tau * a * d[i];
+          m[i + 1] = tau * b * d[i];
+        }
+      }
+      return m;
     }
     // 점 배열의 위생 검사 — 저장본이나 임포트가 준 것을 그대로 믿지 않는다.
     function paintNormCurvePts(raw) {
@@ -60069,12 +60118,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             brush.pMin = Math.max(0, Math.min(100, Math.round(y0 * 100)));
             notes.push('필압 곡선 첫 점 y=' + y0.toFixed(3) + ' → 최소 크기 ' + brush.pMin + '%');
           }
-          // ver1622: 곡선을 **그대로 싣는다**(앱이 제어점을 받게 됐다). 점 사이는 선형 보간이라
-          // CSP 편집기의 매끄러운 이음과 미세하게 다를 수 있다 — 그 사실을 적어 둔다.
+          // ver1622: 곡선을 **그대로 싣는다**(앱이 제어점을 받게 됐다). `.sut` 는 점만 주고 보간
+          // 방식은 안 주므로(줄 필드가 없다) 잇는 것은 앱이 정한다 — ver2313 부터 monotone cubic.
           brush.pCurvePts = sizeEff.curve.map(function(pt) { return { x: pt.x, y: pt.y }; });
           notes.push('필압 곡선(' + sizeEff.curve.length + '점) 적용: '
-            + sizeEff.curve.map(function(pt) { return '(' + pt.x.toFixed(2) + ',' + pt.y.toFixed(2) + ')'; }).join(' ')
-            + ' (점 사이는 직선으로 이음)');
+            + sizeEff.curve.map(function(pt) { return '(' + pt.x.toFixed(2) + ',' + pt.y.toFixed(2) + ')'; }).join(' '));
         }
         // ver1622: 기울기. 두 번째 곡선이 기울기 곡선이고, 그 **y 진폭**이 곧 「얼마나 영향을 주는가」다
         // (평평하면 0, 1↔0 으로 훑으면 100). 추정이므로 notes 에 그렇게 적는다.
