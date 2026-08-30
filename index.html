@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2301</title>
+  <title>MoArt ver2302</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -61499,16 +61499,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const incBox = incOk ? s.newBox : null;
       const wx = incBox ? incBox.x : bx, wy = incBox ? incBox.y : by;
       const ww = incBox ? incBox.w : bw, wh = incBox ? incBox.h : bh;
-      // ── ver2301: 점이 늘지 않은 프레임은 지난 결과를 그대로 얹는다 ──────────────────────────
-      // 세션이 있는데 s.newBox 가 없다 = 이번 프레임에 새 dab 이 없다 = s.cv·s.av·pts·radii·마스크·
-      // gbox 전부 지난 프레임 그대로다. 그런데 아래 사슬은 그때 incOk 가 서지 않아 **작업 구역을
-      // gbox 전체로 넓혀** 클리어→변환→곱→되얹기를 통째로 다시 했다 — sc(reused)가 이미 그 결과를
-      // 들고 있는데도. 실기 실측(연필R size100, 교대 3라운드)에서 이런 프레임이 곧 획 중 스파이크였다:
-      // 스킵으로 >17ms 프레임 2~5→0~1, 획 총 시간 -19~25%(경위는 changelog ver2301).
+      // ── ver2301: 변화 없는 프레임은 지난 결과를 그대로 얹는다 ──────────────────────────────
+      // s.clean = 이번 paintInkSessionStep 호출이 s.cv 를 안 바꿨다(ver2302 — 세션이 직접 남기는
+      // 정본 판정). 그러면 s.cv·s.av·pts(개수 불변)·radii(pts 의 순수 함수)·마스크(깊이는 획 시작
+      // 필압 고정, ver2070)·gbox 전부 지난 프레임 그대로라 sc(reused)가 이미 최종 결과를 들고 있다.
+      // 그런데 아래 사슬은 그때 incOk 가 서지 않아 **작업 구역을 gbox 전체로 넓혀** 클리어→변환→
+      // 곱→되얹기를 통째로 다시 했다. 실기 실측(연필R size100, 교대 3라운드)에서 이런 프레임이 곧
+      // 획 중 스파이크였다: 스킵으로 >17ms 프레임 2~5→0~1, 획 총 -19~25%(changelog ver2301).
+      // ver2302: 판정을 `!s.newBox` 에서 `s.clean` 으로 바꿨다 — newBox 는 「찍었는데 null」이
+      // 두 갈래로 가능해(paintStrokeScratchBox 가 상자=캔버스 전체면 null · 비잉크 분기는 스탬프
+      // 성공과 무관하게 점에서 계산) 작은 레이어+큰 브러시에서 낡은 그림을 얹을 수 있었다.
       // 스킵이 서는 경로는 sc 내용이 프레임 불변인 두 가지뿐이다 — 잉크 장(필터 경로)과 팁 세션.
       // 필터가 없는 브라우저(iOS JS 폴백·평균 알파 물러섬)는 종전대로 지나간다(flatAlpha 가 매
       // 프레임 ctx.globalAlpha 에 곱혀야 하므로 여기서 끊으면 안 된다).
-      if (s && !s.newBox && sc.reused && (!s.inkMode || lumFilter)) {
+      if (s && s.clean && sc.reused && (!s.inkMode || lumFilter)) {
         ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // 최종 blit 은 매 프레임 필요(ctx 는 프레임마다 씻긴다)
         return;
       }
@@ -61900,6 +61904,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       cx.globalCompositeOperation = 'source-over';
       cx.filter = 'none';
       const grew = n > s.done || !s.walk.firstEmitted;
+      // ver2302: 「이번 호출이 s.cv 를 실제로 바꿨는가」를 세션에 남긴다 — 소비자(그레인/잉크
+      // 합성의 변화 없는 프레임 스킵)의 판정 근거다. s.newBox 로 대신 읽으면 어긋난다:
+      // paintStrokeScratchBox 의 null 은 「빈 교집합」과 「캔버스 전체」를 겸하기 때문이다.
+      // 판정의 본질은 방출 수가 아니라 **캔버스에 닿았는가**다 — 실측(연필R, 획이 용지 아래
+      // 경계를 벗어난 구간 9프레임)에서 dab 이 3~73개 방출됐지만 전부 캔버스 밖에 찍혀 클립됐고
+      // s.cv 는 불변이었다. 그래서 「이번 구간의 상자(클램프 전)가 [0,w)×[0,h) 와 겹치는가」로
+      // 판정한다. 패딩 수학은 paintStrokeScratchBox 한 벌을 그대로 쓴다(캔버스를 1e9 로 넘겨
+      // 우하단 클램프를 무력화한 raw 상자 — 좌상단 밖은 그 함수가 null 을 내므로 그대로 「안 닿음」).
+      // 리셋(canResume 실패)은 clear/fill 로 이미 s.cv 를 바꿨으므로 그 자체가 변화다.
+      let cvChanged = !canResume;
       if (inkMode) {
         // ver1784: 장은 이제 **두 이유로** 켜진다 — 筆圧→濃度(alphaFor 있음)와 絵の具量(flow<1).
         // 후자만일 때는 필압 알파가 없으므로 av 를 1 로 채운다. 그러면 dab 의 농도는 flow 하나가 정하고
@@ -61921,6 +61935,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // 구역이 정확히 이것이다. s.box 는 그것들의 합집합(스트로크 전체)이라 쓰임이 다르다.
           s.newBox = b ? paintStrokeScratchBox(b, null, null, w, h) : null;
           if (b) {
+            // ver2302: b = 실제 찍은 좌표 범위. 캔버스와 겹칠 때만 변화다(밖은 클립되어 s.cv 불변).
+            if (b.x1 > 0 && b.y1 > 0 && b.x0 < w && b.y0 < h) cvChanged = true;
             s.box = s.box
               ? { x0: Math.min(s.box.x0, b.x0), y0: Math.min(s.box.y0, b.y0),
                   x1: Math.max(s.box.x1, b.x1), y1: Math.max(s.box.y1, b.y1) }
@@ -61931,12 +61947,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver1629: 이번에 새로 들어온 점들의 범위 = 이번 프레임에 dab 이 찍힐 범위. 직전 점 하나를
         // 포함해야 한다 — dab 은 **점과 점 사이**에 놓이므로, 새 점만 재면 그 앞 구간이 빠진다.
         const from = Math.max(0, s.done - 1);
-        s.newBox = paintStrokeScratchBox(null, pts.slice(from), radii.slice(from), w, h);
+        const slicePts = pts.slice(from), sliceRadii = radii.slice(from);
+        s.newBox = paintStrokeScratchBox(null, slicePts, sliceRadii, w, h);
+        // ver2302: 이번 구간이 캔버스에 닿는가(위 배너). raw 상자의 x/y 는 0 클램프라 항상 ≥0 이므로
+        // 우하단 검사만 남고, 좌상단 밖은 raw 자체가 null 이다.
+        const rawBox = paintStrokeScratchBox(null, slicePts, sliceRadii, 1e9, 1e9);
+        if (rawBox && rawBox.x < w && rawBox.y < h) cvChanged = true;
         // ver1625: 혼색이면 dab 마다 틴트하므로 **원본 팁**을 넘긴다(미리 틴트하면 그 색을 다시
         // 덮어쓰는 헛일이 된다). 아니면 종전대로 한 번 틴트한 한 장.
         paintStampTexturedPath(cx, pts, radii, s.mixTipFor ? tipImage : paintTintedTip(tipImage, color),
           opts.tip, s.walk, s.mixTipFor, flow);   // ver1784
       } else s.newBox = null;
+      s.clean = !cvChanged;   // ver2302: 스킵 판정의 정본 — true 면 s.cv 가 지난 호출 그대로다
       s.done = n;
       return s;
     }
