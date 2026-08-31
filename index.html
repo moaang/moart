@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2321</title>
+  <title>MoArt ver2322</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -61898,9 +61898,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (ss > pad) { ds = pad > 0 ? seam * (pad / ss) : 0; ss = pad; }   // 여백을 넘으면 둘 다 줄인다
       return { sx: pad + u0 * rs.len - ss, sw: span + ss * 2, dx: -ds, dw: len + ds * 2 };
     }
+    // ver2322: 리본 축 양끝의 완전 투명 줄 수 {t0, t1}. 스캔은 **원본 방향**에서 한다 —
+    // 세로가 긴 팁(w<h)은 리본 축이 y(행), 아니면 x(열). 못 읽으면(oob 등) 0/0 = 안 자른다.
+    function paintRibbonTrim(img) {
+      const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      if (!w || !h) return { t0: 0, t1: 0 };
+      let c = img;
+      if (!c.getContext) {   // IMG 면 읽기용 캔버스에 한 번 옮긴다(팁당 1회 — rs 캐시 뒤라 무해)
+        c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0);
+      }
+      let d = null;
+      try { d = c.getContext('2d').getImageData(0, 0, w, h).data; } catch (e) { return { t0: 0, t1: 0 }; }
+      const vert = w < h;
+      const n = vert ? h : w;
+      const lineEmpty = function(i) {
+        if (vert) { for (let x = 0; x < w; x += 1) { if (d[(i * w + x) * 4 + 3] > 0) return false; } }
+        else { for (let y = 0; y < h; y += 1) { if (d[(y * w + i) * 4 + 3] > 0) return false; } }
+        return true;
+      };
+      let t0 = 0, t1 = 0;
+      while (t0 < n && lineEmpty(t0)) t0 += 1;
+      while (t1 < n - t0 && lineEmpty(n - 1 - t1)) t1 += 1;
+      return { t0: t0, t1: t1 };
+    }
     // 팁을 「가로 = 경로 방향, 세로 = 선 폭」으로 통일한다. 이후 걷기·그리기가 회전을 안 봐도 된다.
     // 세로로 긴 팁은 반시계 90° 로 눕힌다(원본 y+ 가 x+ 로 간다).
-    function paintRibbonSource(img) {
+    // ver2322: alphaRef — 빈 끝 판정에 쓸 알파 원본(잉크 장의 lum 은 불투명이라 필수. 없으면 img).
+    // ★alphaRef 가 다르면 같은 img 라도 다른 결과가 되므로 캐시는 img 키 그대로 둔다 —
+    // 실호출은 (tinted/tipImage, 없음)과 (lum, tipImage) 둘뿐이고 lum 은 tipId 캐시라 안정적이다.
+    function paintRibbonSource(img, alphaRef) {
       if (!img) return null;
       const hit = paintRibbonSrcCache.get(img);
       if (hit) return hit;
@@ -61916,6 +61944,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cx.rotate(-Math.PI / 2);
         cx.drawImage(img, -w / 2, -h / 2);
         base = c; L = h; W = w;
+      }
+      // ver2322: 리본 방향 양끝의 **완전 투명 줄**을 잘라 굽는다. 내셔멍청펜 소재는 1284px
+      // 캔버스의 마지막 1px 행이 비어 있어(파이썬 정본 도구와 교차 실측 — 소재 그림 자체가
+      // 그렇다. 다른 소재 셋은 안 그렇다), 팁을 이어 붙일 때마다 그 빈 줄이 주기적인 흰 틈이
+      // 됐다(제보 「일정한 간격의 틈」 — 틈 위치가 팁 경계와 1.4px 안에서 일치). wrap 여백도
+      // 빈 끝을 복제하므로 seam 오버랩으로 안 덮인다. 판정은 alphaRef(잉크 장의 lum 은
+      // 불투명이라 자기 알파로는 못 잰다 — 원본 팁을 받는다)에서, 크롭은 눕힌 base 에서.
+      // 회전(-90°)은 원본 y → 눕힌 x 방향 보존이라 t0/t1 이 그대로 대응한다.
+      // 완전 투명(알파 0)만 자른다 — 옅은 가장자리는 그림의 일부다(빈 캔버스 여백은 콘텐츠가 아니다).
+      {
+        const tr = paintRibbonTrim(alphaRef || img);
+        if ((tr.t0 > 0 || tr.t1 > 0) && L - tr.t0 - tr.t1 > 1) {
+          const trimmed = document.createElement('canvas');
+          trimmed.width = L - tr.t0 - tr.t1; trimmed.height = W;
+          trimmed.getContext('2d').drawImage(base, tr.t0, 0, trimmed.width, W, 0, 0, trimmed.width, W);
+          base = trimmed; L = trimmed.width;
+        }
       }
       // ver2094: 앞뒤에 **wrap 여백**을 붙여 굽는다. 조각을 그릴 때 소스도 seam 만큼
       // 넓혀야 하는데(안 그러면 조각마다 텍스처가 늘어난다), 그 몫이 이미지 밖으로
@@ -62336,7 +62381,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 만들어 두고 그 **일부를 잘라** 조각으로 붙인다. 알파가 직전 조각과 같으면 다시 안 만든다 —
       // 멍청펜은 필압 변조가 전부 꺼져 있어 획 하나에 한 번만 만들어진다.
       if (tip && tip.ribbon && lum) {
-        const rs = paintRibbonSource(lum);
+        const rs = paintRibbonSource(lum, tipImage);   // ver2322: 빈 끝 판정은 원본 팁 알파로
         if (rs) {
           if (paintInkDabScratch.width !== rs.full) paintInkDabScratch.width = rs.full;   // ver2094: 여백 포함
           if (paintInkDabScratch.height !== rs.wide) paintInkDabScratch.height = rs.wide;
