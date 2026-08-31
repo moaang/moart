@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2324</title>
+  <title>MoArt ver2325</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24294,6 +24294,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2325, items: [
+        { ja: '**「筆圧→濃度」を入れたリボンブラシがさらに軽くなりました。**'
+            + '濃度が変わるたびに描画をいったん区切っていたのをやめ、濃度を頂点ごとに持たせて'
+            + 'ひと筆を一度に描くようにしました。線の見た目は変わりません。',
+          ko: '**「필압→농도」를 켠 리본 브러시가 더 가벼워졌습니다.**'
+            + ' 농도가 바뀔 때마다 그리기를 끊던 것을 없애고, 농도를 정점마다 실어 한 획을 한 번에 그립니다. 선의 모양은 그대로입니다.',
+          en: '**Ribbon brushes with pressure → density got lighter still.** The renderer no longer'
+            + ' breaks the batch every time the density changes — density now rides on each vertex,'
+            + ' so a stroke is drawn in one pass. Strokes look the same as before.',
+          zh: '**开启「笔压→浓度」的丝带笔刷变得更轻快了。** 不再每次浓度变化就中断绘制，'
+            + '而是把浓度放在每个顶点上，一笔一次绘制完成。线条外观保持不变。' }
+      ] },
       { ver: 2324, items: [
         { ja: '**リボンブラシ（メチャペン系）が軽くなりました。**'
             + 'WebGL で描くときに、ひと塗りごとに描画用キャンバスを作り直していたのをやめました。'
@@ -61762,12 +61774,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return sh;
       };
       try {
+        // ver2325: 정점마다 알파를 싣는다(aA). 잉크 장은 조각마다 알파가 달라지는데, 종전에는
+        // 그때마다 배치를 끊어 flush 했다 — 조각 수만큼 draw call·텍스처 업로드·blit 이 났다.
+        // uOpaque=1 이면 「검정 배경에 알파 a 로 팁을 그린 것」과 같은 식(rgb×a, 알파 1)이라
+        // 잉크 스크래치를 굽지 않고 원본 팁을 그대로 텍스처로 쓸 수 있다.
         const vs = compile(gl.VERTEX_SHADER,
-          'attribute vec2 aPos;attribute vec2 aUv;uniform vec2 uSize;varying vec2 vUv;' +
-          'void main(){vec2 q=aPos/uSize;gl_Position=vec4(q.x*2.0-1.0,1.0-q.y*2.0,0.0,1.0);vUv=aUv;}');
+          'attribute vec2 aPos;attribute vec2 aUv;attribute float aA;uniform vec2 uSize;' +
+          'varying vec2 vUv;varying float vA;' +
+          'void main(){vec2 q=aPos/uSize;gl_Position=vec4(q.x*2.0-1.0,1.0-q.y*2.0,0.0,1.0);vUv=aUv;vA=aA;}');
         const fs = compile(gl.FRAGMENT_SHADER,
-          'precision mediump float;uniform sampler2D uTex;varying vec2 vUv;' +
-          'void main(){gl_FragColor=texture2D(uTex,vUv);}');
+          'precision mediump float;uniform sampler2D uTex;uniform float uOpaque;' +
+          'varying vec2 vUv;varying float vA;' +
+          'void main(){vec4 c=texture2D(uTex,vUv);gl_FragColor=mix(c*vA,vec4(c.rgb*vA,1.0),uOpaque);}');
         const program = gl.createProgram();
         gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
         gl.deleteShader(vs); gl.deleteShader(fs);
@@ -61788,7 +61806,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintRibbonMeshGlState = {
           cv: cv, gl: gl, minmax: minmax, program: program, buffer: buffer, texture: texture,
           aPos: gl.getAttribLocation(program, 'aPos'), aUv: gl.getAttribLocation(program, 'aUv'),
+          aA: gl.getAttribLocation(program, 'aA'),
           uSize: gl.getUniformLocation(program, 'uSize'), uTex: gl.getUniformLocation(program, 'uTex'),
+          uOpaque: gl.getUniformLocation(program, 'uOpaque'),
           texImg: null   // ver2321: 마지막으로 올린 텍스처 소스(참조 캐시 — rs.src 는 팁당 불변)
         };
         return paintRibbonMeshGlState;
@@ -61801,15 +61821,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintRibbonMeshBatch() {
       return { data: [], pieces: [], x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
     }
-    function paintRibbonMeshVertex(batch, x, y, u, v) {
-      batch.data.push(x, y, u, v);
+    function paintRibbonMeshVertex(batch, x, y, u, v, a) {
+      batch.data.push(x, y, u, v, a);   // ver2325: 정점당 5 — 알파가 함께 실린다
       if (x < batch.x0) batch.x0 = x; if (y < batch.y0) batch.y0 = y;
       if (x > batch.x1) batch.x1 = x; if (y > batch.y1) batch.y1 = y;
     }
-    function paintRibbonMeshPiece(batch, rs, u0, u1, p0x, p0y, ang0, p1x, p1y, ang1, w, len, flipY, seam, firstPiece, w0, w1) {
+    function paintRibbonMeshPiece(batch, rs, u0, u1, p0x, p0y, ang0, p1x, p1y, ang1, w, len, flipY, seam, firstPiece, w0, w1, alpha) {
       if (!batch || !rs || !(w > 0)) return;
+      // ver2325: 조각의 알파. 안 주면 1(모양 스탬퍼·컬러 필드는 종전대로 blit 의 globalAlpha 가 나른다).
+      const pa = Number.isFinite(alpha) ? alpha : 1;
       batch.pieces.push({ u0: u0, u1: u1, p0x: p0x, p0y: p0y, ang0: ang0,
-        p1x: p1x, p1y: p1y, ang1: ang1, w: w, len: len, flipY: flipY, seam: seam });
+        p1x: p1x, p1y: p1y, ang1: ang1, w: w, len: len, flipY: flipY, seam: seam, a: pa });
       let d = ang1 - ang0;
       while (d > Math.PI) d -= Math.PI * 2;
       while (d < -Math.PI) d += Math.PI * 2;
@@ -61835,12 +61857,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const b = section(k + 1);
         // A(top0), B(bottom0), C(bottom1) / A, C, D(top1). 첫 셀은 A=B=P0 이므로
         // 자연스럽게 P0-C-D 삼각형 하나로 축퇴한다.
-        paintRibbonMeshVertex(batch, a.tx, a.ty, a.u, vTop);
-        paintRibbonMeshVertex(batch, a.bx, a.by, a.u, vBot);
-        paintRibbonMeshVertex(batch, b.bx, b.by, b.u, vBot);
-        paintRibbonMeshVertex(batch, a.tx, a.ty, a.u, vTop);
-        paintRibbonMeshVertex(batch, b.bx, b.by, b.u, vBot);
-        paintRibbonMeshVertex(batch, b.tx, b.ty, b.u, vTop);
+        paintRibbonMeshVertex(batch, a.tx, a.ty, a.u, vTop, pa);
+        paintRibbonMeshVertex(batch, a.bx, a.by, a.u, vBot, pa);
+        paintRibbonMeshVertex(batch, b.bx, b.by, b.u, vBot, pa);
+        paintRibbonMeshVertex(batch, a.tx, a.ty, a.u, vTop, pa);
+        paintRibbonMeshVertex(batch, b.bx, b.by, b.u, vBot, pa);
+        paintRibbonMeshVertex(batch, b.tx, b.ty, b.u, vTop, pa);
         a = b;
       }
     }
@@ -61851,7 +61873,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (op === 'source-over') return 'source-over';
       return '';
     }
-    function paintRibbonMeshDraw(ctx, img, batch, mode, texDirty) {
+    function paintRibbonMeshDraw(ctx, img, batch, mode, texDirty, opaque) {
       if (!ctx || !img || !batch || !batch.data.length || !mode) return false;
       const st = paintRibbonMeshGl();
       if (!st || (mode === 'max' && !st.minmax)) return false;
@@ -61875,9 +61897,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         st.cv.height = Math.max(st.cv.height, bh);
       }
       const src = new Float32Array(batch.data.length);
-      for (let i = 0; i < batch.data.length; i += 4) {
+      for (let i = 0; i < batch.data.length; i += 5) {   // ver2325: 정점당 5(x,y,u,v,a)
         src[i] = batch.data[i] - x0; src[i + 1] = batch.data[i + 1] - y0;
         src[i + 2] = batch.data[i + 2]; src[i + 3] = batch.data[i + 3];
+        src[i + 4] = batch.data[i + 4];
       }
       try {
         // ver2324: 캔버스가 배치보다 클 수 있다(위 grow-only) — 이번 몫을 **좌상단**에 둔다.
@@ -61889,9 +61912,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
         gl.useProgram(st.program);
         gl.bindBuffer(gl.ARRAY_BUFFER, st.buffer); gl.bufferData(gl.ARRAY_BUFFER, src, gl.STREAM_DRAW);
-        gl.enableVertexAttribArray(st.aPos); gl.vertexAttribPointer(st.aPos, 2, gl.FLOAT, false, 16, 0);
-        gl.enableVertexAttribArray(st.aUv); gl.vertexAttribPointer(st.aUv, 2, gl.FLOAT, false, 16, 8);
+        gl.enableVertexAttribArray(st.aPos); gl.vertexAttribPointer(st.aPos, 2, gl.FLOAT, false, 20, 0);
+        gl.enableVertexAttribArray(st.aUv); gl.vertexAttribPointer(st.aUv, 2, gl.FLOAT, false, 20, 8);
+        gl.enableVertexAttribArray(st.aA); gl.vertexAttribPointer(st.aA, 1, gl.FLOAT, false, 20, 16);
         gl.uniform2f(st.uSize, bw, bh); gl.uniform1i(st.uTex, 0);
+        gl.uniform1f(st.uOpaque, opaque ? 1 : 0);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.texture);
         // ver2321: 텍스처는 참조 캐시 — rs.src 는 팁당 불변이라 획 내내 1회 업로드로 충분하다.
         // 잉크 장 스크래치는 flush 사이에 내용이 바뀌므로(알파 갈림) texDirty 로 강제 업로드.
@@ -61909,7 +61934,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         } else {
           gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
         }
-        gl.drawArrays(gl.TRIANGLES, 0, src.length / 4);
+        gl.drawArrays(gl.TRIANGLES, 0, src.length / 5);
         // ver2321: gl.finish() 는 걷었다 — 뒤따르는 drawImage(st.cv) 가 암묵 동기화한다.
         ctx.drawImage(st.cv, 0, 0, bw, bh, x0, y0, bw, bh);   // ver2324: 캔버스의 이번 몫만
         return true;
@@ -61918,15 +61943,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return false;
       }
     }
-    function paintRibbonMeshDrawOrFallback(ctx, img, rs, batch, texDirty) {
+    // ver2325: `opaque` 는 셰이더 식(잉크 장 = rgb×a·알파 1), `fallbackSrc` 는 Canvas2D 로 물러설 때
+    // **조각마다 소스를 만들어 주는** 콜백이다(잉크 장은 그 조각의 알파로 스크래치를 굽는다).
+    // 없으면 종전대로 img 한 장을 그대로 쓴다.
+    function paintRibbonMeshDrawOrFallback(ctx, img, rs, batch, texDirty, opaque, fallbackSrc) {
       if (!batch || !batch.pieces.length) return;
       // ver2321: 렌더러 스위치는 여기 한 곳이다 — Canvas2D 고정이면 WebGL 을 시도조차 안 한다.
       // WebGL 을 걷어낼 때는 mesh 계열 + 環境設定 항목을 지우고 소비자의 flush 를 조각 직접
       // 호출로 되돌리면 된다. Canvas2D 를 걷을 때는 아래 폴백 루프와 paintDrawRibbonJoin 계열이 대상.
       if (ribbonRendererMode() !== 'canvas2d'
-        && paintRibbonMeshDraw(ctx, img, batch, paintRibbonMeshMode(ctx), texDirty)) return;
+        && paintRibbonMeshDraw(ctx, img, batch, paintRibbonMeshMode(ctx), texDirty, opaque)) return;
       batch.pieces.forEach(function(p) {
-        paintDrawRibbonJoin(ctx, img, rs, p.u0, p.u1, p.p0x, p.p0y, p.ang0,
+        paintDrawRibbonJoin(ctx, fallbackSrc ? fallbackSrc(p) : img, rs, p.u0, p.u1, p.p0x, p.p0y, p.ang0,
           p.p1x, p.p1y, p.ang1, p.w, p.len, p.flipY, p.seam);
       });
     }
@@ -62445,9 +62473,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // Canvas2D 렌더의 실체는 종전 그대로 paintDrawRibbonJoin(컬러 필드는 색만 나른다 —
           // 알파는 최종 source-in 에서 잉크 장이 이긴다. changelog ver2308~2310).
           let inkMesh = paintRibbonMeshBatch(), colorMesh = paintRibbonMeshBatch();
+          // ver2325: 알파는 **정점에 실린다** — 조각마다 달라도 배치를 끊지 않는다. 셰이더가
+          // `rgb×a, 알파 1` 을 내므로 「검정 배경에 알파 a 로 팁」과 같은 그림이고, 텍스처는
+          // 팁 원본 그대로라 업로드도 획당 한 번이다(스크래치를 굽지 않는다).
+          // Canvas2D 로 물러설 때만 조각의 알파로 스크래치를 구워 종전과 같은 픽셀을 낸다.
+          const inkFallbackSrc = function(p) {
+            if (p.a !== lastA) {
+              dctx.globalCompositeOperation = 'source-over';
+              dctx.globalAlpha = 1;
+              dctx.fillStyle = '#000';
+              dctx.fillRect(0, 0, rs.full, rs.wide);   // ver2094: 여백 포함
+              dctx.globalAlpha = p.a;
+              dctx.drawImage(rs.src, 0, 0);
+              dctx.globalAlpha = 1;
+              lastA = p.a;
+            }
+            return paintInkDabScratch;
+          };
           const flushInkMesh = function() {
             if (!inkMesh.pieces.length) return;
-            paintRibbonMeshDrawOrFallback(fctx, paintInkDabScratch, rs, inkMesh, true);
+            paintRibbonMeshDrawOrFallback(fctx, rs.src, rs, inkMesh, false, true, inkFallbackSrc);
             inkMesh = paintRibbonMeshBatch();
           };
           const okR = paintWalkRibbonPieces(pts, radii, tip, rs.len, rs.wide, function(u0, u1, px, py, ang0, w, len, i, t, seam, tipIdx, ex, ey, ang1, firstPiece, w0, w1) {
@@ -62456,20 +62501,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             let a = Math.max(0, Math.min(1, a0 + (a1 - a0) * t));
             if (flowCurve) a = a * fl * paintCurveEvalPts(flowCurve, paintDabPressure(pts, i, t));
             else if (fl < 1) a = a * fl;
-            if (a !== lastA) {
-              flushInkMesh();
-              dctx.globalCompositeOperation = 'source-over';
-              dctx.globalAlpha = 1;
-              dctx.fillStyle = '#000';
-              dctx.fillRect(0, 0, rs.full, rs.wide);   // ver2094: 여백 포함
-              dctx.globalAlpha = a;
-              dctx.drawImage(rs.src, 0, 0);
-              dctx.globalAlpha = 1;
-              lastA = a;
-            }
             const flip = Boolean(alt && (tipIdx & 1));
             paintRibbonMeshPiece(inkMesh, rs, u0, u1, px, py, ang0, ex, ey, ang1,
-              w, len, flip, seam, firstPiece, w0, w1);
+              w, len, flip, seam, firstPiece, w0, w1, a);   // ver2325: 알파는 조각에 실어 보낸다
             if (cctx) paintRibbonMeshPiece(colorMesh, rs, u0, u1, px, py, ang0, ex, ey, ang1,
               w, len, flip, seam, firstPiece, w0, w1);
             const halfR = w / 2 + 2;
@@ -62479,7 +62513,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (Math.max(py, ey) + halfR > y1) y1 = Math.max(py, ey) + halfR;
           }, resume);
           flushInkMesh();
-          if (cctx) paintRibbonMeshDrawOrFallback(cctx, rs.src, rs, colorMesh);
+          if (cctx) paintRibbonMeshDrawOrFallback(cctx, rs.src, rs, colorMesh, false, false);
           fctx.filter = 'none';
           fctx.restore();
           if (!okR || x0 === Infinity) return null;
