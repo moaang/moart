@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2340</title>
+  <title>MoArt ver2341</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24351,6 +24351,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2341, items: [
+        { ja: '**線を引き終えた瞬間に太さが変わることがなくなりました。**'
+            + '描いている間の太さは点が増えるたびに線全体で計算し直されるのに、すでに打った跡は直さないので、'
+            + 'フレームの切れ目がそのまま絵に焼き付いていました — 同じ線を二度引くと違う絵になるのも同じ理由です。'
+            + 'これからは**末尾のわずかな区間を確定させず**毎フレーム描き直します。見た目の遅れはありません。',
+          ko: '**선을 다 긋는 순간 굵기가 바뀌던 것이 없어졌습니다.**'
+            + ' 그리는 동안의 굵기는 점이 늘 때마다 선 전체로 다시 계산되는데 이미 찍은 자국은 고치지 않아서,'
+            + ' 프레임이 끊긴 자리가 그대로 그림에 굳고 있었습니다 — 같은 선을 두 번 그으면 다른 그림이 되던 것도 같은 이유입니다.'
+            + ' 이제부터는 **끝의 짧은 구간을 확정하지 않고** 매 프레임 다시 그립니다. 보이는 지연은 없습니다.',
+          en: '**A stroke no longer changes thickness the moment you lift the pen.**'
+            + ' While you draw, thickness is recomputed across the whole line every time a point arrives, but marks already'
+            + ' laid down were never revised — so where the frames happened to break got baked into the picture, which is'
+            + ' also why drawing the same line twice gave two different results. The **last short stretch is now left'
+            + ' unsettled** and redrawn every frame. There is no visible lag.',
+          zh: '**抬笔的瞬间线条粗细不再改变了。**'
+            + '绘制过程中，每增加一个点都会重新计算整条线的粗细，但已经落下的笔迹不会被修正 —— '
+            + '于是帧的断点被直接烙进了画面，同一条线画两次会得到不同结果也是同样的原因。'
+            + '现在**末尾的一小段不再确定**，每帧重画。看不出延迟。' }
+      ] },
       { ver: 2340, items: [
         { ja: '**ペン先と線のずれ（遅延）が小さくなりました。**'
             + 'デスクトップの低遅延キャンバスが、ver2185 以降ずっと無効のままでした — インクトレイル（既定オフ）と'
@@ -63384,6 +63403,65 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // host가 있으면(라이브) 그 스트로크의 세션을 이어 쓰고, 없으면(커밋·재베이크) 공용 스크래치에
     // 처음부터 한 번 만든다 — **두 경우가 같은 함수를 지나므로** 미리보기와 커밋이 코드로 갈라질 수 없다.
     let paintInkOneShotSession = null;
+    // ── ver2341 (판정 q2=A): 라이브는 **꼬리를 확정하지 않는다** ─────────────────────────────
+    // 굵기(paintVariableWidthRadii)는 점 목록 **전체**의 함수다 — 머리 클램프 · 5창 미디언 ·
+    // **역방향** EMA · **후진 slew** 넷이 뒤를 본다. 그래서 꼬리 쪽 굵기는 점이 더 들어오면 값이
+    // 바뀌는데, 증분 걷기는 **이미 찍은 dab 을 다시 안 고친다** — 그 프레임 시점의 굵기로 찍고
+    // 넘어간다. 프레임 경계는 rAF 와 이벤트 묶음(getCoalescedEvents)이 정하므로 회차마다 다르고,
+    // dab 간격이 굵기에서 나오니 **찍히는 개수까지** 갈렸다(실측: 분할만 바꿔 dab 331 vs 327,
+    // 최대 위치차 15.3px). 같은 이유로 **라이브와 커밋도 갈렸다** — 벡터·콘티 획은 스트로크를
+    // 저장해 다시 그리므로 손을 떼면 굵기 프로파일이 바뀐다.
+    // 정본 docs/drawing_frame_budget_2026-09-02.md 5 절.
+    //
+    // 처방: 뒤에서 이만큼의 점은 **잉크 장에 굳히지 않는다.** 확정 구간만 이어 찍고, 꼬리는 매
+    // 프레임 지웠다 다시 찍는다 — 화면에는 그대로 보이므로 **지연이 없고**, 굳은 픽셀은
+    // 결정적이다.
+    // ★값은 **픽셀로 정했다.** 0.01px 수렴 거리(중앙값 5 · 최대 8)로는 모자란다 — dab 좌표는
+    //  float 이라 0.001px 차이도 AA 를 바꾸므로 **완전 수렴**이 필요하고, EMA 는 지수 감쇠라
+    //  (1−k)^K 가 float 잡음 아래로 내려가야 한다(k=0.385 → 12 점 1.6e-3 · 40 점 1.3e-9).
+    //  실측이 그대로 말했다: 12 에서는 분할을 바꾸면 여전히 갈렸고(diff 4,860) **40 에서 PNG
+    //  바이트가 완전히 같아졌다**(분할 1/5/15 셋 다). 라이브와 커밋의 차이도 22,670 → 4 px.
+    // ★대가는 **꼬리 재생성**이다 — 프레임당 점 하나만 들어오는 최악 조건에서 획당 dab 방출이
+    //  1,108 → 3,113(2.8 배), 실제 밀도(프레임당 5~15 점)에서는 1.07~1.28 배다. ver2339 가 dab
+    //  하나의 값을 18 배 낮춰 둔 뒤라 감당되는 거래다(그 순서가 아니면 못 냈다).
+    // ★혼색(mixTipFor)에서는 끈다 — 색 장에 dab 색을 얹는 함수가 **상태를 들고** 있어서 같은
+    //  dab 을 두 번 태우면 그 상태가 오염된다(ver1630 의 「dab 당 정확히 한 번」 계약).
+    const PAINT_LIVE_TAIL_HOLD = 40;
+    // 상자 합집합({x,y,w,h} — paintStrokeScratchBox 가 내는 꼴). 한쪽이 없으면 다른 쪽.
+    function paintBoxUnion(a, b) {
+      if (!a) return b || null;
+      if (!b) return a;
+      const x0 = Math.min(a.x, b.x), y0 = Math.min(a.y, b.y);
+      const x1 = Math.max(a.x + a.w, b.x + b.w), y1 = Math.max(a.y + a.h, b.y + b.h);
+      return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
+    }
+    // 꼬리를 찍기 **전**의 잉크 장을 그 구역만 떠 둔다(다음 프레임에 되돌릴 것).
+    function paintInkTailBackup(s, pts, radii, from, w, h) {
+      const at = Math.max(0, from - 1);   // dab 은 점과 점 **사이**라 앞 점 하나를 포함한다
+      const box = paintStrokeScratchBox(null, pts.slice(at), radii.slice(at), w, h);
+      s.tailBox = box;
+      if (!box) return;
+      if (!s.tailBak) s.tailBak = document.createElement('canvas');
+      if (s.tailBak.width < box.w) s.tailBak.width = box.w;
+      if (s.tailBak.height < box.h) s.tailBak.height = box.h;
+      const t = s.tailBak.getContext('2d');
+      t.setTransform(1, 0, 0, 1, 0, 0);
+      t.globalCompositeOperation = 'source-over';
+      t.globalAlpha = 1;
+      t.filter = 'none';
+      t.clearRect(0, 0, box.w, box.h);
+      t.drawImage(s.cv, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
+    }
+    // 지난 프레임 꼬리를 지우고 확정 상태로 되돌린다. 되돌린 구역을 돌려준다 —
+    // 그 자리도 이번 프레임에 다시 만들어야 하므로 소비자의 작업 구역(newBox)에 들어가야 한다.
+    function paintInkTailRestore(s, cx) {
+      const box = s.tailBox;
+      if (!box || !s.tailBak) return null;
+      cx.clearRect(box.x, box.y, box.w, box.h);
+      cx.drawImage(s.tailBak, 0, 0, box.w, box.h, box.x, box.y, box.w, box.h);
+      s.tailBox = null;
+      return box;
+    }
     // ver1711: 라이브 증분 세션을 **이어 그릴 수 있는 호스트인가**. 도형과 Shift 직선은 매 프레임
     // 점 배열을 처음부터 다시 만들어 개수가 안 늘거나 줄기까지 한다 — 세션은 `n >= s.done` 을
     // 「새로 찍을 것이 없다」로 읽으므로 그림이 **첫 프레임에서 굳는다**(ver1699 의 제보).
@@ -63452,6 +63530,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.walk = { seg: 0, carry: 0, dabIndex: 0, firstEmitted: false, live: Boolean(host) };
         s.av = [];
         s.done = 0;
+        s.tailBox = null;   // ver2341: 굳히지 않은 꼬리가 지금 어디 있나(백업 캔버스는 재사용한다)
         s.box = null; // ver1370: 이 스트로크가 장에서 실제로 건드린 범위(휘도→알파를 JS로 옮길 때의 작업 구역)
         s.newBox = null; // ver1629: **이번 호출**에 새로 찍은 범위(그레인 증분 합성의 작업 구역)
         // ver1625: 혼색. **아래 색은 여기서 한 번만 읽는다** — 세션 수명이 곧 획 수명이라 이 자리가
@@ -63500,6 +63579,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       cx.globalCompositeOperation = 'source-over';
       cx.filter = 'none';
       s.grainPD = grainPD;   // ver2303: 소비자(paintFillVariableWidthBody)가 획 단위 마스크 생략을 이것으로 판정한다
+      // ver2341: 확정 상한. 커밋(host 없음)은 전체가 확정이고, 혼색은 위 배너대로 제외한다.
+      const confirmN = host ? Math.max(1, n - PAINT_LIVE_TAIL_HOLD) : n;
+      const tailHold = confirmN < n && !s.mixTipFor;
       const grew = n > s.done || !s.walk.firstEmitted;
       // ver2302: 「이번 호출이 s.cv 를 실제로 바꿨는가」를 세션에 남긴다 — 소비자(그레인/잉크
       // 합성의 변화 없는 프레임 스킵)의 판정 근거다. s.newBox 로 대신 읽으면 어긋난다:
@@ -63527,33 +63609,60 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // dab**의 범위뿐이므로, 스트로크 전체 범위는 여기서 합집합으로 쌓아야 한다. 휘도→알파를 JS로
         // 옮겨야 하는 브라우저(iOS/WebKit)에서 훑을 구역이 이것 — 캔버스 전체가 아니라 획이 지나간 곳만.
         if (grew) {
-          const b = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);   // ver1784 // ver2303: grainPD
+          // ver2341: 지난 프레임 꼬리를 되돌리고 → 확정 구간만 이어 찍고 → 꼬리를 새로 찍는다.
+          const prevTail = paintInkTailRestore(s, cx);
+          const cPts = tailHold ? pts.slice(0, confirmN) : pts;
+          const cRadii = tailHold ? radii.slice(0, confirmN) : radii;
+          const b = paintStampInkField(cx, cPts, cRadii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);   // ver1784 // ver2303: grainPD
+          let tb = null;
+          if (tailHold) {
+            paintInkTailBackup(s, pts, radii, confirmN, w, h);
+            // 확정 상태의 **사본**에서 이어 걷는다 — s.walk 를 더럽히면 꼬리가 확정되어 버린다.
+            // 얕은 복사인 이유: 워커마다 남기는 필드가 다르다(dab 은 seg/carry/dabIndex, 리본은
+            // ribbonU/ribbonSeg/pcAng). 이름을 여기서 다시 적으면 워커가 늘 때 조용히 갈린다.
+            tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk), s.mixTipFor, s.colorCtx, flow, grainPD);
+          }
+          const b2 = (b && tb)
+            ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) }
+            : (b || tb);
           // ver1629: 스탬퍼가 돌려주는 것이 **이번 호출이 건드린 범위**다 — 그레인 증분이 다시 만들
           // 구역이 정확히 이것이다. s.box 는 그것들의 합집합(스트로크 전체)이라 쓰임이 다르다.
-          s.newBox = b ? paintStrokeScratchBox(b, null, null, w, h) : null;
-          if (b) {
-            // ver2302: b = 실제 찍은 좌표 범위. 캔버스와 겹칠 때만 변화다(밖은 클립되어 s.cv 불변).
-            if (b.x1 > 0 && b.y1 > 0 && b.x0 < w && b.y0 < h) cvChanged = true;
+          // ver2341: 되돌린 지난 꼬리 자리도 이번 프레임에 다시 만들어야 한다(그 자리가 바뀌었다).
+          s.newBox = paintBoxUnion(b2 ? paintStrokeScratchBox(b2, null, null, w, h) : null, prevTail);
+          if (prevTail) cvChanged = true;   // 되돌리기 자체가 s.cv 를 바꿨다
+          if (b2) {
+            // ver2302: b2 = 실제 찍은 좌표 범위. 캔버스와 겹칠 때만 변화다(밖은 클립되어 s.cv 불변).
+            if (b2.x1 > 0 && b2.y1 > 0 && b2.x0 < w && b2.y0 < h) cvChanged = true;
             s.box = s.box
-              ? { x0: Math.min(s.box.x0, b.x0), y0: Math.min(s.box.y0, b.y0),
-                  x1: Math.max(s.box.x1, b.x1), y1: Math.max(s.box.y1, b.y1) }
-              : b;
+              ? { x0: Math.min(s.box.x0, b2.x0), y0: Math.min(s.box.y0, b2.y0),
+                  x1: Math.max(s.box.x1, b2.x1), y1: Math.max(s.box.y1, b2.y1) }
+              : b2;
           }
         } else s.newBox = null;
       } else if (grew) {
+        // ver2341: 잉크 장 분기와 **같은 순서** — 되돌리고 · 확정만 찍고 · 꼬리를 새로 찍는다.
+        const prevTail = paintInkTailRestore(s, cx);
         // ver1629: 이번에 새로 들어온 점들의 범위 = 이번 프레임에 dab 이 찍힐 범위. 직전 점 하나를
         // 포함해야 한다 — dab 은 **점과 점 사이**에 놓이므로, 새 점만 재면 그 앞 구간이 빠진다.
         const from = Math.max(0, s.done - 1);
         const slicePts = pts.slice(from), sliceRadii = radii.slice(from);
-        s.newBox = paintStrokeScratchBox(null, slicePts, sliceRadii, w, h);
+        s.newBox = paintBoxUnion(paintStrokeScratchBox(null, slicePts, sliceRadii, w, h), prevTail);
         // ver2302: 이번 구간이 캔버스에 닿는가(위 배너). raw 상자의 x/y 는 0 클램프라 항상 ≥0 이므로
         // 우하단 검사만 남고, 좌상단 밖은 raw 자체가 null 이다.
         const rawBox = paintStrokeScratchBox(null, slicePts, sliceRadii, 1e9, 1e9);
         if (rawBox && rawBox.x < w && rawBox.y < h) cvChanged = true;
+        if (prevTail) cvChanged = true;   // 되돌리기 자체가 s.cv 를 바꿨다
         // ver1625: 혼색이면 dab 마다 틴트하므로 **원본 팁**을 넘긴다(미리 틴트하면 그 색을 다시
         // 덮어쓰는 헛일이 된다). 아니면 종전대로 한 번 틴트한 한 장.
-        paintStampTexturedPath(cx, pts, radii, s.mixTipFor ? tipImage : paintTintedTip(tipImage, color),
-          opts.tip, s.walk, s.mixTipFor, flow);   // ver1784
+        const tipSrc = s.mixTipFor ? tipImage : paintTintedTip(tipImage, color);
+        paintStampTexturedPath(cx, tailHold ? pts.slice(0, confirmN) : pts,
+          tailHold ? radii.slice(0, confirmN) : radii, tipSrc, opts.tip, s.walk, s.mixTipFor, flow);   // ver1784
+        if (tailHold) {
+          paintInkTailBackup(s, pts, radii, confirmN, w, h);
+          paintStampTexturedPath(cx, pts, radii, tipSrc, opts.tip, Object.assign({}, s.walk), s.mixTipFor, flow);
+          s.newBox = paintBoxUnion(s.newBox, s.tailBox);
+          cvChanged = true;
+        }
       } else s.newBox = null;
       s.clean = !cvChanged;   // ver2302: 스킵 판정의 정본 — true 면 s.cv 가 지난 호출 그대로다
       s.done = n;
