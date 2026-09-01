@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2338</title>
+  <title>MoArt ver2340</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -18721,6 +18721,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.inkTrailOn = Boolean(on);
       try { localStorage.setItem('memoInkTrail', on ? 'on' : 'off'); } catch (e) {}
       renderInkTrailChoices();
+      // ver2340: 이 스위치가 곧 원화 프리뷰의 컨텍스트 옵션을 정한다(gengaPreviewCtx) — 그런데
+      // getContext 옵션은 **그 요소의 첫 호출에만** 유효하므로, 다시 만들지 않으면 토글이 다음
+      // 실행까지 반영되지 않는다(켠 줄 알았는데 아무 일도 없는 조용한 실패). 스테이지 전체 렌더가
+      // 캔버스 요소를 새로 만들고, 그 첫 getContext 가 새 판정을 탄다.
+      paintInkPresenters.clear();   // 끄면 남은 presenter 를 버리고, 켜면 죽은 요소의 것을 버린다
+      paintInkPendingAreas.clear();
+      if (state.project && state.project.kind === 'genga') renderGengaView();
     }
     function renderInkTrailChoices() {
       renderSettingChoices(
@@ -24344,6 +24351,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2340, items: [
+        { ja: '**ペン先と線のずれ（遅延）が小さくなりました。**'
+            + 'デスクトップの低遅延キャンバスが、ver2185 以降ずっと無効のままでした — インクトレイル（既定オフ）と'
+            + '排他なのに、「使えるかどうか」で判定していたためです。これからは**インクトレイルを入れた時だけ**そちらを使い、'
+            + 'それ以外は低遅延キャンバスが効きます。原画のキャンバスが対象です。',
+          ko: '**펜 끝과 선 사이의 어긋남(지연)이 줄었습니다.**'
+            + ' 데스크톱의 저지연 캔버스가 ver2185 이후 계속 꺼져 있었습니다 — 잉크 트레일(기본 꺼짐)과 상호배타인데'
+            + ' 「쓸 수 있는가」로 판정하고 있었기 때문입니다. 이제 **잉크 트레일을 켠 경우에만** 그쪽을 쓰고,'
+            + ' 그 외에는 저지연 캔버스가 걸립니다. 원화 캔버스가 대상입니다.',
+          en: '**The gap between the pen tip and the line (latency) is smaller.**'
+            + ' The desktop low-latency canvas had been off since ver2185 — it is mutually exclusive with the ink trail'
+            + ' (off by default), but the choice was made on whether the trail was *available* rather than *on*.'
+            + ' Now the trail wins **only when you turn it on**; otherwise the low-latency canvas applies. Genga canvas only.',
+          zh: '**笔尖与线条之间的偏移（延迟）变小了。**'
+            + '桌面端的低延迟画布自 ver2185 起一直处于关闭状态 — 它与墨迹轨迹（默认关闭）互斥，'
+            + '但判断依据是「是否可用」而非「是否开启」。现在**只有开启墨迹轨迹时**才使用它，否则启用低延迟画布。仅原画画布。' }
+      ] },
       { ver: 2338, items: [
         { ja: '**CLIP STUDIO から読み込んだブラシの「厚さ」が、潰す向きを間違えていたのを直しました。**'
             + '「適用方向」（水平＝先端画像の横／垂直＝縦）をそのまま受けます。'
@@ -57758,6 +57782,30 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       PAINT_GRAIN_MASKS[key] = cv;
       return cv;
     }
+    // ★ver2339: 종이결 배율을 **타일에 미리 굽는다.** 패턴 변환(`setTransform`)에 배율이 들어
+    //   있으면 dab 마다 원점이 바뀔 때 브라우저가 스케일된 타일을 다시 만들어야 해서, 그 한 줄이
+    //   프레임 비용의 전부였다 — 실측(실기 격리 Chrome, 鉛筆R): 잉크 장 dab 이 s40 22.9ms ·
+    //   s150 13.7ms 인데 `paperTexDepth=0`(= 곱 한 덩어리만 건너뜀)이면 **0.6 / 0.3ms** 다.
+    //   굽어 둔 타일로 만든 패턴은 변환이 평행이동뿐이라 타일이 그대로 재사용된다.
+    //   배율은 타일 크기(정수)에서 되도출한다 — 반복 주기가 정수여야 위상이 안 어긋난다.
+    let paintGrainScaledCache = new Map();
+    function paintGrainScaledTile(tile, id, k) {
+      if (!tile || !(k > 0) || Math.abs(k - 1) < 1e-6) return tile;
+      const w = Math.max(1, Math.min(2048, Math.round(tile.width * k)));
+      const h = Math.max(1, Math.min(2048, Math.round(tile.height * k)));
+      if (w === tile.width && h === tile.height) return tile;
+      const key = id + '|' + w + 'x' + h;
+      const hit = paintGrainScaledCache.get(key);
+      if (hit) return hit;
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const cx = c.getContext('2d');
+      cx.imageSmoothingQuality = 'high';
+      cx.drawImage(tile, 0, 0, tile.width, tile.height, 0, 0, w, h);
+      if (paintGrainScaledCache.size > 24) paintGrainScaledCache = new Map();   // paintTipLumCache 와 같은 관용구
+      paintGrainScaledCache.set(key, c);
+      return c;
+    }
     // ver2303: perDab 이 서려면 패턴 원점을 dab 마다 옮길 수 있어야 한다(용지 고정 위상).
     // 안 되는 환경에서 강행하면 결이 dab 을 따라다니거나 예외로 죽는다 — 그때는 perDab 을
     // 무효로 두어 획 단위 마스크(기존 경로)가 그대로 선다. 조용한 소실이 아니라 동작 보존이다.
@@ -62729,8 +62777,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (gLum) {
         if (!paintInkGrainScratch) paintInkGrainScratch = document.createElement('canvas');
         gctx = paintInkGrainScratch.getContext('2d');
-        gPat = gctx.createPattern(gLum, 'repeat');
         gK = Math.max(0.05, (Number(grainPD.scale) || 100) / 100);
+        // ver2339: 배율은 타일에 굽고 패턴 변환에는 안 넣는다(위 paintGrainScaledTile 주석).
+        gPat = gctx.createPattern(paintGrainScaledTile(gLum, grainPD.id, gK), 'repeat');
         gDepth = Math.max(0, Math.min(1, (Number(grainPD.depth) || 0) / 100));
         gCurve = grainPD.depthCurve || null;
         gOx = Number(grainPD.originX) || 0;
@@ -62756,7 +62805,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (gd > 0) {
           // 패턴 원점을 용지 좌표로 되돌린다(용지 고정 위상 — 획 단위 마스크의 규칙과 같다).
-          gPat.setTransform(new DOMMatrix([gK, 0, 0, gK, -gOx - gx, -gOy - gy]));
+          // ver2339: **평행이동뿐**이다 — 배율은 타일에 이미 구워져 있다. 타일이 gK 배 작아졌으므로
+          // 같은 용지 좌표가 같은 결 픽셀에 오고 위상은 종전과 같다.
+          gPat.setTransform({ a: 1, b: 0, c: 0, d: 1, e: -gOx - gx, f: -gOy - gy });
           gctx.globalCompositeOperation = 'multiply';
           gctx.globalAlpha = gd;
           gctx.fillStyle = gPat;
@@ -97523,9 +97574,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // MPO is disabled at the OS level (the registry tweak in the project root), Chromium silently falls back
     // to the normal queue; the hint is then inert, never harmful.
     function gengaPreviewCtx(canvas) {
-      // ver2185: Ink 트레일을 쓸 수 있으면 desynchronized 를 **요청하지 않는다** — 둘은 상호배타다
-      // (paintInkTrailAvailable 위의 주석). 못 쓰는 환경에서는 아래 종전 경로 그대로다.
-      if (paintInkTrailAvailable()) return canvas.getContext('2d');
+      // ver2185: 둘은 상호배타라 하나를 골라야 한다(그쪽 주석). ver2340: 고르는 기준이 **API 존재**
+      // 여부였던 것을 **실제로 쓰는가**로 고쳤다. 종전 판정에는 Chrome 데스크톱이 전부 걸렸고
+      // (`navigator.ink` 가 있다), 그래서 desynchronized 를 내주는데 정작 트레일은 ver2305 부터
+      // **기본 꺼짐**이라 아무도 안 쓰고 있었다 — 저지연 수단이 둘 다 없는 상태가 남았다.
+      // 트레일은 켜도 팁·종이결 브러시(`.sut` 전부)에서는 spec 이 null 이라 애초에 안 걸린다.
+      // 실기 A/B(`_perf_latency_ab.html`, 사용자 판정): desynchronized 있는 팔이 확연히 빠르고
+      // 각짐도 없다 · rAF 유무는 거의 무관. 그 판정이 이 한 줄을 정한다.
+      if (inkTrailUserOn()) return canvas.getContext('2d');
       return canvas.getContext('2d', { desynchronized: true });
     }
     // ver1438: 원화 라쏘의 짝. 이쪽은 pointermove 마다 프리뷰를 **통째로 재합성**하고 있었고
