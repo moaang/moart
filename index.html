@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2382</title>
+  <title>MoArt ver2383</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -50700,6 +50700,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // decoded), so kick the decodes for the sources the user is ABOUT to scrub over -- the nearest
     // not-yet-decoded sources around the grab point -- the moment the drag begins. Capped so a huge
     // project doesn't stampede the decoder; the byte-budget LRU (trimAudioBufferCache) bounds memory.
+    // ver2383: 스크럽 프리디코드의 「이 클립이 지금 프레임에서 얼마나 먼가」 한 벌(안에 있으면 0).
+    // ★끝 프레임의 뜻이 두 엔진에서 다르지만(원화=포함 끝 · 콘티=배타 끝) **자기 값을 그대로**
+    // 넘기면 된다 — center == end 에서 어느 쪽이든 0 이라 결과가 안 바뀐다.
+    function scrubWarmDistance(center, start, end) {
+      return center < start ? start - center : (center > end ? center - end : 0);
+    }
     function warmScrubAudioBuffers(project, centerFrame) {
       const clips = audioTimelineAudibleClips(project);
       const center = Math.max(0, Math.round(Number(centerFrame) || 0));
@@ -50722,7 +50728,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         } else if (state.audioBufferCache[sourceKey] || state.audioBufferPendingCache[sourceKey]) continue;
         const start = Math.round(Number(clip.startFrame) || 0);
         const end = start + Math.max(0, Math.round(Number(clip.durationFrames) || 0));
-        const dist = center < start ? start - center : (center >= end ? center - end : 0);
+        const dist = scrubWarmDistance(center, start, end); // ver2383: 원화와 같은 한 벌
         candidates.push({ clip: clip, dist: dist });
       }
       candidates.sort(function(left, right) { return left.dist - right.dist; });
@@ -50807,13 +50813,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return peaks;
     }
 
-    function touchAudioSourcePeaks(sourceKey) {
-      if (!sourceKey) return;
-      state.audioSourcePeaksOrder = Array.isArray(state.audioSourcePeaksOrder) ? state.audioSourcePeaksOrder : [];
-      const existing = state.audioSourcePeaksOrder.indexOf(sourceKey);
-      if (existing >= 0) state.audioSourcePeaksOrder.splice(existing, 1);
-      state.audioSourcePeaksOrder.push(sourceKey);
+    // ver2383: LRU 순서 배열의 「맨 뒤로 보내기」 한 벌 — state 의 **어느 순서 배열인가**만 다르다.
+    // 배열을 그대로 넘기지 않고 이름을 넘기는 이유: 없을 때 새 배열을 **state 에 다시 꽂아야** 한다.
+    function touchLruOrder(prop, key) {
+      if (!key) return;
+      state[prop] = Array.isArray(state[prop]) ? state[prop] : [];
+      const existing = state[prop].indexOf(key);
+      if (existing >= 0) state[prop].splice(existing, 1);
+      state[prop].push(key);
     }
+    function touchAudioSourcePeaks(sourceKey) { touchLruOrder('audioSourcePeaksOrder', sourceKey); }
 
     function trimAudioSourcePeaks() {
       let total = 0;
@@ -50937,13 +50946,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return state.audioBufferPendingCache[key];
     }
 
-    function touchAudioBufferCache(cacheKey) {
-      if (!cacheKey) return;
-      state.audioBufferCacheOrder = Array.isArray(state.audioBufferCacheOrder) ? state.audioBufferCacheOrder : [];
-      const existing = state.audioBufferCacheOrder.indexOf(cacheKey);
-      if (existing >= 0) state.audioBufferCacheOrder.splice(existing, 1);
-      state.audioBufferCacheOrder.push(cacheKey);
-    }
+    function touchAudioBufferCache(cacheKey) { touchLruOrder('audioBufferCacheOrder', cacheKey); } // ver2383: 피크 LRU 와 같은 한 벌
 
     // Decoded PCM is enormous relative to the compressed sources (float32 x channels: a 16-minute stereo
     // 48kHz recording is ~370MB decoded from a 20MB mp3), so an item-count cap alone is meaningless --
@@ -51054,29 +51057,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!headBuffer || headBuffer.byteLength < 44) return null;
       const view = new DataView(headBuffer);
       if (readAscii(view, 0, 4) !== 'RIFF' || readAscii(view, 8, 4) !== 'WAVE') return null;
-      let offset = 12;
-      let format = null;
-      let dataOffset = 0;
-      let dataSize = 0;
-      while (offset + 8 <= view.byteLength) {
-        const id = readAscii(view, offset, 4);
-        const size = view.getUint32(offset + 4, true);
-        const chunkStart = offset + 8;
-        if (id === 'fmt ' && size >= 16) {
-          format = {
-            audioFormat: view.getUint16(chunkStart, true),
-            channels: Math.max(1, view.getUint16(chunkStart + 2, true)),
-            sampleRate: Math.max(1, view.getUint32(chunkStart + 4, true)),
-            blockAlign: Math.max(1, view.getUint16(chunkStart + 12, true)),
-            bitsPerSample: Math.max(1, view.getUint16(chunkStart + 14, true))
-          };
-        } else if (id === 'data') {
-          dataOffset = chunkStart;
-          dataSize = Math.min(size || (totalBytes - chunkStart), totalBytes - chunkStart);
-          break;
-        }
-        offset = chunkStart + size + (size % 2);
-      }
+      const scan = parseWavChunks(view, totalBytes, true, true); // 머리만 받았으므로 첫 data 에서 멈춘다
+      const format = scan.format;
+      const dataOffset = scan.dataOffset;
+      const dataSize = scan.dataSize;
       if (!format || !dataOffset || dataSize <= 0) return null;
       if (format.audioFormat !== 1 && format.audioFormat !== 3) return null;
       const sampleFrames = Math.max(1, Math.floor(dataSize / format.blockAlign));
@@ -51675,10 +51659,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return analyzeAudioBlobForClip(clip, await response.blob());
     }
 
-    function parseWavHeaderDuration(buffer) {
-      if (!buffer || buffer.byteLength < 44) return null;
-      const view = new DataView(buffer);
-      if (readAscii(view, 0, 4) !== 'RIFF' || readAscii(view, 8, 4) !== 'WAVE') return null;
+    // ver2383: WAV 의 RIFF 청크를 훑어 fmt/data 를 찾는 한 벌. 두 호출부의 **정책 차이**를 인자로
+    // 받는다 — 길이만 알려는 쪽은 끝까지 훑고, 잘라 읽는 쪽은 **첫 data 에서 멈춘다**(머리만 받아
+    // 뒤를 못 보므로). `sizeFallback` 은 크기 0 인 data 청크를 「남은 바이트 전부」로 볼지다.
+    function parseWavChunks(view, limitBytes, stopAtData, sizeFallback) {
       let offset = 12;
       let format = null;
       let dataOffset = 0;
@@ -51692,15 +51676,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             audioFormat: view.getUint16(chunkStart, true),
             channels: Math.max(1, view.getUint16(chunkStart + 2, true)),
             sampleRate: Math.max(1, view.getUint32(chunkStart + 4, true)),
+            blockAlign: Math.max(1, view.getUint16(chunkStart + 12, true)),
             bitsPerSample: Math.max(1, view.getUint16(chunkStart + 14, true))
           };
         } else if (id === 'data') {
           dataOffset = chunkStart;
-          dataSize = Math.min(size, view.byteLength - chunkStart);
+          dataSize = Math.min((sizeFallback && !size) ? limitBytes - chunkStart : size, limitBytes - chunkStart);
+          if (stopAtData) break;
         }
         offset = chunkStart + size + (size % 2);
       }
-      if (!format || !dataOffset || !dataSize) return null;
+      return { format: format, dataOffset: dataOffset, dataSize: dataSize };
+    }
+
+    function parseWavHeaderDuration(buffer) {
+      if (!buffer || buffer.byteLength < 44) return null;
+      const view = new DataView(buffer);
+      if (readAscii(view, 0, 4) !== 'RIFF' || readAscii(view, 8, 4) !== 'WAVE') return null;
+      const scan = parseWavChunks(view, view.byteLength, false, false); // 길이만 필요하므로 끝까지 훑는다
+      const format = scan.format;
+      const dataSize = scan.dataSize;
+      if (!format || !scan.dataOffset || !dataSize) return null;
       if (format.audioFormat !== 1 && format.audioFormat !== 3) return null;
       const bytesPerSample = Math.max(1, Math.round(format.bitsPerSample / 8));
       const frameBytes = bytesPerSample * format.channels;
@@ -53098,27 +53094,35 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       runTimelineStructureCommand('Add picture panel', function(project) {
         const selectedIndex = selectedCutIndexForEdit(project);
         if (selectedIndex < 0) return;
-        const video = buildVideoTimeline(project);
-        const selectedCut = project.cuts[selectedIndex];
-        const selectedSlot = video.slots.find(function(slot) { return slot.cut && slot.cut.id === selectedCut.id; }) || null;
-        const insertIndex = selectedIndex + 1;
-        const cut = createBlankCut(project.cuts.length + 1);
-        cut.id = 'panel-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
-        const frames = ensureCutHasOneSecondPicturePanel(project, cut);
-        project.cuts.splice(insertIndex, 0, cut);
-        resetCutOrders(project);
-        if (selectedSlot) {
-          const ownerId = cutGroupOwnerIdFromSlot(selectedSlot);
-          const ownerItem = ownerId ? timelineGroupItemForOwner(project, ownerId) : null;
-          if (ownerItem) setCutGroupFramesByOwnerId(project, ownerId, ownerItem.frames + frames);
-          shiftTimelineMediaAfterFrame(project, selectedSlot.endFrame, frames);
-        }
-        setCurrentPicturePanelId(selectedCut.id);
+        const inserted = insertBlankPicturePanelAfterIndex(project, selectedIndex); // ver2383: 끼우는 몸통은 한 벌
+        setCurrentPicturePanelId(inserted.selectedCut.id);
         const selectedPanels = selectedPicturePanelSet();
         selectedPanels.clear();
         selectedPanels.add(selectedCut.id);
         state.activeConteSelectionType = 'panel';
       }, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.cutStructure, partialTimeline: true });
+    }
+
+    // ver2383: 「그 컷 뒤에 1 초짜리 그림 패널을 끼운다」의 몸통 한 벌 — 두 호출부는 **끼운 뒤의
+    // 선택 처리**만 다르다(하나는 새로 고르고, 하나는 콘티 레이어 선택을 보존한다). 컷그룹 총
+    // 프레임 보정과 뒤 미디어 밀기까지가 이 몸통에 든다 — 밖에서 다시 하면 두 벌로 갈린다.
+    function insertBlankPicturePanelAfterIndex(project, selectedIndex) {
+      const video = buildVideoTimeline(project);
+      const selectedCut = project.cuts[selectedIndex];
+      const selectedSlot = video.slots.find(function(slot) { return slot.cut && slot.cut.id === selectedCut.id; }) || null;
+      const insertIndex = selectedIndex + 1;
+      const cut = createBlankCut(project.cuts.length + 1);
+      cut.id = 'panel-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+      const frames = ensureCutHasOneSecondPicturePanel(project, cut);
+      project.cuts.splice(insertIndex, 0, cut);
+      resetCutOrders(project);
+      if (selectedSlot) {
+        const ownerId = cutGroupOwnerIdFromSlot(selectedSlot);
+        const ownerItem = ownerId ? timelineGroupItemForOwner(project, ownerId) : null;
+        if (ownerItem) setCutGroupFramesByOwnerId(project, ownerId, ownerItem.frames + frames);
+        shiftTimelineMediaAfterFrame(project, selectedSlot.endFrame, frames);
+      }
+      return { cut: cut, selectedCut: selectedCut, frames: frames };
     }
 
     function addPicturePanelAfterCutPreserveLayerSelection(cutId) {
@@ -53135,21 +53139,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       runTimelineStructureCommand('Add picture panel', function(project) {
         const selectedIndex = cutIndexById(project, targetCutId);
         if (selectedIndex < 0) return;
-        const video = buildVideoTimeline(project);
-        const selectedCut = project.cuts[selectedIndex];
-        const selectedSlot = video.slots.find(function(slot) { return slot.cut && slot.cut.id === selectedCut.id; }) || null;
-        const insertIndex = selectedIndex + 1;
-        const cut = createBlankCut(project.cuts.length + 1);
-        cut.id = 'panel-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
-        const frames = ensureCutHasOneSecondPicturePanel(project, cut);
-        project.cuts.splice(insertIndex, 0, cut);
-        resetCutOrders(project);
-        if (selectedSlot) {
-          const ownerId = cutGroupOwnerIdFromSlot(selectedSlot);
-          const ownerItem = ownerId ? timelineGroupItemForOwner(project, ownerId) : null;
-          if (ownerItem) setCutGroupFramesByOwnerId(project, ownerId, ownerItem.frames + frames);
-          shiftTimelineMediaAfterFrame(project, selectedSlot.endFrame, frames);
-        }
+        insertBlankPicturePanelAfterIndex(project, selectedIndex); // ver2383: 끼우는 몸통은 한 벌
         setCurrentPicturePanelId(targetCutId);
         const selectedPanels = selectedPicturePanelSet();
         selectedPanels.clear();
@@ -61114,6 +61104,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // ver1995: 사이드독 스크롤 인디케이터(97919 부근)와 같은 공식 — H*H/contentH 로 썸 높이,
     // 스크롤 비율로 top. 좌표계만 다르다(여기는 grid.scrollTop 이 곧 스크롤 위치).
+    // ver2383: 오버레이 스크롤 표시자의 크기·자리 한 벌 — 트랙 높이·내용 높이·지금 스크롤에서 낸다.
+    // 최소 24px 은 「손가락으로 잡을 수 있는 크기」라서 두 자리가 같은 값을 쓴다.
+    function scrollIndicatorMetrics(trackH, contentH, scrollY) {
+      const maxScroll = Math.max(0, contentH - trackH);
+      const size = Math.max(24, Math.round(trackH * trackH / contentH));
+      return { size: size, offset: maxScroll > 0 ? Math.round((trackH - size) * (scrollY / maxScroll)) : 0 };
+    }
     function updateBrushLibScrollbar() {
       const win = document.getElementById('brushLibraryWindow');
       const grid = win && win.querySelector('[data-bl-grid]');
@@ -61121,10 +61118,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!grid || !bar) return;
       const H = grid.clientHeight, contentH = grid.scrollHeight;
       if (contentH <= H) { bar.style.height = '0px'; return; }
-      const sbH = Math.max(24, Math.round(H * H / contentH));
-      const sbTop = Math.round((H - sbH) * (grid.scrollTop / (contentH - H)));
-      bar.style.height = sbH + 'px';
-      bar.style.top = sbTop + 'px';
+      const sb = scrollIndicatorMetrics(H, contentH, grid.scrollTop); // ver2383: 사이드 도크와 같은 한 벌
+      bar.style.height = sb.size + 'px';
+      bar.style.top = sb.offset + 'px';
     }
     let blScrollFlashTimer = null;
     function flashBrushLibScrollbar() {
@@ -69011,18 +69007,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const nx = c.querySelector('#tlTutNext'); if (nx) nx.onclick = tlTutNext;
     }
 
-    function tlTutNext(){
-      if (!tlTut || !tlTut.solved) return;
+    // ver2383: 「다음 레슨으로 넘긴다」의 몸통 한 벌 — 두 호출부는 **진입 가드만** 다르다.
+    function tlTutAdvance(){
       if (tlTut.idx >= tlTut.lessons.length - 1){ tlTutExit(); return; }
       tlTut.idx += 1; tlTut.solved = false;
       tlTutApplyLesson(tlTut.idx); tlTutRenderCoach();
     }
-    function tlTutSkip(){ // ver1152: advance even if the user cannot / does not want to do this one
-      if (!tlTut || !tlTut.lessons) return;
-      if (tlTut.idx >= tlTut.lessons.length - 1){ tlTutExit(); return; }
-      tlTut.idx += 1; tlTut.solved = false;
-      tlTutApplyLesson(tlTut.idx); tlTutRenderCoach();
-    }
+    function tlTutNext(){ if (!tlTut || !tlTut.solved) return; tlTutAdvance(); }   // 푼 뒤에만
+    function tlTutSkip(){ if (!tlTut || !tlTut.lessons) return; tlTutAdvance(); }  // ver1152: 못 하거나 하기 싫은 레슨도 넘긴다
 
     let tlTutToastTimer = 0;
     function tlTutToast(msg, warn){
@@ -75278,7 +75270,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // rectangle evenly; now the window (and column count) is user-resizable, so an incomplete last row
       // just leaves the window's own background showing, which is the point of the zero-gap minimal look.
       root.innerHTML = items.map(function(item) {
-        return '<button class="paint-picker-swatch' + (item.color === activeColor ? ' active' : '') + '" type="button" data-paint-picker-color="' + escapeAttr(item.color) + '" style="--paint-color:' + escapeAttr(item.color) + '" aria-label="Color history ' + escapeAttr(item.color) + '"></button>';
+        return paintSwatchButtonHtml(item.color, item.color === activeColor, '', 'Color history ');
       }).join('');
     }
 
@@ -75441,14 +75433,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ];
     }
 
+    // ver2383: 색 스와치 버튼 한 벌 — 붙는 data 속성과 aria 앞말만 호출부가 정한다.
+    function paintSwatchButtonHtml(color, active, extraAttrs, ariaPrefix) {
+      const c = escapeAttr(color);
+      return '<button class="paint-picker-swatch' + (active ? ' active' : '') + '" type="button"'
+        + ' data-paint-picker-color="' + c + '"' + (extraAttrs ? ' ' + extraAttrs : '')
+        + ' style="--paint-color:' + c + '" aria-label="' + (ariaPrefix || '') + c + '"></button>';
+    }
     function renderPaintPaletteInto(root, pal, activeColor) {
       root.innerHTML = panelItemsHtml(pal.items, function(it, i) {
         if (it.t !== 'c') return '';
         const c = normalizePaintBaseColor(it.v);
         // norecord: 自分で並べた棚から選んでも「最近の色」には積まない
-        return '<button class="paint-picker-swatch' + (c === activeColor ? ' active' : '') + '" type="button"'
-          + ' data-paint-picker-color="' + escapeAttr(c) + '" data-paint-picker-norecord="1" data-pal-idx="' + i + '"'
-          + ' style="--paint-color:' + escapeAttr(c) + '" aria-label="' + escapeAttr(c) + '"></button>';
+        return paintSwatchButtonHtml(c, c === activeColor, 'data-paint-picker-norecord="1" data-pal-idx="' + i + '"', '');
       });
     }
 
@@ -80814,10 +80811,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       return svg;
     }
+    // ver2383: 「시트가 몇 장인가」의 수학 한 벌 — 총 프레임을 페이지당 프레임으로 나눠 올린다.
+    // ★총 프레임은 **호출부가 맞춰서 넘긴다**(원화는 빈 값을 1 로 보고, 컷그룹은 만든 값을 그대로).
+    function timesheetPageCountOf(gt, totalFrames) {
+      return Math.max(1, Math.ceil(totalFrames / timesheetPageFramesFor(gt)));
+    }
     function gengaTimesheetPageCount(project) {
       const gt = project && project.gengaTimeline;
       if (!gt) return 0;
-      return Math.max(1, Math.ceil((gt.totalFrames || 1) / timesheetPageFramesFor(gt)));
+      return timesheetPageCountOf(gt, gt.totalFrames || 1);
     }
 
     // Shared kernel: how many コンテ撮 sheet pages this cut group needs — must be known *before* the export
@@ -80826,7 +80828,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function conteCutGroupTimesheetPageCount(project, ownerCut) {
       const layout = conteCutGroupLocalLayout(project, ownerCut);
       const gt = conteCutGroupToGengaTimeline(project, ownerCut, layout);
-      return Math.max(1, Math.ceil(gt.totalFrames / timesheetPageFramesFor(gt)));
+      return timesheetPageCountOf(gt, gt.totalFrames);
     }
 
     async function conteRasterizeSvgToCanvas(svgEl, scale) {
@@ -84145,7 +84147,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!gengaAudioUrl(c.ref)) return;      // no bytes in the store — nothing to decode
         const start = Math.max(1, Math.round(Number(c.startFrame) || 1));
         const end = start + Math.max(1, Math.round(Math.max(0.05, Number(c.durationSec) || 0.05) * fps)) - 1;
-        const dist = center < start ? start - center : (center > end ? center - end : 0);
+        const dist = scrubWarmDistance(center, start, end); // ver2383: 콘티와 같은 한 벌
         candidates.push({ ref: c.ref, dist: dist });
       });
       candidates.sort(function(left, right) { return left.dist - right.dist; });
@@ -86877,7 +86879,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // → parse input.timelineCommand → match images to (layer,drawing) → build a NEW genga project timeline.
     // Grammar/matching mirror the #preview playback app (timesheet_playback_preview.html). See
     // docs/genga_sheet_folder_import_research.md.
-    function gengaSheetNormToken(t) { return String(t == null ? '' : t).normalize('NFKC').trim(); }
+    function gengaSheetNormToken(t) { return String(t == null ? '' : t).normalize('NFKC').trim(); } // ver2383: #preview 의 normalizeText 도 이 한 벌이다(gengaSheetNormalizeText 흡수)
     // ★ver2235: 시트 토큰 어휘의 **정본 한 벌**. 종전에는 gengaSheetFramesFromTokens 한 함수 안에만
     // 네 벌이 있었고 그중 둘이 갈려 있었다 — cells 수집 제외식에서 `clear`·`blank` 가 빠졌고, 꼬리
     // 리피트의 `plain` 판정은 넉 자(n/x/dot/~)만 배제해 **같은 뜻의 다른 표기**(○ ◯ 〇 ● ・ × ✕ _ -
@@ -87088,7 +87090,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         else { cell += ch; }
       }
       if (cell.length || row.length) { row.push(cell); rows.push(row); }
-      return rows.map(function(r) { return r.map(function(v) { return gengaSheetNormalizeText(v); }); });
+      return rows.map(function(r) { return r.map(function(v) { return gengaSheetNormToken(v); }); });
     }
     function gengaSheetInferColumnRole(name) {                                                                      // inferColumnRole (no configured roles here)
       const bg = gengaSheetCanonicalBgBook(name);
@@ -87119,13 +87121,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       columns.forEach(function(col) {
         const role = gengaSheetInferColumnRole(col.name);
         if (role !== 'cell' && role !== 'bg' && role !== 'book') return;
-        const layerName = role === 'cell' ? (gengaSheetCanonicalBgBook(col.name) || gengaSheetNormalizeText(col.name)) : (gengaSheetCanonicalBgBook(col.name) || (role === 'bg' ? 'BG' : 'BOOK'));
+        const layerName = role === 'cell' ? (gengaSheetCanonicalBgBook(col.name) || gengaSheetNormToken(col.name)) : (gengaSheetCanonicalBgBook(col.name) || (role === 'bg' ? 'BG' : 'BOOK'));
         const frames = Array.from({ length: totalFrames }, function() { return null; });
         const dotFrames = Array.from({ length: totalFrames }, function() { return false; });
         let active = null, cursor = 1;
         dataRows.forEach(function(item) {
           while (cursor < item.frame && cursor <= totalFrames) { frames[cursor - 1] = active; cursor += 1; }
-          const raw = gengaSheetNormalizeText(item.row[col.index] || '');
+          const raw = gengaSheetNormToken(item.row[col.index] || '');
           if (raw) {
             if (/^(○|◯|〇|●|・|dot|o)$/i.test(raw)) { dotFrames[item.frame - 1] = true; frames[item.frame - 1] = active; }
             else if (/^(x|_|-|clear|blank|×|✕|✖|✗)$/i.test(raw)) { active = null; frames[item.frame - 1] = null; }
@@ -87189,8 +87191,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver782 (parity): these are lifted from #preview/timesheet_playback_preview.html so both apps resolve a
     // dropped folder identically. Do NOT "improve" one side alone — see the mirror rule in
     // docs/genga_sheet_import_parity_design_2026-07-19.md. Source symbols kept in the names below.
-    function gengaSheetNormalizeText(v) { return String(v == null ? '' : v).normalize('NFKC').trim(); }            // normalizeText
-    function gengaSheetCompactKey(v) { return gengaSheetNormalizeText(v).toUpperCase().replace(/[\s_\-]+/g, ''); }  // compactKey
+    function gengaSheetCompactKey(v) { return gengaSheetNormToken(v).toUpperCase().replace(/[\s_\-]+/g, ''); }  // compactKey
     function gengaSheetNormNumericKey(key) { const raw = String(key || '').toUpperCase(); const m = raw.match(/^0*(\d+)(.*)$/); return m ? (String(Number(m[1])) + (m[2] || '')) : raw; } // normalizeNumericKey
     function gengaSheetNumericValue(key) { const m = String(key || '').match(/^0*(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : NaN; } // numericValueFromKey
     function gengaSheetCleanBase(base) { return String(base || '').replace(/\s*\(\d+\)\s*$/, '').replace(/[_\s]?\d+[%％]$/, ''); } // cleanCelBase
@@ -87202,7 +87203,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaSheetRevisionBonus(suffix) { const i = GENGA_SHEET_REVISION_ORDER.indexOf(gengaSheetNormRevisionSuffix(suffix)); return i < 0 ? 6 : (28 - i); } // revisionSuffixScoreBonus (base-suffix path)
     function gengaSheetRevisionRestInfo(rest) { const m = String(rest || '').match(/^(0*\d+(?:\.\d+)?)([A-Za-z][A-Za-z0-9]{0,7})$/); if (!m) return null; return { restKey: gengaSheetNormNumericKey(m[1]), suffix: gengaSheetNormRevisionSuffix(m[2]) }; } // revisionRestInfo
     function gengaSheetCanonicalBgBook(name) {                                                                       // canonicalBgBookName/Key (parity: NO bracket stripping)
-      const raw = gengaSheetNormalizeText(name); if (!raw) return '';
+      const raw = gengaSheetNormToken(name); if (!raw) return '';
       let key = raw.toUpperCase().replace(/^[\s_\-]+|[\s_\-]+$/g, '');
       if (key === 'BACKGROUND') return 'BG';
       let m = key.match(/^(BGBOOK|BOOK|BG)(\d*)$/i);
@@ -91679,11 +91680,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return t;
     })();
 
-    async function tvppInflate(bytes) {
-      const ds = new DecompressionStream('deflate');
-      const stream = new Blob([bytes]).stream().pipeThrough(ds);
-      return new Uint8Array(await new Response(stream).arrayBuffer());
-    }
     async function tvppUnczmp(buf, off, size) {
       const dv = new DataView(buf, off, size);
       const nblk = tvppU32(dv, 16);
@@ -91691,7 +91687,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const parts = [];
       for (let i = 0; i < nblk; i++) {
         const csz = tvppU32(dv, p + 8); p += 12;
-        const chunk = await tvppInflate(new Uint8Array(buf, off + p, csz));
+        const chunk = await clipInflateDeflate(new Uint8Array(buf, off + p, csz)); // ver2383: .clip 과 같은 한 벌
         parts.push(chunk); total += chunk.length; p += csz;
       }
       const out = new Uint8Array(total);
@@ -109283,9 +109279,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       let scrollbarHtml = '';
       if (maxScroll > 0) {
-        const sbH = Math.max(24, Math.round(H * H / contentH));
-        const sbTop = Math.round((H - sbH) * (dock.scrollY / maxScroll));
-        scrollbarHtml = '<div class="side-dock-scrollbar" style="top:' + sbTop + 'px;height:' + sbH + 'px"></div>';
+        const sb = scrollIndicatorMetrics(H, contentH, dock.scrollY); // ver2383: 브러시 라이브러리와 같은 한 벌
+        scrollbarHtml = '<div class="side-dock-scrollbar" style="top:' + sb.offset + 'px;height:' + sb.size + 'px"></div>';
       }
       rail.hidden = false;
       rail.style.left = left + 'px';
@@ -109375,14 +109370,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (x + w >= r.right - DOCK_EDGE_ENTER) return 'right';
       return null;
     }
-    function sideDockInsertIndexAt(side, cy) { // cy is LOCAL px
-      const els = sideDockVisibleEls(side);
+    // ver2383: 「이 y 는 목록의 몇 번째로 들어가나」 한 벌 — 각 창의 **세로 중간점**과 견준다.
+    // 목록을 받는 이유: 재정렬은 끌고 있는 창을 뺀 목록으로 같은 것을 물어본다.
+    function sideDockInsertIndexIn(els, cy) { // cy is LOCAL px
       for (let i = 0; i < els.length; i += 1) {
         const r = localRect(els[i]);
         if (cy < r.top + r.height / 2) return i;
       }
       return els.length;
     }
+    function sideDockInsertIndexAt(side, cy) { return sideDockInsertIndexIn(sideDockVisibleEls(side), cy); }
     // ver1947 (a1): 예전엔 컬럼이 이미 차 있어도 항상 컬럼 전체 높이를 보여줬다 — 실제로는 §q1 규칙대로
     // 마지막(대개 드롭 지점)이 도구모음형이면 늘어나지 않는다. 이미 쌓인 창들이 먹은 높이를 그 자리에서
     // 재고(layoutSideDockCore 와 같은 식), 드롭될 창이 늘어나는 부류일 때만 남는 공간을 보여준다.
@@ -109451,11 +109448,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function sideDockReorderTarget(side, dragEl, py) {
       const dock = sideDockState(side);
       const els = sideDockVisibleEls(side).filter(function(e) { return e !== dragEl; });
-      let idx = els.length;
-      for (let i = 0; i < els.length; i += 1) {
-        const r = localRect(els[i]);
-        if (py < r.top + r.height / 2) { idx = i; break; }
-      }
+      const idx = sideDockInsertIndexIn(els, py); // ver2383: 삽입 자리 계산은 한 벌
       let lineY;
       if (!els.length) lineY = dock.colTop;
       else if (idx < els.length) lineY = localRect(els[idx]).top - SIDE_DOCK_GUTTER / 2;
