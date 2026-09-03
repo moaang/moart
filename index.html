@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2380</title>
+  <title>MoArt ver2381</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -60190,6 +60190,222 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const d = (((a1 - a0) % 360) + 540) % 360 - 180;   // -180..180 (짧은 쪽 부호 있는 차이)
       return (((a0 + d * t) % 360) + 360) % 360;
     }
+    // pull-average smoothing; state lives on the op (one gesture = one smoothing run). The pointerup
+    // replay (endPaintStroke → continue) passes through RAW so the line reaches where the pen lifted.
+    // ver1177 split the pull step out into paintStabilizeStep so the brush preview could smooth at a level
+    // that is NOT the armed tool's. ver1236 dropped smoothing from the preview entirely (it only flattened
+    // the synthetic sample wobble and pulled the stroke's end short, saying nothing about the mark), so that
+    // second caller is gone and this is the live gesture's smoother again. Kept as its own function anyway:
+    // paintStabilizePoint owns the gesture rules (seeding from the pointerdown anchor, the raw pointerup
+    // snap) and this owns the arithmetic — a clean split on its own merits.
+    // ★ver1637: **이동 평균 창**이다. 최근 n 개 입력 좌표의 평균을 잉크로 삼는다.
+    //
+    // 그전 두 판의 경위 — ver1328 ② 는 EMA(`x += (pen-x)*k`)를 버리고 **pulled string(dead zone)** 을
+    // 넣었다. EMA 는 지연이 지수적으로 남아 **영원히 펜을 못 따라잡는** 것이 문제였고, rope 는 시간
+    // 지연이 0 이라 그 문제가 없다. 그런데 rope 에는 다른 대가가 있었고 그것이 실사용에서 터졌다
+    // (사용자 필기 스크린샷 비교, 2026-08-08):
+    //   · **각진다** — 끈이 팽팽하면 잉크는 「펜에서 정확히 radius 떨어진 점」을 따라가므로, 곡선이
+    //     펜 궤적의 **내측 다각형**이 된다. 글씨처럼 방향 전환이 잦은 획에서 전부 직선 조각이 됐다.
+    //   · **버려진다** — dead zone 안의 입력은 결과에 **하나도 기여하지 않는다.** 반경보다 짧은 획은
+    //     한 점도 안 나갔다(ver1636 의 catch-up 이 그 끝만 겨우 이어 준 상태였다).
+    //   · **빠르면 더 심하다** — 샘플 간격이 radius 를 넘으면 매 샘플이 큰 스텝이라 다각형이 거칠어진다.
+    //
+    // Krita 를 보면 그 둘은 애초에 **다른 자리**의 장치다: 스무딩 본체는 `Sample Count`(가중 이동
+    // 평균)이고 dead zone 은 `Delay` 라는 **별도 옵션**이며, 문서가 그 목적을 「Without the delay dead
+    // zone, it is impossible to make sharp corners」라고 적는다 — **날카로운 코너를 만들기 위한** 것이다.
+    // 우리는 보조만 갖고 본체를 안 만든 상태였다. CSP 의 手ブレ補正도 「값이 클수록 지연이 는다」는
+    // 시간 지연형이지 dead zone 이 아니다.
+    //
+    // 이동 평균은 세 증상이 구조적으로 없다: 모든 샘플이 평균에 기여하고(버려짐 없음), 평균이라
+    // 곡선이 곡선으로 남고(각짐 없음), 지연이 **유한**하다 — 펜이 멈추면 n 샘플 뒤 정확히 그 자리에
+    // 도달한다(EMA 가 못 하던 것). 창 크기가 곧 강도이자 지연이고, 그 둘이 같은 것이 이 방식의 정직한
+    // 성질이다.
+    //
+    // ★ver1639: 평균을 **두 단**으로 돌린다(= 삼각 가중). ver1637 의 한 단(균등 가중 box)은 각짐을
+    // 없앴지만 사용자가 「꾸불거림이 오히려 생긴다」고 했고, 그것이 box 필터의 알려진 성질이다:
+    // 주파수 응답이 sinc 라 **sidelobe 에서 위상이 뒤집혀** 원래 떨림이 반대 방향으로 되살아난다(ringing).
+    // box 를 두 번 통과시키면 응답이 sinc² 가 되어 그 sidelobe 가 제곱만큼 눌린다. Krita 가 자기
+    // 스무딩을 「**Weighted** Smoothing」이라 부르는 이유가 이것 — 균등 평균이 아니라 가중이다.
+    //
+    // 실측(완만한 곡선 + 고주파 떨림 2 성분, 이상 궤적과의 오차):
+    //   입력            RMS 2.551 · 부호반전 217
+    //   box 창21        RMS 0.859 · 부호반전 **45**   ← ver1637
+    //   box×2 창11      RMS **0.391** · 부호반전 **2**  ← 여기
+    //   주파수 f≈0.071  box21 이 0.2126 을 통과시키는데 box×2 는 0.0646 (3 배 억제)
+    //
+    // **지연은 같다.** box(N) 의 지연이 (N-1)/2 이므로 창 11 두 번 = 창 21 한 번이다 — 같은 값을
+    // 두 단으로 쪼갠 것뿐이라 「더 부드러운데 더 늦지는 않다」.
+    // 비용도 그대로 샘플당 O(1) — 각 단이 합을 들고 다니며 더하고 뺀다(`shift` 는 n ≤ 11 이라 무시할
+    // 만하다). dab 마다가 아니라 **입력 샘플마다** 한 번이다.
+    // ver1640: **한 축**의 삼각 가중 이동 평균. 좌표의 x·y 와 필압이 전부 이 함수를 지난다 —
+    // 「같은 수학이면 공용 커널 먼저」이고, 무엇보다 **셋이 같은 창을 써야 서로 정렬된다**(아래).
+    function paintStabilizeAxisMake(seed) {
+      const v = Number(seed) || 0;
+      return { b1: [v], s1: v, b2: [v], s2: v };
+    }
+    function paintStabilizeScalar(ax, v, half) {
+      const b1 = ax.b1, b2 = ax.b2;
+      b1.push(v);
+      ax.s1 += v;
+      while (b1.length > half) ax.s1 -= b1.shift();
+      const m = ax.s1 / b1.length;      // 1 단
+      b2.push(m);
+      ax.s2 += m;
+      while (b2.length > half) ax.s2 -= b2.shift();
+      return ax.s2 / b2.length;         // 2 단 — sinc 의 sidelobe 를 sinc² 로 누른다
+    }
+    // ver2373: 창 산수 한 벌 — 레벨→창(샘플 수)과 창→한 단(box×2 의 각 단). 같은 식이
+    // paintStabilizeStep·paintStabilizeAux·paintStabilizeAzimuth 에 세 벌 인라인이었고, catch-up
+    // 수렴 방출(paintStabilizeCatchupReplay)이 넷째 사본이 될 자리라 모았다.
+    function paintStabilizeWinN(level) { return 1 + level * 2; }
+    function paintStabilizeWinHalf(n) { return Math.max(1, Math.round(n / 2)); }
+    function paintStabilizeStep(smoothState, point, n) {
+      const half = paintStabilizeWinHalf(n);
+      return {
+        x: paintStabilizeScalar(smoothState.ax, Number(point.x) || 0, half),
+        y: paintStabilizeScalar(smoothState.ay, Number(point.y) || 0, half)
+      };
+    }
+    // ── ver1640: 필압도 **좌표와 같은 창**을 지난다 ─────────────────────────────────────────────
+    // 그전에는 셋이 제각각이었다: 원화는 **비대칭** slew-limit(올라갈 때만 프레임당 0.1, 내려갈 때는
+    // raw — ver616 이 Apple Pencil 의 lift-spike 로 꼬리가 굵어지는 것을 막으려고 넣었다), 콘티·용지는
+    // 아무것도 없었다. 그래서 (1) 굵어질 때와 얇아질 때의 반응이 다르고, (2) 엔진마다 같은 필압이 다른
+    // 굵기로 나오고, (3) ver1637 부터 **좌표만 창 지연을 타면서 필압과 시간이 어긋나** 굵기가 제 자리보다
+    // 앞서 붙었다. 사용자 보고의 「필압이 불안정하다」가 이 셋이다.
+    // 좌표와 **같은 창**으로 평균하면 지연이 같아져 (3) 이 자동으로 정렬되고, 같은 커널이라 (1)·(2) 도
+    // 함께 사라진다. 대가는 정직하게 하나 있다: 보정을 세게 할수록 **入り抜き(입·빼기)의 빠른 필압
+    // 변화도 함께 뭉개진다.** 보정 0 이면 창이 없어 raw 그대로다.
+    // 상승 slew-limit 은 남긴다 — 보정이 0 일 때도 lift-spike 방어가 필요하고, 창 평균은 스파이크를
+    // 1/n 로 희석할 뿐 없애지는 않는다.
+    // 상태는 **스트로크 수명 객체**에 산다(콘티·용지는 stroke, 원화는 세션) — 그래서 호출부를 고치지
+    // 않고도 세 엔진이 같은 함수를 쓴다.
+    // ver1641: **좌표 밖의 축**(필압·기울기)을 하나가 맡는다. ver1640 이 필압 전용으로 만든 것을
+    // 일반화했다 — 기울기도 같은 이유(손이 떨리면 값이 흔들린다)로 같은 처리가 필요한데, 그때까지는
+    // 원화만 EMA(0.35)로 따로 하고 콘티에는 아무것도 없었다. ver1640 직전의 필압과 **똑같은 모양의
+    // 파리티 구멍**이다. 이제 이 파일에서 손떨림 보정을 타는 축은 x · y · 필압 · 기울기 넷이고
+    // 커널은 `paintStabilizeScalar` 한 벌이다.
+    //   · key      — host 에 상태를 둘 이름(`p` · `t`). 축마다 창이 따로 돈다.
+    //   · riseMax  — 상승 slew-limit. 필압만 쓴다(ver616: Apple Pencil 이 펜을 뗄 때 필압을 튀겨
+    //                꼬리를 굵히는 것을 막는다). 기울기에는 그런 스파이크가 없으므로 0 을 준다.
+    // 창은 좌표와 **같다** — 그래야 세 축의 지연이 같아져 굵기가 제 자리에 붙는다(ver1640 참조).
+    const PAINT_PRESSURE_RISE_MAX = 0.25;   // ver616: 0.1 → ver2328 (판정 q2=A): 상승 지연 100→40ms@60Hz. 원 표적(lift-spike 1~2샘플)은 median±2 가 이미 잡는다
+    const PAINT_CATCHUP_TAIL_FLOOR_RATIO = 0.5;   // ver2377: 수렴 꼬리 압의 바닥 = 마지막 인식 필압 × 이 값 — 뾰족 0 수렴(pf 의 end taper 스타일)과 네이티브 뚝(마지막 값 유지) 사이의 안착점
+    // ver2362: smoothWin === false 면 이동평균 창을 건너뛴다(rise-limit 은 그대로) — **필압('p')이
+    // 이 경로다.** 레퍼런스 표준(CSP 補正 전 항목 = 좌표 전용·필압 스무딩 항목 없음, Krita 는
+    // Smooth Pressure 가 좌표와 분리된 별도 옵트인)에 맞춰 손떨림 레벨은 좌표에만 건다.
+    // 기울기('t')는 종전대로 창을 지난다(이번 판 범위 밖).
+    function paintStabilizeAux(host, key, raw, riseMax, smoothWin) {
+      if (raw == null || !host) return raw;
+      let v = Math.max(0, Math.min(1, Number(raw) || 0));
+      const pk = key + 'Prev', ak = key + 'Axis';
+      const prev = host[pk];
+      // ver2368 (q2=A, pressure_head_taper §5·§6): **어택 시드.** 브라우저 스트림에는 눌러 가는
+      // 과정(램프업)이 없어(호버 p=0 · 접촉 후 0~2샘플) 첫 샘플부터 몸통 필압이 온다 — 그 스트림을
+      // 그대로 실으면 획 머리가 올챙이가 된다. perfect-freehand(tldraw·Excalidraw)의 「낮은 시작
+      // + 추종 관성」 구조를 기존 rise-limit 하나로 재현한다: 상승 기준을 0 에 두어 0→몸통을
+      // 2~4샘플의 램프로 따라간다. 그 샘플들의 실제 이동 거리가 곧 머리 테이퍼라 빠른 획일수록
+      // 길고 천천히 대면 없다 — 속도 비례가 산수에서 나온다. 하강(리프트 꼬리)은 종전대로 자유.
+      // ver2370 (감사 q2=A): **첫 샘플도 캡을 지난다** — ver2368 의 「첫 샘플 원값 통과」는 down
+      // 점만 램프 밖에 남겨 시작에 원값 dab 이 한 방 찍혔다(radii [0.1→18.5] 점프 = 제보 「시작
+      // 동그라미가 들킨다」의 실증). 탭·시작점의 원값 계약(ver628)은 host.pFirstRaw 보관으로
+      // 옮긴다 — 탭 커밋(n==1)과 first-dab flush 가 그 값을 쓴다.
+      // riseMax 가 0 인 축(기울기)은 이 시드·보관을 아예 안 지난다.
+      if (riseMax && prev == null) { host.pFirstRaw = v; v = Math.min(v, riseMax); host[pk] = v; }
+      else {
+        if (riseMax && prev != null && v > prev) v = Math.min(v, prev + riseMax);
+        if (riseMax) host[pk + '2'] = prev;   // ver2375: 직전값(pPrev2) — catch-up 이 ①(실측 리프트 하강)의 샘플당 하강률을 상속하는 데 쓴다
+        host[pk] = v;
+      }
+      const level = smoothWin === false ? 0 : paintStabilizerVal();
+      if (!level) { host[ak] = null; return v; }
+      if (!host[ak]) host[ak] = paintStabilizeAxisMake(v);
+      return Math.max(0, Math.min(1, paintStabilizeScalar(host[ak], v, paintStabilizeWinHalf(paintStabilizeWinN(level)))));
+    }
+    // ver1637: 창 크기는 **샘플 수**라 좌표계와 무관하다 — rope 시절 필요했던 `op.stabScale`(로컬
+    // 단위/화면 픽셀) 환산이 여기서는 아예 필요 없다. 그 필드는 지우지 않는다: Shift 직선(ver1610)이
+    // 같은 값을 「화면 픽셀 기준 팔 길이」로 계속 쓴다.
+    // 레벨 0 = 끔. 1~10 → 창 3~21 샘플(ver1639 부터 그 절반씩 두 단이라 지연은 같고 훨씬 부드럽다).
+    // Apple Pencil 은 coalesced 로 240Hz 까지 들어오므로 최대치가 100ms 를 조금 넘는 지연이고,
+    // 마우스(60Hz)에서는 더 길게 느껴진다 — 강도와 지연이 같은 값인 것이 이동 평균의 정직한 성질이라
+    // 슬라이더 하나로 둔다.
+    function paintStabilizePoint(op, point, event) {
+      const level = paintStabilizerVal();
+      if (!op || !level) return point;
+      if (event && (event.type === 'pointerup' || event.type === 'pointercancel')) {
+        // catch-up: 획은 펜을 뗀 자리에서 끝난다(ver750 = TVPaint 의 Catch Up, ver1636 에서 원화에도 배선).
+        // 창을 그 점 하나로 비워 두면 다음 획이 지난 획의 꼬리를 평균에 섞지 않는다.
+        // ver2373: 종전에는 이 raw 반환이 「뒤처진 창 출력 → 실좌표」 한 세그먼트 직결이 됐다 —
+        // 그 랙 구간은 이제 세 end 호출부가 이 반환 **직전에** paintStabilizeCatchupReplay 로
+        // 수렴 방출하므로, 여기 도달할 때는 창이 이미 실좌표에 가 있어 이 반환은 종점 보장이다.
+        if (op.smoothState) {
+          // ver1638: 모양이 옛것이어도 여기서 새 모양이 된다. ver1639/1640: 두 단 모두 비운다.
+          op.smoothState = { ax: paintStabilizeAxisMake(point.x), ay: paintStabilizeAxisMake(point.y) };
+        }
+        return point;
+      }
+      // ★ver1638: **모양까지 확인해서 만든다.** ver1637 은 `!op.smoothState` 만 봤는데, 원화 세션은
+      // 자기가 `smoothState: {x, y}`(pointerdown 자리)를 **미리 심는다** — 옛 rope 커널의 상태 모양
+      // 그대로다. 그래서 이 분기를 안 타고 `buf` 가 undefined 인 채 `paintStabilizeStep` 에 들어가
+      // 첫 획에서 TypeError 가 났다(그 뒤 점이 안 쌓여 「이상한 직선」만 남았다 — 사용자 보고).
+      // 커널이 상태의 모양을 바꿨으면 **그 모양을 아는 곳은 커널 하나여야 한다.** 그래서 남이 심어
+      // 둔 값은 「좌표 힌트」로만 읽고, 실제 구조는 여기서 만든다.
+      // 시드 우선순위: 이미 있는 좌표(원화가 심어 둔 앵커) → 스트로크의 첫 점(conte) → 지금 점.
+      if (!op.smoothState || !op.smoothState.ax) {
+        const prev = op.smoothState;
+        const seed = (prev && Number.isFinite(Number(prev.x)) && Number.isFinite(Number(prev.y))) ? prev
+          : ((op.stroke && op.stroke.points && op.stroke.points[0]) ? op.stroke.points[0] : point);
+        op.smoothState = { ax: paintStabilizeAxisMake(seed.x), ay: paintStabilizeAxisMake(seed.y) };
+      }
+      return paintStabilizeStep(op.smoothState, point, paintStabilizeWinN(level));
+    }
+    // ★ver2373~2380: 펜을 뗄 때, up 좌표를 pointermove 로 창이 찰 때까지 재투입해 손떨림 랙을
+    // 직결 세그먼트 대신 필터 자신의 감속 곡선으로 감는다(감사 pressure_stack_audit q1=A 둘째 성분).
+    // 재투입은 각 엔진의 실제 move 사슬(continueFn)을 그대로 타므로 리샘플·필압·잉크 0 계약이
+    // 진짜 샘플과 같은 한 벌로 걸리고, 마지막 재투입 뒤 출력이 정확히 up 좌표라 이어지는 진짜
+    // up(커널 raw 반환)은 같은 자리 no-op — 종점 보장은 그 자리가 진다.
+    // fake 필압은 본 획의 실측 하강률(pPrev2−pPrev)을 그대로 연장하고, 바닥(pFloor)은 «잉크 컷
+    // 문턱»이다 — 값으로 찍으면 꼬리 끝에 꼭지 알갱이가 남는다. 하강 기록 없는 up 은 바닥까지 선형.
+    // 가드: smoothState.ax(커널 창을 실제로 지난 펜 획)에서만 · pointercancel 은 파기라 no-op.
+    // pHost = 필압 사슬이 사는 객체(conte 는 stroke, 원화는 세션 — host 와 같은 객체).
+    // 다섯 판의 경위·실측·기각(직결→보간→기울기 상속→바닥→관통 마감)은 changelog ver2373~2380 이 정본.
+    function paintStabilizeCatchupReplay(host, upEvent, continueFn, pHost) {
+      if (!upEvent || upEvent.type !== 'pointerup' || !host) return;
+      const level = paintStabilizerVal();
+      if (!level) return;
+      const st = host.smoothState;
+      if (!st || !st.ax) return;
+      const fake = {
+        type: 'pointermove',
+        pointerId: upEvent.pointerId, pointerType: upEvent.pointerType,
+        clientX: upEvent.clientX, clientY: upEvent.clientY,
+        pressure: upEvent.pressure,
+        tiltX: upEvent.tiltX, tiltY: upEvent.tiltY,
+        altitudeAngle: upEvent.altitudeAngle, azimuthAngle: upEvent.azimuthAngle,
+        timeStamp: upEvent.timeStamp, shiftKey: upEvent.shiftKey, altKey: upEvent.altKey,
+        cancelable: false,
+        preventDefault: function() {}, stopPropagation: function() {}
+      };
+      const pFrom = pHost && typeof pHost.pPrev === 'number' ? pHost.pPrev : null;
+      const pTo = typeof upEvent.pressure === 'number' ? upEvent.pressure : pFrom;
+      const pFall = (pHost && typeof pHost.pPrev2 === 'number' && pFrom != null && pHost.pPrev2 > pFrom)
+        ? (pHost.pPrev2 - pFrom) : 0;   // ①(본 획 리프트 하강)의 샘플당 실측 하강률 — 꼬리는 이것의 «연장»이다(ver2375)
+      const pFloor = pFrom == null ? null
+        : Math.max(pTo != null ? pTo : 0, pFrom * PAINT_CATCHUP_TAIL_FLOOR_RATIO);
+      const steps = 2 * paintStabilizeWinHalf(paintStabilizeWinN(level));   // box×2 — 각 단이 half 샘플 뒤에 찬다
+      for (let i = 1; i <= steps; i += 1) {
+        if (pFrom != null && pFloor != null) {
+          if (pFall > 0) {
+            const pRaw = pFrom - pFall * i;
+            fake.pressure = pRaw > pFloor ? pRaw : 0;   // 문턱을 넘는 순간 잉크 끝(ver2380 — 문턱값을 찍으면 꼭지가 된다)
+          } else {
+            fake.pressure = pFrom + (pFloor - pFrom) * (i / steps);   // 리터럴 객체라 재대입이 안전
+          }
+        }
+        continueFn(fake);
+      }
+    }
+
+    // ===========================================================================================
     // ver1335: 팁 렌더 옵션을 읽는 단 하나의 자리. conte 스트로크 레코드와 genga 세션이 같은 필드
     // 이름을 쓰므로 양쪽이 이 함수 하나를 통과한다 — 필드가 늘어도 커널 시그니처가 다시 넓어지지 않고,
     // 두 엔진이 표류할 수 없다(ver1329에서 배운 것). 팁이 없으면 null → 호출부는 옛 원형 dab 경로.
@@ -60404,6 +60620,163 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // window kills 1–2 sample spikes; a light bidirectional low-pass then softens the rest. Intentional
     // pressure trends (a sustained firm line, a deliberate taper) pass through unchanged (verified: a
     // steady stroke's body radius is identical before/after).
+    // ver1239: put the ACTIVE tool's textured tip on a stroke. One helper rather than four copies, so the
+    // rule 'which strokes may be textured' has exactly one statement.
+    // ver1345: 호출부가 더 이상 `paintStrokeWantsPressure` 안에 있지 않다. 옛 주석은 "필압 없는
+    // 스트로크는 팁을 렌더할 수 없으니 필압 분기 안에서만 부른다"고 했는데, 그 전제는 ver1338에
+    // 무너졌다 — 팁이 있으면 그것만으로 whole-path(=팁 렌더 가능)가 강제된다
+    // (paintStrokeWantsWholePath). 전제가 사라진 뒤에도 게이트가 남아 있어서 **마우스로 그리면
+    // conte에서만 팁이 사라지는** 엔진 편측 결함이 됐다(genga는 무조건 부른다).
+    function paintAttachTip(stroke) {
+      const tipId = paintBrushGet('tipId');
+      if (!tipId) return;
+      stroke.tipId = tipId;
+      const sp = Number(paintBrushGet('tipSpacing')) || 0;
+      if (sp > 0) stroke.tipSpacing = sp;
+      // ver1335: 회전도 여기서 실린다 — conte의 세 빌더와 genga 세션이 전부 이 함수 하나를 지나므로
+      // (48442 / 53820 / 55994 / gengaPreviewPointerDown) 두 엔진이 회전을 따로 배선할 자리가 없다.
+      // 값은 스트로크 시점에 고정된다: 저장된 벡터가 나중의 브러시 설정 변경으로 다시 그려지면 안 된다.
+      const ang = Number(paintBrushGet('tipAngle')) || 0;
+      if (ang) stroke.tipAngle = ang;
+      const thk = Number(paintBrushGet('tipThick'));   // ver1628: 100 이면 안 싣는다(옛 레코드와 동일)
+      if (Number.isFinite(thk) && thk !== 100) stroke.tipThick = thk;
+      const rot = paintBrushGet('tipRotate');
+      if (rot === 'dir' || rot === 'azimuth') stroke.tipRotate = rot;
+      // ver2073: 리본과 比較(暗). 스토어까지는 ver2072 가 이었는데 **여기가 비어 있어서**
+      // 렌더러가 못 읽었다 — 렌더는 스토어가 아니라 스트로크를 읽는다. 꺼져 있으면 안 싣는다
+      // (옛 레코드와 같은 모양을 유지한다 — 위 tipThick/tipRotate 와 같은 규칙).
+      if (paintBrushGet('tipRibbon')) {
+        stroke.tipRibbon = true;
+        if (paintBrushGet('tipRibbonAlt')) stroke.tipRibbonAlt = true;   // ver2076
+        const sc2 = Number(paintBrushGet('tipScaling'));
+        if (Number.isFinite(sc2) && sc2 > 0) stroke.tipScaling = sc2;   // ver2080
+        const rp = Number(paintBrushGet('tipRibbonPitch'));
+        if (Number.isFinite(rp) && rp !== 100) stroke.tipRibbonPitch = rp;   // 100 이면 안 싣는다(옛 레코드와 같은 모양)
+      }
+      if (paintBrushGet('tipDarken')) stroke.tipDarken = true;
+      if (paintBrushGet('tipThickVert')) stroke.tipThickVert = true;   // ver2077
+      // ver1336: 지터 3종 + 시드. 시드는 여기서 한 번만 뽑는다 — 스트로크 레코드에 실려 저장되므로
+      // 로드 후 재렌더도 같은 흩뿌림이 나온다(렌더러가 좌표에서 유도하면 conte의 op 경계 확장 때
+      // 제스처 중간에 재배치된다). 지터가 전부 0이면 시드도 싣지 않는다 — 옛 스트로크와 같은 레코드.
+      const js = Number(paintBrushGet('tipJitSize')) || 0;
+      const ja = Number(paintBrushGet('tipJitAngle')) || 0;
+      const sc = Number(paintBrushGet('tipScatter')) || 0;
+      const jf = Number(paintBrushGet('tipJitFlow')) || 0;   // ver2343: dab 마다의 농도 랜덤
+      if (js) stroke.tipJitSize = js;
+      if (ja) stroke.tipJitAngle = ja;
+      if (sc) stroke.tipScatter = sc;
+      if (jf) stroke.tipJitFlow = jf;
+      if (js || ja || sc || jf) stroke.tipSeed = paintNewTipSeed();   // ver2343: 농도만 켜도 시드가 필요하다
+    }
+    // ver1337: 종이결은 팁과 독립이라 별도 함수 — 팁이 없는 브러시도 거친 종이에 그릴 수 있어야 한다.
+    // 그래서 paintAttachTip의 `if (!tipId) return` 조기 반환에 갇히면 안 된다. 호출부는 팁 부착과
+    // 같은 자리들(conte 세 빌더 + genga 세션)이고, 값은 같은 이유로 스트로크 시점에 고정된다.
+    // ver1622: **스트로크에 브러시의 성격을 싣는 자리는 하나다.** conte 의 두 빌더(映像 레이어 ·
+    // 用紙 페이지 메모)가 같은 열세 줄을 각자 갖고 있었고, 이 판이 필압 곡선 두 필드를 더하면서
+    // **같은 줄을 두 곳에 적었다** — 그게 두 벌의 비용이다(다음에 필드가 늘면 또 두 번이고, 한쪽을
+    // 빠뜨리면 用紙에서만 조용히 사라진다. ver1345 가 고친 것이 정확히 그 계열의 사고였다).
+    // genga 는 스트로크가 아니라 **세션**을 만들고 수명이 달라 여기 들어오지 않는다 — 대신 같은
+    // 정본 필드 이름을 쓴다(ver1345). 도형(shapeKind)은 이 성격을 아예 안 받는다.
+    // ver1724: `plainBrush` — 외부 브러시(팁)와 종이결을 **안 싣는다**. 用紙 페이지 메모가 그것이다
+    // (노트라 기본 브러시만 쓴다 — 사용자 지시). 필압·기울기·굵기는 그대로다.
+    function paintAttachBrushDynamics(stroke, event, shapeKind, opts) {
+      // 기울기를 필압보다 **먼저** 심는 순서가 중요하다 — paintAttachPressure 가 tiltSizePct/tiltAlphaPct
+      // 를 보고 점에 t 를 실을지 정한다.
+      paintAttachTilt(stroke);                          // ver1328 ③ · ver2318: 최소치·최대치·곡선 한 벌
+      if (!(opts && opts.plainBrush)) {                   // ver1724: 用紙 메모는 기본 브러시만
+        paintAttachTip(stroke);                          // ver1239
+        paintAttachPaperTex(stroke);                     // ver1337: 종이결은 팁과 독립(팁 없는 브러시도 거친 종이에 그린다)
+        paintAttachMix(stroke);                          // ver1625: 혼색 — 팁이 있어야 걸리므로 여기 함께 둔다
+        // ver1784: 絵の具量도 이 게이트 안이다. flow 는 팁이 없어도 걸리지만, 用紙 메모 획은
+        // paintRenderPageStrokeInto 라는 **별도 경로**로 그려지고 그쪽은 잉크 장을 안 지난다 —
+        // 싣기만 하고 그리는 쪽이 안 읽으면 「설정은 있는데 안 먹는」 거짓말이 된다(ver1518 의 계열).
+        paintAttachFlow(stroke);
+        // ver2359: 入り抜き — 브러시 정체라 用紙 메모(plainBrush)에는 안 싣고, **도형에도 안 싣는다**:
+        // 원화 도형(gengaShapeRedraw)은 radii 에 taper 를 안 곱므로 콘티 도형에만 실으면 엔진이 갈린다.
+        if (!shapeKind) paintAttachTaper(stroke);
+      }
+      // ver1706: **도형에 안 맞는 것은 필압뿐이다** — 드래그로 만드는 도형에는 필압 곡선을 실을
+      // 자리가 없다(사용자). 팁·종이결은 「선을 어떤 붓으로 긋는가」라 직선·사각·원의 외곽선에도
+      // 그대로 뜻이 있다. ver1702 가 같은 것을 했다가 ver1704 에 되돌렸는데, 그때의 사고 원인
+      // (도형 슬롯이 펜을 상속하는데 도형에서 바꿀 수 없다)은 ver1705(입구)와 ver1706(슬롯 공유)로
+      // 사라졌다 — 이제 도형의 붓은 펜의 붓과 같은 것이고, 어느 쪽에서든 바꿀 수 있다.
+      if (shapeKind) return;
+      if (!paintStrokeWantsPressure(event)) return;
+      stroke.pressure = true;
+      stroke.pressureSize = paintPressureSizeOn();
+      stroke.pressureAlpha = paintPressureAlphaOn();
+      stroke.pressureMin = paintPressureMinSizeVal() / 100;   // ver623: brush shape captured per stroke
+      stroke.pRaw = 1;                                        // ver2362: 필압을 손떨림에서 분리한 사슬로 그린 획 — 렌더 EMA 없음(paintStrokeEmaKOf 가 1 로 읽는다). stab 은 더 안 싣는다(유일 소비처가 그 EMA 였다). 옛 획은 stab/부재 규칙 그대로 — ver2328 의 「만든 시점으로 고정」 계약 유지
+      // ver2317: `pressureGamma` 를 안 싣는다(감마 단계 삭제) — 커널이 1 로 읽고, 저장된 옛 획은 자기 값을 그대로 쓴다.
+      stroke.pressureCurvePts = paintBrushGet('pCurvePts');   // ver1622
+      stroke.pressureAlphaCurvePts = paintBrushGet('pAlphaCurvePts');
+      stroke.pressureGain = paintPressureGainMul();           // ver626: device calibration (ver2255: 정본 한 벌)
+      paintAttachPressure(stroke.points[0], event, stroke);
+    }
+    // ver1625: 혼색을 스트로크(genga 는 세션)에 싣는다. paintAttachTip / paintAttachPaperTex 와 같은
+    // 자리·같은 이유 — 값은 **획 시점에 고정**된다(저장된 벡터가 나중의 브러시 설정으로 다시 그려지면
+    // 안 된다). 꺼져 있으면 필드를 아예 안 싣는다 = 기존 스트로크 레코드와 바이트 동일.
+    // ver1718: 값을 어디서 읽을지만 인자로 받는다(기본 = 지금 브러시). 썸네일은 **저장된 레코드**를
+    // 읽어야 하는데, 그 매핑을 프리뷰 쪽에 다시 적으면 필드가 늘 때마다 두 곳이 갈린다 —
+    // ver1628(tipThick)이 프리뷰를 안 봐서 생긴 것이 정확히 그 사고다.
+    // ver1784: 絵の具量을 스트로크(genga 는 세션)에 싣는다. paintAttachMix 와 **같은 규격**이다 —
+    // 값은 획 시점에 고정되고, `get` 으로 읽는 곳만 갈아끼울 수 있어 썸네일이 저장된 레코드를 읽는다.
+    // ★100 이면 **필드를 아예 안 싣는다** — 옛 스트로크 레코드와 바이트 동일이고, 렌더 쪽
+    // paintStrokeFlowVal 이 없는 필드를 1 로 읽으므로 종전 경로가 그대로 나온다(회귀 안전의 뿌리).
+    function paintAttachFlow(stroke, get) {
+      const g = get || paintBrushGet;
+      // ver2073: 筆圧→絵の具量 곡선. **flow 가 100 이어도 실어야 한다** — 鉛筆R 이 정확히
+      // 그 경우다(BrushFlow=100 인데 곡선이 그 100 을 0~100 으로 훑는다). 종전 조기 반환은
+      // 「100 이면 실을 것이 없다」는 전제였는데 곡선이 생기면서 그 전제가 깨졌다.
+      const curve = paintCurveIfOn(g('flowCurveOn'), g('flowCurvePts'));   // ver2304: 꺼진 곡선은 아예 안 싣는다 — 하류(렌더·whole-path 판정)는 필드 부재로 종전 경로
+      if (curve) stroke.flowCurvePts = curve;
+      const f = Number(g('flow'));
+      if (!Number.isFinite(f) || f >= 100) return;
+      stroke.flow = Math.max(1, Math.min(100, Math.round(f)));
+    }
+    // 렌더가 읽는 쪽. 필드가 없으면(대부분의 획) 1 = 「종전대로」.
+    function paintStrokeFlowVal(src) {
+      const f = Number(src && src.flow);
+      return (Number.isFinite(f) && f > 0 && f < 100) ? f / 100 : 1;
+    }
+    // ver2359: 入り抜き를 스트로크(genga 는 세션)에 싣는다 — paintAttachFlow 와 같은 규격: 값은 획
+    // 시점에 고정, `get` 으로 읽는 곳을 갈아끼울 수 있어 썸네일이 저장된 레코드를 읽는다.
+    // ★0 이면 **필드를 아예 안 싣는다** — 옛 스트로크 레코드와 바이트 동일이고, 렌더 쪽
+    // paintStrokeTaperOf 가 없는 필드를 0 으로 읽으므로 종전 경로가 그대로 나온다.
+    // ver2366→ver2367: taperBySpeed 는 **켬일 때만** 싣는다(기본 꺼짐 — 필드 없음 = 끔).
+    // 렌더(paintSpeedTaperInLen)가 실제로 읽는다 — 「렌더가 안 읽으니 안 싣는다」던 ver2359 의
+    // 근거는 ver2366 에서 뒤집혔고, 기본값은 ver2367 채팅 판정으로 꺼짐이 됐다(스타일 기능).
+    function paintAttachTaper(stroke, get) {
+      const g = get || paintBrushGet;
+      const tIn = Number(g('taperIn'));
+      const tOut = Number(g('taperOut'));
+      if (Number.isFinite(tIn) && tIn > 0) stroke.taperIn = Math.round(tIn);
+      if (Number.isFinite(tOut) && tOut > 0) stroke.taperOut = Math.round(tOut);
+      if (g('taperBySpeed') === true) stroke.taperBySpeed = true;
+    }
+    function paintAttachMix(stroke, get) {
+      const g = get || paintBrushGet;
+      if (!g('mixOn')) return;
+      stroke.mixOn = true;
+      stroke.mixAmount = Number(g('mixAmount')) || 0;
+      stroke.mixExtend = Number(g('mixExtend')) || 0;
+      stroke.mixDensity = Number(g('mixDensity')) || 0;
+      if (g('mixAmtPressure')) {
+        stroke.mixAmtPressure = true;
+        stroke.mixAmtCurvePts = g('mixAmtCurvePts');
+      }
+    }
+    function paintAttachPaperTex(stroke) {
+      const id = paintBrushGet('paperTexId');
+      if (!id) return;
+      stroke.paperTexId = id;
+      stroke.paperTexDepth = Number(paintBrushGet('paperTexDepth'));
+      stroke.paperTexScale = Number(paintBrushGet('paperTexScale'));
+      // ver2073: 筆圧→紙質濃度 곡선(획 단위로 쓰인다 — ver2070 참조. perDab 이면 dab 단위 — ver2303).
+      const tc = paintCurveIfOn(paintBrushGet('paperTexDepthCurveOn'), paintBrushGet('paperTexDepthCurvePts'));   // ver2304
+      if (tc) stroke.paperTexDepthCurvePts = tc;
+      if (paintBrushGet('paperTexPerDab')) stroke.paperTexPerDab = true;   // ver2303: 描点ごとに適用
+    }
     // ver2376: 창 미디언 한 벌 — 정렬은 사본에서(원배열 불변), 중앙 = (len-1)>>1. head clamp 의
     // settle 창과 미디언5 본체가 같은 산수를 각자 인라인으로 갖고 있었다(감사 「같은 산수 사본」).
     function paintMedianOf(arr) {
@@ -62250,352 +62623,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // hidden 만 뒤집는 두 번째 토글을 남겨 두면 폰 표시 클래스가 또 갈라진다.
 
     // ===========================================================================================
-    // ## SECTION: BRUSH IMPORT — minimal SQLite3 table-scan reader (for .sut, a plain SQLite3 file)
-    // ★ver1332: 진입점이 생겼다 — 브러시 라이브러리의 드롭 임포터(brushLibraryImportSutBytes, 위)가
-    //   sqliteLoadDatabase / sqliteGetSchema / sqliteReadTableRows / tarReadEntries의 첫 호출자다.
-    //   (ver1232~1331 동안은 "진입점 없음(의도)"로 대기하던 검증된 기반이었다.)
-    // Not a SQL engine — walks one named table's b-tree and returns every row's column values, in
-    // rowid order. Ported line-for-line from a Python reference (mini_sqlite_reader.py) that was
-    // validated against real .sut files: every row/column of every table matched Python's own
-    // sqlite3 module exactly (622 column-checks, both sample files), including BLOB columns that
-    // overflow onto multiple overflow pages and a genuinely 2-level interior b-tree (sqlite_master
-    // itself, in both files). See docs/brush_import_engine_plan_2026-07-27.md for the investigation
-    // history. Reference: https://www.sqlite.org/fileformat2.html
-    // ===========================================================================================
-    function sqliteReadVarint(buf, offset) {
-      // SQLite's own varint (NOT protobuf varint): up to 9 bytes, first 8 each contribute 7 bits
-      // (MSB = continuation), a 9th byte (if reached) contributes its full 8 bits with no
-      // continuation semantics. Values here never exceed 32 safe-integer bits in practice (page
-      // sizes/rowids/lengths), so plain Number arithmetic is fine — no BigInt needed.
-      let value = 0;
-      for (let i = 0; i < 8; i++) {
-        const byte = buf[offset + i];
-        value = value * 128 + (byte & 0x7F);
-        if ((byte & 0x80) === 0) return { value: value, offset: offset + i + 1 };
-      }
-      value = value * 256 + buf[offset + 8];
-      return { value: value, offset: offset + 9 };
-    }
-    function sqliteReadUint32BE(buf, offset) {
-      return ((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
-    }
-    function sqliteParseDbHeader(data) {
-      if (data.length < 100) throw new Error('File too small to be a SQLite database');
-      for (let i = 0; i < 16; i++) { if (data[i] !== SQLITE_MAGIC_BYTES[i]) throw new Error('Not a SQLite3 database file (bad magic header string)'); }
-      let pageSize = (data[16] << 8) | data[17];
-      if (pageSize === 1) pageSize = 65536; // on-disk 0x0001 means 65536 (doesn't fit a uint16 any other way)
-      const reservedSpace = data[20];
-      const textEncoding = ((data[56] << 24) | (data[57] << 16) | (data[58] << 8) | data[59]) >>> 0;
-      if (textEncoding !== 1 && textEncoding !== 2 && textEncoding !== 3) throw new Error('Unexpected text encoding code: ' + textEncoding);
-      return { pageSize: pageSize, reservedSpace: reservedSpace, textEncoding: textEncoding, usableSize: pageSize - reservedSpace };
-    }
-    const SQLITE_MAGIC_BYTES = [0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00]; // "SQLite format 3\0"
-    const SQLITE_PAGE_TYPE_INTERIOR_TABLE = 5, SQLITE_PAGE_TYPE_LEAF_TABLE = 13;
-    function sqliteGetPageBytes(db, pageNumber) {
-      const start = (pageNumber - 1) * db.header.pageSize;
-      return { pageBytes: db.data.subarray(start, start + db.header.pageSize), headerStart: pageNumber === 1 ? 100 : 0 };
-    }
-    function sqliteParseBTreePageHeader(pageBytes, headerStart) {
-      const pageType = pageBytes[headerStart];
-      let cellContentStart = (pageBytes[headerStart + 5] << 8) | pageBytes[headerStart + 6];
-      if (cellContentStart === 0) cellContentStart = 65536;
-      const isInterior = pageType === SQLITE_PAGE_TYPE_INTERIOR_TABLE;
-      return {
-        pageType: pageType,
-        cellCount: (pageBytes[headerStart + 3] << 8) | pageBytes[headerStart + 4],
-        cellContentStart: cellContentStart,
-        rightMostPointer: isInterior ? sqliteReadUint32BE(pageBytes, headerStart + 8) : null,
-        headerLen: isInterior ? 12 : 8
-      };
-    }
-    function sqliteReadCellPointerArray(pageBytes, headerStart, btreeHeader) {
-      const ptrArrayStart = headerStart + btreeHeader.headerLen;
-      const pointers = [];
-      for (let i = 0; i < btreeHeader.cellCount; i++) {
-        const off = ptrArrayStart + i * 2;
-        pointers.push((pageBytes[off] << 8) | pageBytes[off + 1]);
-      }
-      return pointers;
-    }
-    function sqliteComputeLocalPayloadSize(payloadSize, usableSize) {
-      // Table B-Tree Leaf Cell local-payload-size formula (sqlite.org/fileformat2.html section 1.5/1.6) —
-      // piecewise, not a simple "usable_size - 35" approximation.
-      const U = usableSize, P = payloadSize, X = U - 35;
-      if (P <= X) return { localSize: P, hasOverflow: false };
-      const M = Math.floor((U - 12) * 32 / 255) - 23;
-      const K = M + ((P - M) % (U - 4));
-      return { localSize: K <= X ? K : M, hasOverflow: true };
-    }
-    function sqliteReadOverflowChain(db, firstOverflowPage, remainingBytes) {
-      const usableSize = db.header.usableSize, contentPerPage = usableSize - 4;
-      const out = new Uint8Array(remainingBytes);
-      let outOff = 0, pageNumber = firstOverflowPage, remaining = remainingBytes;
-      while (remaining > 0) {
-        if (pageNumber === 0) throw new Error('Overflow chain ended early: ' + remaining + ' bytes still needed');
-        const pageBytes = sqliteGetPageBytes(db, pageNumber).pageBytes;
-        const nextPageNumber = sqliteReadUint32BE(pageBytes, 0);
-        const take = Math.min(remaining, contentPerPage);
-        out.set(pageBytes.subarray(4, 4 + take), outOff);
-        outOff += take; remaining -= take; pageNumber = nextPageNumber;
-      }
-      return out;
-    }
-    function sqliteReadTableLeafCell(db, pageBytes, cellOffset) {
-      let r = sqliteReadVarint(pageBytes, cellOffset);
-      const payloadSize = r.value;
-      r = sqliteReadVarint(pageBytes, r.offset);
-      const rowid = r.value, off0 = r.offset;
-      const lp = sqliteComputeLocalPayloadSize(payloadSize, db.header.usableSize);
-      const localPayload = pageBytes.slice(off0, off0 + lp.localSize);
-      let fullPayload = localPayload;
-      if (lp.hasOverflow) {
-        const overflowPageNumber = sqliteReadUint32BE(pageBytes, off0 + lp.localSize);
-        const overflowBytes = sqliteReadOverflowChain(db, overflowPageNumber, payloadSize - lp.localSize);
-        fullPayload = new Uint8Array(payloadSize);
-        fullPayload.set(localPayload, 0);
-        fullPayload.set(overflowBytes, lp.localSize);
-      }
-      if (fullPayload.length !== payloadSize) throw new Error('Payload assembly mismatch: expected ' + payloadSize + ' bytes, got ' + fullPayload.length);
-      return { rowid: rowid, payload: fullPayload };
-    }
-    function sqliteWalkTableBTree(db, rootPageNumber, out) {
-      out = out || [];
-      const g = sqliteGetPageBytes(db, rootPageNumber), pageBytes = g.pageBytes, headerStart = g.headerStart;
-      const btreeHeader = sqliteParseBTreePageHeader(pageBytes, headerStart);
-      const pointers = sqliteReadCellPointerArray(pageBytes, headerStart, btreeHeader);
-      if (btreeHeader.pageType === SQLITE_PAGE_TYPE_LEAF_TABLE) {
-        pointers.forEach(function(cellOffset) { out.push(sqliteReadTableLeafCell(db, pageBytes, cellOffset)); });
-      } else if (btreeHeader.pageType === SQLITE_PAGE_TYPE_INTERIOR_TABLE) {
-        pointers.forEach(function(cellOffset) {
-          const leftChildPage = sqliteReadUint32BE(pageBytes, cellOffset); // interior table cells: 4-byte child page + varint key (key unused — pure routing)
-          sqliteWalkTableBTree(db, leftChildPage, out);
-        });
-        sqliteWalkTableBTree(db, btreeHeader.rightMostPointer, out); // highest-keyed subtree — always visited last
-      } else {
-        throw new Error('Page ' + rootPageNumber + ' has page_type=' + btreeHeader.pageType + ', not a table b-tree page (expected 5 or 13)');
-      }
-      return out;
-    }
-    function sqliteDecodeSignedBE(bytes) {
-      let value = 0;
-      for (let i = 0; i < bytes.length; i++) value = value * 256 + bytes[i];
-      const signBit = Math.pow(2, 8 * bytes.length - 1);
-      if (value >= signBit) value -= Math.pow(2, 8 * bytes.length);
-      return value;
-    }
-    const SQLITE_UTF8_DECODER = new TextDecoder('utf-8'), SQLITE_UTF16LE_DECODER = new TextDecoder('utf-16le');
-    function sqliteDecodeUtf16be(bytes) { // TextDecoder has no native utf-16be; byte-swap into a utf-16le buffer
-      const swapped = new Uint8Array(bytes.length);
-      for (let i = 0; i + 1 < bytes.length; i += 2) { swapped[i] = bytes[i + 1]; swapped[i + 1] = bytes[i]; }
-      return SQLITE_UTF16LE_DECODER.decode(swapped);
-    }
-    function sqliteDecodeSerialValue(payload, offset, serialType, textEncoding) {
-      if (serialType === 0) return { value: null, offset: offset };                          // NULL
-      if (serialType >= 1 && serialType <= 6) {                                                // int8/16/24/32/48/64
-        const len = [1, 2, 3, 4, 6, 8][serialType - 1];
-        return { value: sqliteDecodeSignedBE(payload.subarray(offset, offset + len)), offset: offset + len };
-      }
-      if (serialType === 7) {                                                                  // float64 (IEEE754 BE)
-        const b = payload.subarray(offset, offset + 8);
-        const dv = new DataView(b.buffer, b.byteOffset, 8);
-        return { value: dv.getFloat64(0, false), offset: offset + 8 };
-      }
-      if (serialType === 8) return { value: 0, offset: offset };                               // integer constant 0, zero bytes stored
-      if (serialType === 9) return { value: 1, offset: offset };                               // integer constant 1, zero bytes stored
-      if (serialType >= 12 && serialType % 2 === 0) {                                          // BLOB
-        const length = (serialType - 12) / 2;
-        return { value: payload.slice(offset, offset + length), offset: offset + length };
-      }
-      if (serialType >= 13 && serialType % 2 === 1) {                                          // TEXT
-        const length = (serialType - 13) / 2;
-        const raw = payload.subarray(offset, offset + length);
-        const value = textEncoding === 1 ? SQLITE_UTF8_DECODER.decode(raw) : textEncoding === 2 ? SQLITE_UTF16LE_DECODER.decode(raw) : sqliteDecodeUtf16be(raw);
-        return { value: value, offset: offset + length };
-      }
-      throw new Error('Encountered reserved/unused serial type ' + serialType + ' -- file is malformed');
-    }
-    function sqliteReadRecord(payload, textEncoding) {
-      let r = sqliteReadVarint(payload, 0);
-      const headerLength = r.value;
-      const serialTypes = [];
-      let off = r.offset;
-      while (off < headerLength) { r = sqliteReadVarint(payload, off); serialTypes.push(r.value); off = r.offset; }
-      if (off !== headerLength) throw new Error('Record header parsing overran: header_length=' + headerLength + ' but stopped at ' + off);
-      let bodyOff = headerLength;
-      const values = serialTypes.map(function(serialType) {
-        const d = sqliteDecodeSerialValue(payload, bodyOff, serialType, textEncoding);
-        bodyOff = d.offset;
-        return d.value;
-      });
-      return values;
-    }
-    const SQLITE_MASTER_COLUMNS = ['type', 'name', 'tbl_name', 'rootpage', 'sql'];
-    function sqliteReadMaster(db) {
-      return sqliteWalkTableBTree(db, 1).map(function(cell) {
-        const values = sqliteReadRecord(cell.payload, db.header.textEncoding);
-        const row = {}; SQLITE_MASTER_COLUMNS.forEach(function(name, i) { row[name] = values[i]; });
-        row.rowid = cell.rowid;
-        return row;
-      });
-    }
-    function sqliteGetSchema(db) { // {tableName: {rootpage, sql}} — read sqlite_master ONCE, not once per table lookup
-      const schema = {};
-      sqliteReadMaster(db).forEach(function(row) { if (row.type === 'table') schema[row.name] = { rootpage: row.rootpage, sql: row.sql }; });
-      return schema;
-    }
-    function sqliteSplitTopLevelCommas(text) {
-      const parts = []; let depth = 0, current = '';
-      for (let i = 0; i < text.length; i++) {
-        const ch = text[i];
-        if (ch === '(') { depth++; current += ch; }
-        else if (ch === ')') { depth--; current += ch; }
-        else if (ch === ',' && depth === 0) { parts.push(current); current = ''; }
-        else current += ch;
-      }
-      if (current) parts.push(current);
-      return parts;
-    }
-    function sqliteStripIdentifierQuoting(name) {
-      name = name.trim();
-      if (name.length >= 2) {
-        if ((name[0] === '"' && name[name.length - 1] === '"') || (name[0] === '`' && name[name.length - 1] === '`')) return name.slice(1, -1);
-        if (name[0] === '[' && name[name.length - 1] === ']') return name.slice(1, -1);
-      }
-      return name;
-    }
-    const SQLITE_TABLE_CONSTRAINT_KEYWORDS = ['PRIMARY', 'UNIQUE', 'CHECK', 'FOREIGN', 'CONSTRAINT'];
-    // NULL is deliberately a stop keyword, not a type name: SQLite's grammar lets a bare `NULL` after a column
-    // name mean the (no-op) nullable constraint, and `PRAGMA table_info` on real .sut files confirms columns
-    // written as e.g. `Foo NULL DEFAULT NULL` really do get declared-type = '' — this reproduces that, not just
-    // approximates it (see mini_sqlite_reader.py's validation notes).
-    const SQLITE_COLUMN_DEF_STOP_KEYWORDS = { PRIMARY: 1, NOT: 1, NULL: 1, UNIQUE: 1, CHECK: 1, DEFAULT: 1, COLLATE: 1, REFERENCES: 1, GENERATED: 1, CONSTRAINT: 1, AS: 1 };
-    function sqliteComputeTypeAffinity(typeText) { // sqlite.org/datatype3.html "Determination Of Column Affinity" — first matching rule wins
-      const t = typeText.toUpperCase();
-      if (t.indexOf('INT') >= 0) return 'INTEGER';
-      if (t.indexOf('CHAR') >= 0 || t.indexOf('CLOB') >= 0 || t.indexOf('TEXT') >= 0) return 'TEXT';
-      if (t.indexOf('BLOB') >= 0 || t === '') return 'BLOB';
-      if (t.indexOf('REAL') >= 0 || t.indexOf('FLOA') >= 0 || t.indexOf('DOUB') >= 0) return 'REAL';
-      return 'NUMERIC';
-    }
-    function sqliteParseCreateTableColumns(sql) {
-      const openParen = sql.indexOf('(');
-      let depth = 0, closeParen = -1;
-      for (let i = openParen; i < sql.length; i++) {
-        if (sql[i] === '(') depth++;
-        else if (sql[i] === ')') { depth--; if (depth === 0) { closeParen = i; break; } }
-      }
-      if (closeParen < 0) throw new Error('Malformed CREATE TABLE statement (unbalanced parens): ' + sql);
-      const columnListText = sql.slice(openParen + 1, closeParen);
-      const columns = [];
-      sqliteSplitTopLevelCommas(columnListText).forEach(function(rawDef) {
-        const definition = rawDef.trim();
-        if (!definition) return;
-        const upperDef = definition.toUpperCase();
-        if (SQLITE_TABLE_CONSTRAINT_KEYWORDS.some(function(kw) { return upperDef.indexOf(kw) === 0; })) return; // table-level constraint, not a column def
-        const firstSpace = definition.search(/\s/);
-        const colName = sqliteStripIdentifierQuoting(firstSpace < 0 ? definition : definition.slice(0, firstSpace));
-        const rest = firstSpace < 0 ? '' : definition.slice(firstSpace + 1);
-        const tokens = rest.split(/\s+/).filter(Boolean);
-        const typeTokens = [];
-        let i = 0;
-        while (i < tokens.length) {
-          const tokenKey = tokens[i].toUpperCase().replace(/[(),]+$/, '');
-          if (SQLITE_COLUMN_DEF_STOP_KEYWORDS[tokenKey]) break;
-          typeTokens.push(tokens[i]); i++;
-        }
-        const typeText = typeTokens.join(' ');
-        const remainingUpper = tokens.slice(i).join(' ').toUpperCase();
-        let isRowidAlias = false;
-        if (typeText.trim().toUpperCase() === 'INTEGER' && remainingUpper.indexOf('PRIMARY KEY') === 0) {
-          const beforeAutoincrement = remainingUpper.split('AUTOINCREMENT')[0];
-          if (beforeAutoincrement.indexOf('DESC') < 0) isRowidAlias = true; // "INTEGER PRIMARY KEY DESC" is NOT a rowid alias
-        }
-        columns.push({ name: colName, isRowidAlias: isRowidAlias, affinity: sqliteComputeTypeAffinity(typeText) });
-      });
-      return columns;
-    }
-    function sqliteReadTableRows(db, tableName, schema) {
-      const entry = schema && schema[tableName];
-      if (!entry) throw new Error('Table ' + tableName + ' not found in schema');
-      const columns = sqliteParseCreateTableColumns(entry.sql);
-      const columnNames = columns.map(function(c) { return c.name; });
-      let rowidAliasIndex = -1;
-      columns.forEach(function(c, i) { if (c.isRowidAlias && rowidAliasIndex < 0) rowidAliasIndex = i; });
-      const rows = [];
-      sqliteWalkTableBTree(db, entry.rootpage).forEach(function(cell) {
-        let values = sqliteReadRecord(cell.payload, db.header.textEncoding);
-        if (values.length < columnNames.length) values = values.concat(new Array(columnNames.length - values.length).fill(null)); // ALTER TABLE ADD COLUMN: older rows lack trailing columns -> NULL
-        if (rowidAliasIndex >= 0) {
-          if (values[rowidAliasIndex] != null) throw new Error('table=' + tableName + ' rowid=' + cell.rowid + ': INTEGER PRIMARY KEY column was NOT null on disk — unexpected');
-          values[rowidAliasIndex] = cell.rowid;
-        }
-        // (Python's reference cast a REAL-affinity int to float() here — a real distinction there, since
-        // Python keeps int/float as separate types. JS has one Number type, so 42 and 42.0 are already
-        // indistinguishable; nothing to cast.)
-        const row = {}; columnNames.forEach(function(name, i) { row[name] = values[i]; });
-        row._rowid = cell.rowid;
-        rows.push(row);
-      });
-      return { columnNames: columnNames, rows: rows };
-    }
-    function sqliteLoadDatabase(bytes) { // bytes: Uint8Array of the whole .sut/.sqlite file
-      return { data: bytes, header: sqliteParseDbHeader(bytes) };
-    }
-    // ===========================================================================================
-    // ## SECTION: BRUSH IMPORT — minimal tar reader (a .sut's MaterialFile.FileData BLOB is a plain
-    // tar archive). POSIX ustar: 512-byte header per entry (name/size/typeflag fields at fixed
-    // offsets, size is octal ASCII) + ceil(size/512)*512 bytes of data, ending at two all-zero
-    // blocks. ustar's `prefix` field (long-path extension) is honored; GNU longname (typeflag 'L')
-    // is NOT — none of the .sut sample files' tar members needed it, and this only needs to read
-    // .sut archives this app creates no other way, not arbitrary tarballs.
-    //
-    // ★ver1357: **이 섹션은 아래 세 함수(tarParseOctal/tarReadNullTerminated/tarReadEntries)로 끝난다.**
-    //   그 뒤부터는 페인트 커널의 후반부이고 tar와 아무 상관이 없다 — 다음 `## SECTION:` 마커부터가
-    //   그쪽이다. 이 마커가 2,168줄(최상위 선언 100개)을 관할하는 것처럼 보였던 이유: .sut 임포터가
-    //   페인트 커널 한복판(#19)에 있었고, 그 헬퍼인 SQLite/tar 리더를 호출자 바로 아래에 끼워 넣으면서
-    //   커널이 두 동강 났다. 아래쪽 절반이 이 마커의 관할로 오인됐던 것이고, 8만 줄 파일에서 마커는
-    //   유일한 탐색 수단이라 그 오인이 곧 결함이었다. 코드는 옮기지 않았다(전 구간 최상위 실행문 0,
-    //   IIFE 없음 — 순수 주석 작업으로 충분하고, 335줄 이동은 diff/blame 비용이 이득을 넘는다).
-    // ===========================================================================================
-    function tarParseOctal(bytes) {
-      let s = '';
-      for (let i = 0; i < bytes.length; i++) {
-        const c = bytes[i];
-        if (c === 0 || c === 32) break; // NUL or space terminates the field
-        s += String.fromCharCode(c);
-      }
-      return s ? parseInt(s, 8) : 0;
-    }
-    function tarReadNullTerminated(bytes, decoder) {
-      let len = 0;
-      while (len < bytes.length && bytes[len] !== 0) len++;
-      return decoder.decode(bytes.subarray(0, len));
-    }
-    function tarReadEntries(bytes) { // -> [{ name, data: Uint8Array }], directories/links/etc. skipped
-      const decoder = new TextDecoder('utf-8');
-      const entries = [];
-      let offset = 0;
-      while (offset + 512 <= bytes.length) {
-        const header = bytes.subarray(offset, offset + 512);
-        let allZero = true;
-        for (let i = 0; i < 512 && allZero; i++) { if (header[i] !== 0) allZero = false; }
-        if (allZero) break; // end-of-archive marker
-        let name = tarReadNullTerminated(header.subarray(0, 100), decoder);
-        const prefix = tarReadNullTerminated(header.subarray(345, 500), decoder);
-        if (prefix) name = prefix + '/' + name;
-        const size = tarParseOctal(header.subarray(124, 136));
-        const typeflag = header[156];
-        offset += 512;
-        if (typeflag === 0 || typeflag === 48 /* ASCII '0' = regular file; skip dirs('5'), links, etc. */) {
-          entries.push({ name: name, data: bytes.slice(offset, offset + size) });
-        }
-        offset += Math.ceil(size / 512) * 512;
-      }
-      return entries;
-    }
-    // ===========================================================================================
-    // ## SECTION: PAINT: TIP STAMP + INK FIELD — 여기부터 다시 페인트 커널이다(#19의 연속. 위 tar
-    // 마커의 ★ver1357 주석 참고). 브러시 팁 틴트·캐시, dab 걷기(paintWalkTipDabs — 모양과 잉크 장이
+    // ## SECTION: PAINT: TIP STAMP + INK FIELD — #19 커널의 연속(도장·잉크 장). ver2381 에 사이를
+    // 끊던 BRUSH IMPORT 두 섹션을 이 섹션 뒤로 옮겼다(brush_section_cleanup 판정 C).
+    // 브러시 팁 틴트·캐시, dab 걷기(paintWalkTipDabs — 모양과 잉크 장이
     // 공유하는 단 하나의 걷기), 잉크 장(paintStampInkField: dab이 곧 팁이고 그 팁이 곧 농도, max 합성),
     // 가변폭 채움(paintFillVariableWidthBody/Shape), 라이브 증분 세션(paintInkSessionStep),
     // 휘도→알파 필터, 경로 스무딩(라쏘)과 손떨림 보정(pulled string).
@@ -64641,258 +64671,349 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return true;
     }
-    // pull-average smoothing; state lives on the op (one gesture = one smoothing run). The pointerup
-    // replay (endPaintStroke → continue) passes through RAW so the line reaches where the pen lifted.
-    // ver1177 split the pull step out into paintStabilizeStep so the brush preview could smooth at a level
-    // that is NOT the armed tool's. ver1236 dropped smoothing from the preview entirely (it only flattened
-    // the synthetic sample wobble and pulled the stroke's end short, saying nothing about the mark), so that
-    // second caller is gone and this is the live gesture's smoother again. Kept as its own function anyway:
-    // paintStabilizePoint owns the gesture rules (seeding from the pointerdown anchor, the raw pointerup
-    // snap) and this owns the arithmetic — a clean split on its own merits.
-    // ★ver1637: **이동 평균 창**이다. 최근 n 개 입력 좌표의 평균을 잉크로 삼는다.
-    //
-    // 그전 두 판의 경위 — ver1328 ② 는 EMA(`x += (pen-x)*k`)를 버리고 **pulled string(dead zone)** 을
-    // 넣었다. EMA 는 지연이 지수적으로 남아 **영원히 펜을 못 따라잡는** 것이 문제였고, rope 는 시간
-    // 지연이 0 이라 그 문제가 없다. 그런데 rope 에는 다른 대가가 있었고 그것이 실사용에서 터졌다
-    // (사용자 필기 스크린샷 비교, 2026-08-08):
-    //   · **각진다** — 끈이 팽팽하면 잉크는 「펜에서 정확히 radius 떨어진 점」을 따라가므로, 곡선이
-    //     펜 궤적의 **내측 다각형**이 된다. 글씨처럼 방향 전환이 잦은 획에서 전부 직선 조각이 됐다.
-    //   · **버려진다** — dead zone 안의 입력은 결과에 **하나도 기여하지 않는다.** 반경보다 짧은 획은
-    //     한 점도 안 나갔다(ver1636 의 catch-up 이 그 끝만 겨우 이어 준 상태였다).
-    //   · **빠르면 더 심하다** — 샘플 간격이 radius 를 넘으면 매 샘플이 큰 스텝이라 다각형이 거칠어진다.
-    //
-    // Krita 를 보면 그 둘은 애초에 **다른 자리**의 장치다: 스무딩 본체는 `Sample Count`(가중 이동
-    // 평균)이고 dead zone 은 `Delay` 라는 **별도 옵션**이며, 문서가 그 목적을 「Without the delay dead
-    // zone, it is impossible to make sharp corners」라고 적는다 — **날카로운 코너를 만들기 위한** 것이다.
-    // 우리는 보조만 갖고 본체를 안 만든 상태였다. CSP 의 手ブレ補正도 「값이 클수록 지연이 는다」는
-    // 시간 지연형이지 dead zone 이 아니다.
-    //
-    // 이동 평균은 세 증상이 구조적으로 없다: 모든 샘플이 평균에 기여하고(버려짐 없음), 평균이라
-    // 곡선이 곡선으로 남고(각짐 없음), 지연이 **유한**하다 — 펜이 멈추면 n 샘플 뒤 정확히 그 자리에
-    // 도달한다(EMA 가 못 하던 것). 창 크기가 곧 강도이자 지연이고, 그 둘이 같은 것이 이 방식의 정직한
-    // 성질이다.
-    //
-    // ★ver1639: 평균을 **두 단**으로 돌린다(= 삼각 가중). ver1637 의 한 단(균등 가중 box)은 각짐을
-    // 없앴지만 사용자가 「꾸불거림이 오히려 생긴다」고 했고, 그것이 box 필터의 알려진 성질이다:
-    // 주파수 응답이 sinc 라 **sidelobe 에서 위상이 뒤집혀** 원래 떨림이 반대 방향으로 되살아난다(ringing).
-    // box 를 두 번 통과시키면 응답이 sinc² 가 되어 그 sidelobe 가 제곱만큼 눌린다. Krita 가 자기
-    // 스무딩을 「**Weighted** Smoothing」이라 부르는 이유가 이것 — 균등 평균이 아니라 가중이다.
-    //
-    // 실측(완만한 곡선 + 고주파 떨림 2 성분, 이상 궤적과의 오차):
-    //   입력            RMS 2.551 · 부호반전 217
-    //   box 창21        RMS 0.859 · 부호반전 **45**   ← ver1637
-    //   box×2 창11      RMS **0.391** · 부호반전 **2**  ← 여기
-    //   주파수 f≈0.071  box21 이 0.2126 을 통과시키는데 box×2 는 0.0646 (3 배 억제)
-    //
-    // **지연은 같다.** box(N) 의 지연이 (N-1)/2 이므로 창 11 두 번 = 창 21 한 번이다 — 같은 값을
-    // 두 단으로 쪼갠 것뿐이라 「더 부드러운데 더 늦지는 않다」.
-    // 비용도 그대로 샘플당 O(1) — 각 단이 합을 들고 다니며 더하고 뺀다(`shift` 는 n ≤ 11 이라 무시할
-    // 만하다). dab 마다가 아니라 **입력 샘플마다** 한 번이다.
-    // ver1640: **한 축**의 삼각 가중 이동 평균. 좌표의 x·y 와 필압이 전부 이 함수를 지난다 —
-    // 「같은 수학이면 공용 커널 먼저」이고, 무엇보다 **셋이 같은 창을 써야 서로 정렬된다**(아래).
-    function paintStabilizeAxisMake(seed) {
-      const v = Number(seed) || 0;
-      return { b1: [v], s1: v, b2: [v], s2: v };
+    // ## SECTION: BRUSH IMPORT — minimal SQLite3 table-scan reader (for .sut, a plain SQLite3 file)
+    // ★ver1332: 진입점이 생겼다 — 브러시 라이브러리의 드롭 임포터(brushLibraryImportSutBytes, 위)가
+    //   sqliteLoadDatabase / sqliteGetSchema / sqliteReadTableRows / tarReadEntries의 첫 호출자다.
+    //   (ver1232~1331 동안은 "진입점 없음(의도)"로 대기하던 검증된 기반이었다.)
+    // Not a SQL engine — walks one named table's b-tree and returns every row's column values, in
+    // rowid order. Ported line-for-line from a Python reference (mini_sqlite_reader.py) that was
+    // validated against real .sut files: every row/column of every table matched Python's own
+    // sqlite3 module exactly (622 column-checks, both sample files), including BLOB columns that
+    // overflow onto multiple overflow pages and a genuinely 2-level interior b-tree (sqlite_master
+    // itself, in both files). See docs/brush_import_engine_plan_2026-07-27.md for the investigation
+    // history. Reference: https://www.sqlite.org/fileformat2.html
+    // ===========================================================================================
+    function sqliteReadVarint(buf, offset) {
+      // SQLite's own varint (NOT protobuf varint): up to 9 bytes, first 8 each contribute 7 bits
+      // (MSB = continuation), a 9th byte (if reached) contributes its full 8 bits with no
+      // continuation semantics. Values here never exceed 32 safe-integer bits in practice (page
+      // sizes/rowids/lengths), so plain Number arithmetic is fine — no BigInt needed.
+      let value = 0;
+      for (let i = 0; i < 8; i++) {
+        const byte = buf[offset + i];
+        value = value * 128 + (byte & 0x7F);
+        if ((byte & 0x80) === 0) return { value: value, offset: offset + i + 1 };
+      }
+      value = value * 256 + buf[offset + 8];
+      return { value: value, offset: offset + 9 };
     }
-    function paintStabilizeScalar(ax, v, half) {
-      const b1 = ax.b1, b2 = ax.b2;
-      b1.push(v);
-      ax.s1 += v;
-      while (b1.length > half) ax.s1 -= b1.shift();
-      const m = ax.s1 / b1.length;      // 1 단
-      b2.push(m);
-      ax.s2 += m;
-      while (b2.length > half) ax.s2 -= b2.shift();
-      return ax.s2 / b2.length;         // 2 단 — sinc 의 sidelobe 를 sinc² 로 누른다
+    function sqliteReadUint32BE(buf, offset) {
+      return ((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
     }
-    // ver2373: 창 산수 한 벌 — 레벨→창(샘플 수)과 창→한 단(box×2 의 각 단). 같은 식이
-    // paintStabilizeStep·paintStabilizeAux·paintStabilizeAzimuth 에 세 벌 인라인이었고, catch-up
-    // 수렴 방출(paintStabilizeCatchupReplay)이 넷째 사본이 될 자리라 모았다.
-    function paintStabilizeWinN(level) { return 1 + level * 2; }
-    function paintStabilizeWinHalf(n) { return Math.max(1, Math.round(n / 2)); }
-    function paintStabilizeStep(smoothState, point, n) {
-      const half = paintStabilizeWinHalf(n);
+    function sqliteParseDbHeader(data) {
+      if (data.length < 100) throw new Error('File too small to be a SQLite database');
+      for (let i = 0; i < 16; i++) { if (data[i] !== SQLITE_MAGIC_BYTES[i]) throw new Error('Not a SQLite3 database file (bad magic header string)'); }
+      let pageSize = (data[16] << 8) | data[17];
+      if (pageSize === 1) pageSize = 65536; // on-disk 0x0001 means 65536 (doesn't fit a uint16 any other way)
+      const reservedSpace = data[20];
+      const textEncoding = ((data[56] << 24) | (data[57] << 16) | (data[58] << 8) | data[59]) >>> 0;
+      if (textEncoding !== 1 && textEncoding !== 2 && textEncoding !== 3) throw new Error('Unexpected text encoding code: ' + textEncoding);
+      return { pageSize: pageSize, reservedSpace: reservedSpace, textEncoding: textEncoding, usableSize: pageSize - reservedSpace };
+    }
+    const SQLITE_MAGIC_BYTES = [0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00]; // "SQLite format 3\0"
+    const SQLITE_PAGE_TYPE_INTERIOR_TABLE = 5, SQLITE_PAGE_TYPE_LEAF_TABLE = 13;
+    function sqliteGetPageBytes(db, pageNumber) {
+      const start = (pageNumber - 1) * db.header.pageSize;
+      return { pageBytes: db.data.subarray(start, start + db.header.pageSize), headerStart: pageNumber === 1 ? 100 : 0 };
+    }
+    function sqliteParseBTreePageHeader(pageBytes, headerStart) {
+      const pageType = pageBytes[headerStart];
+      let cellContentStart = (pageBytes[headerStart + 5] << 8) | pageBytes[headerStart + 6];
+      if (cellContentStart === 0) cellContentStart = 65536;
+      const isInterior = pageType === SQLITE_PAGE_TYPE_INTERIOR_TABLE;
       return {
-        x: paintStabilizeScalar(smoothState.ax, Number(point.x) || 0, half),
-        y: paintStabilizeScalar(smoothState.ay, Number(point.y) || 0, half)
+        pageType: pageType,
+        cellCount: (pageBytes[headerStart + 3] << 8) | pageBytes[headerStart + 4],
+        cellContentStart: cellContentStart,
+        rightMostPointer: isInterior ? sqliteReadUint32BE(pageBytes, headerStart + 8) : null,
+        headerLen: isInterior ? 12 : 8
       };
     }
-    // ── ver1640: 필압도 **좌표와 같은 창**을 지난다 ─────────────────────────────────────────────
-    // 그전에는 셋이 제각각이었다: 원화는 **비대칭** slew-limit(올라갈 때만 프레임당 0.1, 내려갈 때는
-    // raw — ver616 이 Apple Pencil 의 lift-spike 로 꼬리가 굵어지는 것을 막으려고 넣었다), 콘티·용지는
-    // 아무것도 없었다. 그래서 (1) 굵어질 때와 얇아질 때의 반응이 다르고, (2) 엔진마다 같은 필압이 다른
-    // 굵기로 나오고, (3) ver1637 부터 **좌표만 창 지연을 타면서 필압과 시간이 어긋나** 굵기가 제 자리보다
-    // 앞서 붙었다. 사용자 보고의 「필압이 불안정하다」가 이 셋이다.
-    // 좌표와 **같은 창**으로 평균하면 지연이 같아져 (3) 이 자동으로 정렬되고, 같은 커널이라 (1)·(2) 도
-    // 함께 사라진다. 대가는 정직하게 하나 있다: 보정을 세게 할수록 **入り抜き(입·빼기)의 빠른 필압
-    // 변화도 함께 뭉개진다.** 보정 0 이면 창이 없어 raw 그대로다.
-    // 상승 slew-limit 은 남긴다 — 보정이 0 일 때도 lift-spike 방어가 필요하고, 창 평균은 스파이크를
-    // 1/n 로 희석할 뿐 없애지는 않는다.
-    // 상태는 **스트로크 수명 객체**에 산다(콘티·용지는 stroke, 원화는 세션) — 그래서 호출부를 고치지
-    // 않고도 세 엔진이 같은 함수를 쓴다.
-    // ver1641: **좌표 밖의 축**(필압·기울기)을 하나가 맡는다. ver1640 이 필압 전용으로 만든 것을
-    // 일반화했다 — 기울기도 같은 이유(손이 떨리면 값이 흔들린다)로 같은 처리가 필요한데, 그때까지는
-    // 원화만 EMA(0.35)로 따로 하고 콘티에는 아무것도 없었다. ver1640 직전의 필압과 **똑같은 모양의
-    // 파리티 구멍**이다. 이제 이 파일에서 손떨림 보정을 타는 축은 x · y · 필압 · 기울기 넷이고
-    // 커널은 `paintStabilizeScalar` 한 벌이다.
-    //   · key      — host 에 상태를 둘 이름(`p` · `t`). 축마다 창이 따로 돈다.
-    //   · riseMax  — 상승 slew-limit. 필압만 쓴다(ver616: Apple Pencil 이 펜을 뗄 때 필압을 튀겨
-    //                꼬리를 굵히는 것을 막는다). 기울기에는 그런 스파이크가 없으므로 0 을 준다.
-    // 창은 좌표와 **같다** — 그래야 세 축의 지연이 같아져 굵기가 제 자리에 붙는다(ver1640 참조).
-    const PAINT_PRESSURE_RISE_MAX = 0.25;   // ver616: 0.1 → ver2328 (판정 q2=A): 상승 지연 100→40ms@60Hz. 원 표적(lift-spike 1~2샘플)은 median±2 가 이미 잡는다
-    const PAINT_CATCHUP_TAIL_FLOOR_RATIO = 0.5;   // ver2377: 수렴 꼬리 압의 바닥 = 마지막 인식 필압 × 이 값 — 뾰족 0 수렴(pf 의 end taper 스타일)과 네이티브 뚝(마지막 값 유지) 사이의 안착점
-    // ver2362: smoothWin === false 면 이동평균 창을 건너뛴다(rise-limit 은 그대로) — **필압('p')이
-    // 이 경로다.** 레퍼런스 표준(CSP 補正 전 항목 = 좌표 전용·필압 스무딩 항목 없음, Krita 는
-    // Smooth Pressure 가 좌표와 분리된 별도 옵트인)에 맞춰 손떨림 레벨은 좌표에만 건다.
-    // 기울기('t')는 종전대로 창을 지난다(이번 판 범위 밖).
-    function paintStabilizeAux(host, key, raw, riseMax, smoothWin) {
-      if (raw == null || !host) return raw;
-      let v = Math.max(0, Math.min(1, Number(raw) || 0));
-      const pk = key + 'Prev', ak = key + 'Axis';
-      const prev = host[pk];
-      // ver2368 (q2=A, pressure_head_taper §5·§6): **어택 시드.** 브라우저 스트림에는 눌러 가는
-      // 과정(램프업)이 없어(호버 p=0 · 접촉 후 0~2샘플) 첫 샘플부터 몸통 필압이 온다 — 그 스트림을
-      // 그대로 실으면 획 머리가 올챙이가 된다. perfect-freehand(tldraw·Excalidraw)의 「낮은 시작
-      // + 추종 관성」 구조를 기존 rise-limit 하나로 재현한다: 상승 기준을 0 에 두어 0→몸통을
-      // 2~4샘플의 램프로 따라간다. 그 샘플들의 실제 이동 거리가 곧 머리 테이퍼라 빠른 획일수록
-      // 길고 천천히 대면 없다 — 속도 비례가 산수에서 나온다. 하강(리프트 꼬리)은 종전대로 자유.
-      // ver2370 (감사 q2=A): **첫 샘플도 캡을 지난다** — ver2368 의 「첫 샘플 원값 통과」는 down
-      // 점만 램프 밖에 남겨 시작에 원값 dab 이 한 방 찍혔다(radii [0.1→18.5] 점프 = 제보 「시작
-      // 동그라미가 들킨다」의 실증). 탭·시작점의 원값 계약(ver628)은 host.pFirstRaw 보관으로
-      // 옮긴다 — 탭 커밋(n==1)과 first-dab flush 가 그 값을 쓴다.
-      // riseMax 가 0 인 축(기울기)은 이 시드·보관을 아예 안 지난다.
-      if (riseMax && prev == null) { host.pFirstRaw = v; v = Math.min(v, riseMax); host[pk] = v; }
-      else {
-        if (riseMax && prev != null && v > prev) v = Math.min(v, prev + riseMax);
-        if (riseMax) host[pk + '2'] = prev;   // ver2375: 직전값(pPrev2) — catch-up 이 ①(실측 리프트 하강)의 샘플당 하강률을 상속하는 데 쓴다
-        host[pk] = v;
+    function sqliteReadCellPointerArray(pageBytes, headerStart, btreeHeader) {
+      const ptrArrayStart = headerStart + btreeHeader.headerLen;
+      const pointers = [];
+      for (let i = 0; i < btreeHeader.cellCount; i++) {
+        const off = ptrArrayStart + i * 2;
+        pointers.push((pageBytes[off] << 8) | pageBytes[off + 1]);
       }
-      const level = smoothWin === false ? 0 : paintStabilizerVal();
-      if (!level) { host[ak] = null; return v; }
-      if (!host[ak]) host[ak] = paintStabilizeAxisMake(v);
-      return Math.max(0, Math.min(1, paintStabilizeScalar(host[ak], v, paintStabilizeWinHalf(paintStabilizeWinN(level)))));
+      return pointers;
     }
-    // ver1637: 창 크기는 **샘플 수**라 좌표계와 무관하다 — rope 시절 필요했던 `op.stabScale`(로컬
-    // 단위/화면 픽셀) 환산이 여기서는 아예 필요 없다. 그 필드는 지우지 않는다: Shift 직선(ver1610)이
-    // 같은 값을 「화면 픽셀 기준 팔 길이」로 계속 쓴다.
-    // 레벨 0 = 끔. 1~10 → 창 3~21 샘플(ver1639 부터 그 절반씩 두 단이라 지연은 같고 훨씬 부드럽다).
-    // Apple Pencil 은 coalesced 로 240Hz 까지 들어오므로 최대치가 100ms 를 조금 넘는 지연이고,
-    // 마우스(60Hz)에서는 더 길게 느껴진다 — 강도와 지연이 같은 값인 것이 이동 평균의 정직한 성질이라
-    // 슬라이더 하나로 둔다.
-    function paintStabilizePoint(op, point, event) {
-      const level = paintStabilizerVal();
-      if (!op || !level) return point;
-      if (event && (event.type === 'pointerup' || event.type === 'pointercancel')) {
-        // catch-up: 획은 펜을 뗀 자리에서 끝난다(ver750 = TVPaint 의 Catch Up, ver1636 에서 원화에도 배선).
-        // 창을 그 점 하나로 비워 두면 다음 획이 지난 획의 꼬리를 평균에 섞지 않는다.
-        // ver2373: 종전에는 이 raw 반환이 「뒤처진 창 출력 → 실좌표」 한 세그먼트 직결이 됐다 —
-        // 그 랙 구간은 이제 세 end 호출부가 이 반환 **직전에** paintStabilizeCatchupReplay 로
-        // 수렴 방출하므로, 여기 도달할 때는 창이 이미 실좌표에 가 있어 이 반환은 종점 보장이다.
-        if (op.smoothState) {
-          // ver1638: 모양이 옛것이어도 여기서 새 모양이 된다. ver1639/1640: 두 단 모두 비운다.
-          op.smoothState = { ax: paintStabilizeAxisMake(point.x), ay: paintStabilizeAxisMake(point.y) };
+    function sqliteComputeLocalPayloadSize(payloadSize, usableSize) {
+      // Table B-Tree Leaf Cell local-payload-size formula (sqlite.org/fileformat2.html section 1.5/1.6) —
+      // piecewise, not a simple "usable_size - 35" approximation.
+      const U = usableSize, P = payloadSize, X = U - 35;
+      if (P <= X) return { localSize: P, hasOverflow: false };
+      const M = Math.floor((U - 12) * 32 / 255) - 23;
+      const K = M + ((P - M) % (U - 4));
+      return { localSize: K <= X ? K : M, hasOverflow: true };
+    }
+    function sqliteReadOverflowChain(db, firstOverflowPage, remainingBytes) {
+      const usableSize = db.header.usableSize, contentPerPage = usableSize - 4;
+      const out = new Uint8Array(remainingBytes);
+      let outOff = 0, pageNumber = firstOverflowPage, remaining = remainingBytes;
+      while (remaining > 0) {
+        if (pageNumber === 0) throw new Error('Overflow chain ended early: ' + remaining + ' bytes still needed');
+        const pageBytes = sqliteGetPageBytes(db, pageNumber).pageBytes;
+        const nextPageNumber = sqliteReadUint32BE(pageBytes, 0);
+        const take = Math.min(remaining, contentPerPage);
+        out.set(pageBytes.subarray(4, 4 + take), outOff);
+        outOff += take; remaining -= take; pageNumber = nextPageNumber;
+      }
+      return out;
+    }
+    function sqliteReadTableLeafCell(db, pageBytes, cellOffset) {
+      let r = sqliteReadVarint(pageBytes, cellOffset);
+      const payloadSize = r.value;
+      r = sqliteReadVarint(pageBytes, r.offset);
+      const rowid = r.value, off0 = r.offset;
+      const lp = sqliteComputeLocalPayloadSize(payloadSize, db.header.usableSize);
+      const localPayload = pageBytes.slice(off0, off0 + lp.localSize);
+      let fullPayload = localPayload;
+      if (lp.hasOverflow) {
+        const overflowPageNumber = sqliteReadUint32BE(pageBytes, off0 + lp.localSize);
+        const overflowBytes = sqliteReadOverflowChain(db, overflowPageNumber, payloadSize - lp.localSize);
+        fullPayload = new Uint8Array(payloadSize);
+        fullPayload.set(localPayload, 0);
+        fullPayload.set(overflowBytes, lp.localSize);
+      }
+      if (fullPayload.length !== payloadSize) throw new Error('Payload assembly mismatch: expected ' + payloadSize + ' bytes, got ' + fullPayload.length);
+      return { rowid: rowid, payload: fullPayload };
+    }
+    function sqliteWalkTableBTree(db, rootPageNumber, out) {
+      out = out || [];
+      const g = sqliteGetPageBytes(db, rootPageNumber), pageBytes = g.pageBytes, headerStart = g.headerStart;
+      const btreeHeader = sqliteParseBTreePageHeader(pageBytes, headerStart);
+      const pointers = sqliteReadCellPointerArray(pageBytes, headerStart, btreeHeader);
+      if (btreeHeader.pageType === SQLITE_PAGE_TYPE_LEAF_TABLE) {
+        pointers.forEach(function(cellOffset) { out.push(sqliteReadTableLeafCell(db, pageBytes, cellOffset)); });
+      } else if (btreeHeader.pageType === SQLITE_PAGE_TYPE_INTERIOR_TABLE) {
+        pointers.forEach(function(cellOffset) {
+          const leftChildPage = sqliteReadUint32BE(pageBytes, cellOffset); // interior table cells: 4-byte child page + varint key (key unused — pure routing)
+          sqliteWalkTableBTree(db, leftChildPage, out);
+        });
+        sqliteWalkTableBTree(db, btreeHeader.rightMostPointer, out); // highest-keyed subtree — always visited last
+      } else {
+        throw new Error('Page ' + rootPageNumber + ' has page_type=' + btreeHeader.pageType + ', not a table b-tree page (expected 5 or 13)');
+      }
+      return out;
+    }
+    function sqliteDecodeSignedBE(bytes) {
+      let value = 0;
+      for (let i = 0; i < bytes.length; i++) value = value * 256 + bytes[i];
+      const signBit = Math.pow(2, 8 * bytes.length - 1);
+      if (value >= signBit) value -= Math.pow(2, 8 * bytes.length);
+      return value;
+    }
+    const SQLITE_UTF8_DECODER = new TextDecoder('utf-8'), SQLITE_UTF16LE_DECODER = new TextDecoder('utf-16le');
+    function sqliteDecodeUtf16be(bytes) { // TextDecoder has no native utf-16be; byte-swap into a utf-16le buffer
+      const swapped = new Uint8Array(bytes.length);
+      for (let i = 0; i + 1 < bytes.length; i += 2) { swapped[i] = bytes[i + 1]; swapped[i + 1] = bytes[i]; }
+      return SQLITE_UTF16LE_DECODER.decode(swapped);
+    }
+    function sqliteDecodeSerialValue(payload, offset, serialType, textEncoding) {
+      if (serialType === 0) return { value: null, offset: offset };                          // NULL
+      if (serialType >= 1 && serialType <= 6) {                                                // int8/16/24/32/48/64
+        const len = [1, 2, 3, 4, 6, 8][serialType - 1];
+        return { value: sqliteDecodeSignedBE(payload.subarray(offset, offset + len)), offset: offset + len };
+      }
+      if (serialType === 7) {                                                                  // float64 (IEEE754 BE)
+        const b = payload.subarray(offset, offset + 8);
+        const dv = new DataView(b.buffer, b.byteOffset, 8);
+        return { value: dv.getFloat64(0, false), offset: offset + 8 };
+      }
+      if (serialType === 8) return { value: 0, offset: offset };                               // integer constant 0, zero bytes stored
+      if (serialType === 9) return { value: 1, offset: offset };                               // integer constant 1, zero bytes stored
+      if (serialType >= 12 && serialType % 2 === 0) {                                          // BLOB
+        const length = (serialType - 12) / 2;
+        return { value: payload.slice(offset, offset + length), offset: offset + length };
+      }
+      if (serialType >= 13 && serialType % 2 === 1) {                                          // TEXT
+        const length = (serialType - 13) / 2;
+        const raw = payload.subarray(offset, offset + length);
+        const value = textEncoding === 1 ? SQLITE_UTF8_DECODER.decode(raw) : textEncoding === 2 ? SQLITE_UTF16LE_DECODER.decode(raw) : sqliteDecodeUtf16be(raw);
+        return { value: value, offset: offset + length };
+      }
+      throw new Error('Encountered reserved/unused serial type ' + serialType + ' -- file is malformed');
+    }
+    function sqliteReadRecord(payload, textEncoding) {
+      let r = sqliteReadVarint(payload, 0);
+      const headerLength = r.value;
+      const serialTypes = [];
+      let off = r.offset;
+      while (off < headerLength) { r = sqliteReadVarint(payload, off); serialTypes.push(r.value); off = r.offset; }
+      if (off !== headerLength) throw new Error('Record header parsing overran: header_length=' + headerLength + ' but stopped at ' + off);
+      let bodyOff = headerLength;
+      const values = serialTypes.map(function(serialType) {
+        const d = sqliteDecodeSerialValue(payload, bodyOff, serialType, textEncoding);
+        bodyOff = d.offset;
+        return d.value;
+      });
+      return values;
+    }
+    const SQLITE_MASTER_COLUMNS = ['type', 'name', 'tbl_name', 'rootpage', 'sql'];
+    function sqliteReadMaster(db) {
+      return sqliteWalkTableBTree(db, 1).map(function(cell) {
+        const values = sqliteReadRecord(cell.payload, db.header.textEncoding);
+        const row = {}; SQLITE_MASTER_COLUMNS.forEach(function(name, i) { row[name] = values[i]; });
+        row.rowid = cell.rowid;
+        return row;
+      });
+    }
+    function sqliteGetSchema(db) { // {tableName: {rootpage, sql}} — read sqlite_master ONCE, not once per table lookup
+      const schema = {};
+      sqliteReadMaster(db).forEach(function(row) { if (row.type === 'table') schema[row.name] = { rootpage: row.rootpage, sql: row.sql }; });
+      return schema;
+    }
+    function sqliteSplitTopLevelCommas(text) {
+      const parts = []; let depth = 0, current = '';
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '(') { depth++; current += ch; }
+        else if (ch === ')') { depth--; current += ch; }
+        else if (ch === ',' && depth === 0) { parts.push(current); current = ''; }
+        else current += ch;
+      }
+      if (current) parts.push(current);
+      return parts;
+    }
+    function sqliteStripIdentifierQuoting(name) {
+      name = name.trim();
+      if (name.length >= 2) {
+        if ((name[0] === '"' && name[name.length - 1] === '"') || (name[0] === '`' && name[name.length - 1] === '`')) return name.slice(1, -1);
+        if (name[0] === '[' && name[name.length - 1] === ']') return name.slice(1, -1);
+      }
+      return name;
+    }
+    const SQLITE_TABLE_CONSTRAINT_KEYWORDS = ['PRIMARY', 'UNIQUE', 'CHECK', 'FOREIGN', 'CONSTRAINT'];
+    // NULL is deliberately a stop keyword, not a type name: SQLite's grammar lets a bare `NULL` after a column
+    // name mean the (no-op) nullable constraint, and `PRAGMA table_info` on real .sut files confirms columns
+    // written as e.g. `Foo NULL DEFAULT NULL` really do get declared-type = '' — this reproduces that, not just
+    // approximates it (see mini_sqlite_reader.py's validation notes).
+    const SQLITE_COLUMN_DEF_STOP_KEYWORDS = { PRIMARY: 1, NOT: 1, NULL: 1, UNIQUE: 1, CHECK: 1, DEFAULT: 1, COLLATE: 1, REFERENCES: 1, GENERATED: 1, CONSTRAINT: 1, AS: 1 };
+    function sqliteComputeTypeAffinity(typeText) { // sqlite.org/datatype3.html "Determination Of Column Affinity" — first matching rule wins
+      const t = typeText.toUpperCase();
+      if (t.indexOf('INT') >= 0) return 'INTEGER';
+      if (t.indexOf('CHAR') >= 0 || t.indexOf('CLOB') >= 0 || t.indexOf('TEXT') >= 0) return 'TEXT';
+      if (t.indexOf('BLOB') >= 0 || t === '') return 'BLOB';
+      if (t.indexOf('REAL') >= 0 || t.indexOf('FLOA') >= 0 || t.indexOf('DOUB') >= 0) return 'REAL';
+      return 'NUMERIC';
+    }
+    function sqliteParseCreateTableColumns(sql) {
+      const openParen = sql.indexOf('(');
+      let depth = 0, closeParen = -1;
+      for (let i = openParen; i < sql.length; i++) {
+        if (sql[i] === '(') depth++;
+        else if (sql[i] === ')') { depth--; if (depth === 0) { closeParen = i; break; } }
+      }
+      if (closeParen < 0) throw new Error('Malformed CREATE TABLE statement (unbalanced parens): ' + sql);
+      const columnListText = sql.slice(openParen + 1, closeParen);
+      const columns = [];
+      sqliteSplitTopLevelCommas(columnListText).forEach(function(rawDef) {
+        const definition = rawDef.trim();
+        if (!definition) return;
+        const upperDef = definition.toUpperCase();
+        if (SQLITE_TABLE_CONSTRAINT_KEYWORDS.some(function(kw) { return upperDef.indexOf(kw) === 0; })) return; // table-level constraint, not a column def
+        const firstSpace = definition.search(/\s/);
+        const colName = sqliteStripIdentifierQuoting(firstSpace < 0 ? definition : definition.slice(0, firstSpace));
+        const rest = firstSpace < 0 ? '' : definition.slice(firstSpace + 1);
+        const tokens = rest.split(/\s+/).filter(Boolean);
+        const typeTokens = [];
+        let i = 0;
+        while (i < tokens.length) {
+          const tokenKey = tokens[i].toUpperCase().replace(/[(),]+$/, '');
+          if (SQLITE_COLUMN_DEF_STOP_KEYWORDS[tokenKey]) break;
+          typeTokens.push(tokens[i]); i++;
         }
-        return point;
-      }
-      // ★ver1638: **모양까지 확인해서 만든다.** ver1637 은 `!op.smoothState` 만 봤는데, 원화 세션은
-      // 자기가 `smoothState: {x, y}`(pointerdown 자리)를 **미리 심는다** — 옛 rope 커널의 상태 모양
-      // 그대로다. 그래서 이 분기를 안 타고 `buf` 가 undefined 인 채 `paintStabilizeStep` 에 들어가
-      // 첫 획에서 TypeError 가 났다(그 뒤 점이 안 쌓여 「이상한 직선」만 남았다 — 사용자 보고).
-      // 커널이 상태의 모양을 바꿨으면 **그 모양을 아는 곳은 커널 하나여야 한다.** 그래서 남이 심어
-      // 둔 값은 「좌표 힌트」로만 읽고, 실제 구조는 여기서 만든다.
-      // 시드 우선순위: 이미 있는 좌표(원화가 심어 둔 앵커) → 스트로크의 첫 점(conte) → 지금 점.
-      if (!op.smoothState || !op.smoothState.ax) {
-        const prev = op.smoothState;
-        const seed = (prev && Number.isFinite(Number(prev.x)) && Number.isFinite(Number(prev.y))) ? prev
-          : ((op.stroke && op.stroke.points && op.stroke.points[0]) ? op.stroke.points[0] : point);
-        op.smoothState = { ax: paintStabilizeAxisMake(seed.x), ay: paintStabilizeAxisMake(seed.y) };
-      }
-      return paintStabilizeStep(op.smoothState, point, paintStabilizeWinN(level));
-    }
-    // ★ver2373: catch-up 을 「직결 한 세그먼트」에서 「창 수렴 방출」로 — 감사 q1=A 의 둘째 성분
-    // (pressure_stack_audit §2 기전 2 · §3 처방 A). ver2369 는 앞 성분(필압 0 = 잉크 0)만 반영했고,
-    // 이 직결이 「빠르게 긋고 떼면 꼬리가 곧게 날아간다」(2026-09-03 제보)로 남아 있었다.
-    // 방법: 진짜 pointerup 을 처리하기 **직전에** up 좌표를 pointermove 로 창이 찰 때까지 재투입한다.
-    // 이동평균의 「입력이 멈추면 창 크기만큼 뒤에 정확히 그 자리」(ver1637) 성질이 뒤처진 랙을
-    // 감속 곡선으로 감고 — 창에 남은 직전 궤적이 처음 몇 스텝의 방향을 이어 줘 곡률도 살아 남는다 —
-    // 마지막 재투입 뒤 출력은 정확히 up 좌표라, 이어지는 진짜 up(커널 raw 반환)은 같은 자리 no-op 다
-    // (ver1636 의 「보정이 꺼져 있으면 replay 는 아무것도 안 바꾼다」와 같은 산수). 기각된 LIFT TAIL
-    // 외삽(one_euro_smoothing_2026-09-03.md)과 다르다 — 새 위치를 지어내지 않고, 실좌표(펜 뗀 자리)로
-    // 가는 길만 직선에서 곡선으로 바꾼다. 재투입은 각 엔진의 실제 move 경로(continueFn)를 그대로
-    // 타므로 아크 리샘플·필압 사슬·잉크 0 계약(ver2369)이 진짜 샘플과 같은 한 벌로 걸린다 — 필압은
-    // 마지막 인식값→up 값 보간이 실리고(ver2374 — 아래), 잉크는 필압이 남은 만큼만 나온다.
-    // 가드: smoothState.ax 는 펜 획이 실제로 커널 창을 지났을 때만 선다 — 탭(이동 0)·도형·벡터
-    // 지우개·라쏘(전부 커널 밖)는 여기서 no-op 라 동작 불변이다. pointercancel 은 파기·탈취라
-    // 꼬리를 만들지 않는다(원화는 cancel 이 이 자리에 오지도 않는다 — ver1712 P0-3).
-    // ver2374 (제보 「끝까지 확 줄여 버리지 말고 인식한 마지막 점에서 자연스럽게 잇고 싶음」):
-    // **필압도 좌표와 같은 시간축으로 잇는다.** ver2373 은 fake 전부에 upEvent.pressure(리프트
-    // 잔압 — 흔히 0 근처)를 고정으로 실었는데, rise-limit 은 하강이 자유라 굵기가 **첫 스텝에
-    // 낭떠러지**로 떨어졌다 — 좌표는 랙 전체에 걸쳐 감기는데 낙차는 첫 세그먼트 안에 압축돼,
-    // 큰 브러시일수록 꼬리가 쐐기로 뚝 끊겼다(제보 스크린샷 X). 마지막 인식 필압(pHost 의 필압
-    // 사슬 `pPrev` — rise-limit 을 지난 최종값)에서 up 필압까지 스텝 전체에 선형 보간해 실으면
-    // 낙차가 랙 길이에 펴진다 — 스텝당 하강이 낙차/steps 로 묶이는 것이 곧 「일정 이상으론 안
-    // 준다」다(별도 상수 없이 산수에서 나온다). 본 획(리프트 전 실제 스트림)의 하강 자유(ver616)와
-    // 멈춰 떼기(랙 0 → no-op)는 그대로다.
-    // pHost — 필압 사슬이 사는 객체: conte 는 stroke(paintAttachPressure 의 host), 원화는 세션
-    // (host 와 같은 객체를 넘긴다). 필압 사슬이 없는 획(pPrev 부재)은 종전대로 up 값 고정.
-    function paintStabilizeCatchupReplay(host, upEvent, continueFn, pHost) {
-      if (!upEvent || upEvent.type !== 'pointerup' || !host) return;
-      const level = paintStabilizerVal();
-      if (!level) return;
-      const st = host.smoothState;
-      if (!st || !st.ax) return;
-      const fake = {
-        type: 'pointermove',
-        pointerId: upEvent.pointerId, pointerType: upEvent.pointerType,
-        clientX: upEvent.clientX, clientY: upEvent.clientY,
-        pressure: upEvent.pressure,
-        tiltX: upEvent.tiltX, tiltY: upEvent.tiltY,
-        altitudeAngle: upEvent.altitudeAngle, azimuthAngle: upEvent.azimuthAngle,
-        timeStamp: upEvent.timeStamp, shiftKey: upEvent.shiftKey, altKey: upEvent.altKey,
-        cancelable: false,
-        preventDefault: function() {}, stopPropagation: function() {}
-      };
-      const pFrom = pHost && typeof pHost.pPrev === 'number' ? pHost.pPrev : null;
-      const pTo = typeof upEvent.pressure === 'number' ? upEvent.pressure : pFrom;
-      // ver2375 (제보 「두 구간이 생기지 않는가」— 적중): ver2374 의 선형 보간은 낙차를 steps 에
-      // 자기 램프로 폈다 — ①(본 획의 실측 리프트 하강)의 기울기와 무관해서, 경계에서 압-거리
-      // 기울기가 꺾였다(실측: 1.81 → 0.26 /kpx — 급하강 뒤 길고 가는 실 = 스샷의 ①②).
-      // 수렴 꼬리는 새 램프가 아니라 ①의 «연장»이어야 한다: 사슬의 직전값(pPrev2)에서 얻은
-      // **샘플당 실측 하강률로 잇는다** — 속도 비례가 산수에서 나오는 것은 어택 시드(ver2368)와
-      // 같은 구조다.
-      // ver2377 (제보 「0까지 뾰족하게 수렴하지 말고, 마지막 인식 필압 기준 하한을」): 목표를
-      // up 잔압(흔히 0)에서 **바닥(pFloor)** 으로 — 바닥 = 마지막 인식 필압 ×
-      // PAINT_CATCHUP_TAIL_FLOOR_RATIO(실측 up 압이 그보다 높으면 실측 우선).
-      // ver2378 (제보 스샷 — 빨강 「일정한 구간 뭐지?」·파랑 = 이상 실루엣): ver2377 의 지수
-      // 감쇠는 바닥에 «안착 후 유지»라, 급리프트에서 랙의 남은 거리가 통째로 **등굵기 평탄
-      // 구간**이 됐다(실측: 0.05 안착 후 17점 유지). 파란 실루엣은 「①의 기세가 이어지며
-      // 매끈하게 끝」 — 그래서 감쇠를 걷고 **①의 실측 하강률(ver2375)을 그대로 연장하다,
-      // 바닥을 관통하는 스텝에 바닥을 한 번 찍고 잉크를 끝낸다**(이후 fake 는 p 0 — 잉크 0
-      // 계약 ver2369 가 걸러 좌표 수렴·벡터 종점만 남는다). 평탄이 사라지고, 기울기 연속
-      // (2375)과 바늘 금지(2377)는 그대로다. 가시 끝 = 바닥 굵기의 라운드 캡 — 손떨림 0
-      // (랙 없음, 마지막 인식 굵기로 끝)과 같은 계열. 하강 기록이 없던 up 은 pFrom→바닥 선형.
-      const pFall = (pHost && typeof pHost.pPrev2 === 'number' && pFrom != null && pHost.pPrev2 > pFrom)
-        ? (pHost.pPrev2 - pFrom) : 0;
-      const pFloor = pFrom == null ? null
-        : Math.max(pTo != null ? pTo : 0, pFrom * PAINT_CATCHUP_TAIL_FLOOR_RATIO);
-      const steps = 2 * paintStabilizeWinHalf(paintStabilizeWinN(level));   // box×2 — 각 단이 half 샘플 뒤에 찬다
-      for (let i = 1; i <= steps; i += 1) {
-        if (pFrom != null && pFloor != null) {
-          if (pFall > 0) {
-            // ver2380 (제보 「뾰족하진 않은데 끝에 꼭지」): 관통 스텝에 바닥값을 «찍던» 것이 몸통에서
-            // 거리상 떨어진 자리에 꼬마 dab 을 남겨 «목+돌기» 이단이 됐다. 바닥은 찍는 값이 아니라
-            // **잉크 컷 문턱**이다 — 기세 연장이 문턱 아래로 내려가는 순간 잉크가 끝나고, 마지막
-            // 양수점(문턱 위)의 라운드 캡이 곧 획의 끝이라 몸통 오므라듦과 한 곡선이 된다.
-            const pRaw = pFrom - pFall * i;   // ①의 기세를 그대로 연장(ver2375)
-            fake.pressure = pRaw > pFloor ? pRaw : 0;
-          } else {
-            fake.pressure = pFrom + (pFloor - pFrom) * (i / steps);   // 리터럴 객체라 재대입이 안전
-          }
+        const typeText = typeTokens.join(' ');
+        const remainingUpper = tokens.slice(i).join(' ').toUpperCase();
+        let isRowidAlias = false;
+        if (typeText.trim().toUpperCase() === 'INTEGER' && remainingUpper.indexOf('PRIMARY KEY') === 0) {
+          const beforeAutoincrement = remainingUpper.split('AUTOINCREMENT')[0];
+          if (beforeAutoincrement.indexOf('DESC') < 0) isRowidAlias = true; // "INTEGER PRIMARY KEY DESC" is NOT a rowid alias
         }
-        continueFn(fake);
-      }
+        columns.push({ name: colName, isRowidAlias: isRowidAlias, affinity: sqliteComputeTypeAffinity(typeText) });
+      });
+      return columns;
     }
-
+    function sqliteReadTableRows(db, tableName, schema) {
+      const entry = schema && schema[tableName];
+      if (!entry) throw new Error('Table ' + tableName + ' not found in schema');
+      const columns = sqliteParseCreateTableColumns(entry.sql);
+      const columnNames = columns.map(function(c) { return c.name; });
+      let rowidAliasIndex = -1;
+      columns.forEach(function(c, i) { if (c.isRowidAlias && rowidAliasIndex < 0) rowidAliasIndex = i; });
+      const rows = [];
+      sqliteWalkTableBTree(db, entry.rootpage).forEach(function(cell) {
+        let values = sqliteReadRecord(cell.payload, db.header.textEncoding);
+        if (values.length < columnNames.length) values = values.concat(new Array(columnNames.length - values.length).fill(null)); // ALTER TABLE ADD COLUMN: older rows lack trailing columns -> NULL
+        if (rowidAliasIndex >= 0) {
+          if (values[rowidAliasIndex] != null) throw new Error('table=' + tableName + ' rowid=' + cell.rowid + ': INTEGER PRIMARY KEY column was NOT null on disk — unexpected');
+          values[rowidAliasIndex] = cell.rowid;
+        }
+        // (Python's reference cast a REAL-affinity int to float() here — a real distinction there, since
+        // Python keeps int/float as separate types. JS has one Number type, so 42 and 42.0 are already
+        // indistinguishable; nothing to cast.)
+        const row = {}; columnNames.forEach(function(name, i) { row[name] = values[i]; });
+        row._rowid = cell.rowid;
+        rows.push(row);
+      });
+      return { columnNames: columnNames, rows: rows };
+    }
+    function sqliteLoadDatabase(bytes) { // bytes: Uint8Array of the whole .sut/.sqlite file
+      return { data: bytes, header: sqliteParseDbHeader(bytes) };
+    }
+    // ===========================================================================================
+    // ## SECTION: BRUSH IMPORT — minimal tar reader (a .sut's MaterialFile.FileData BLOB is a plain
+    // tar archive). POSIX ustar: 512-byte header per entry (name/size/typeflag fields at fixed
+    // offsets, size is octal ASCII) + ceil(size/512)*512 bytes of data, ending at two all-zero
+    // blocks. ustar's `prefix` field (long-path extension) is honored; GNU longname (typeflag 'L')
+    // is NOT — none of the .sut sample files' tar members needed it, and this only needs to read
+    // .sut archives this app creates no other way, not arbitrary tarballs.
+    //
+    // ★ver1357: **이 섹션은 아래 세 함수(tarParseOctal/tarReadNullTerminated/tarReadEntries)로 끝난다.**
+    //   그 뒤부터는 페인트 커널의 후반부이고 tar와 아무 상관이 없다 — 다음 `## SECTION:` 마커부터가
+    //   그쪽이다. 이 마커가 2,168줄(최상위 선언 100개)을 관할하는 것처럼 보였던 이유: .sut 임포터가
+    //   페인트 커널 한복판(#19)에 있었고, 그 헬퍼인 SQLite/tar 리더를 호출자 바로 아래에 끼워 넣으면서
+    //   커널이 두 동강 났다. 아래쪽 절반이 이 마커의 관할로 오인됐던 것이고, 8만 줄 파일에서 마커는
+    //   유일한 탐색 수단이라 그 오인이 곧 결함이었다. 코드는 옮기지 않았다(전 구간 최상위 실행문 0,
+    //   IIFE 없음 — 순수 주석 작업으로 충분하고, 335줄 이동은 diff/blame 비용이 이득을 넘는다).
+    // ===========================================================================================
+    function tarParseOctal(bytes) {
+      let s = '';
+      for (let i = 0; i < bytes.length; i++) {
+        const c = bytes[i];
+        if (c === 0 || c === 32) break; // NUL or space terminates the field
+        s += String.fromCharCode(c);
+      }
+      return s ? parseInt(s, 8) : 0;
+    }
+    function tarReadNullTerminated(bytes, decoder) {
+      let len = 0;
+      while (len < bytes.length && bytes[len] !== 0) len++;
+      return decoder.decode(bytes.subarray(0, len));
+    }
+    function tarReadEntries(bytes) { // -> [{ name, data: Uint8Array }], directories/links/etc. skipped
+      const decoder = new TextDecoder('utf-8');
+      const entries = [];
+      let offset = 0;
+      while (offset + 512 <= bytes.length) {
+        const header = bytes.subarray(offset, offset + 512);
+        let allZero = true;
+        for (let i = 0; i < 512 && allZero; i++) { if (header[i] !== 0) allZero = false; }
+        if (allZero) break; // end-of-archive marker
+        let name = tarReadNullTerminated(header.subarray(0, 100), decoder);
+        const prefix = tarReadNullTerminated(header.subarray(345, 500), decoder);
+        if (prefix) name = prefix + '/' + name;
+        const size = tarParseOctal(header.subarray(124, 136));
+        const typeflag = header[156];
+        offset += 512;
+        if (typeflag === 0 || typeflag === 48 /* ASCII '0' = regular file; skip dirs('5'), links, etc. */) {
+          entries.push({ name: name, data: bytes.slice(offset, offset + size) });
+        }
+        offset += Math.ceil(size / 512) * 512;
+      }
+      return entries;
+    }
     // ===========================================================================================
     // ## SECTION: PAINT: BUCKET FILL (塗りつぶし) — flood fill 커널과 그 옵션 테이블. 두 엔진이
     // 공유한다(conte paintBucketApply / genga pointerdown 즉시 채움). 아래 ver607 배너 참고.
@@ -77424,163 +77545,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       updatePaintUI();
     }
 
-    // ver1239: put the ACTIVE tool's textured tip on a stroke. One helper rather than four copies, so the
-    // rule 'which strokes may be textured' has exactly one statement.
-    // ver1345: 호출부가 더 이상 `paintStrokeWantsPressure` 안에 있지 않다. 옛 주석은 "필압 없는
-    // 스트로크는 팁을 렌더할 수 없으니 필압 분기 안에서만 부른다"고 했는데, 그 전제는 ver1338에
-    // 무너졌다 — 팁이 있으면 그것만으로 whole-path(=팁 렌더 가능)가 강제된다
-    // (paintStrokeWantsWholePath). 전제가 사라진 뒤에도 게이트가 남아 있어서 **마우스로 그리면
-    // conte에서만 팁이 사라지는** 엔진 편측 결함이 됐다(genga는 무조건 부른다).
-    function paintAttachTip(stroke) {
-      const tipId = paintBrushGet('tipId');
-      if (!tipId) return;
-      stroke.tipId = tipId;
-      const sp = Number(paintBrushGet('tipSpacing')) || 0;
-      if (sp > 0) stroke.tipSpacing = sp;
-      // ver1335: 회전도 여기서 실린다 — conte의 세 빌더와 genga 세션이 전부 이 함수 하나를 지나므로
-      // (48442 / 53820 / 55994 / gengaPreviewPointerDown) 두 엔진이 회전을 따로 배선할 자리가 없다.
-      // 값은 스트로크 시점에 고정된다: 저장된 벡터가 나중의 브러시 설정 변경으로 다시 그려지면 안 된다.
-      const ang = Number(paintBrushGet('tipAngle')) || 0;
-      if (ang) stroke.tipAngle = ang;
-      const thk = Number(paintBrushGet('tipThick'));   // ver1628: 100 이면 안 싣는다(옛 레코드와 동일)
-      if (Number.isFinite(thk) && thk !== 100) stroke.tipThick = thk;
-      const rot = paintBrushGet('tipRotate');
-      if (rot === 'dir' || rot === 'azimuth') stroke.tipRotate = rot;
-      // ver2073: 리본과 比較(暗). 스토어까지는 ver2072 가 이었는데 **여기가 비어 있어서**
-      // 렌더러가 못 읽었다 — 렌더는 스토어가 아니라 스트로크를 읽는다. 꺼져 있으면 안 싣는다
-      // (옛 레코드와 같은 모양을 유지한다 — 위 tipThick/tipRotate 와 같은 규칙).
-      if (paintBrushGet('tipRibbon')) {
-        stroke.tipRibbon = true;
-        if (paintBrushGet('tipRibbonAlt')) stroke.tipRibbonAlt = true;   // ver2076
-        const sc2 = Number(paintBrushGet('tipScaling'));
-        if (Number.isFinite(sc2) && sc2 > 0) stroke.tipScaling = sc2;   // ver2080
-        const rp = Number(paintBrushGet('tipRibbonPitch'));
-        if (Number.isFinite(rp) && rp !== 100) stroke.tipRibbonPitch = rp;   // 100 이면 안 싣는다(옛 레코드와 같은 모양)
-      }
-      if (paintBrushGet('tipDarken')) stroke.tipDarken = true;
-      if (paintBrushGet('tipThickVert')) stroke.tipThickVert = true;   // ver2077
-      // ver1336: 지터 3종 + 시드. 시드는 여기서 한 번만 뽑는다 — 스트로크 레코드에 실려 저장되므로
-      // 로드 후 재렌더도 같은 흩뿌림이 나온다(렌더러가 좌표에서 유도하면 conte의 op 경계 확장 때
-      // 제스처 중간에 재배치된다). 지터가 전부 0이면 시드도 싣지 않는다 — 옛 스트로크와 같은 레코드.
-      const js = Number(paintBrushGet('tipJitSize')) || 0;
-      const ja = Number(paintBrushGet('tipJitAngle')) || 0;
-      const sc = Number(paintBrushGet('tipScatter')) || 0;
-      const jf = Number(paintBrushGet('tipJitFlow')) || 0;   // ver2343: dab 마다의 농도 랜덤
-      if (js) stroke.tipJitSize = js;
-      if (ja) stroke.tipJitAngle = ja;
-      if (sc) stroke.tipScatter = sc;
-      if (jf) stroke.tipJitFlow = jf;
-      if (js || ja || sc || jf) stroke.tipSeed = paintNewTipSeed();   // ver2343: 농도만 켜도 시드가 필요하다
-    }
-    // ver1337: 종이결은 팁과 독립이라 별도 함수 — 팁이 없는 브러시도 거친 종이에 그릴 수 있어야 한다.
-    // 그래서 paintAttachTip의 `if (!tipId) return` 조기 반환에 갇히면 안 된다. 호출부는 팁 부착과
-    // 같은 자리들(conte 세 빌더 + genga 세션)이고, 값은 같은 이유로 스트로크 시점에 고정된다.
-    // ver1622: **스트로크에 브러시의 성격을 싣는 자리는 하나다.** conte 의 두 빌더(映像 레이어 ·
-    // 用紙 페이지 메모)가 같은 열세 줄을 각자 갖고 있었고, 이 판이 필압 곡선 두 필드를 더하면서
-    // **같은 줄을 두 곳에 적었다** — 그게 두 벌의 비용이다(다음에 필드가 늘면 또 두 번이고, 한쪽을
-    // 빠뜨리면 用紙에서만 조용히 사라진다. ver1345 가 고친 것이 정확히 그 계열의 사고였다).
-    // genga 는 스트로크가 아니라 **세션**을 만들고 수명이 달라 여기 들어오지 않는다 — 대신 같은
-    // 정본 필드 이름을 쓴다(ver1345). 도형(shapeKind)은 이 성격을 아예 안 받는다.
-    // ver1724: `plainBrush` — 외부 브러시(팁)와 종이결을 **안 싣는다**. 用紙 페이지 메모가 그것이다
-    // (노트라 기본 브러시만 쓴다 — 사용자 지시). 필압·기울기·굵기는 그대로다.
-    function paintAttachBrushDynamics(stroke, event, shapeKind, opts) {
-      // 기울기를 필압보다 **먼저** 심는 순서가 중요하다 — paintAttachPressure 가 tiltSizePct/tiltAlphaPct
-      // 를 보고 점에 t 를 실을지 정한다.
-      paintAttachTilt(stroke);                          // ver1328 ③ · ver2318: 최소치·최대치·곡선 한 벌
-      if (!(opts && opts.plainBrush)) {                   // ver1724: 用紙 메모는 기본 브러시만
-        paintAttachTip(stroke);                          // ver1239
-        paintAttachPaperTex(stroke);                     // ver1337: 종이결은 팁과 독립(팁 없는 브러시도 거친 종이에 그린다)
-        paintAttachMix(stroke);                          // ver1625: 혼색 — 팁이 있어야 걸리므로 여기 함께 둔다
-        // ver1784: 絵の具量도 이 게이트 안이다. flow 는 팁이 없어도 걸리지만, 用紙 메모 획은
-        // paintRenderPageStrokeInto 라는 **별도 경로**로 그려지고 그쪽은 잉크 장을 안 지난다 —
-        // 싣기만 하고 그리는 쪽이 안 읽으면 「설정은 있는데 안 먹는」 거짓말이 된다(ver1518 의 계열).
-        paintAttachFlow(stroke);
-        // ver2359: 入り抜き — 브러시 정체라 用紙 메모(plainBrush)에는 안 싣고, **도형에도 안 싣는다**:
-        // 원화 도형(gengaShapeRedraw)은 radii 에 taper 를 안 곱므로 콘티 도형에만 실으면 엔진이 갈린다.
-        if (!shapeKind) paintAttachTaper(stroke);
-      }
-      // ver1706: **도형에 안 맞는 것은 필압뿐이다** — 드래그로 만드는 도형에는 필압 곡선을 실을
-      // 자리가 없다(사용자). 팁·종이결은 「선을 어떤 붓으로 긋는가」라 직선·사각·원의 외곽선에도
-      // 그대로 뜻이 있다. ver1702 가 같은 것을 했다가 ver1704 에 되돌렸는데, 그때의 사고 원인
-      // (도형 슬롯이 펜을 상속하는데 도형에서 바꿀 수 없다)은 ver1705(입구)와 ver1706(슬롯 공유)로
-      // 사라졌다 — 이제 도형의 붓은 펜의 붓과 같은 것이고, 어느 쪽에서든 바꿀 수 있다.
-      if (shapeKind) return;
-      if (!paintStrokeWantsPressure(event)) return;
-      stroke.pressure = true;
-      stroke.pressureSize = paintPressureSizeOn();
-      stroke.pressureAlpha = paintPressureAlphaOn();
-      stroke.pressureMin = paintPressureMinSizeVal() / 100;   // ver623: brush shape captured per stroke
-      stroke.pRaw = 1;                                        // ver2362: 필압을 손떨림에서 분리한 사슬로 그린 획 — 렌더 EMA 없음(paintStrokeEmaKOf 가 1 로 읽는다). stab 은 더 안 싣는다(유일 소비처가 그 EMA 였다). 옛 획은 stab/부재 규칙 그대로 — ver2328 의 「만든 시점으로 고정」 계약 유지
-      // ver2317: `pressureGamma` 를 안 싣는다(감마 단계 삭제) — 커널이 1 로 읽고, 저장된 옛 획은 자기 값을 그대로 쓴다.
-      stroke.pressureCurvePts = paintBrushGet('pCurvePts');   // ver1622
-      stroke.pressureAlphaCurvePts = paintBrushGet('pAlphaCurvePts');
-      stroke.pressureGain = paintPressureGainMul();           // ver626: device calibration (ver2255: 정본 한 벌)
-      paintAttachPressure(stroke.points[0], event, stroke);
-    }
-    // ver1625: 혼색을 스트로크(genga 는 세션)에 싣는다. paintAttachTip / paintAttachPaperTex 와 같은
-    // 자리·같은 이유 — 값은 **획 시점에 고정**된다(저장된 벡터가 나중의 브러시 설정으로 다시 그려지면
-    // 안 된다). 꺼져 있으면 필드를 아예 안 싣는다 = 기존 스트로크 레코드와 바이트 동일.
-    // ver1718: 값을 어디서 읽을지만 인자로 받는다(기본 = 지금 브러시). 썸네일은 **저장된 레코드**를
-    // 읽어야 하는데, 그 매핑을 프리뷰 쪽에 다시 적으면 필드가 늘 때마다 두 곳이 갈린다 —
-    // ver1628(tipThick)이 프리뷰를 안 봐서 생긴 것이 정확히 그 사고다.
-    // ver1784: 絵の具量을 스트로크(genga 는 세션)에 싣는다. paintAttachMix 와 **같은 규격**이다 —
-    // 값은 획 시점에 고정되고, `get` 으로 읽는 곳만 갈아끼울 수 있어 썸네일이 저장된 레코드를 읽는다.
-    // ★100 이면 **필드를 아예 안 싣는다** — 옛 스트로크 레코드와 바이트 동일이고, 렌더 쪽
-    // paintStrokeFlowVal 이 없는 필드를 1 로 읽으므로 종전 경로가 그대로 나온다(회귀 안전의 뿌리).
-    function paintAttachFlow(stroke, get) {
-      const g = get || paintBrushGet;
-      // ver2073: 筆圧→絵の具量 곡선. **flow 가 100 이어도 실어야 한다** — 鉛筆R 이 정확히
-      // 그 경우다(BrushFlow=100 인데 곡선이 그 100 을 0~100 으로 훑는다). 종전 조기 반환은
-      // 「100 이면 실을 것이 없다」는 전제였는데 곡선이 생기면서 그 전제가 깨졌다.
-      const curve = paintCurveIfOn(g('flowCurveOn'), g('flowCurvePts'));   // ver2304: 꺼진 곡선은 아예 안 싣는다 — 하류(렌더·whole-path 판정)는 필드 부재로 종전 경로
-      if (curve) stroke.flowCurvePts = curve;
-      const f = Number(g('flow'));
-      if (!Number.isFinite(f) || f >= 100) return;
-      stroke.flow = Math.max(1, Math.min(100, Math.round(f)));
-    }
-    // 렌더가 읽는 쪽. 필드가 없으면(대부분의 획) 1 = 「종전대로」.
-    function paintStrokeFlowVal(src) {
-      const f = Number(src && src.flow);
-      return (Number.isFinite(f) && f > 0 && f < 100) ? f / 100 : 1;
-    }
-    // ver2359: 入り抜き를 스트로크(genga 는 세션)에 싣는다 — paintAttachFlow 와 같은 규격: 값은 획
-    // 시점에 고정, `get` 으로 읽는 곳을 갈아끼울 수 있어 썸네일이 저장된 레코드를 읽는다.
-    // ★0 이면 **필드를 아예 안 싣는다** — 옛 스트로크 레코드와 바이트 동일이고, 렌더 쪽
-    // paintStrokeTaperOf 가 없는 필드를 0 으로 읽으므로 종전 경로가 그대로 나온다.
-    // ver2366→ver2367: taperBySpeed 는 **켬일 때만** 싣는다(기본 꺼짐 — 필드 없음 = 끔).
-    // 렌더(paintSpeedTaperInLen)가 실제로 읽는다 — 「렌더가 안 읽으니 안 싣는다」던 ver2359 의
-    // 근거는 ver2366 에서 뒤집혔고, 기본값은 ver2367 채팅 판정으로 꺼짐이 됐다(스타일 기능).
-    function paintAttachTaper(stroke, get) {
-      const g = get || paintBrushGet;
-      const tIn = Number(g('taperIn'));
-      const tOut = Number(g('taperOut'));
-      if (Number.isFinite(tIn) && tIn > 0) stroke.taperIn = Math.round(tIn);
-      if (Number.isFinite(tOut) && tOut > 0) stroke.taperOut = Math.round(tOut);
-      if (g('taperBySpeed') === true) stroke.taperBySpeed = true;
-    }
-    function paintAttachMix(stroke, get) {
-      const g = get || paintBrushGet;
-      if (!g('mixOn')) return;
-      stroke.mixOn = true;
-      stroke.mixAmount = Number(g('mixAmount')) || 0;
-      stroke.mixExtend = Number(g('mixExtend')) || 0;
-      stroke.mixDensity = Number(g('mixDensity')) || 0;
-      if (g('mixAmtPressure')) {
-        stroke.mixAmtPressure = true;
-        stroke.mixAmtCurvePts = g('mixAmtCurvePts');
-      }
-    }
-    function paintAttachPaperTex(stroke) {
-      const id = paintBrushGet('paperTexId');
-      if (!id) return;
-      stroke.paperTexId = id;
-      stroke.paperTexDepth = Number(paintBrushGet('paperTexDepth'));
-      stroke.paperTexScale = Number(paintBrushGet('paperTexScale'));
-      // ver2073: 筆圧→紙質濃度 곡선(획 단위로 쓰인다 — ver2070 참조. perDab 이면 dab 단위 — ver2303).
-      const tc = paintCurveIfOn(paintBrushGet('paperTexDepthCurveOn'), paintBrushGet('paperTexDepthCurvePts'));   // ver2304
-      if (tc) stroke.paperTexDepthCurvePts = tc;
-      if (paintBrushGet('paperTexPerDab')) stroke.paperTexPerDab = true;   // ver2303: 描点ごとに適用
-    }
     // ## SECTION: SHORTCUTS + GLOBAL KEYDOWN ........ ver942 data-driven action defs UI + resolver
     // ver1321 (Tier-2 section-boundary sweep): marker moved up — shortcut-key normalization + settings
     // persistence is this section's own topic; it used to sit inside MEMO TOOLS / UI STATE above. No
