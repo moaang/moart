@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2399</title>
+  <title>MoArt ver2401</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -60400,6 +60400,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const d = (((a1 - a0) % 360) + 540) % 360 - 180;   // -180..180 (짧은 쪽 부호 있는 차이)
       return (((a0 + d * t) % 360) + 360) % 360;
     }
+    // ★ver2401: 점 사이를 «부드럽게» 잇는다(smoothstep). 굵기와 농도는 점마다 값이 정해지고 그
+    //   사이를 `v0 + (v1−v0)·t` 로 이었는데, 그러면 값은 이어져도 **기울기가 점에서 꺾인다**(C1
+    //   불연속). 필압이 점마다 흔들리는 실제 획에서는 그 꺾임이 **획을 가로지르는 줄**로 보이고,
+    //   줄 간격이 곧 입력 점 간격이다 — 제보 「빨간색으로 격자 무늬 생기는 부분 표시함」의 표시가
+    //   정확히 그 간격(20~40px)이었다. 각도는 ver2390 이 이미 같은 이유로 중앙 차분 + 호 보간으로
+    //   갔고, **세 축 중 이 둘만 선형으로 남아 있었다.**
+    //   smoothstep 은 양 끝에서 기울기가 0 이라 점을 지날 때 꺾임이 사라진다. 점 위의 값 자체는
+    //   그대로이므로(t=0·1 에서 항등) **획의 굵기·농도 자체는 안 바뀐다** — 사이를 잇는 방식만 바뀐다.
+    function paintLerpSmooth(v0, v1, t) {
+      const u = t <= 0 ? 0 : (t >= 1 ? 1 : t * t * (3 - 2 * t));
+      return v0 + (v1 - v0) * u;
+    }
     // pull-average smoothing; state lives on the op (one gesture = one smoothing run). The pointerup
     // replay (endPaintStroke → continue) passes through RAW so the line reaches where the pen lifted.
     // ver1177 split the pull step out into paintStabilizeStep so the brush preview could smooth at a level
@@ -63457,7 +63469,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // ver1345: 필압/틸트는 여기서 더 이상 보간하지 않는다 — dab의 크기는 radii가 이미 담고 있고
           // (paintVariableWidthRadii가 점마다 필압·틸트를 반영해 만든다). ver1356: 농도도 여기서
           // 곱하지 않는다 — 잉크 장 스탬퍼가 같은 (i,t)로 자기 몫을 계산한다.
-          stamp(a.x + dx * t, a.y + dy * t, ra + (rb - ra) * t, rad, i, t);
+          stamp(a.x + dx * t, a.y + dy * t, paintLerpSmooth(ra, rb, t), rad, i, t);   // ver2401
           s += spacing;
           k += 1;
         }
@@ -64478,7 +64490,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const okR = paintWalkRibbonPieces(pts, radii, tip, rs.len, rs.wide, rs.swapped, function(u0, u1, px, py, ang0, w, len, i, t, seam, tipIdx, ex, ey, ang1, firstPiece, w0, w1) {
             const a0 = av[i] != null ? av[i] : 1;
             const a1 = av[i + 1] != null ? av[i + 1] : a0;
-            let a = Math.max(0, Math.min(1, a0 + (a1 - a0) * t));
+            let a = Math.max(0, Math.min(1, paintLerpSmooth(a0, a1, t)));   // ver2401
             if (flowCurve) a = a * fl * paintCurveEvalPts(flowCurve, paintDabPressure(pts, i, t, pGain));
             else if (fl < 1) a = a * fl;
             const flip = Boolean(alt && (tipIdx & 1));
@@ -64503,7 +64515,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const ok = paintWalkTipDabs(pts, radii, tip, function(x, y, d, rad, i, t, di) {
         const a0 = av[i] != null ? av[i] : 1;
         const a1 = av[i + 1] != null ? av[i + 1] : a0;
-        let a = Math.max(0, Math.min(1, a0 + (a1 - a0) * t));
+        let a = Math.max(0, Math.min(1, paintLerpSmooth(a0, a1, t)));   // ver2401
         if (flowCurve) a = a * fl * paintCurveEvalPts(flowCurve, paintDabPressure(pts, i, t, pGain));   // ver2060
         else if (fl < 1) a = a * fl;   // ver1784: dab 한 번이 얹는 양. 겹침은 위 screen 이 쌓는다.
         if (jFlow) a = a * (1 - jFlow * paintJitterUnit(jSeed, di, 4));   // ver2343: dab 마다의 농도 랜덤
@@ -64636,7 +64648,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintDiagLast = null;   // 마지막으로 끝난 획
     function paintDiagStart() {
       if (!paintDiagOn) { paintDiagCur = null; return; }
-      paintDiagCur = { t0: performance.now(), frames: 0, fillMs: 0, fillMax: 0, dabs: 0,
+      paintDiagCur = { t0: performance.now(), frames: 0, fillMs: 0, fillMax: 0, dabs: 0, boxes: [],
                        pMin: 2, pMax: -1, tiltMax: 0, azSeen: false, ptType: '', pts: 0 };
     }
     function paintDiagSample(ev) {
@@ -64660,10 +64672,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       c.fillAvg = c.frames ? c.fillMs / c.frames : 0;
       paintDiagLast = c;
       const b = paintBrushGet;
+      // ver2400: **수치 옆에 «그래서 무엇을 해야 하는가»를 붙인다.** 첫 판은 「필압 0.36~0.57」까지만
+      //   찍었는데, 그것이 **기기가 범위를 다 안 준다**는 뜻이고 感度 보정으로 펴진다는 것을 아는 사람만
+      //   읽을 수 있었다(제보자는 그 줄을 보고도 무엇을 할지 알 수 없었다). 진단은 판정까지 해야 쓸모가 있다.
+      const gainHint = (function() {
+        if (c.pMax < 0) return '';
+        const g = paintSuggestedPressureGain();
+        if (!g) return '';
+        return ' → 感度 ' + g + '% 권장(環境設定>入力) — 지금 기기가 0~1 중 ' + Math.round(c.pMax * 100) + '% 까지만 준다';
+      })();
+      // dab 이 프레임보다 훨씬 많으면 렌더가 입력을 못 따라간 것이다 — 그 사실도 말해 준다.
+      const slowHint = (c.frames > 0 && c.fillAvg > 16.7)
+        ? ' ⚠ 프레임당 ' + Math.round(c.dabs / c.frames) + ' dab · ' + Math.round(1000 / Math.max(1, c.fillAvg)) + 'fps' : '';
       const line = '입력 ' + (c.ptType || '?') + ' · 필압 ' + (c.pMax < 0 ? '없음' : (c.pMin.toFixed(2) + '~' + c.pMax.toFixed(2)))
+        + gainHint
         + ' · 기울기 ' + c.tiltMax.toFixed(0) + '° · 방위 ' + (c.azSeen ? '있음' : '없음')
         + ' | dab ' + c.dabs + ' · 프레임 ' + c.frames
-        + ' · fill 평균 ' + c.fillAvg.toFixed(1) + 'ms 최대 ' + c.fillMax.toFixed(1) + 'ms';
+        + ' · fill 평균 ' + c.fillAvg.toFixed(1) + 'ms 최대 ' + c.fillMax.toFixed(1) + 'ms' + slowHint
+        + (c.boxes && c.boxes.length ? ' · 구역 ' + c.boxes.length + '개(증분 ' + c.boxes.filter(function(b){ return b[4]; }).length + ')' : '');
       try {
         console.info('[moartDiag] ' + line, { 브러시: { 크기: b('size'), 간격: b('tipSpacing'), 종이결배율: b('paperTexScale'),
           종이결농도: b('paperTexDepth'), 수채경계: b('waterEdge'), 경계세기: b('waterEdgePower'), 팁회전: b('tipRotate') }, 획: c });
@@ -64751,6 +64777,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const incBox = incOk ? s.newBox : null;
       const wx = incBox ? incBox.x : bx, wy = incBox ? incBox.y : by;
       const ww = incBox ? incBox.w : bw, wh = incBox ? incBox.h : bh;
+      // ver2400: 진단이 켜져 있으면 **이 프레임이 실제로 다시 만든 구역**을 남긴다. 「흰 격자가
+      //   생겼다 없어졌다 옮겨 다닌다」는 제보는 고정된 타일이 아니라 **프레임마다 달라지는 이 구역**을
+      //   가리킨다 — 격자가 보인 자리와 이 좌표가 겹치는지 대조하면 그 자리에서 판정이 선다.
+      //   (조사자 환경은 pane 이 숨어 있어 프레임이 거의 안 쪼개지고, 그래서 재현이 안 됐다.)
+      if (diagOn) diagOn.boxes.push([wx, wy, ww, wh, incBox ? 1 : 0]);
       // ── ver2301: 변화 없는 프레임은 지난 결과를 그대로 얹는다 ──────────────────────────────
       // s.clean = 이번 paintInkSessionStep 호출이 s.cv 를 안 바꿨다(ver2302 — 세션이 직접 남기는
       // 정본 판정). 그러면 s.cv·s.av·pts(개수 불변)·radii(pts 의 순수 함수)·마스크(깊이는 획 시작
