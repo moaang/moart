@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2387</title>
+  <title>MoArt ver2388</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -61842,6 +61842,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 토큰이 아예 없으면 "material 1줄 = 팁"인 단순 브러시(G펜형) 폴백.
       let tipDataUrl = null, tipW = 0, tipH = 0, sawPaperTexture = false;
       let paperDataUrl = null; // ver1337: PaperTexture 자재를 이제 실제로 쓴다(ver1332는 로그만 남겼다)
+      let paperLayer = null;   // ver2388: 그 소재의 data/*.layer — forEach 뒤에서 풀해상도를 해독한다
+      let paperNote = '';      // ver2388: 무엇을 썼는지(비고)
       const utf8 = new TextDecoder('utf-8');
       const candidates = [];
       materials.forEach(function(m) {
@@ -61858,7 +61860,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const layerMem = members.find(function(en) { return /\.layer$/i.test(en.name); });   // ver2102
         if (xmlText.indexOf('PaperTexture') >= 0) {
           sawPaperTexture = true;
-          if (thumb && !paperDataUrl) paperDataUrl = brushLibraryPngBytesToDataUrl(thumb.data);
+          // ver2388: 종이결도 **풀해상도를 시도한다.** ver2102 가 낸 그 길이 팁에만 갔던 탓에
+          // 종이결은 썸네일(긴 변 300px 캡)만 받고 있었다 — 구아슈·수채 평붓의 종이결 소재는
+          // 원본이 1001×1001 이라 **3.34 배 뭉개져** 들어왔고, `TextureScale2` 는 원본 크기를
+          // 기준으로 적힌 값이라 **결의 밀도까지 그만큼 어긋났다**. 해독은 여기서 못 한다
+          // (이 콜백은 async 가 아니다) — 아래 forEach 뒤에서 처리하도록 후보만 쥔다.
+          if (thumb && !paperDataUrl) {
+            paperDataUrl = brushLibraryPngBytesToDataUrl(thumb.data);
+            paperLayer = layerMem || null;
+          }
           return;
         }
         // ver2080: `scaling` — 소재의 표시 배율(layerData.xml). ver2323: **렌더 미사용 — 기록으로만
@@ -61868,6 +61878,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const scal = msc ? Number(msc[1]) : 0;
         if (thumb) candidates.push({ isTagged: xmlText.indexOf('BrushPattern') >= 0, thumb: thumb, layer: layerMem, scaling: (Number.isFinite(scal) && scal > 0) ? scal : 0 });
       });
+      // ver2388: 종이결 풀해상도. 팁과 **같은 함수·같은 이득 게이트**를 지난다(썸네일이 이미 원본
+      // 크기면 해독하지 않는다 — ver2384). 종이결 소재도 팁과 같은 형식이다: 썸네일의 RGB 는
+      // 0/255 이진이고 **알파가 결의 값**이라(실측), `paintGrainMask` 의 채널 판정(알파에 변화가
+      // 있으면 알파를 쓴다, ver1341)이 그대로 성립한다.
+      if (paperLayer && paperDataUrl) {
+        try {
+          const pfull = await brushLibraryFullTipFromLayer(paperLayer.data, paperDataUrl);
+          if (pfull && pfull.skip) {
+            paperNote = '종이결 풀해상도(' + pfull.width + '×' + pfull.height + ')가 썸네일('
+              + pfull.thumbW + '×' + pfull.thumbH + ')보다 크지 않다 — 해독하지 않고 썸네일을 쓴다';
+          } else if (pfull && !(pfull.truncated || []).length && !(pfull.failed || []).length) {
+            paperDataUrl = pfull.dataUrl;
+            paperNote = '종이결 풀해상도 ' + pfull.width + '×' + pfull.height
+              + ' (썸네일 대신 data/*.layer 를 해독 — TextureScale2 가 원본 크기 기준이라 결의 밀도도 함께 맞는다)';
+          } else if (pfull) {
+            paperNote = '종이결 풀해상도(' + pfull.width + '×' + pfull.height + ') 해독은 됐으나 타일 '
+              + [].concat(pfull.truncated || [], pfull.failed || []).join(',') + ' 가 끊겨 있다 — 썸네일을 쓴다';
+            console.warn('[brushLibrary] ' + paperNote);
+          } else {
+            paperNote = '종이결 풀해상도를 해독하지 못했다 — 썸네일을 쓴다 (파일에 data/*.layer 는 있다)';
+            console.warn('[brushLibrary] ' + paperNote);
+          }
+        } catch (e) {
+          paperNote = '종이결 풀해상도 해독 중 예외 — 썸네일을 쓴다';
+          console.error('[brushLibrary] ' + paperNote, e);
+        }
+      }
       const pick = candidates.find(function(c) { return c.isTagged; }) || (candidates.length === 1 ? candidates[0] : null);
       let tipScaling = 0;   // ver2080
       let fullTipNote = '';   // ver2102
@@ -61950,6 +61987,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           notes.push('소재 scaling=' + tipScaling + ' → 리본 주기를 그 배수로 늘린다(썸네일이 길이 방향으로 잘려 있다)');
         }
         if (fullTipNote) notes.push(fullTipNote);   // ver2102
+        if (paperNote) notes.push(paperNote);       // ver2388
         if (sawPaperTexture) notes.push(paperRef ? 'PaperTexture 적용 (ver1337)' : 'PaperTexture material 존재 — thumbnail.png 없어 미적용');
         console.info('[brushLibrary] .sut variant 파라미터(미매핑 전체 — D5 기록): ', fileName, v);
         lib.entries.push({
