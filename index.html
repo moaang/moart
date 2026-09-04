@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2403</title>
+  <title>MoArt ver2404</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64696,6 +64696,70 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } catch (err) {}
       try { showToast(line); } catch (err) {}
     }
+    // ★ver2404: 「흰 세로선이 렌더 구역 경계인가」를 **앱이 직접 대조한다.**
+    //   구역 경계는 한 획에 수십~백 개가 불규칙하게 흩어져 있어서, 사람이 눈으로 맞추면
+    //   **우연히 겹친다** — 판정이 안 선다. 그림에서 밝은 세로 열을 실제로 찾아내고,
+    //   그 자리가 경계에 붙어 있는 비율을 **같은 수의 무작위 자리와 비교**해야 뜻이 있다.
+    //   (무작위보다 유의하게 높지 않으면 구역 경계는 원인이 아니다.)
+    //   쓰는 법: 격자가 보이는 획을 긋고 `moartDiagStripes()`.
+    window.moartDiagStripes = function(tol) {
+      const d = paintDiagLast;
+      if (!d || !d.boxes || !d.boxes.length) return '먼저 moartDiag(true) 로 켜고 한 획 긋는다';
+      const cv = document.getElementById('gengaPreviewCanvas')
+        || document.querySelector('.video-preview-layer-canvas') || document.querySelector('canvas');
+      if (!cv) return '캔버스를 못 찾았다';
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      d.boxes.forEach(function(b) {
+        if (b[0] < x0) x0 = b[0]; if (b[1] < y0) y0 = b[1];
+        if (b[0] + b[2] > x1) x1 = b[0] + b[2]; if (b[1] + b[3] > y1) y1 = b[1] + b[3];
+      });
+      x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0));
+      x1 = Math.min(cv.width, Math.ceil(x1)); y1 = Math.min(cv.height, Math.ceil(y1));
+      const w = x1 - x0, h = y1 - y0;
+      if (!(w > 8 && h > 8)) return '획 범위가 너무 작다';
+      let img;
+      try { img = cv.getContext('2d').getImageData(x0, y0, w, h); }
+      catch (e) { return '캔버스를 읽지 못했다: ' + e.message; }
+      const px = img.data;
+      // 열별 «잉크 픽셀의 평균 밝기» — 잉크가 충분한 열만 본다(획 밖은 제외)
+      const col = new Array(w).fill(null);
+      for (let x = 0; x < w; x++) {
+        let sum = 0, n = 0;
+        for (let y = 0; y < h; y++) {
+          const i = (y * w + x) * 4;
+          if (px[i + 3] > 16 && !(px[i] > 246 && px[i+1] > 246 && px[i+2] > 246)) { sum += px[i]; n++; }
+        }
+        if (n > h * 0.25) col[x] = sum / n;
+      }
+      const vals = col.filter(function(v) { return v != null; });
+      if (vals.length < 20) return '잉크가 충분한 열이 적다 — 더 굵고 긴 획으로';
+      const m = vals.reduce(function(a, b) { return a + b; }, 0) / vals.length;
+      const sd = Math.sqrt(vals.reduce(function(a, b) { return a + (b - m) * (b - m); }, 0) / vals.length);
+      // 「흰선」 = 이웃보다 뚜렷하게 밝은 열(국소 극대). 절대 밝기가 아니라 **이웃 대비**로 잡는다.
+      const stripes = [];
+      for (let x = 2; x < w - 2; x++) {
+        const c = col[x], l = col[x - 2], r = col[x + 2];
+        if (c == null || l == null || r == null) continue;
+        if (c > l + sd * 0.8 && c > r + sd * 0.8) stripes.push(x0 + x);
+      }
+      const edges = {};
+      d.boxes.forEach(function(b) { edges[b[0]] = 1; edges[b[0] + b[2]] = 1; });
+      const ek = Object.keys(edges).map(Number);
+      const T = (tol == null) ? 2 : tol;
+      const near = function(v) { for (let i = 0; i < ek.length; i++) if (Math.abs(ek[i] - v) <= T) return true; return false; };
+      const hit = stripes.filter(near).length;
+      // 대조군: 같은 수의 무작위 열이 경계에 붙는 비율(경계가 많으면 그냥 잘 붙는다)
+      let rndHit = 0; const R = Math.max(200, stripes.length * 20);
+      for (let i = 0; i < R; i++) if (near(x0 + Math.floor(Math.random() * w))) rndHit++;
+      const obs = stripes.length ? hit / stripes.length : 0;
+      const exp = rndHit / R;
+      const verdict = !stripes.length ? '흰선을 못 찾았다(이 획에는 없다)'
+        : (obs > exp * 1.8 && obs > 0.5) ? '★구역 경계와 일치 — 렌더 구역이 원인이다'
+        : '구역 경계와 무관 — 다른 계통이다';
+      return { 획범위: [x0, y0, w, h], '흰선 x': stripes, '흰선 수': stripes.length,
+               '경계에 붙은 비율': +(obs * 100).toFixed(0) + '%', '무작위였다면': +(exp * 100).toFixed(0) + '%',
+               '구역 경계 수': ek.length, 판정: verdict };
+    };
     window.moartDiag = function(on) {
       // ver2403: 기록이 없을 때 **null 을 돌려주지 않는다** — 제보자가 `moartDiag().boxes` 에서
       //   `Cannot read properties of null` 을 봤다. 리로드하면 진단은 꺼지는데 그 사실을 알 길이
