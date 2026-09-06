@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2421</title>
+  <title>MoArt ver2422</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64930,8 +64930,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const c = paintDiagCur; paintDiagCur = null;
       if (!c) return;
       const endT0 = performance.now();   // ver2419: 펜업 «시작» — 커밋은 이 뒤에 온다
-      // ver2421: 여기서 리셋해야 아래 세 시점 사이(= 「대기」 구간)의 몫만 담긴다.
-      paintDiagIdle.thumb = 0; paintDiagIdle.save = 0; paintDiagIdle.bake = 0;
+      c.idle0 = paintDiagIdleSnapshot();   // ver2422: 리셋이 아니라 스냅샷 — 겹쳐도 자기 몫만 본다
       c.totalMs = endT0 - c.t0;
       // ver2419: 입력 지연 = pointerdown 에서 첫 픽셀까지. 간격이 60fps 로 멀쩡해도 이게 크면
       //   선은 늦게 따라온다 — 「선이 늦다」가 프레임 페이스와 다른 층일 수 있는 자리다.
@@ -65002,13 +65001,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver2421: 대기 구간에 실제로 돈 것. **0 인 항목은 안 적는다** — 셋 다 0 이면 대기를 먹은 것이
       //   이 셋 밖이라는 뜻이고, 그것도 판정이다(칸이 비면 「?」로 남겨 그 사실이 보이게 한다).
       const idleBreak = (function() {
-        c.idle = { thumb: paintDiagIdle.thumb, save: paintDiagIdle.save, bake: paintDiagIdle.bake };
+        const now = paintDiagIdleSnapshot(), was = c.idle0 || {};
+        const label = { thumb: '썸네일', save: '저장', bake: '베이크', encode: '인코드', comp: '재합성', undo: 'undo', hud: 'HUD' };
+        c.idle = {};
         const parts = [];
-        if (c.idle.thumb > 0.5) parts.push('썸네일 ' + c.idle.thumb.toFixed(0));
-        if (c.idle.save > 0.5) parts.push('저장 ' + c.idle.save.toFixed(0));
-        if (c.idle.bake > 0.5) parts.push('베이크 ' + c.idle.bake.toFixed(0));
+        Object.keys(label).forEach(function(k) {
+          const d = (now[k] || 0) - (was[k] || 0);
+          c.idle[k] = d;
+          if (d > 0.5) parts.push(label[k] + ' ' + d.toFixed(0));
+        });
         if (parts.length) return '(' + parts.join(' · ') + ')';
-        return c.waitMs > 50 ? '(셋 다 0 — 이 셋 밖이다)' : '';
+        return c.waitMs > 50 ? '(전부 0 — 이 목록 밖이다)' : '';
       })();
       const waitHint = (c.commitMs <= 16.7 && (c.waitMs + c.paintMs) > 100)
         ? ' ⚠ 커밋은 짧은데 화면까지 멀다 — 메인 스레드를 다른 일이 먹었다' : '';
@@ -65137,7 +65140,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 빼 보는 수밖에 없다(제보자 기기라 왕복이 한 번에 하루다). 획 사이에 도는 것은 셋이다 —
     // 타임라인 레이어 썸네일(idle · timeout 300) · IndexedDB 오토세이브 · 칸 베이크(ver2416 이
     // 이월한 리드백). **진단이 꺼져 있으면 원본을 그대로 부른다.**
-    const paintDiagIdle = { thumb: 0, save: 0, bake: 0 };
+    // ver2422: **누적만 하고 리셋하지 않는다.** ver2421 은 paintDiagEnd 머리에서 0 으로 되돌렸는데,
+    //   연타하면 획들의 측정 구간이 겹쳐 여러 획이 같은 누적을 읽는다(iPad 4 차 회수분에서 베이크가
+    //   62·62·62·62 → 128·128 로 반복·계단식이었던 것이 그 증거다). 각 획은 자기 시작값을 들고
+    //   있다가 **차이**를 본다 — 겹쳐도 자기 구간의 증가분만 나온다.
+    const paintDiagIdle = { thumb: 0, save: 0, bake: 0, encode: 0, comp: 0, undo: 0, hud: 0 };
+    function paintDiagIdleSnapshot() {
+      const out = {};
+      Object.keys(paintDiagIdle).forEach(function(k) { out[k] = paintDiagIdle[k]; });
+      return out;
+    }
     (function paintDiagWrapIdleWork() {
       const wrapIdleWork = function(name, key) {
         const orig = window[name];
@@ -65152,6 +65164,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       wrapIdleWork('flushTimelineLayerThumbnailQueue', 'thumb');
       wrapIdleWork('saveProjectToIndexedDbAutosave', 'save');
       wrapIdleWork('gengaTileSetBakePending', 'bake');
+      // ver2422: iPad 4 차에서 **대기 488ms 중 베이크는 39ms 뿐**이었다 — 나머지를 찾는다.
+      wrapIdleWork('gengaFlushPendingDrawingEncodes', 'encode');   // 그림 인코드(획마다)
+      wrapIdleWork('gengaCompositeFrame', 'comp');                 // 커밋 뒤 재합성(ver2205 에서 42ms 였다)
+      wrapIdleWork('pushUndoCommand', 'undo');                     // undo 스냅샷
+      // ★**진단 자신도 잰다.** HUD 는 매 획 최대 12 줄을 textContent 로 다시 만들고 scrollTop 을
+      //   건드린다(레이아웃 강제) — 그 비용은 **다음 획의 「대기」에 실린다.** 관측자가 관측 대상을
+      //   만들고 있지 않은지부터 본다.
+      wrapIdleWork('paintDiagHudPush', 'hud');
     })();
     const PAINT_DIAG_HUD_KEEP = 12;   // 최근 몇 획을 들고 있나 — 스크롤 없이 읽히는 길이
     let paintDiagHudLog = [];
