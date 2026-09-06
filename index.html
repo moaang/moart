@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2417</title>
+  <title>MoArt ver2418</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64900,13 +64900,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintDiagStart() {
       if (!paintDiagOn) { paintDiagCur = null; return; }
       paintDiagCur = { t0: performance.now(), frames: 0, fillMs: 0, fillMax: 0, dabs: 0, boxes: [],
-                       pMin: 2, pMax: -1, tiltMax: 0, azSeen: false, ptType: '', pts: 0 };
+                       pMin: 2, pMax: -1, tiltMax: 0, azSeen: false, ptType: '', pts: 0,
+                       // ver2418: **프레임 «간격»과 move 수.** fill 이 짧아도 프레임이 안 오면 선이 늦다 —
+                       //   그 둘은 다른 명제라 fill ms 만으로는 「그리는 중 화면이 멈춘다」를 못 가른다
+                       //   (합성기·GPU 몫은 JS 함수 시간에 안 잡힌다 — perf-groundtruth 의 rAF 간격 규칙).
+                       //   move 가 오는데 프레임이 안 늘면 렌더 층, 둘 다 안 늘면 입력 층이다.
+                       moveN: 0, gaps: [], lastFrameT: 0 };
     }
     function paintDiagSample(ev) {
       // ver2399: 골든은 함수를 «잘라서» 돌린다 — 이 함수만 실려 오고 위 `let` 이 안 오면
       //   참조 자체가 예외가 되므로 typeof 로 먼저 막는다(진단은 없어도 그리기는 돌아야 한다).
       if (typeof paintDiagCur === 'undefined') return;
       const c = paintDiagCur; if (!c || !ev) return;
+      // ver2418: 이 리스너는 pointerdown 에도 걸려 있다(paintObservePressure) — move 만 센다.
+      if (ev.type === 'pointermove') c.moveN += 1;
       c.ptType = ev.pointerType || '';
       const p = Number(ev.pressure);
       if (Number.isFinite(p)) { if (p < c.pMin) c.pMin = p; if (p > c.pMax) c.pMax = p; }
@@ -64921,6 +64928,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!c) return;
       c.totalMs = performance.now() - c.t0;
       c.fillAvg = c.frames ? c.fillMs / c.frames : 0;
+      // ver2418: 프레임 간격의 분포. 평균은 멈춤을 감춘다 — 60fps 로 돌다 한 번 800ms 멈춰도
+      //   평균은 멀쩡하다. 「선이 늦다」가 보이는 자리는 p90 과 최대다.
+      const gs = (c.gaps || []).slice().sort(function(a, b) { return a - b; });
+      const gq = function(p) { return gs.length ? gs[Math.min(gs.length - 1, Math.floor(gs.length * p))] : 0; };
+      c.gapMed = gq(0.5); c.gapP90 = gq(0.9); c.gapMax = gs.length ? gs[gs.length - 1] : 0;
+      c.slow20 = gs.filter(function(g) { return g > 20; }).length;
       paintDiagLast = c;
       const b = paintBrushGet;
       // ver2400: **수치 옆에 «그래서 무엇을 해야 하는가»를 붙인다.** 첫 판은 「필압 0.36~0.57」까지만
@@ -64935,17 +64948,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // dab 이 프레임보다 훨씬 많으면 렌더가 입력을 못 따라간 것이다 — 그 사실도 말해 준다.
       const slowHint = (c.frames > 0 && c.fillAvg > 16.7)
         ? ' ⚠ 프레임당 ' + Math.round(c.dabs / c.frames) + ' dab · ' + Math.round(1000 / Math.max(1, c.fillAvg)) + 'fps' : '';
+      // ver2418: **fill 은 짧은데 간격이 벌어졌다 = 이 함수 밖이 범인이다.** 그 판정을 여기서 낸다 —
+      //   수치만 내면 읽는 사람이 두 축을 스스로 대조해야 하고, 그게 ver2400 이 고친 병이다.
+      const gapHint = (c.gapP90 > 33 && c.fillAvg < c.gapP90 / 2)
+        ? ' ⚠ 화면 갱신이 벌어졌다 — fill 밖(합성·GPU·rAF)이다' : '';
       const line = '입력 ' + (c.ptType || '?') + ' · 필압 ' + (c.pMax < 0 ? '없음' : (c.pMin.toFixed(2) + '~' + c.pMax.toFixed(2)))
         + gainHint
         + ' · 기울기 ' + c.tiltMax.toFixed(0) + '° · 방위 ' + (c.azSeen ? '있음' : '없음')
-        + ' | dab ' + c.dabs + ' · 프레임 ' + c.frames
+        + ' | move ' + c.moveN + ' · dab ' + c.dabs + ' · 프레임 ' + c.frames
+        + ' · 간격 中' + c.gapMed.toFixed(0) + '/p90 ' + c.gapP90.toFixed(0) + '/최대 ' + c.gapMax.toFixed(0) + 'ms(20ms↑ ' + c.slow20 + ')' + gapHint
         + ' · fill 평균 ' + c.fillAvg.toFixed(1) + 'ms 최대 ' + c.fillMax.toFixed(1) + 'ms' + slowHint
         + (c.boxes && c.boxes.length ? ' · 구역 ' + c.boxes.length + '개(증분 ' + c.boxes.filter(function(b){ return b[4]; }).length + ')' : '');
       try {
         console.info('[moartDiag] ' + line, { 브러시: { 크기: b('size'), 간격: b('tipSpacing'), 종이결배율: b('paperTexScale'),
           종이결농도: b('paperTexDepth'), 수채경계: b('waterEdge'), 경계세기: b('waterEdgePower'), 팁회전: b('tipRotate') }, 획: c });
       } catch (err) {}
+      c.line = line;   // ver2418: HUD·[복사]가 이 줄을 그대로 쓴다 — 같은 문자열을 두 벌 만들지 않는다
       try { showToast(line); } catch (err) {}
+      try { paintDiagHudPush(c); } catch (err) {}   // ver2418: 콘솔이 없는 기기(iPad)의 회수 채널
     }
     // ★ver2404: 「흰 세로선이 렌더 구역 경계인가」를 **앱이 직접 대조한다.**
     //   구역 경계는 한 획에 수십~백 개가 불규칙하게 흩어져 있어서, 사람이 눈으로 맞추면
@@ -65036,11 +65056,100 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try { showToast(paintDiagOn ? '획 진단 ON — 한 획 그으면 결과가 뜬다' : '획 진단 OFF'); } catch (err) {}
       return paintDiagOn;
     };
+    // ── ver2418: 온디바이스 HUD ──────────────────────────────────────────────────────
+    // **콘솔이 없는 기기(iPad)에서 제보 수치를 회수하는 채널이다.** URL 뒤에 `#diag` 를 붙여 열면
+    // 진단이 켜지고 화면 구석에 최근 획이 쌓인다 — [복사]가 그 줄들을 클립보드에 담으므로 사용자는
+    // 채팅에 붙여넣기만 하면 된다(스크린샷은 수치를 눈으로 옮겨 적어야 하고 긴 줄이 잘린다).
+    // 옛 `#perf` HUD(ver568~ver1454)와 같은 자리이나 **계측을 새로 만들지 않는다** — 위 paintDiag*
+    // 한 벌이 이미 쌓는 것을 읽기만 한다(그 HUD 는 자기 리스너를 부팅부터 달아 핫패스에 매 move
+    // gBCR 을 태웠다 — ver1324 가 고친 자리다).
+    const PAINT_DIAG_HUD_KEEP = 12;   // 최근 몇 획을 들고 있나 — 스크롤 없이 읽히는 길이
+    let paintDiagHudLog = [];
+    let paintDiagHudBody = null;
+    // HUD 껍데기(제목·버튼·상태)는 **영어**다 — 개발자 도구는 번역하지 않는 것이 이 파일의
+    // 관례이고 validate_i18n_bypass 가 그것을 지킨다. 진단 «내용» 줄은 ver2399 부터의 기존 정본.
+    const PAINT_DIAG_HUD_EMPTY = '(empty - draw one stroke)';
+    function paintDiagHudPush(c) {
+      if (!paintDiagHudBody || !c || !c.line) return;
+      paintDiagHudLog.push(c.line);
+      if (paintDiagHudLog.length > PAINT_DIAG_HUD_KEEP) paintDiagHudLog.shift();
+      paintDiagHudBody.textContent = paintDiagHudLog.map(function(s, i) { return (i + 1) + '. ' + s; }).join('\n\n');
+      paintDiagHudBody.scrollTop = paintDiagHudBody.scrollHeight;
+    }
+    function paintDiagHudCopy(btn) {
+      const text = paintDiagHudLog.length ? paintDiagHudLog.join('\n') : PAINT_DIAG_HUD_EMPTY;
+      const say = function(msg) { btn.textContent = msg; setTimeout(function() { btn.textContent = 'Copy'; }, 2000); };
+      // 클립보드가 막힌 환경(비 HTTPS · 권한 거부)에서는 **본문을 선택 상태로 만들고 그렇다고 말한다** —
+      // iOS 는 선택된 텍스트를 길게 눌러 복사할 수 있다. 조용히 실패하지 않는 것이 요점이다.
+      const selectFallback = function() {
+        try {
+          paintDiagHudBody.style.pointerEvents = 'auto';
+          const r = document.createRange(); r.selectNodeContents(paintDiagHudBody);
+          const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+        } catch (err) {}
+      };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function() { say('Copied'); },
+            function() { selectFallback(); say('Long-press'); });
+          return;
+        }
+      } catch (err) {}
+      selectFallback(); say('Long-press');
+    }
+    function paintDiagHudOpen() {
+      if (paintDiagHudBody) return paintDiagHudBody;
+      const wrap = document.createElement('div');
+      wrap.id = 'paintDiagHud';
+      // 스타일은 인라인이다 — 진단은 임시 도구라 앱 스킨(셸 토큰·죽은 선언 장부)에 자리를 만들지 않는다.
+      wrap.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483000;max-width:min(94vw,620px);'
+        + 'background:rgba(12,12,14,0.86);color:#e9ebed;border:1px solid rgba(255,255,255,0.18);border-radius:8px;'
+        + 'padding:6px 8px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;'
+        + 'pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,0.5)';
+      const head = document.createElement('div');
+      head.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:4px;pointer-events:auto';
+      const title = document.createElement('span');
+      title.textContent = 'Stroke diag ver' + APP_DISPLAY_VERSION;
+      title.style.cssText = 'flex:1;min-width:0;font-weight:700;opacity:0.85';
+      head.appendChild(title);
+      const body = document.createElement('div');
+      // 본문은 **포인터를 안 받는다** — 그리기를 가리지 않는 것이 우선이고, 선택이 필요한 것은
+      // 클립보드가 막혔을 때뿐이라 그때 selectFallback 이 auto 로 돌린다.
+      body.style.cssText = 'max-height:38vh;overflow:auto;white-space:pre-wrap;word-break:break-word;'
+        + '-webkit-user-select:text;user-select:text;pointer-events:none';
+      body.textContent = PAINT_DIAG_HUD_EMPTY;
+      [['Copy', function(b) { paintDiagHudCopy(b); }],
+       ['Clear', function() { paintDiagHudLog = []; body.textContent = PAINT_DIAG_HUD_EMPTY; }],
+       ['×', function() { wrap.remove(); paintDiagHudBody = null; }]].forEach(function(it) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = it[0];
+        b.style.cssText = 'font:inherit;padding:2px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.28);'
+          + 'background:rgba(255,255,255,0.10);color:inherit;cursor:pointer';
+        b.addEventListener('click', function() { it[1](b); });
+        head.appendChild(b);
+      });
+      wrap.appendChild(head); wrap.appendChild(body);
+      document.body.appendChild(wrap);
+      paintDiagHudBody = body;
+      paintDiagOn = true;   // HUD 를 연다 = 진단을 켠다. 따로 켜게 하면 빈 상자만 보게 된다
+      return body;
+    }
+    window.moartDiagHud = paintDiagHudOpen;
+    if (typeof window !== 'undefined' && /(^|[#&])diag\b/.test(location.hash)) {
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function() { paintDiagHudOpen(); });
+      else paintDiagHudOpen();
+    }
     function paintFillVariableWidthBody(ctx, pts, radii, color, opts) {
       opts = opts || {};
       const diagOn = (typeof paintDiagCur !== 'undefined') && paintDiagCur;   // ver2399: typeof 가드(골든 자립성)
       const diagT0 = diagOn ? performance.now() : 0;
-      if (diagOn) { diagOn.frames += 1; diagOn.pts = pts ? pts.length : 0; }
+      if (diagOn) {
+        // ver2418: 프레임 «간격» — 화면이 얼마나 자주 갱신됐는가. fill ms 와 다른 축이라
+        //   fill 이 짧은데 간격이 벌어지면 이 함수 밖(합성·GPU·rAF)이 범인이다.
+        if (diagOn.lastFrameT) diagOn.gaps.push(diagT0 - diagOn.lastFrameT);
+        diagOn.lastFrameT = diagT0;
+        diagOn.frames += 1; diagOn.pts = pts ? pts.length : 0;
+      }
       try {
       const tip = opts.tip, grain = opts.grain, alphaFor = opts.alphaFor;
       // 라이브(liveHost)든 커밋이든 같은 함수 — 라이브만 이어 그리고, 커밋은 처음부터 한 번 만든다.
