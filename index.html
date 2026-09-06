@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2418</title>
+  <title>MoArt ver2419</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64905,7 +64905,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                        //   그 둘은 다른 명제라 fill ms 만으로는 「그리는 중 화면이 멈춘다」를 못 가른다
                        //   (합성기·GPU 몫은 JS 함수 시간에 안 잡힌다 — perf-groundtruth 의 rAF 간격 규칙).
                        //   move 가 오는데 프레임이 안 늘면 렌더 층, 둘 다 안 늘면 입력 층이다.
-                       moveN: 0, gaps: [], lastFrameT: 0 };
+                       moveN: 0, gaps: [], lastFrameT: 0,
+                       // ver2419: 첫 프레임 시각 — pointerdown 에서 «첫 픽셀»까지가 입력 지연이다.
+                       //   프레임 간격이 60fps 로 멀쩡해도 시작이 늦으면 선은 늦게 따라온다.
+                       firstFrameT: 0 };
     }
     function paintDiagSample(ev) {
       // ver2399: 골든은 함수를 «잘라서» 돌린다 — 이 함수만 실려 오고 위 `let` 이 안 오면
@@ -64926,7 +64929,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintDiagEnd() {
       const c = paintDiagCur; paintDiagCur = null;
       if (!c) return;
-      c.totalMs = performance.now() - c.t0;
+      const endT0 = performance.now();   // ver2419: 펜업 «시작» — 커밋은 이 뒤에 온다
+      c.totalMs = endT0 - c.t0;
+      // ver2419: 입력 지연 = pointerdown 에서 첫 픽셀까지. 간격이 60fps 로 멀쩡해도 이게 크면
+      //   선은 늦게 따라온다 — 「선이 늦다」가 프레임 페이스와 다른 층일 수 있는 자리다.
+      c.lagMs = c.firstFrameT ? c.firstFrameT - c.t0 : -1;
       c.fillAvg = c.frames ? c.fillMs / c.frames : 0;
       // ver2418: 프레임 간격의 분포. 평균은 멈춤을 감춘다 — 60fps 로 돌다 한 번 800ms 멈춰도
       //   평균은 멀쩡하다. 「선이 늦다」가 보이는 자리는 p90 과 최대다.
@@ -64935,6 +64942,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       c.gapMed = gq(0.5); c.gapP90 = gq(0.9); c.gapMax = gs.length ? gs[gs.length - 1] : 0;
       c.slow20 = gs.filter(function(g) { return g > 20; }).length;
       paintDiagLast = c;
+      // ver2419: **줄을 여기서 만들지 않는다.** 이 함수는 펜업 핸들러의 «첫 줄»에서 불리므로
+      //   커밋은 아직 하나도 안 일어났다 — 여기서 찍으면 ver2416 이 고친 바로 그 축(펜업 커밋)이
+      //   통째로 빠진다. iPad 제보의 첫 회수(ver2418)가 실제로 그렇게 헛돌았다: 12 획 전부
+      //   「fill 0.0ms · 간격 60fps」로 멀쩡한데 제보자는 늦다고 했다. 다음 «태스크»로 미루면
+      //   그 사이 핸들러의 동기 나머지 = 커밋이 끝나 c.commitMs 에 담긴다.
+      setTimeout(function() { paintDiagReport(c, endT0); }, 0);
+    }
+    function paintDiagReport(c, endT0) {
+      c.commitMs = performance.now() - endT0;
       const b = paintBrushGet;
       // ver2400: **수치 옆에 «그래서 무엇을 해야 하는가»를 붙인다.** 첫 판은 「필압 0.36~0.57」까지만
       //   찍었는데, 그것이 **기기가 범위를 다 안 준다**는 뜻이고 感度 보정으로 펴진다는 것을 아는 사람만
@@ -64952,13 +64968,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       //   수치만 내면 읽는 사람이 두 축을 스스로 대조해야 하고, 그게 ver2400 이 고친 병이다.
       const gapHint = (c.gapP90 > 33 && c.fillAvg < c.gapP90 / 2)
         ? ' ⚠ 화면 갱신이 벌어졌다 — fill 밖(합성·GPU·rAF)이다' : '';
+      // ver2419: 펜업이 한 프레임을 넘으면 사람은 「뗄 때 걸린다」로 느낀다(ver2416 이 고친 축).
+      const commitHint = (c.commitMs > 16.7) ? ' ⚠ 뗄 때 걸린다' : '';
+      // ver2419: **조건이 성립했는지를 수치 옆에 함께 찍는다.** ver2418 회수분은 12 획 전부
+      //   `dab 0` 이었는데 그것이 「평소 브러시가 아니었다」인지 「그 브러시는 원래 dab 0」인지
+      //   줄만 봐서는 갈리지 않았다 — 브러시가 안 찍혀 있었기 때문이다.
+      const brushHint = ' | 브러시 ' + (b('preset') || '기본') + ' ' + Math.round(b('size') || 0) + 'px'
+        + (b('tipId') ? '·팁' : '·원') + (b('paperTexId') ? '·결' : '') + (b('pAlpha') ? '·筆圧α' : '');
       const line = '입력 ' + (c.ptType || '?') + ' · 필압 ' + (c.pMax < 0 ? '없음' : (c.pMin.toFixed(2) + '~' + c.pMax.toFixed(2)))
         + gainHint
         + ' · 기울기 ' + c.tiltMax.toFixed(0) + '° · 방위 ' + (c.azSeen ? '있음' : '없음')
+        + ' | 지연 ' + (c.lagMs < 0 ? '?' : c.lagMs.toFixed(0)) + 'ms · 펜업 ' + c.commitMs.toFixed(1) + 'ms' + commitHint
         + ' | move ' + c.moveN + ' · dab ' + c.dabs + ' · 프레임 ' + c.frames
         + ' · 간격 中' + c.gapMed.toFixed(0) + '/p90 ' + c.gapP90.toFixed(0) + '/최대 ' + c.gapMax.toFixed(0) + 'ms(20ms↑ ' + c.slow20 + ')' + gapHint
         + ' · fill 평균 ' + c.fillAvg.toFixed(1) + 'ms 최대 ' + c.fillMax.toFixed(1) + 'ms' + slowHint
-        + (c.boxes && c.boxes.length ? ' · 구역 ' + c.boxes.length + '개(증분 ' + c.boxes.filter(function(b){ return b[4]; }).length + ')' : '');
+        + (c.boxes && c.boxes.length ? ' · 구역 ' + c.boxes.length + '개(증분 ' + c.boxes.filter(function(b){ return b[4]; }).length + ')' : '')
+        + brushHint;
       try {
         console.info('[moartDiag] ' + line, { 브러시: { 크기: b('size'), 간격: b('tipSpacing'), 종이결배율: b('paperTexScale'),
           종이결농도: b('paperTexDepth'), 수채경계: b('waterEdge'), 경계세기: b('waterEdgePower'), 팁회전: b('tipRotate') }, 획: c });
@@ -65147,6 +65172,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver2418: 프레임 «간격» — 화면이 얼마나 자주 갱신됐는가. fill ms 와 다른 축이라
         //   fill 이 짧은데 간격이 벌어지면 이 함수 밖(합성·GPU·rAF)이 범인이다.
         if (diagOn.lastFrameT) diagOn.gaps.push(diagT0 - diagOn.lastFrameT);
+        else diagOn.firstFrameT = diagT0;   // ver2419: 이 획의 첫 프레임 = 첫 픽셀이 나온 시각
         diagOn.lastFrameT = diagT0;
         diagOn.frames += 1; diagOn.pts = pts ? pts.length : 0;
       }
