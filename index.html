@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2420</title>
+  <title>MoArt ver2421</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64930,6 +64930,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const c = paintDiagCur; paintDiagCur = null;
       if (!c) return;
       const endT0 = performance.now();   // ver2419: 펜업 «시작» — 커밋은 이 뒤에 온다
+      // ver2421: 여기서 리셋해야 아래 세 시점 사이(= 「대기」 구간)의 몫만 담긴다.
+      paintDiagIdle.thumb = 0; paintDiagIdle.save = 0; paintDiagIdle.bake = 0;
       c.totalMs = endT0 - c.t0;
       // ver2419: 입력 지연 = pointerdown 에서 첫 픽셀까지. 간격이 60fps 로 멀쩡해도 이게 크면
       //   선은 늦게 따라온다 — 「선이 늦다」가 프레임 페이스와 다른 층일 수 있는 자리다.
@@ -64997,6 +64999,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const commitHint = (c.commitMs > 16.7) ? ' ⚠ 뗄 때 걸린다' : '';
       // ver2420: 커밋은 짧은데 화면까지가 멀면 그 사이를 다른 일이 먹은 것이다 — 그것도 사람에게는
       //   똑같이 「늦다」로 보이므로 판정을 붙인다(어느 층인지가 다르다).
+      // ver2421: 대기 구간에 실제로 돈 것. **0 인 항목은 안 적는다** — 셋 다 0 이면 대기를 먹은 것이
+      //   이 셋 밖이라는 뜻이고, 그것도 판정이다(칸이 비면 「?」로 남겨 그 사실이 보이게 한다).
+      const idleBreak = (function() {
+        c.idle = { thumb: paintDiagIdle.thumb, save: paintDiagIdle.save, bake: paintDiagIdle.bake };
+        const parts = [];
+        if (c.idle.thumb > 0.5) parts.push('썸네일 ' + c.idle.thumb.toFixed(0));
+        if (c.idle.save > 0.5) parts.push('저장 ' + c.idle.save.toFixed(0));
+        if (c.idle.bake > 0.5) parts.push('베이크 ' + c.idle.bake.toFixed(0));
+        if (parts.length) return '(' + parts.join(' · ') + ')';
+        return c.waitMs > 50 ? '(셋 다 0 — 이 셋 밖이다)' : '';
+      })();
       const waitHint = (c.commitMs <= 16.7 && (c.waitMs + c.paintMs) > 100)
         ? ' ⚠ 커밋은 짧은데 화면까지 멀다 — 메인 스레드를 다른 일이 먹었다' : '';
       // ver2419: **조건이 성립했는지를 수치 옆에 함께 찍는다.** ver2418 회수분은 12 획 전부
@@ -65008,7 +65021,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         + gainHint
         + ' · 기울기 ' + c.tiltMax.toFixed(0) + '° · 방위 ' + (c.azSeen ? '있음' : '없음')
         + ' | 지연 ' + (c.lagMs < 0 ? '?' : c.lagMs.toFixed(0)) + 'ms · 펜업 ' + c.commitMs.toFixed(1) + 'ms'
-        + ' · 대기 ' + c.waitMs.toFixed(0) + 'ms · 화면 ' + c.paintMs.toFixed(0) + 'ms' + (c.paintTag === 'timeout' ? '(rAF 안 옴)' : '')
+        + ' · 대기 ' + c.waitMs.toFixed(0) + 'ms' + idleBreak + ' · 화면 ' + c.paintMs.toFixed(0) + 'ms' + (c.paintTag === 'timeout' ? '(rAF 안 옴)' : '')
         + commitHint + waitHint
         + ' | move ' + c.moveN + ' · dab ' + c.dabs + ' · 프레임 ' + c.frames
         + ' · 간격 中' + c.gapMed.toFixed(0) + '/p90 ' + c.gapP90.toFixed(0) + '/최대 ' + c.gapMax.toFixed(0) + 'ms(20ms↑ ' + c.slow20 + ')' + gapHint
@@ -65119,6 +65132,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 옛 `#perf` HUD(ver568~ver1454)와 같은 자리이나 **계측을 새로 만들지 않는다** — 위 paintDiag*
     // 한 벌이 이미 쌓는 것을 읽기만 한다(그 HUD 는 자기 리스너를 부팅부터 달아 핫패스에 매 move
     // gBCR 을 태웠다 — ver1324 가 고친 자리다).
+    // ── ver2421: 획 «사이»에 도는 무거운 일의 몫 ────────────────────────────────────
+    // 「대기」가 크다는 것까지는 ver2420 이 갈랐는데, **무엇이 먹었는지**가 없으면 후보를 하나씩
+    // 빼 보는 수밖에 없다(제보자 기기라 왕복이 한 번에 하루다). 획 사이에 도는 것은 셋이다 —
+    // 타임라인 레이어 썸네일(idle · timeout 300) · IndexedDB 오토세이브 · 칸 베이크(ver2416 이
+    // 이월한 리드백). **진단이 꺼져 있으면 원본을 그대로 부른다.**
+    const paintDiagIdle = { thumb: 0, save: 0, bake: 0 };
+    (function paintDiagWrapIdleWork() {
+      const wrapIdleWork = function(name, key) {
+        const orig = window[name];
+        if (typeof orig !== 'function') { console.warn('[moartDiag] 획 사이 계측 대상이 없다 — ' + name + ' (개명됐으면 이 목록을 고친다)'); return; }
+        window[name] = function() {
+          if (!paintDiagOn) return orig.apply(this, arguments);
+          const t0 = performance.now();
+          try { return orig.apply(this, arguments); }
+          finally { paintDiagIdle[key] += performance.now() - t0; }
+        };
+      };
+      wrapIdleWork('flushTimelineLayerThumbnailQueue', 'thumb');
+      wrapIdleWork('saveProjectToIndexedDbAutosave', 'save');
+      wrapIdleWork('gengaTileSetBakePending', 'bake');
+    })();
     const PAINT_DIAG_HUD_KEEP = 12;   // 최근 몇 획을 들고 있나 — 스크롤 없이 읽히는 길이
     let paintDiagHudLog = [];
     let paintDiagHudBody = null;
