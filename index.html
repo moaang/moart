@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2419</title>
+  <title>MoArt ver2420</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -64947,10 +64947,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       //   통째로 빠진다. iPad 제보의 첫 회수(ver2418)가 실제로 그렇게 헛돌았다: 12 획 전부
       //   「fill 0.0ms · 간격 60fps」로 멀쩡한데 제보자는 늦다고 했다. 다음 «태스크»로 미루면
       //   그 사이 핸들러의 동기 나머지 = 커밋이 끝나 c.commitMs 에 담긴다.
-      setTimeout(function() { paintDiagReport(c, endT0); }, 0);
+      // ver2420: **세 시점으로 갈라 잰다.** ver2419 는 `setTimeout(…,0)` 하나로 「커밋」을 쟀는데
+      //   그것은 핸들러의 동기 나머지가 아니라 **다음 태스크가 실제로 도는 시각**이다 — 연달아
+      //   그으면 그 사이 들어온 이벤트의 처리 시간이 통째로 「펜업」으로 실린다. iPad 2 차 회수분
+      //   12 획이 1161 → 779ms 로 **단조 감소**한 것이 그 증거다(커밋이 획마다 빨라질 이유는 없다.
+      //   큐가 비어 간 것이다). 마이크로태스크는 현재 태스크가 끝난 «직후» 다른 이벤트가 끼어들기
+      //   전에 돌므로, 그것이 핸들러의 동기 나머지 = 커밋이다.
+      //   ① micro  — 펜업 핸들러의 동기 비용(커밋)
+      //   ② task   — 그 뒤 다음 태스크까지. 메인 스레드가 다른 일로 막힌 몫
+      //   ③ paint  — 그 뒤 첫 프레임까지. 「화면에 언제 나오나」
+      Promise.resolve().then(function() {
+        c.commitMs = performance.now() - endT0;
+        setTimeout(function() {
+          c.waitMs = performance.now() - endT0 - c.commitMs;
+          // rAF 가 안 오는 상태(백그라운드·숨은 문서)에서 보고가 영영 안 나오면 그것이 조용한
+          // 실패다 — 타이머와 경주시키고 **어느 쪽이 이겼는지 함께 찍는다**.
+          let settled = false;
+          const finish = function(tag) {
+            if (settled) return; settled = true;
+            c.paintMs = performance.now() - endT0 - c.commitMs - c.waitMs;
+            c.paintTag = tag;
+            paintDiagReport(c, endT0);
+          };
+          requestAnimationFrame(function() { finish('raf'); });
+          setTimeout(function() { finish('timeout'); }, 500);
+        }, 0);
+      });
     }
     function paintDiagReport(c, endT0) {
-      c.commitMs = performance.now() - endT0;
       const b = paintBrushGet;
       // ver2400: **수치 옆에 «그래서 무엇을 해야 하는가»를 붙인다.** 첫 판은 「필압 0.36~0.57」까지만
       //   찍었는데, 그것이 **기기가 범위를 다 안 준다**는 뜻이고 感度 보정으로 펴진다는 것을 아는 사람만
@@ -64969,7 +64993,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gapHint = (c.gapP90 > 33 && c.fillAvg < c.gapP90 / 2)
         ? ' ⚠ 화면 갱신이 벌어졌다 — fill 밖(합성·GPU·rAF)이다' : '';
       // ver2419: 펜업이 한 프레임을 넘으면 사람은 「뗄 때 걸린다」로 느낀다(ver2416 이 고친 축).
+      // ver2420: 그 판정은 **커밋(micro)** 으로만 한다 — 대기(task)는 이 획이 쓴 시간이 아니다.
       const commitHint = (c.commitMs > 16.7) ? ' ⚠ 뗄 때 걸린다' : '';
+      // ver2420: 커밋은 짧은데 화면까지가 멀면 그 사이를 다른 일이 먹은 것이다 — 그것도 사람에게는
+      //   똑같이 「늦다」로 보이므로 판정을 붙인다(어느 층인지가 다르다).
+      const waitHint = (c.commitMs <= 16.7 && (c.waitMs + c.paintMs) > 100)
+        ? ' ⚠ 커밋은 짧은데 화면까지 멀다 — 메인 스레드를 다른 일이 먹었다' : '';
       // ver2419: **조건이 성립했는지를 수치 옆에 함께 찍는다.** ver2418 회수분은 12 획 전부
       //   `dab 0` 이었는데 그것이 「평소 브러시가 아니었다」인지 「그 브러시는 원래 dab 0」인지
       //   줄만 봐서는 갈리지 않았다 — 브러시가 안 찍혀 있었기 때문이다.
@@ -64978,7 +65007,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const line = '입력 ' + (c.ptType || '?') + ' · 필압 ' + (c.pMax < 0 ? '없음' : (c.pMin.toFixed(2) + '~' + c.pMax.toFixed(2)))
         + gainHint
         + ' · 기울기 ' + c.tiltMax.toFixed(0) + '° · 방위 ' + (c.azSeen ? '있음' : '없음')
-        + ' | 지연 ' + (c.lagMs < 0 ? '?' : c.lagMs.toFixed(0)) + 'ms · 펜업 ' + c.commitMs.toFixed(1) + 'ms' + commitHint
+        + ' | 지연 ' + (c.lagMs < 0 ? '?' : c.lagMs.toFixed(0)) + 'ms · 펜업 ' + c.commitMs.toFixed(1) + 'ms'
+        + ' · 대기 ' + c.waitMs.toFixed(0) + 'ms · 화면 ' + c.paintMs.toFixed(0) + 'ms' + (c.paintTag === 'timeout' ? '(rAF 안 옴)' : '')
+        + commitHint + waitHint
         + ' | move ' + c.moveN + ' · dab ' + c.dabs + ' · 프레임 ' + c.frames
         + ' · 간격 中' + c.gapMed.toFixed(0) + '/p90 ' + c.gapP90.toFixed(0) + '/최대 ' + c.gapMax.toFixed(0) + 'ms(20ms↑ ' + c.slow20 + ')' + gapHint
         + ' · fill 평균 ' + c.fillAvg.toFixed(1) + 'ms 최대 ' + c.fillMax.toFixed(1) + 'ms' + slowHint
