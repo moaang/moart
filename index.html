@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2443</title>
+  <title>MoArt ver2444</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -16462,10 +16462,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           zh: function(max) { return '已保存的项目（最多 ' + max + ' 个）'; } },
         'settings.storage.clean': { ja: '今すぐ整理', ko: '지금 정리', en: 'Clean up now', zh: '立即清理' },
         'settings.storage.cleaned': {
-          ja: function(n, size) { return n + ' 件（' + size + '）を削除しました'; },
-          ko: function(n, size) { return n + '건(' + size + ')을 삭제했습니다'; },
-          en: function(n, size) { return 'Deleted ' + n + ' row(s) (' + size + ')'; },
-          zh: function(n, size) { return '已删除 ' + n + ' 项（' + size + '）'; } },
+          ja: function(n, size) { return n + ' 件' + (size ? '（' + size + '）' : '') + 'を削除しました'; },
+          ko: function(n, size) { return n + '건' + (size ? '(' + size + ')' : '') + '을 삭제했습니다'; },
+          en: function(n, size) { return 'Deleted ' + n + ' row(s)' + (size ? ' (' + size + ')' : ''); },
+          zh: function(n, size) { return '已删除 ' + n + ' 项' + (size ? '（' + size + '）' : ''); } },
         'settings.storage.cleaning': {
           ja: function(done, total) { return '整理中… ' + done + ' / ' + total; },
           ko: function(done, total) { return '정리 중… ' + done + ' / ' + total; },
@@ -20245,6 +20245,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Consequence, and why redo needs no byte trim of its own: redo only ever grows by traversal, so the
     // combined total stays bounded by budget + (the newest command, which the floor protects).
     function pushUndoCommand(command, options) {
+      storageRootsChanged();
       if (!command) return;
       // ver1725: 눈금은 **한 번만** 찍는다 — redo 로 되살아난 명령이 다시 찍히면 用紙 획과의 순서가
       // 뒤집힌다(그 명령은 새로 생긴 것이 아니다).
@@ -20266,6 +20267,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function pushRedoCommand(command, options) {
+      storageRootsChanged();
       if (!command) return;
       state.redoStack.push(command);
       trimCommandStack(state.redoStack, MAX_REDO_HISTORY);
@@ -20606,6 +20608,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       closeAnchoredPopover();
     }
     function restoreProject(project, memoPagesOverride, options) {
+      storageRootsChanged();
       teardownProjectFloatingWindows();
       options = options || {};
       const historyViewport = options.historyTimelineViewport || null;
@@ -24388,6 +24391,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2444, items: [
+        { ja: '画面を離れる際の保存失敗と、重なった保存の順序を修正しました。保存中の絵はストレージ整理から保護します。',
+          ko: '화면을 떠날 때의 저장 실패 처리와 겹친 저장의 순서를 고쳤습니다. 저장 중인 그림도 저장공간 정리에서 보호합니다.',
+          en: 'Fixed failed saves when leaving the page and overlapping save order. Storage cleanup now protects drawings while they are being saved.',
+          zh: '修正了离开页面时的保存失败处理和重叠保存的顺序。存储清理会保护正在保存的画面。' } ] },
       { ver: 2443, items: [
         { ja: '**保存に失敗したときは、前の正常な保存内容をそのまま残すようにしました。**これまでは絵が'
             + 'ディスクに入らなくても保存自体は進んでいて、開き直すと空のコマになることがありました。'
@@ -54060,6 +54068,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // cycling is also where WebKit's IndexedDB has historically been flakiest. Open once, reuse, and only
     // drop the cache if the connection is actually closed out from under us.
     let workspaceDbPromise = null;
+    // ver2444: 저장/참조 변경은 진행 중인 GC를 취소한다. 입력과 저장이 GC를 기다리지 않는다.
+    // 세대는 scan 이전부터 delete 완료까지 유효해야 하며, 보유 해제 뒤에도 되돌리지 않는다.
+    let storageRootEpoch = 0;
+    const storageDeleteTransactions = new Set();
+    let storageDeleteQueue = Promise.resolve();
+    function storageRootsChanged() {
+      storageRootEpoch += 1;
+      storageDeleteTransactions.forEach(function(tx) {
+        try { tx.abort(); } catch (error) { /* 이미 완료된 tx는 oncomplete가 등록을 해제한다. */ }
+      });
+    }
     // WebKit's IndexedDB has two failure modes that fire NO error event at all, which turns any naive
     // "await the transaction" into an infinite hang (seen in the wild: iPad ZIP import stuck forever on
     // "ZIPを展開中…"): (1) a transaction aborted by the UA (quota, internal error) fires only "abort",
@@ -54205,6 +54224,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     async function putWorkspaceDbValue(key, value) {
       if (!indexedDbAvailable()) return false;
+      storageRootsChanged();
       for (let attempt = 0; ; attempt += 1) {
         const db = await openWorkspaceDb();
         try {
@@ -54223,30 +54243,69 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    // ver1460: **여러 개를 한 트랜잭션에서** 지운다. 실사용에서 무참조 행이 3178건 나왔는데
-    // (사용자 환경, 411MB) 그것을 deleteWorkspaceDbValue 로 하나씩 지우면 트랜잭션이 3178개다 —
-    // 느리고, 중간에 실패하면 어디까지 지웠는지도 흐려진다.
-    // 청크로 끊는 이유: 한 트랜잭션이 WORKSPACE_DB_OP_TIMEOUT_MS(20초)를 넘으면 스톨로 잡혀
-    // **성공한 삭제까지 실패로 보고**된다. 400개면 그 한참 아래다.
-    // 스톨 재시도는 일부러 안 넣는다 — 부분 삭제 뒤의 재시도는 「무엇이 남았나」를 모르게 만든다.
-    // 실패하면 그 청크에서 멈추고 **거기까지의 건수를 사실대로** 돌려준다.
-    async function deleteWorkspaceDbValues(keys, onProgress) {
-      if (!indexedDbAvailable() || !keys || !keys.length) return 0;
+    // ver2444: 자동/수동 정리의 공통 진입부. 요청 목록은 후보일 뿐이며 최신 root로 다시 판정한다.
+    // 두 정리가 겹쳐 같은 행의 삭제 수를 두 번 세지 않도록 이 실행기만 직렬화한다.
+    function deleteWorkspaceDbValues(keys, onProgress) {
+      if (!indexedDbAvailable() || !keys || !keys.length) return Promise.resolve(0);
+      const requested = Array.from(new Set(keys || []));
+      const job = storageDeleteQueue.then(function() { return storageDeleteUnreferenced(requested, onProgress); });
+      storageDeleteQueue = job.catch(function() { /* 호출자는 원래 job의 실패를 받는다. 다음 정리는 재개 가능. */ });
+      return job;
+    }
+    async function storageDeleteUnreferenced(keys, onProgress) {
+      if (!indexedDbAvailable() || !keys.length) return 0;
+      const epoch = storageRootEpoch;
+      const live = await storageLiveRefsScan(null);
+      if (live.unknown || epoch !== storageRootEpoch) return 0;
+      const unused = new Set(storagePartitionRows(live).unused);
+      const eligible = keys.filter(function(k) { return unused.has(k); });
       const CHUNK = 400;
       let done = 0;
-      for (let i = 0; i < keys.length; i += CHUNK) {
-        const slice = keys.slice(i, i + CHUNK);
+      for (let i = 0; i < eligible.length; i += CHUNK) {
+        const slice = eligible.slice(i, i + CHUNK);
         const db = await openWorkspaceDb();
-        await workspaceDbOp(db, 'deleteMany(' + slice.length + ')', function(resolve, reject) {
-          const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
-          const store = tx.objectStore(WORKSPACE_STORE_NAME);
-          slice.forEach(function(k) { store.delete(k); });
-          tx.oncomplete = function() { resolve(); };
-          tx.onabort = function() { reject(tx.error || new Error('bulk delete aborted')); };
-          tx.onerror = function() { reject(tx.error || new Error('bulk delete failed')); };
-        });
-        done += slice.length;
+        if (epoch !== storageRootEpoch) break;
+        const removed = [];
+        let activeTx = null;
+        try {
+          await workspaceDbOp(db, 'delete unused rows: ' + slice.length, function(resolve, reject) {
+            const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+            activeTx = tx;
+            storageDeleteTransactions.add(tx);
+            const store = tx.objectStore(WORKSPACE_STORE_NAME);
+            slice.forEach(function(k) {
+              if (storageRowHeldBySave(k)) return;
+              store.delete(k); removed.push(k);
+            });
+            tx.oncomplete = function() {
+              storageDeleteTransactions.delete(tx);
+              removed.forEach(function(k) {
+                if (k.indexOf('gd:') === 0) {
+                  const ref = k.slice(3);
+                  gengaPersistedRefs.delete(ref);
+                  gengaPersistFailures.delete(ref);
+                } else if (k.indexOf('gdd:') === 0) gengaDeltaDiskDone.delete(k.slice(4));
+              });
+              resolve();
+            };
+            tx.onabort = function() {
+              storageDeleteTransactions.delete(tx);
+              removed.length = 0;
+              if (epoch !== storageRootEpoch) resolve();
+              else reject(tx.error || new Error('unused-row delete aborted'));
+            };
+            tx.onerror = function() { /* onabort가 삭제 건수와 등록 해제를 확정한다. */ };
+          });
+        } catch (error) {
+          if (activeTx) {
+            try { activeTx.abort(); } catch (abortError) { /* 이미 종료된 트랜잭션 */ }
+            storageDeleteTransactions.delete(activeTx);
+          }
+          throw error;
+        }
+        done += removed.length;
         if (onProgress) onProgress(done, keys.length);
+        if (epoch !== storageRootEpoch) break;
       }
       return done;
     }
@@ -54555,10 +54614,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //    덮지 않게 projectId 별로 마지막 게시 번호를 쥔다(§5-A).
     let projectSaveSeqNext = 0;
     const projectSavePublishedSeq = new Map();   // projectId → 마지막으로 게시된 요청 번호
+    const projectSaveLatestSeq = new Map();      // projectId → 화면 상태를 소유하는 최신 요청
+    const projectSavePublishJobs = new Map();    // projectId → 게시 직렬 실행(준비는 병렬 가능)
     // 저장 결과 표시는 **그 응답이 지금 화면의 프로젝트를 가리킬 때만** 갱신한다 — 저장 중 다른
     // 프로젝트로 옮겼으면 그 라벨은 남의 저장 결과다.
-    function projectSaveMarkStatus(id, label) {
-      if (String(state.project && state.project.projectId || '') !== String(id)) return;
+    function projectSaveMarkStatus(id, seq, label) {
+      if (projectSaveLatestSeq.get(id) !== seq || String(state.project && state.project.projectId || '') !== String(id)) return;
       state.indexedDbAutosaveStatus = label;
       updatePrefsUI();
     }
@@ -54603,40 +54664,52 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ★트랜잭션을 연 뒤에는 외부 await 를 하지 않는다 — IndexedDB 트랜잭션은 요청 사이가 비면
     //   자동으로 완료(비활성)되므로, 준비(직렬화·인코드·pinned 읽기)는 부르는 쪽이 앞에서 끝낸다.
     //   성공은 **tx.oncomplete 하나**다.
-    async function publishProjectSaveTx(id, payload, meta, pinned) {
-      if (!indexedDbAvailable()) return { ok: false, code: 'refused' };
-      for (let attempt = 0; ; attempt += 1) {
-        const db = await openWorkspaceDb();
-        try {
-          return await workspaceDbOp(db, 'publish ' + id, function(resolve, reject) {
-            const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
-            const store = tx.objectStore(WORKSPACE_STORE_NAME);
-            let versionSeq = 0;
-            store.put(payload, indexedDbProjectPayloadKey(id));
-            const idxReq = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
-            idxReq.onsuccess = function() {
-              const plan = planProjectSlotIndex(idxReq.result, id, meta, pinned);
-              store.put(normalizeIndexedDbProjectIndex(plan.index), INDEXED_DB_PROJECT_INDEX_KEY);
-              plan.evicted.forEach(function(gone) { store.delete(indexedDbProjectPayloadKey(gone)); });
-            };
-            const viReq = store.get(indexedDbVersionIndexKey(id));
-            viReq.onsuccess = function() {
-              const plan = planProjectVersionPush(viReq.result, payload, meta.savedAt);
-              if (!plan) return;
-              versionSeq = plan.seq;
-              store.put(payload, indexedDbVersionPayloadKey(id, plan.seq));
-              store.put(plan.index, indexedDbVersionIndexKey(id));
-              plan.drops.forEach(function(s) { store.delete(indexedDbVersionPayloadKey(id, s)); });
-            };
-            tx.oncomplete = function() { resolve({ ok: true, versionSeq: versionSeq }); };
-            tx.onabort = function() { reject(tx.error || new Error(t('msg.idb.txAbortedFor', indexedDbProjectPayloadKey(id)))); };
-            tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', indexedDbProjectPayloadKey(id)))); };
-          });
-        } catch (error) {
-          if (attempt === 0 && error && error.name === 'WorkspaceDbStallError') continue; // fresh connection, one retry
-          throw error;
+    async function publishProjectSaveTx(id, payload, meta, pinned, seq) {
+      const previous = projectSavePublishJobs.get(id) || Promise.resolve();
+      const job = previous.catch(function() {}).then(async function() {
+        if ((projectSavePublishedSeq.get(id) || 0) > seq) return { ok: false, code: 'stale' };
+        if (!indexedDbAvailable()) return { ok: false, code: 'refused' };
+        storageRootsChanged();
+        for (let attempt = 0; ; attempt += 1) {
+          const db = await openWorkspaceDb();
+          try {
+            return await workspaceDbOp(db, 'publish ' + id, function(resolve, reject) {
+              const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+              const store = tx.objectStore(WORKSPACE_STORE_NAME);
+              let versionSeq = 0;
+              store.put(payload, indexedDbProjectPayloadKey(id));
+              const idxReq = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
+              idxReq.onsuccess = function() {
+                const plan = planProjectSlotIndex(idxReq.result, id, meta, pinned);
+                store.put(normalizeIndexedDbProjectIndex(plan.index), INDEXED_DB_PROJECT_INDEX_KEY);
+                plan.evicted.forEach(function(gone) { store.delete(indexedDbProjectPayloadKey(gone)); });
+              };
+              const viReq = store.get(indexedDbVersionIndexKey(id));
+              viReq.onsuccess = function() {
+                const plan = planProjectVersionPush(viReq.result, payload, meta.savedAt);
+                if (!plan) return;
+                versionSeq = plan.seq;
+                store.put(payload, indexedDbVersionPayloadKey(id, plan.seq));
+                store.put(plan.index, indexedDbVersionIndexKey(id));
+                plan.drops.forEach(function(s) { store.delete(indexedDbVersionPayloadKey(id, s)); });
+              };
+              tx.oncomplete = function() {
+                projectSavePublishedSeq.set(id, seq);
+                resolve({ ok: true, versionSeq: versionSeq });
+              };
+              tx.onabort = function() { reject(tx.error || new Error(t('msg.idb.txAbortedFor', indexedDbProjectPayloadKey(id)))); };
+              tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', indexedDbProjectPayloadKey(id)))); };
+            });
+          } catch (error) {
+            if (attempt === 0 && error && error.name === 'WorkspaceDbStallError') continue; // fresh connection, one retry
+            throw error;
+          }
         }
-      }
+      });
+      projectSavePublishJobs.set(id, job);
+      const release = function() { if (projectSavePublishJobs.get(id) === job) projectSavePublishJobs.delete(id); };
+      job.then(release, release);
+      return job;
     }
     // ── ver2443 (저장 무결성 S-B · §5): **저장본이 가리키는 필수 데이터가 전부 확정된 뒤에만 그것을
     //    최신 정상 저장본으로 게시한다.** 종전에는 그림이 디스크에 못 들어가도 본문·목록·판본을 그대로
@@ -54644,69 +54717,52 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //    덮었다. 반환도 boolean 이 아니라 결과 객체다 — 부르는 쪽이 실패를 볼 수 있어야 한다(F1·F7).
     async function writeProjectToIndexedDbSlot(opts) {
       const id = ensureCurrentProjectId();
-      // autosave keeps genga drawings as refs (light); the base64 is already in IndexedDB under 'gd:<ref>'
-      // — ver1324: "already" is now a promise the deferred encode must keep, so settle any stragglers first.
-      // ver2440 (P3): delta 는 동기 붕괴 대신 변경분 행(gdd:)으로 — flush(동기)와 직렬화(동기)가 같은
-      // 태스크에서 ref 집합을 고정하고, 게시는 그 변경분 쓰기를 기다린 뒤에 한다(「변경분을 먼저
-      // 내구성 있게, 그 뒤 프로젝트 세대를 게시」). opts.syncWall(pagehide 계열 — async 를 기다릴 수
-      // 없는 마지막 저장 기회)은 종전 그대로 동기 붕괴이고, 순서는 메인 커넥션의 FIFO 가 준다
-      // (gd: 트랜잭션이 먼저 커밋되므로 본문이 커밋됐다면 그 그림도 커밋된 것이다).
-      const syncWall = Boolean(opts && opts.syncWall);
-      gengaFlushPendingDrawingEncodes(syncWall ? null : { deltaAsync: true });
-      // ── snapshot 고정(§5-A) — payload 와 rootRefs 는 **같은 시점·같은 객체**에서 나온다. 여기부터
-      //    게시까지 `state.project` 를 다시 읽어 이번 저장의 대상을 재정의하지 않는다(F4: await 사이에
-      //    새 획이나 프로젝트 전환이 들어오면 그 판정이 갈려 실패한 ref 가 조용히 빠진다).
-      const payload = serializedProjectJson({ portable: false });
-      const savedAt = new Date().toISOString();
-      const title = String(state.project && state.project.title || '');
-      const kind = state.project && state.project.kind === 'genga' ? 'genga' : 'conte';
-      const rootRefs = new Set();
-      gengaAddProjectRefs(state.project, rootRefs, new Set());
       const seq = ++projectSaveSeqNext;
-      const leaseRefs = Array.from(rootRefs);
-      gengaSaveLeaseAcquire(leaseRefs);   // 첫 await «전»에 잡는다 — 저장 중 회수 금지(§5-C)
+      projectSaveLatestSeq.set(id, seq);
+      let leaseRefs = [];
       try {
-        if (!syncWall) {
-          let failures = await gengaAwaitSnapshotDurability(rootRefs);
-          if (failures.length) {
-            // 마지막 구제 — 변경분 행이 못 써진 그림만 동기 붕괴로 완전체를 만들어 **한 번** 다시
-            // 시도한다(논리 시도당 한 번 · 재시도 루프를 만들지 않는다). 그래도 남으면 게시하지 않는다.
-            failures.forEach(function(f) {
-              if (!gengaIsDrawDelta(gengaDrawStore.get(f.ref))) return;   // 그새 붕괴됐거나 다른 원인 — 이 폴백의 대상이 아니다
-              console.warn('[gengaDelta] durability barrier falling back to a sync collapse for ' + f.ref);
-              const collapsed = gengaCollapseDeltaChainSync(f.ref);
-              if (!collapsed) return;   // 실패 로그는 collapse 가 남겼다 — delta 는 살아 있고 다음 저장이 재시도한다
-              gengaEncodeTileCells(collapsed, Infinity);
-              if (gengaTileCellsAllBlob(collapsed)) gengaPersistTileSet(f.ref, collapsed, true);   // 메인 FIFO 로 게시보다 먼저 커밋시킨다
-              else console.error('[gengaDelta] fallback collapse left unencoded cell(s) for ' + f.ref + ' - the gd: row is not written yet');
-            });
-            failures = await gengaAwaitSnapshotDurability(rootRefs);
-          }
-          if (failures.length) {
-            const codes = failures.map(function(f) { return f.ref + ':' + f.code; }).join(', ');
-            console.error('[persist] 저장을 중단했다 — 이 저장본이 가리키는 그림 ' + failures.length + ' 장이 디스크에 없다(' + codes + '). 직전 정상 저장본을 유지한다');
-            projectSaveMarkStatus(id, t('msg.workspace.saveFailed', failures.length + ' drawing(s) not written to disk'));
-            return { ok: false, projectId: id, code: 'drawings', failures: failures };
-          }
+        // syncWall은 준비를 메인에서 서두를 뿐이다. FIFO는 성공의 증거가 아니므로 같은 완료 계약을 통과한다.
+        // 페이지 종료 전에 완료하지 못하면 새 본문을 게시하지 않고 직전 정상 저장본을 유지한다.
+        const syncWall = Boolean(opts && opts.syncWall);
+        gengaFlushPendingDrawingEncodes(syncWall ? null : { deltaAsync: true });
+        const payload = serializedProjectJson({ portable: false });
+        const savedAt = new Date().toISOString();
+        const title = String(state.project && state.project.title || '');
+        const kind = state.project && state.project.kind === 'genga' ? 'genga' : 'conte';
+        const rootRefs = new Set();
+        gengaAddProjectRefs(state.project, rootRefs, new Set());
+        leaseRefs = Array.from(rootRefs);
+        gengaSaveLeaseAcquire(leaseRefs);
+        let failures = await gengaAwaitSnapshotDurability(rootRefs);
+        if (failures.length) {
+          // 변경분 저장 실패는 논리 요청당 한 번 완전체로 구제한다. 실패한 본문을 게시하지 않는다.
+          failures.forEach(function(f) {
+            if (!gengaIsDrawDelta(gengaDrawStore.get(f.ref))) return;
+            const collapsed = gengaCollapseDeltaChainSync(f.ref);
+            if (!collapsed) return;
+            gengaEncodeTileCells(collapsed, Infinity);
+            if (gengaTileCellsAllBlob(collapsed)) gengaPersistTileSet(f.ref, collapsed, true);
+          });
+          failures = await gengaAwaitSnapshotDurability(rootRefs);
         }
-        if ((projectSavePublishedSeq.get(id) || 0) > seq) {   // 이 요청보다 «새» 저장본이 이미 게시됐다
-          console.warn('[persist] 더 새 저장본이 이미 게시됐다 — 이 게시는 건너뛴다(' + id + ')');
-          return { ok: false, projectId: id, code: 'stale' };
+        if (failures.length) {
+          console.error('[persist] required drawing(s) not durable; retaining the last good save', failures);
+          projectSaveMarkStatus(id, seq, t('msg.workspace.saveFailed', failures.length + ' drawing(s) not written to disk'));
+          return { ok: false, projectId: id, code: 'drawings', failures: failures };
         }
         const pinnedForEviction = await loadPinnedProjectSlots();
         const published = await publishProjectSaveTx(id, payload,
-          { title: title, savedAt: savedAt, bytes: payload.length, kind: kind }, pinnedForEviction);
+          { title: title, savedAt: savedAt, bytes: payload.length, kind: kind }, pinnedForEviction, seq);
         if (!published.ok) {
-          projectSaveMarkStatus(id, t('msg.workspace.saveFailed', published.code || 'publish'));
+          if (published.code !== 'stale') projectSaveMarkStatus(id, seq, t('msg.workspace.saveFailed', published.code || 'publish'));
           return { ok: false, projectId: id, code: published.code || 'publish' };
         }
-        projectSavePublishedSeq.set(id, seq);
-        projectSaveMarkStatus(id, indexedDbAutosaveRecordLabel({ savedAt: savedAt, title: title, bytes: payload.length }));
+        projectSaveMarkStatus(id, seq, indexedDbAutosaveRecordLabel({ savedAt: savedAt, title: title, bytes: payload.length }));
         renderProjectTabBar();
         return { ok: true, projectId: id, seq: seq };
       } catch (error) {
-        console.error('[persist] 저장 게시 실패 — 직전 정상 저장본을 유지한다', error);
-        projectSaveMarkStatus(id, t('msg.workspace.saveFailed', error && error.message ? error.message : error));
+        console.error('[persist] save failed; retaining the last good save', error);
+        projectSaveMarkStatus(id, seq, t('msg.workspace.saveFailed', error && error.message ? error.message : error));
         return { ok: false, projectId: id, code: 'publish', error: error };
       } finally {
         gengaSaveLeaseRelease(leaseRefs);
@@ -55185,18 +55241,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const next = {};
         unused.forEach(function(k) { next[k] = (Number(prev[k]) || 0) + 1; });
         // ver1460: 익은 것만 모아 **한 트랜잭션에** 지운다(실사용에서 한 번에 수천 건이 나온다).
-        // ver2443 (F5 · §5-C): scan 과 delete 사이에 **새 저장이 시작될 수 있다** — 그 사이 lease 가
-        // 잡은 행은 이번 판에서 뺀다(관측한 root 세대가 바뀌었다는 뜻이다). streak 은 그대로 두어
-        // 다음 판이 다시 판정한다 — 참조가 되살아났으면 위 next 에서 자연히 사라진다.
-        const ripe = Object.keys(next).filter(function(k) {
-          if (next[k] < STORAGE_SWEEP_STREAK_LIMIT) return false;
-          return !storageRowHeldBySave(k);
-        });
+        // 삭제 가능성의 최종 판정은 자동/수동이 공유하는 deleteWorkspaceDbValues가 맡는다.
+        const ripe = Object.keys(next).filter(function(k) { return next[k] >= STORAGE_SWEEP_STREAK_LIMIT; });
         let deletedCount = 0;
         if (ripe.length) {
           try {
             deletedCount = await deleteWorkspaceDbValues(ripe);
-            ripe.forEach(function(k) { delete next[k]; });
+            // 보류된 후보는 다음 scan에서 다시 판정한다. 전부 삭제한 경우에만 기록을 비운다.
+            if (deletedCount === ripe.length) ripe.forEach(function(k) { delete next[k]; });
           } catch (error) {
             // 남은 것은 지워지지 않았고 카운트도 그대로다 → 다음 판에 다시 걸린다(조용히 넘어가지 않는다).
             console.error('[storage] bulk delete failed — 남은 것은 다음 판에 다시 걸린다', error);
@@ -55391,8 +55443,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ver1460: 수동 정리. 자동 sweep 의 **유예 3회를 안 기다린다** — 유예는 「사용자가 안 보고 있을 때」의
-    // 보험이고, 여기서는 사용자가 건수·용량을 읽고 확인창까지 통과해 누른다. 대신 지우는 대상은 방금
-    // 조사가 본 그 목록 그대로다(다시 스캔하지 않는다 — 두 번 스캔하면 화면의 숫자와 지우는 것이 갈린다).
+    // 보험이고, 여기서는 사용자가 건수·용량을 읽고 확인창까지 통과해 누른다.
+    // ver2444: 확인한 목록 안에서만 지우되, 그 사이 살아난 행은 공통 삭제기가 제외한다.
     let storageCleanRunning = false;
     async function runStorageCleanNow() {
       const status = document.getElementById('storageUsageStatus');
@@ -55409,7 +55461,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const removed = await deleteWorkspaceDbValues(scan.keys, function(done, total) {
           if (status) status.textContent = t('settings.storage.cleaning', done, total);
         });
-        if (status) status.textContent = t('settings.storage.cleaned', removed, sizeLabel);
+        if (status) status.textContent = t('settings.storage.cleaned', removed, removed === scan.count ? sizeLabel : '');
         storageLastScan = null;
         await renderStorageUsage(); // 숫자를 새로 읽는다 — 지운 뒤의 화면이 지우기 전 값을 들고 있으면 안 된다
         // ver1602: 여기 있던 「상태줄 되쓰기」는 없앴다 — 렌더가 진행 중에는 상태줄을 안 건드린다.
@@ -55718,8 +55770,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!state.indexedDbAutosaveTimer) return;
       clearTimeout(state.indexedDbAutosaveTimer);
       state.indexedDbAutosaveTimer = 0;
-      // ver2440: 마지막 저장 기회 — 페이지가 죽기 전이라 게시 배리어(await)를 기다릴 수 없다.
-      // 종전 그대로 동기 붕괴로 확정까지 마친다(입력 중이 아니므로 벽이 서도 잃는 것이 없다).
+      // ver2444: 종료 준비도 그림 쓰기의 실제 완료 뒤에만 게시한다. 완료 전에 종료되면 직전 저장본 유지.
+      // syncWall은 인코드 실행기 선택이며, 실패 검사를 생략하라는 옵션이 아니다.
       saveProjectToIndexedDbAutosave({ syncWall: true }).catch(function(error) {
         state.indexedDbAutosaveStatus = t('msg.workspace.saveFailed', error && error.message ? error.message : error);
         updatePrefsUI();
@@ -84195,6 +84247,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaTileBlobShareAdd(b);
     }
     function gengaDrawStorePut(ref, v) {
+      storageRootsChanged();
       const old = gengaDrawStore.get(ref);
       if (old === v) { gengaDrawStoreReweighValue(v); return; }
       if (old !== undefined) gengaDrawStoreUntrackValue(old);
@@ -84277,6 +84330,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     const gengaSaveLeaseRefs = new Map();      // ref → 보유 수
     const gengaDrawStoreFaults = new Map();    // ref → 재읽기 프라미스(중복 요청 합치기)
     function gengaSaveLeaseAcquire(refs) {
+      storageRootsChanged();
       refs.forEach(function(ref) { if (ref) gengaSaveLeaseRefs.set(ref, (gengaSaveLeaseRefs.get(ref) || 0) + 1); });
     }
     function gengaSaveLeaseRelease(refs) {
@@ -84288,6 +84342,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // 실행기가 무엇이든 같은 결과 계약(true = 디스크 확정)으로 정규화해 등록한다.
     function gengaPersistJobRegister(ref, p) {
+      storageRootsChanged();
       const job = Promise.resolve(p).then(function(ok) { return ok === true; }, function() { return false; });
       gengaPersistJobs.set(ref, job);
       job.then(function() { if (gengaPersistJobs.get(ref) === job) gengaPersistJobs.delete(ref); });
@@ -84443,6 +84498,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
      * 같은 ref 로 겹쳐 들어오는 요청은 하나로 합친다(스크럽 중에 프레임마다 다시 온다). */
     function gengaDrawStoreFaultIn(ref, onReady) {
       if (!ref || gengaDrawStore.has(ref)) return null;
+      storageRootsChanged();
       const inflight = gengaDrawStoreFaults.get(ref);
       if (inflight) { if (onReady) inflight.then(function() { onReady(); }); return inflight; }
       const job = (async function() {
@@ -85782,8 +85838,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       } catch (e) { console.error('[gengaTile] IndexedDB write threw for gd:' + ref, e); return Promise.resolve(false); }
     }
     // 전 칸이 Blob 로 확정된 묶음의 gd: 행 쓰기 — 종전 gengaPutDrawingTiles 의 쓰기와 같은 계약.
-    // preferMain: 동기 벽 flush(내보내기·pagehide·스왑) 전용 — 그 경로는 게시 배리어를 안 지나므로
-    // 메인 커넥션의 FIFO(gd: put 이 payload put 보다 먼저)가 유일한 순서 보장이다.
+    // preferMain: 내보내기·pagehide·스왑의 준비를 메인에서 실행한다.
+    // ver2444: 프로젝트 본문 게시는 실행기와 무관하게 완료 promise를 확인한다.
     // ver2443 (F2): 어느 실행기를 택하든 **같은 완료 프라미스**(Promise<boolean>)를 돌려주고 ref 당
     // 하나의 논리 작업으로 등록한다 — 워커 실패 뒤의 메인 대체 처리도 그 작업 안이라, 응답 맵에서
     // 빠져도 최종 결과가 유실되지 않는다(게시 배리어가 기다리는 것이 이 작업이다).
@@ -85981,8 +86037,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           return;
         }
         gengaEncodeTileCells(ts, Infinity);
-        // ver2440: 동기 벽 flush(deltaAsync 아님)는 게시 배리어를 안 지나므로 메인 커넥션 FIFO 가
-        // 「gd: 먼저, payload 나중」의 유일한 보장이다 — 워커에 태우지 않는다.
+        // 동기 준비는 메인에 태운다. ver2444부터 본문 게시자는 이 쓰기의 성공도 기다린다.
         if (gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts, !(opts && opts.deltaAsync));
         else console.error('[gengaTile] flush left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
       });
@@ -97045,6 +97100,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaCopyLayer() {
       const layer = ensureGengaSelectedLayer();
       if (!layer || layer.role === 'paper') return; // 用紙 is a project-wide singleton — never copyable
+      storageRootsChanged();
       gengaLayerClipboard = fastClone(layer);
       gengaClipTouch('layer'); // ver1396 (도장은 클론이 아니라 gengaClipStamps 에 — 붙여넣은 레이어를 오염시키지 않는다)
       state.timelineStatus = t('status.genga.layer.copied');
@@ -107944,6 +108000,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       if (!slices.length) return false;
       slices.sort(function(a, b) { return a.rel - b.rel; });
+      storageRootsChanged();
       gengaKomaClipboard = { span: (selE - selS + 1), komas: slices.map(function(k) { return { rel: k.rel, holdFrames: k.holdFrames, instanceValue: k.instanceValue, drawing: k.drawing }; }) };
       gengaClipTouch('koma'); // ver1396
       // mirror to the OS clipboard (marker + first drawn slice's bitmap)
