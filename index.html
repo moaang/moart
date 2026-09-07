@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2436</title>
+  <title>MoArt ver2437</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24387,6 +24387,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2437, items: [
+        { ja: '**同じコマに続けて描くときの始まりを軽くしました。**描き込みが多い絵でも、次のストロークが前の結果から'
+            + 'そのまま始まります（毎回の絵の組み立て直しをやめました）。',
+          ko: '**같은 코마에 이어 그릴 때의 시작을 가볍게 했습니다.** 그림이 많이 그려진 코마에서도 다음 획이 직전'
+            + ' 결과에서 그대로 시작됩니다(매번 그림을 다시 조립하던 것을 걷었습니다).',
+          en: '**Starting consecutive strokes on the same frame is lighter.** Even on a heavily drawn frame, the next stroke'
+            + ' starts directly from the previous result (the per-stroke reassembly of the drawing is gone).',
+          zh: '**让同一格上连续作画的起笔更轻了。**即使画面已经画得很满，下一笔也会直接从上一笔的结果开始'
+            + '（去掉了每笔重新拼装图像的步骤）。' } ] },
       { ver: 2436, items: [
         { ja: '**塗りつぶしの［隙間閉じ］を作り直しました。**線の切れ目を見つけて仮の線でつなぐ方式になり、細い枝や通路が'
             + '消えることも、狭い所で塗れずに止まることもなくなりました。つないだ隙間は塗った色で埋まります。また［参照］で'
@@ -101906,6 +101915,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gt = state.project.gengaTimeline;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       const frame = gengaCurrentFrame();
+      // ver2437 (occupancy q1=B · P1): **같은 코마에 잇는 획은 기존 칸을 다시 보지 않는다.** 직전 칸
+      // 커밋이 쥔 용지 캔버스가 이 코마의 최신 ref 와 일치하면 완비 검사·시드 합성·매 획 용지 할당
+      // 없이 그 픽셀에서 바로 시작한다. 벡터 레이어는 제외(픽셀이 정본이 아니다 — 스트로크 재렌더),
+      // 뜬 선택도 제외(아래 확정이 픽셀을 바꾼다).
+      const activeExp = gengaExposureAt(layer, frame);
+      const activeDr = gengaExposureDrawing(layer, activeExp);
+      const reuseActive = Boolean(gengaActiveCanvas && activeExp && activeDr && activeDr.ref
+        && gengaActiveCanvas.ref === activeDr.ref
+        && String(gengaActiveCanvas.layerId) === String(layer.id)
+        && String(gengaActiveCanvas.expId) === String(activeExp.id)
+        && gengaActiveCanvas.canvas.width === pw && gengaActiveCanvas.canvas.height === ph
+        && !gengaLayerDrawsVector(layer)
+        && !(gengaSelLifted(gengaSel) && String(gengaSel.layerId) === String(layer.id) && gengaSel.frame === frame));
       // ★ver2230: **그림이 준비되기 전에는 그리기를 시작하지 않는다.** ver2192 가 축출을 들이면서
       // 「그리기 진입은 gengaEnsureDrawingReady 가 막는다」고 적었는데 그 문이 리프트·전체선택·
       // 스탬프에만 걸려 있었다 — 펜·도형·버킷은 그냥 지나갔다. 축출된 그림은 시드가 **빈 캔버스**라
@@ -101914,7 +101936,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 획은 되감을 수 없으므로 retry 는 화면 갱신만 한다 — 그림이 돌아오면 다시 그으면 된다.
       // 그림이 돌아온 순간 안내를 거둔다 — 성공한 조작 뒤에 남은 안내는 거짓말이 된다(ver1162 가
       // 무장 안내에 세운 규칙과 같다). 그 순간이 곧 「다시 그을 수 있게 된」 때다.
-      if (!gengaEnsureDrawingReady(layer, frame, function() {
+      // ver2437: 재사용이면 이 문을 지나지 않는다 — 활성 캔버스가 픽셀 정본이라 store 의 디코드
+      // 상태(축출·이관 미완)와 무관하게 그릴 수 있다(축출된 코마의 「이어 긋기」는 오히려 이 길만 된다).
+      if (!reuseActive && !gengaEnsureDrawingReady(layer, frame, function() {
         if (state.timelineStatus === t('status.genga.drawing.notReady')) state.timelineStatus = '';
         drawGengaPreview(); renderGengaView();
       })) {
@@ -101924,8 +101948,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return;
       }
       const diagSeedT = paintDiagOn ? performance.now() : 0;
-      const cv = document.createElement('canvas'); cv.width = pw; cv.height = ph;
+      const cv = reuseActive ? gengaActiveCanvas.canvas : document.createElement('canvas');
+      if (!reuseActive) { cv.width = pw; cv.height = ph; }
       const c = cv.getContext('2d');
+      // ver2437: 세션이 이 캔버스를 소유하는 동안 활성 등록은 없다 — 커밋 성공(gengaCommitCanvas)만이
+      // 재등록한다. 커밋 없이 버려지는 획(핀치 확정 드롭 · 곡선 세션 드롭 · pointercancel)이 어느
+      // 자리에서 죽어도 다음 진입은 자연 미스 → 재조립이라, 드롭 경로 전수에 훅을 걸 필요가 없다.
+      gengaActiveCanvas = null;
+      if (reuseActive) {
+        // 재사용 ctx 에는 지난 세션의 상태가 남는다 — clip 은 아무 세션도 cv 에 안 건다(전수 grep,
+        // 거는 자리는 전부 save/restore 짝 + 다른 캔버스). 나머지는 명시로 되돌린다 — 아래
+        // applyPaintStrokeStyle 이 다시 세우는 값들의 상위집합이다.
+        c.setTransform(1, 0, 0, 1, 0, 0);
+        c.globalAlpha = 1; c.globalCompositeOperation = 'source-over';
+        c.filter = 'none'; c.shadowBlur = 0;
+        c.imageSmoothingEnabled = true;
+      }
       // bake any floating selection (lasso/transform) first — synchronous seed avoids the dataUrl-reload race.
       let seedCanvas = null;
       let seedRect = null;       // ver1196 (union-scan): the seed's footprint, captured HERE and nowhere else
@@ -101937,6 +101975,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       if (seedCanvas) {
         c.drawImage(seedCanvas, 0, 0);
+      } else if (reuseActive) {
+        seedRect = gengaDrawingSeedRect(activeDr, pw, ph); // ver1196 계약 그대로 — 스캔 창의 시드 상자(그림 메타만 읽는다)
       } else {
         const existingDr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
         seedRect = gengaDrawingSeedRect(existingDr, pw, ph); // ver1196: read BEFORE the seed draw, from the same drawing
@@ -103090,6 +103130,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaThumbBakeFromCommitCanvas(drawing.ref, cv, committedTs, layerId, frame);
       }
       gengaCommitDrawing(layerId, frame, drawing, label, selectionRider); // ver1314: 선택을 같은 undo 스텝에 태울 때만 전달
+      // ver2437 (occupancy q1=B · P1): 이 커밋의 용지 캔버스를 다음 획의 시작점으로 쥔다 — 칸 커밋만
+      // (통짜 폴백은 gengaLastStrokeCanvas 가 그 역할, 벡터 레이어는 픽셀이 정본이 아니다). expId 는
+      // 커밋이 코마를 «만든» 경우가 있어 지금 다시 읽는다. 그 밖의 결과(빈 그림·폴백)는 활성을 비운다 —
+      // 미스는 언제나 종전 재조립이라 비우는 쪽이 항상 안전하다.
+      const activeLayer = gengaLayerById(layerId);
+      const committedExp = activeLayer && gengaExposureAt(activeLayer, frame);
+      if (tiled && drawing && drawing.ref && committedExp && activeLayer && !gengaLayerDrawsVector(activeLayer)) {
+        gengaActiveCanvas = { layerId: layerId, expId: committedExp.id, ref: drawing.ref, canvas: cv };
+      } else {
+        gengaActiveCanvas = null;
+      }
       // ver2203 (q1=A): 여기 있던 ver2193 의 커밋 후 패치(gengaUpdateExpDom + drawGengaLayerThumbs)를
       // 걷었다 — 어느 경로에서든 재탕이었다. lean 커밋은 gengaCommitDrawing 안에서 같은 둘을 이미
       // 부르고, 코마 생성 커밋은 runCommand 풀 렌더가 시트째 다시 그린다. 칸 커밋의 썸은
@@ -103393,6 +103444,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaStamp = null; gengaStampPt = null; gengaStampDrag = null;
       gengaCamDrag = null; gengaExpDrag = null; gengaCelDrag = null;
       gengaLastStrokeCanvas = null;              // ★실측된 누수 — 이전 프로젝트의 용지 캔버스
+      gengaActiveCanvas = null;                  // ver2437: 같은 근거 — 활성 캔버스도 이전 프로젝트의 용지다
       gengaDrawSession = null;                   // 진행 중 스트로크(옛 레이어 대상)
       gengaFxLive = null;                        // 라이브 FX 미리보기 값(옛 레이어)
       gengaFxGizmoDrag = null;
@@ -103500,6 +103552,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     let gengaPointers = new Map(); // active TOUCH pointerId -> {x,y} (client px); 2+ → pinch (one input model: Pointer Events)
     let gengaPinch = null;     // two-finger pinch zoom+pan (iPad) — driven by gengaPointers via Pointer Events (not TouchEvents)
     let gengaLastStrokeCanvas = null; // { dataUrl, canvas } — last committed stroke, seeds the next stroke before its dataUrl decodes
+    // ver2437 (occupancy q1=B · P1): 마지막 «칸» 커밋의 용지 캔버스를 코마 열쇠와 함께 쥔다 — 다음 획이
+    // 같은 코마·같은 ref 면 칸 재조립(gengaDrawDrawingInto 의 N 칸 drawImage · 완비 검사 · 매 획 용지
+    // 할당 — 전부 기존 잉크 양에 비례) 없이 이 픽셀에서 바로 시작한다(3-A: 활성 그림의 정본은 이 캔버스다).
+    // 일치 판정이 곧 유효성이라 무효화 훅이 없다: undo·redo·변형·붙여넣기는 코마의 ref 를 바꾸고, 형제
+    // 코마(sharedDrawings 공유)는 expId 가 가르고, 용지 크기는 판정이 본다. 세션이 이 캔버스를 잡는 순간
+    // 비우고 커밋 성공만 재등록하므로 커밋 없이 버려진 획(핀치 드롭·취소)이 남을 길도 없다.
+    // 해제는 프로젝트 스왑 한 곳(gengaLastStrokeCanvas 와 같은 자리 — 그쪽의 누수 근거 그대로).
+    let gengaActiveCanvas = null; // { layerId, expId, ref, canvas }
     // ver751 (quad-only): identity quad = the bounds rect corners — "no transform pending".
     function gengaSelIdentityQuad(sel) {
       const b = sel.bounds;
