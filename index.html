@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2429</title>
+  <title>MoArt ver2430</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21967,8 +21967,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (cancelPendingPaintTransform()) return; // ver1283
       if (cancelPendingGengaTransform()) return; // ver1320: 원화도 같은 계약
       applyHistoryCommand('undo');
+      gengaKickTileEncodePump();   // ver2430: 되돌아온 그림이 대기 중(굽지 않은 prev)이면 펌프가 이제 그것을 참조 ref 로 굽는다
     }
-    function redo() { applyHistoryCommand('redo'); }
+    function redo() { applyHistoryCommand('redo'); gengaKickTileEncodePump(); }   // ver2430: undo 와 같은 이유
 
     // ver1725 (판정 q3=A): 두 히스토리(명령 스택 · 用紙 메모 스택)를 **한 줄로 세우는 눈금**.
     // 벽시계를 바닥으로 쓰되 단조 증가시킨다 — 같은 ms 안의 두 동작도 안 겹치고, 세션을 넘겨도
@@ -65041,6 +65042,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (c.idle.cells > 0) parts.push('└칸 ' + c.idle.cells + '개');
         c.idle.evict = (now.evict || 0) - (was.evict || 0);   // ver2429: 축출된 그림 수 — 예산에 닿았다는 신호
         if (c.idle.evict > 0) parts.push('└축출 ' + c.idle.evict + '장');
+        // ver2430: 보고 시점에 대기 중인 스냅(굽지 않은 이전 그림) — 연타에서 몇 장이 쌓였는지. 펌프가 값을 갱신한다.
+        if ((now.pendSnap || 0) > 0) parts.push('대기스냅 ' + now.pendSnap + '장 ' + (now.pendSnapMB || 0).toFixed(0) + 'MB');
         if (parts.length) return '(' + parts.join(' · ') + ')';
         return c.waitMs > 50 ? '(전부 0 — 이 목록 밖이다)' : '';
       })();
@@ -65186,7 +65189,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   evict 는 시간이 아니라 축출된 그림 수(gengaTrimDrawStore 의 반환값). 시드는 gengaPreviewPointerDown 이 직접 잰다.
     const paintDiagIdle = { thumb: 0, save: 0, bake: 0, encode: 0, comp: 0, undo: 0, hud: 0,
                             readback: 0, cut: 0, cells: 0,
-                            serialize: 0, pump: 0, thumbs: 0, render: 0, trim: 0, evict: 0 };
+                            serialize: 0, pump: 0, thumbs: 0, render: 0, trim: 0, evict: 0,
+                            pendSnap: 0, pendSnapMB: 0 };   // ver2430: 대기 스냅 수·MB — 펌프가 값을 대입한다(시간 아님)
     function paintDiagIdleSnapshot() {
       const out = {};
       Object.keys(paintDiagIdle).forEach(function(k) { out[k] = paintDiagIdle[k]; });
@@ -84176,9 +84180,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 조각 캔버스 → PNG Blob. ★실패는 null 이 아니라 예외 — null 은 「빈 칸」이라 그 자리의 그림이
     //   조용히 사라진다(옛 gengaTileEncodeCell 의 계약 그대로. 부르는 쪽이 잡아서 재시도·폴백한다).
     function gengaTileEncodeCanvas(t) {
+      // ver2430: **한 조각은 한 번만 굽는다.** 베이크가 자른 조각 캔버스는 이후 그림들이 cells 값으로 그대로
+      //   물려받는데(ver2216 이관), 묶음마다 인코드 루프가 각자 굽고 있었다 — 12 획 연타 뒤 자동저장 flush 에서
+      //   잘린 칸 2,014 개에 인코드 7,859 회(같은 계산 네 벌). 결과를 조각에 붙여 두면 뒤 묶음은 그대로 쓴다.
+      if (t._tileBlob) return t._tileBlob;
       const url = t.toDataURL('image/png');
       const blob = gengaDataUrlToBlob(url);
       if (!blob) throw new Error('tile encode produced no blob');
+      t._tileBlob = blob;
       return blob;
     }
     // 커밋된 통짜 캔버스 → 칸 묶음. `prev` 가 같은 격자의 칸 묶음이면 **안 닿은 칸을 그대로 물려받고**
@@ -84404,6 +84413,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 획이 쌓인 큐를 통째로 기다린다(iPad 실측 1.5 초 — R7). 연타 간격 ~120ms 보다 길고, 저장·스왑의
     // 동기 flush(gengaFlushTileEncodes)는 이 게이트를 안 지나므로 소실 창은 안 는다.
     const GENGA_BAKE_QUIET_MS = 350;
+    // ver2430 (q2=A): 잠잠의 기준은 **마지막 커밋 시각 한 벌**이다 — 종전에는 묶음마다 자기 `pendingBake.at`
+    //   을 봐서, 연타 중 오래된 prev 가 350ms 를 넘기는 순간 그 베이크(리드백)가 획 사이에 끼었다
+    //   (iPad 10 차: 빈 코마 12 획에 리드백 190~220ms 가 획마다 · 데스크톱 재현 8,944 칸).
+    let gengaBakeQuietAt = 0;
+    // ver2430: 대기 스냅(pendingBake.snap)의 총 픽셀 상한 — 용지 몇 벌분. 대체된 prev 는 undo 로 돌아올 때까지
+    //   굽지 않으므로 그 스냅이 연타 수만큼 상주한다(12 획에 138MB 실측). 상한을 넘으면 가장 오래된 prev 부터
+    //   펌프 태스크에서 굽는다(펜업에는 안 실린다). 3 은 실측 근거다 — 12 획 연타의 union 창이 용지 4 벌 상당
+    //   (8,944 칸)이었고, 그 안에서 굽기가 한 번 나는 크기.
+    const GENGA_PENDING_SNAP_MAX_PAPERS = 3;
+    // ver2430: 이 ref 가 지금 프로젝트에 참조되는가 — 대체된 prev(연타 중간 그림)는 어떤 저장본도 가리키지 않는
+    //   고아라(자동저장 JSON 은 최신 ref 만 담고 undo 스택은 저장하지 않는다) undo 로 돌아올 때까지 굽거나
+    //   저장할 이유가 없다. 순회는 있는 것(gengaFindDrawingByRef)을 재사용한다.
+    function gengaPendingRefReferenced(ref) { return Boolean(gengaFindDrawingByRef(ref)); }
+    function gengaKickTileEncodePump() {
+      if (gengaPendingTileEncode.size && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+    }
     // ver2365 (q1=A): 커밋이 미룬 칸 베이크 — 스냅에서 리드백 1회 + 빈 판정 + 칸 자르기.
     // 커밋의 동기 구간이 하던 픽셀 일 그대로다(gengaTileCutCell 재사용 — 판정식·memcpy 등가.
     // cv 자리에 스냅을 넘기지만 창이 칸 정렬이라 scanImg 경로만 탄다 — 창 밖 걸침 폴백은 도달
@@ -84489,22 +84514,32 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaTileEncodeTimer = 0;
       if (strokeInProgress()) { gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, GENGA_BG_STROKE_DEFER_MS); return; } // ver2298 (F2) · ver2326 (3-E): 판정은 정본 한 벌 — 콘티 획도 물리고, 곡선 pending(포인터 없음)은 무기한 미루지 않는다
       // ver2365 (q1=A): 베이크 대기가 있으면 그것부터, **태스크당 한 건만** — 리드백(GPU 동기화)이
-      // 태스크의 지배 비용이라 인코드 배치와 같은 태스크에 안 섞는다. 남은 일은 재예약이 잇고,
-      // 그래서 아래 인코드 루프에 오는 묶음에는 pendingBake 가 구조적으로 없다.
-      const bit = gengaPendingTileEncode.entries();
-      let bstep = bit.next();
-      while (!bstep.done) {
-        const bref = bstep.value[0], bts = bstep.value[1];
-        bstep = bit.next();
-        if (!bts.pendingBake) continue;
-        if (gengaDrawStore.get(bref) !== bts) { gengaPendingTileEncode.delete(bref); continue; }   // 스왑·prune·재커밋 — 펌프의 정리 짝
+      // 태스크의 지배 비용이라 인코드 배치와 같은 태스크에 안 섞는다. 남은 일은 재예약이 잇는다.
+      // ver2430 (q2=A): **참조하는 ref 만 굽는다.** 대체된 prev(연타 중간 그림)는 undo 로 돌아올 때까지
+      //   대기에 남긴다 — 그 베이크·인코드·gd: 행은 undo 없이는 아무도 안 읽는 일이었다(정본
+      //   genga_pending_shared_tiles_design_2026-09-07.md 4-A). 잠잠은 마지막 커밋 기준 한 벌(gengaBakeQuietAt).
+      //   대기 스냅의 총 픽셀이 상한을 넘으면 가장 오래된 prev 부터 즉시 굽는다(메모리 그물).
+      let bakeRef = '', bakeTs = null, oldestRef = '', oldestTs = null, snapPx = 0, snapN = 0, paperPx = 0;
+      gengaPendingTileEncode.forEach(function(ts, ref) {
+        if (!ts.pendingBake) return;
+        if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); return; }   // 스왑·prune·재커밋 — 펌프의 정리 짝
+        snapN += 1; snapPx += ts.pendingBake.snap.width * ts.pendingBake.snap.height;
+        if (!paperPx) paperPx = Math.max(1, ts.pw) * Math.max(1, ts.ph);
+        if (gengaPendingRefReferenced(ref)) { if (!bakeTs) { bakeRef = ref; bakeTs = ts; } }
+        else if (!oldestTs || (Number(ts.pendingBake.at) || 0) < (Number(oldestTs.pendingBake.at) || 0)) { oldestRef = ref; oldestTs = ts; }
+      });
+      paintDiagIdle.pendSnap = snapN; paintDiagIdle.pendSnapMB = snapPx * 4 / 1048576;   // 진단 줄의 「대기스냅」 — 켜짐과 무관한 값 대입
+      if (oldestTs && snapPx > paperPx * GENGA_PENDING_SNAP_MAX_PAPERS) { bakeRef = oldestRef; bakeTs = oldestTs; }   // 상한 그물 — 잠잠을 안 기다린다
+      else if (bakeTs) {
         // ver2425: 잠잠 게이트. 다음 커밋이 더는 동기 베이크를 강제하지 않으므로(inheritBake) 미루는 것이
         //   펜업으로 옮겨가지 않는다 — 종전에는 그래서 미룰 수가 없었다.
-        const quietLeft = GENGA_BAKE_QUIET_MS - (performance.now() - (Number(bts.pendingBake.at) || 0));
+        const quietLeft = GENGA_BAKE_QUIET_MS - (performance.now() - gengaBakeQuietAt);
         if (quietLeft > 0) { gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, quietLeft); return; }
-        if (!gengaTileSetBakePending(bts) && bts.pendingBake.failures >= LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) {
-          gengaPendingTileEncode.delete(bref);
-          console.error('[gengaTile] giving up deferred bake for ' + bref + ' - the snapshot keeps it visible and file export stays correct, but the gd: row will not be written');
+      }
+      if (bakeTs) {
+        if (!gengaTileSetBakePending(bakeTs) && bakeTs.pendingBake.failures >= LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) {
+          gengaPendingTileEncode.delete(bakeRef);
+          console.error('[gengaTile] giving up deferred bake for ' + bakeRef + ' - the snapshot keeps it visible and file export stays correct, but the gd: row will not be written');
         }
         gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
         return;
@@ -84519,6 +84554,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 프로젝트 스왑·prune·tlTut 복귀로 store 에서 밀려난 묶음은 확정할 이유가 없다 —
         // 디스크에 쓰면 고아 행만 는다. 여기서 조용히 내리는 것이 그 경로들의 정리 짝이다.
         if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); continue; }
+        if (ts.pendingBake) continue;   // ver2430: 대기 중인 prev(참조 없음) — 인코드·persist 하지 않는다(획이 빠진 부분 그림이 된다)
         const r = gengaEncodeTileCells(ts, budget, deadline);   // ver2395: 시간 예산
         budget -= Math.max(1, r.done);
         if (r.failed) {
@@ -84532,7 +84568,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (gengaTileCellsAllBlob(ts)) { gengaPendingTileEncode.delete(ref); gengaPersistTileSet(ref, ts); }
         if (performance.now() >= deadline) break;   // ver2395: 시간이 다 됐으면 다음 태스크로
       }
-      if (gengaPendingTileEncode.size && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+      // ver2430: 참조 없는 대기 prev 만 남았으면 재예약하지 않는다(0ms 재예약 루프가 된다) — undo/redo 가
+      //   그 ref 를 다시 참조하는 순간 gengaKickTileEncodePump 가 깨운다.
+      let more = false;
+      gengaPendingTileEncode.forEach(function(ts, ref) { if (!ts.pendingBake || gengaPendingRefReferenced(ref)) more = true; });
+      if (more && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
     }
     // 동기 flush — 저장·프로젝트 스왑 직전의 마지막 확정. gengaFlushPendingDrawingEncodes 가 부른다.
     function gengaFlushTileEncodes() {
@@ -84543,6 +84583,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       entries.forEach(function(kv) {
         const ref = kv[0], ts = kv[1];
         if (gengaDrawStore.get(ref) !== ts) return;
+        // ver2430: 참조 없는 대기 prev 는 확정하지 않고 대기에 되돌린다 — 저장본이 안 가리키는 그림이라
+        //   여기서 굽는 것은 자동저장·스왑 앞의 동기 벽(데스크톱 재현 5 초)만 만든다. undo 로 돌아오면
+        //   참조 ref 가 되어 다음 flush·펌프가 확정한다. 스왑 뒤 고아는 펌프의 store 대조가 내린다.
+        if (!gengaPendingRefReferenced(ref)) { gengaPendingTileEncode.set(ref, ts); return; }   // 베이크 대기든 인코드 대기든 — 참조 없으면 동기 벽에 안 싣는다(펌프가 idle 에서 잇는다)
         // ver2365: 베이크 대기분을 먼저 확정한다 — 안 하면 물려받은 칸이 전부 Blob 인 묶음이
         // 「완비」로 보여 **획이 빠진 부분 그림**이 gd: 에 박힌다. 실패하면 재등록하고 안 적는다
         // (부분 그림을 적느니 종전 그림이 낫다 — ver1448 계약).
@@ -84555,6 +84599,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts);
         else console.error('[gengaTile] flush left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
       });
+      // ver2430: 참조 없는 묶음을 대기에 되돌렸으면 펌프가 idle 에서 잇는다 — 위에서 타이머를 지웠으므로 여기서
+      //   안 깨우면 undo 가 올 때까지 잠든다(첫 실측에서 정착 대기 6 이 60 초 동안 안 줄었다).
+      gengaKickTileEncodePump();
     }
     // ── ver2428: 여기 있던 재수화 펌프(ver2216 — 이관이 비운 base 의 decoded 를 커밋 밖에서 도로 채우던
     // gengaScheduleTileRehydrate / gengaTileRehydratePump)는 걷었다. 획마다 직전 그림 전체를 재디코드하고
@@ -84661,6 +84708,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // persist 하면 획이 빠진 부분 그림이 gd: 에 박힌다. 펌프(베이크 선행)로 보낸다.
       if (!ts.pendingBake && gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts);   // 물려받기만으로 끝난 묶음(전 칸이 이미 Blob)
       else gengaScheduleTileEncode(ref, ts);
+      if (ts.pendingBake) gengaBakeQuietAt = performance.now();   // ver2430: 잠잠의 기준은 마지막 커밋 한 벌
       gengaTrimDrawStore(ref);
       // ★그림 객체에 「칸이다」 표시를 **넣지 않는다.** 저장 직전의 화이트리스트(gengaIngestDrawing)가
       //   모르는 필드를 조용히 버리므로 넣어도 죽은 필드가 되고, 애초에 필요가 없다 — 칸인지는
