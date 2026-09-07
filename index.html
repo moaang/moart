@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2441</title>
+  <title>MoArt ver2442</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -54553,6 +54553,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const savedAt = new Date().toISOString();
       const title = String(state.project && state.project.title || '');
       const kind = state.project && state.project.kind === 'genga' ? 'genga' : 'conte';
+      // ver2440: 이번 게시에서 «디스크에 못 들어간» 그림 수. 0 이 아니면 아래에서 저장 상태를
+      // **실패로** 표시한다 — payload 는 그대로 쓴다(같은 판의 다른 편집까지 잃을 이유가 없다)
+      // 대신 「저장됨」이라고 말하지 않는다. 그 표시가 거짓이면 사용자는 지금 닫아도 된다고 믿는다.
+      let unsavedDrawings = 0;
       if (!syncWall) {
         const failedRefs = await gengaAwaitDeltaDurability();
         failedRefs.forEach(function(ref) {
@@ -54560,10 +54564,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (!gengaIsDrawDelta(v) || !gengaPendingRefReferenced(ref)) return;   // 그새 붕괴됐거나 참조 밖 — 소실 축이 아니다
           console.warn('[gengaDelta] durability barrier falling back to a sync collapse for ' + ref);
           const collapsed = gengaCollapseDeltaChainSync(ref);
-          if (!collapsed) return;   // 실패 로그는 collapse 가 남겼다 — delta 는 살아 있고 다음 저장이 재시도한다
+          if (!collapsed) { unsavedDrawings += 1; return; }   // 실패 로그는 collapse 가 남겼다 — delta 는 살아 있고 다음 저장이 재시도한다
           gengaEncodeTileCells(collapsed, Infinity);
           if (gengaTileCellsAllBlob(collapsed)) gengaPersistTileSet(ref, collapsed, true);   // 배리어는 이미 지났다 — 메인 FIFO 로 게시보다 먼저 커밋시킨다
-          else console.error('[gengaDelta] fallback collapse left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
+          else {
+            unsavedDrawings += 1;
+            console.error('[gengaDelta] fallback collapse left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
+          }
         });
       }
       await putWorkspaceDbValue(indexedDbProjectPayloadKey(id), payload);
@@ -54589,7 +54596,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       await saveIndexedDbProjectIndex({ slots: slots, lastActiveId: id });
       await maybePushProjectVersion(id, payload, savedAt); // ver902: feed the per-project rollback ring
-      state.indexedDbAutosaveStatus = indexedDbAutosaveRecordLabel({ savedAt: savedAt, title: title, bytes: payload.length });
+      // ver2440: 그림이 하나라도 디스크에 못 들어갔으면 「저장됨」이라 적지 않는다(조용한 실패 금지 —
+      // trackPersistFailure 와 같은 채널·같은 문구 틀). 다음 자동저장이 재시도하고, 성공하면 이 줄이
+      // 정상 라벨로 돌아간다.
+      state.indexedDbAutosaveStatus = unsavedDrawings
+        ? t('msg.workspace.saveFailed', unsavedDrawings + ' drawing(s) not written to disk')
+        : indexedDbAutosaveRecordLabel({ savedAt: savedAt, title: title, bytes: payload.length });
       updatePrefsUI();
       renderProjectTabBar();
       return true;
@@ -54921,6 +54933,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (parsed) gengaAddProjectRefs(parsed, drawRefs, audioRefs);   // ④⑤
         else unknown += 1;
         if (onProgress) onProgress(i + 1, payloadKeys.length);
+      }
+      // ⑥ ver2440: **변경분 행(gdd:)의 base 도 참조다.** 프로젝트·이력은 최신 ref 만 가리키는데 그 ref 가
+      // 아직 delta 면, 리로드 복원(gengaRestoreDeltaChain)이 직전 그림의 gd: 행을 읽어야 한다 — 폐포로
+      // 따라가지 않으면 sweep 이 그 필수 조각을 「미사용」으로 지워 **다음에 열 때 빈 코마**가 된다
+      // (undo 스택이 잡아 주는 것은 같은 세션뿐이고, 이력 없는 저장본에는 아무도 없다).
+      // 못 읽은 행은 「참조 없음」이 아니라 **모른다**로 센다 — 이 함수의 다른 실패와 같은 등급이다.
+      const gddRefs = new Set();
+      keys.forEach(function(k) { if (storageKeyBucket(k) === 'gdd') gddRefs.add(k.slice(4)); });
+      let deltaFrontier = Array.from(drawRefs).filter(function(r) { return gddRefs.has(r); });
+      const deltaSeen = new Set(deltaFrontier);
+      let deltaGuard = GENGA_DELTA_CHAIN_MAX + 2;
+      while (deltaFrontier.length && deltaGuard-- > 0) {
+        const next = [];
+        for (let i = 0; i < deltaFrontier.length; i += 1) {
+          let head = null;
+          try {
+            const row = await getWorkspaceDbValue('gdd:' + deltaFrontier[i]);
+            if (row != null) head = await gengaDeltaFromBlob(row);   // 행이 사라졌으면(붕괴가 방금 지웠다) 파서를 부르지 않는다 — 아래 unknown 이 그 몫이다
+          }
+          catch (error) { console.error('[storage] delta row read failed for gdd:' + deltaFrontier[i], error); }
+          if (!head || !head.base) { unknown += 1; continue; }
+          drawRefs.add(head.base);
+          if (gddRefs.has(head.base) && !deltaSeen.has(head.base)) { deltaSeen.add(head.base); next.push(head.base); }
+        }
+        deltaFrontier = next;
       }
       return { keys: keys, drawRefs: drawRefs, audioRefs: audioRefs, conteAudioAlive: conteAudioAlive,
                unknown: unknown + liveTextUnknown, payloadCount: payloadKeys.length };
@@ -84454,6 +84491,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return Promise.all(waits).then(function(list) { return list.filter(Boolean); });
     }
     async function gengaDeltaFromBlob(b) {
+      if (!b || typeof Blob === 'undefined' || !(b instanceof Blob)) {   // 행 없음·다른 모양 — 부르는 쪽의 「모른다」이지 컨테이너 파손이 아니다(gengaBlobIsTileSet 과 같은 가드)
+        console.warn('[gengaDelta] delta row is missing or not a Blob - the caller treats this as unknown');
+        return null;
+      }
       let buf = null;
       try { buf = new Uint8Array(await gengaBlobToArrayBuffer(b)); } catch (e) {
         console.error('[gengaDelta] delta container read failed', e); return null;
@@ -84475,10 +84516,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         x: Number(head.x), y: Number(head.y), w: Number(head.w), h: Number(head.h),
         png: b.slice(nl + 1, b.size, 'image/png') };
     }
+    // 같은 ref 로 겹쳐 들어오는 복원을 하나로 합친다(hydrate 의 일괄 복원과 화면 소비처의 fault-in 이
+    // 같은 ref 를 동시에 요구한다 — 실측에서 리로드 1 회에 2 벌이 돌았다). fault-in 의
+    // `gengaDrawStoreFaults` 와 같은 무늬. 두 소비처가 같은 ts 를 받아 각자 put 해도 무해하다
+    // (gengaDrawStorePut 은 같은 값이면 재계상만 한다).
+    const gengaDeltaRestores = new Map();   // ref → 복원 프라미스
+    function gengaRestoreDeltaChain(ref) {
+      const inflight = gengaDeltaRestores.get(ref);
+      if (inflight) return inflight;
+      const job = gengaRestoreDeltaChainRun(ref).then(function(ts) {
+        gengaDeltaRestores.delete(ref); return ts;
+      }, function(err) {
+        gengaDeltaRestores.delete(ref); throw err;
+      });
+      gengaDeltaRestores.set(ref, job);
+      return job;
+    }
     // gd: 행이 없는 ref 를 gdd: 사슬로 복원한다 — 뿌리(gd: 완전체·통짜)까지 내려가 변경분을 위로
     // 얹고 칸 묶음으로 굽는다. O(사슬 깊이 ≤ GENGA_DELTA_CHAIN_MAX) — 리로드·fault-in 1회의 몫이다.
     // 반환: GengaTileSet(store 등록·인코드 예약은 부르는 쪽) · null(실패 — 로그는 여기서 남긴다).
-    async function gengaRestoreDeltaChain(ref) {
+    async function gengaRestoreDeltaChainRun(ref) {
       const chain = [];
       let cur = ref;
       let baseTs = null, baseWhole = null;
@@ -84539,7 +84596,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           else res(null);
         });
         if (!bm) { console.error('[gengaDelta] restore: delta png decode failed on the chain of ' + ref); return null; }
-        cx.drawImage(bm, d.sx, d.sy);   // 스냅은 그 창의 완성 픽셀이다 — pendingBake 의 blit 계약(ver2365)과 같은 무늬
+        // ★창은 **교체**다 — 스냅은 그 창의 «완성» 픽셀이라 아래가 비치면 안 된다. source-over 로
+        //   얹으면 창 안의 반투명 픽셀(붓 불투명도·AA 가장자리)이 base 와 이중 합성돼 진해진다
+        //   — 획이 지나지 않은 자리까지 창 전체가 그렇다. ver2440 초판이 이 자리를 「pendingBake 의
+        //   blit 과 같은 무늬」라고 적었는데 **틀린 근거**였다: 그쪽은 물려받은 칸과 창이 정확히
+        //   배타(gengaTileSetComposeCanvas 의 ver2365 주석)라 순서가 무관한 것이고, 여기는 base 전체를
+        //   깐 «위»라 배타가 아니다. 붕괴 경로(gengaCollapseDeltaOnce)가 창 칸을 cells 에 **교체**로
+        //   넣는 것과 같은 계약으로 맞춘다. 재현: 불투명도 0.5 획 위에 delta 획 → 복원본의 알파 합
+        //   +25.5%(잉크 픽셀 «수»는 정확히 일치 — 그 지표로는 안 잡힌다).
+        cx.clearRect(d.sx, d.sy, bm.width, bm.height);
+        cx.drawImage(bm, d.sx, d.sy);
         if (typeof bm.close === 'function') bm.close();
       }
       const ts = gengaTileSetFromCanvas(cv, null, null, false);
