@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2439</title>
+  <title>MoArt ver2440</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -54530,15 +54530,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver1256: the write itself, unconditional — split out of saveProjectToIndexedDbAutosave (right below,
     // which still gates on the passive-autosave toggle) so the project-tab-bar switch handler can force a
     // save point on every tab click regardless of that toggle (see snapshotCurrentProjectForTabSwitch).
-    async function writeProjectToIndexedDbSlot() {
+    async function writeProjectToIndexedDbSlot(opts) {
       const id = ensureCurrentProjectId();
       // autosave keeps genga drawings as refs (light); the base64 is already in IndexedDB under 'gd:<ref>'
       // — ver1324: "already" is now a promise the deferred encode must keep, so settle any stragglers first.
-      gengaFlushPendingDrawingEncodes();
+      // ver2440 (P3): delta 는 동기 붕괴 대신 변경분 행(gdd:)으로 — flush(동기)와 직렬화(동기)가 같은
+      // 태스크에서 ref 집합을 고정하고, 게시(payload put)는 그 변경분 쓰기를 기다린 뒤에 한다(3-C 의
+      // 「변경분을 먼저 내구성 있게, 그 뒤 프로젝트 세대를 게시」). await 중에 커밋된 새 획은 새 ref 라
+      // 이 payload 밖이다. opts.syncWall(pagehide 계열 — async 를 기다릴 수 없는 마지막 저장 기회)은
+      // 종전 그대로 동기 붕괴다.
+      const syncWall = Boolean(opts && opts.syncWall);
+      gengaFlushPendingDrawingEncodes(syncWall ? null : { deltaAsync: true });
       const payload = serializedProjectJson({ portable: false });
       const savedAt = new Date().toISOString();
       const title = String(state.project && state.project.title || '');
       const kind = state.project && state.project.kind === 'genga' ? 'genga' : 'conte';
+      if (!syncWall) {
+        const failedRefs = await gengaAwaitDeltaDurability();
+        failedRefs.forEach(function(ref) {
+          const v = gengaDrawStore.get(ref);
+          if (!gengaIsDrawDelta(v) || !gengaPendingRefReferenced(ref)) return;   // 그새 붕괴됐거나 참조 밖 — 소실 축이 아니다
+          console.warn('[gengaDelta] durability barrier falling back to a sync collapse for ' + ref);
+          const collapsed = gengaCollapseDeltaChainSync(ref);
+          if (!collapsed) return;   // 실패 로그는 collapse 가 남겼다 — delta 는 살아 있고 다음 저장이 재시도한다
+          gengaEncodeTileCells(collapsed, Infinity);
+          if (gengaTileCellsAllBlob(collapsed)) gengaPersistTileSet(ref, collapsed, true);   // 배리어는 이미 지났다 — 메인 FIFO 로 게시보다 먼저 커밋시킨다
+          else console.error('[gengaDelta] fallback collapse left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
+        });
+      }
       await putWorkspaceDbValue(indexedDbProjectPayloadKey(id), payload);
       const index = await loadIndexedDbProjectIndex();
       const slots = index.slots.filter(function(slot) { return slot.id !== id; });
@@ -54567,9 +54586,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       renderProjectTabBar();
       return true;
     }
-    async function saveProjectToIndexedDbAutosave() {
+    async function saveProjectToIndexedDbAutosave(opts) {
       if (!indexedDbAutosaveEnabled(state.project)) return false;
-      return writeProjectToIndexedDbSlot();
+      return writeProjectToIndexedDbSlot(opts);
     }
     // ver1256: forces the save point the project-tab-bar's "no confirm dialog" premise depends on — a tab
     // click is a deliberate switch, not the passive background autosave the toggle above governs (which
@@ -54769,6 +54788,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (k.indexOf(INDEXED_DB_PROJECT_VERSION_INDEX_PREFIX) === 0) return 'versionIndex';
       if (k.indexOf(INDEXED_DB_PROJECT_VERSION_PREFIX) === 0) return 'version';
       if (k.indexOf(INDEXED_DB_PROJECT_PAYLOAD_PREFIX) === 0) return 'project';
+      if (k.indexOf('gdd:') === 0) return 'gdd'; // ver2440: 원화 delta 변경분 행 — 본체와 같은 참조 판정으로 sweep 이 거둔다('gd:' 와는 세 번째 글자가 달라 아래에 안 걸리지만, 읽는 순서를 위해 먼저 둔다)
       if (k.indexOf('gd:') === 0) return 'gd';
       if (k.indexOf('gt:') === 0) return 'gt';   // ver2197: 원화 코마 썸(파생물) — 본체와 같은 참조 판정으로 sweep 이 거둔다
       if (k.indexOf('ga:') === 0) return 'ga';
@@ -54793,7 +54813,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // 싼 조사: **값을 안 읽는다**(키 목록 + 이미 세어져 있는 바이트만). base64 를 메모리에 안 올린다.
     async function storageUsageSnapshot() {
-      const out = { available: true, estimate: null, counts: { gd: 0, gt: 0, ga: 0, bt: 0, conteAudio: 0, project: 0, version: 0, versionIndex: 0, other: 0 },
+      const out = { available: true, estimate: null, counts: { gd: 0, gdd: 0, gt: 0, ga: 0, bt: 0, conteAudio: 0, project: 0, version: 0, versionIndex: 0, other: 0 },
                     slotCount: 0, slotBytes: 0, versionBytes: 0, undoPinned: 0 };
       if (!indexedDbAvailable()) { out.available = false; return out; }
       out.estimate = await storageEstimateSafe();
@@ -54911,6 +54931,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const b = storageKeyBucket(k);
         let referenced;
         if (b === 'gd' || b === 'gt') referenced = live.drawRefs.has(k.slice(3));   // ver2197: 썸은 본체와 같은 운명
+        else if (b === 'gdd') referenced = live.drawRefs.has(k.slice(4));           // ver2440: 변경분 행도 본체와 같은 운명 — 확정된 것은 persist 가 이미 지웠고, 남은 것은 참조가 말한다
         else if (b === 'ga') referenced = live.audioRefs.has(k.slice(3));
         // ver1469: 콘티 음성은 clipId 가 root 텍스트 어디엔가 나타나는가로 판정한다(storageLiveRefsScan
         // 의 주석 참고 — 형태를 열거하지 않는다). `conteAudioAlive` 가 없으면(옛 호출부) 전부 살아 있는
@@ -55079,7 +55100,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         t('settings.storage.rows', snap.slotCount) + ' / ' + bytesLabel(snap.slotBytes)));
       rows.appendChild(storageUsageRow(t('settings.storage.row.versions'),
         t('settings.storage.rows', snap.counts.version) + ' / ' + bytesLabel(snap.versionBytes)));
-      rows.appendChild(storageUsageRow(t('settings.storage.row.gengaDraw'), t('settings.storage.rows', snap.counts.gd)));
+      rows.appendChild(storageUsageRow(t('settings.storage.row.gengaDraw'), t('settings.storage.rows', snap.counts.gd + snap.counts.gdd)));   // ver2440: 변경분 행(gdd:)도 그림 행이다 — 따로 세면 사용자가 「모르는 행」을 본다
       if (snap.counts.gt) rows.appendChild(storageUsageRow(t('settings.storage.row.gengaThumb'), t('settings.storage.rows', snap.counts.gt)));
       if (snap.counts.ga) rows.appendChild(storageUsageRow(t('settings.storage.row.gengaAudio'), t('settings.storage.rows', snap.counts.ga)));
       if (snap.counts.conteAudio) rows.appendChild(storageUsageRow(t('settings.storage.row.conteAudio'), t('settings.storage.rows', snap.counts.conteAudio)));
@@ -55104,7 +55125,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const status = document.getElementById('memoryUsageStatus');
       if (!rows) return;
       let storeBytes = 0;
-      gengaDrawStore.forEach(function(v) { storeBytes += gengaDrawStoreEntryBytes(v); });
+      // ver2440: 대조도 장부와 같은 「유니크 Blob」 규칙으로 — 계산 방식만 다르다(전수 순회 + Set).
+      // 명목 전수 합산(gengaDrawStoreEntryBytes)으로 재면 cells 구조 공유 몫만큼 늘 어긋나 warn 이 상시 점등된다.
+      const seenCellBlobs = new Set();
+      gengaDrawStore.forEach(function(v) {
+        if (gengaIsTileSet(v)) {
+          storeBytes += gengaTileSetOwnBytes(v);
+          v.cells.forEach(function(b) { if (b && typeof b.size === 'number' && !seenCellBlobs.has(b)) { seenCellBlobs.add(b); storeBytes += b.size; } });
+        } else storeBytes += gengaDrawStoreEntryBytes(v);
+      });
       // ver2215: 이 전수 합산이 증분 총량(gengaDrawStoreTotal)의 독립 대조 계통이다 — 어긋나면
       // 어느 뮤테이션 자리가 장부를 안 지난 것. 조용히 굴러가지 않게 warn 하고 재동기화한다.
       if (storeBytes !== gengaDrawStoreTotal) {
@@ -55527,7 +55556,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!state.indexedDbAutosaveTimer) return;
       clearTimeout(state.indexedDbAutosaveTimer);
       state.indexedDbAutosaveTimer = 0;
-      saveProjectToIndexedDbAutosave().catch(function(error) {
+      // ver2440: 마지막 저장 기회 — 페이지가 죽기 전이라 게시 배리어(await)를 기다릴 수 없다.
+      // 종전 그대로 동기 붕괴로 확정까지 마친다(입력 중이 아니므로 벽이 서도 잃는 것이 없다).
+      saveProjectToIndexedDbAutosave({ syncWall: true }).catch(function(error) {
         state.indexedDbAutosaveStatus = t('msg.workspace.saveFailed', error && error.message ? error.message : error);
         updatePrefsUI();
       });
@@ -83970,15 +84001,52 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // set/delete 는 총량 드리프트다. 안전망: 메모리 패널(renderMemoryUsage)이 열려 있는 동안
     // 전수 합산과 대조해 어긋나면 warn + gengaDrawStoreResyncWeights 로 재동기화한다.
     let gengaDrawStoreTotal = 0;
-    const gengaTileSetWeightLedger = new WeakMap(); // 칸 묶음 값 → 마지막 계상 bytes
+    // ver2440: cells 의 Blob 은 커밋·붕괴가 **구조 공유**한다(ver2193 물려받기 · ver2438 붕괴) — 같은
+    // Blob 을 든 묶음이 undo 사슬에 여럿 남아도 실제 상주는 한 벌이다. 명목 전수 합산으로 Total 을
+    // 재면 그 겹침만큼 부풀어(ver2438 실측 세트 끝 +38MB) 조기 축출을 부른다. 그래서 Total 의 Blob
+    // 몫은 「유니크 Blob 합」이다: gengaTileBlobShare 가 참조 수를 들고 **0→1 만 가산 · 1→0 만 차감**.
+    // 장부(WeakMap)에는 Blob 몫을 뺀 «자기 몫»(decoded·썸·베이크 스냅 — gengaTileSetOwnBytes)만 둔다 —
+    // store 재류 중 변하는 것이 그 몫뿐이라 reweigh 는 그 diff 다. 인코드 확정(캔버스 조각 → 새 Blob)
+    // 은 set 하는 두 자리(gengaEncodeTileCells · gengaTileSetToBlob 그물)가 gengaTileSetCellBlobSettled
+    // 로 직접 가산한다. 안전망은 종전 그대로 메모리 패널의 독립 전수 대조(renderMemoryUsage — 같은
+    // 유니크 규칙, 다른 계산 방식) + resync 다.
+    // 칸 묶음 값 → 마지막 계상 «자기 몫» bytes (cells Blob 몫 제외). delta 값 → put 시점 계상액 —
+    // 붕괴·회수가 스냅을 반납(0×0)·null 로 만든 «뒤» drop 이 와도 갱신 전 무게가 그대로 차감되게
+    // (안 그러면 delta 마다 스냅 픽셀 × 4 가 Total 에 유령으로 남는다 — ver2438 부터의 결함,
+    // ver2440 의 독립 대조 계통이 잡았다).
+    const gengaDrawWeightLedger = new WeakMap();
+    const gengaTileBlobShare = new Map();           // cells Blob → store 재류 묶음의 참조 수
+    function gengaTileBlobShareAdd(b) {
+      const n = gengaTileBlobShare.get(b) || 0;
+      gengaTileBlobShare.set(b, n + 1);
+      if (!n) gengaDrawStoreTotal += b.size;
+    }
+    function gengaTileBlobShareDrop(b) {
+      const n = gengaTileBlobShare.get(b) || 0;
+      if (n <= 1) { gengaTileBlobShare.delete(b); if (n === 1) gengaDrawStoreTotal -= b.size; }
+      else gengaTileBlobShare.set(b, n - 1);
+    }
+    // 인코드 확정의 짝 — 캔버스 조각을 새 Blob 으로 cells 에 set 한 «그 자리»가 부른다.
+    // store 밖(장부 미스 — 구축 중) 묶음이면 no-op: put 이 들어올 때 현재 집합을 전부 계상한다.
+    function gengaTileSetCellBlobSettled(ts, b) {
+      if (!gengaDrawWeightLedger.has(ts)) return;
+      gengaTileBlobShareAdd(b);
+    }
     function gengaDrawStorePut(ref, v) {
       const old = gengaDrawStore.get(ref);
       if (old === v) { gengaDrawStoreReweighValue(v); return; }
       if (old !== undefined) gengaDrawStoreUntrackValue(old);
       gengaDrawStore.set(ref, v);
-      const w = gengaDrawStoreEntryBytes(v);
-      gengaDrawStoreTotal += w;
-      if (gengaIsTileSet(v)) gengaTileSetWeightLedger.set(v, w);
+      if (gengaIsTileSet(v)) {
+        const own = gengaTileSetOwnBytes(v);
+        gengaDrawStoreTotal += own;
+        gengaDrawWeightLedger.set(v, own);
+        v.cells.forEach(function(b) { if (b && typeof b.size === 'number') gengaTileBlobShareAdd(b); });
+      } else {
+        const w = gengaDrawStoreEntryBytes(v);
+        gengaDrawStoreTotal += w;
+        if (gengaIsDrawDelta(v)) gengaDrawWeightLedger.set(v, w);   // 스냅 반납 뒤의 drop 대비 — 장부 서두 주석
+      }
     }
     function gengaDrawStoreDrop(ref) {
       const old = gengaDrawStore.get(ref);
@@ -83988,26 +84056,40 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function gengaDrawStoreUntrackValue(v) {
       if (gengaIsTileSet(v)) {
-        const w = gengaTileSetWeightLedger.get(v);
+        const own = gengaDrawWeightLedger.get(v);
+        gengaDrawStoreTotal -= (own != null ? own : gengaTileSetOwnBytes(v));
+        gengaDrawWeightLedger.delete(v);
+        v.cells.forEach(function(b) { if (b && typeof b.size === 'number') gengaTileBlobShareDrop(b); });
+      } else if (gengaIsDrawDelta(v)) {
+        const w = gengaDrawWeightLedger.get(v);
         gengaDrawStoreTotal -= (w != null ? w : gengaDrawStoreEntryBytes(v));
-        gengaTileSetWeightLedger.delete(v);
+        gengaDrawWeightLedger.delete(v);
       } else gengaDrawStoreTotal -= gengaDrawStoreEntryBytes(v);
     }
-    // 칸 묶음의 무게가 store 재류 중에 변하는 자리가 부른다. 장부 미스(store 밖)면 no-op.
+    // 칸 묶음의 «자기 몫» 무게가 store 재류 중에 변하는 자리가 부른다(디코드 채움·썸 부착·회수).
+    // 장부 미스(store 밖)면 no-op. cells Blob 의 증감은 여기 없다 — put/drop/CellBlobSettled 의 몫이다.
     function gengaDrawStoreReweighValue(v) {
       if (!gengaIsTileSet(v)) return;
-      const w0 = gengaTileSetWeightLedger.get(v);
+      const w0 = gengaDrawWeightLedger.get(v);
       if (w0 == null) return;
-      const w = gengaDrawStoreEntryBytes(v);
+      const w = gengaTileSetOwnBytes(v);
       gengaDrawStoreTotal += w - w0;
-      gengaTileSetWeightLedger.set(v, w);
+      gengaDrawWeightLedger.set(v, w);
     }
     function gengaDrawStoreResyncWeights() {
       gengaDrawStoreTotal = 0;
+      gengaTileBlobShare.clear();
       gengaDrawStore.forEach(function(v) {
-        const w = gengaDrawStoreEntryBytes(v);
-        gengaDrawStoreTotal += w;
-        if (gengaIsTileSet(v)) gengaTileSetWeightLedger.set(v, w);
+        if (gengaIsTileSet(v)) {
+          const own = gengaTileSetOwnBytes(v);
+          gengaDrawStoreTotal += own;
+          gengaDrawWeightLedger.set(v, own);
+          v.cells.forEach(function(b) { if (b && typeof b.size === 'number') gengaTileBlobShareAdd(b); });
+        } else {
+          const w = gengaDrawStoreEntryBytes(v);
+          gengaDrawStoreTotal += w;
+          if (gengaIsDrawDelta(v)) gengaDrawWeightLedger.set(v, w);
+        }
       });
     }
     let gengaDrawRefSeq = 0;
@@ -84168,8 +84250,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const values = await readWorkspaceDbValues(['gd:' + ref]);
           const v = values.get('gd:' + ref);
           if (v == null) {
-            console.error('[gengaStore] fault-in miss for gd:' + ref + ' - this drawing is not on disk either');
-            return false;
+            // ver2440 (P3): gd: 가 없다 = 붕괴 전의 delta 였을 수 있다 — 변경분 행(gdd:) 사슬로 복원한다.
+            const restored = await gengaRestoreDeltaChain(ref);
+            if (!restored) {
+              console.error('[gengaStore] fault-in miss for gd:' + ref + ' - this drawing is not on disk either');
+              return false;
+            }
+            gengaDrawStorePut(ref, restored);
+            gengaScheduleTileEncode(ref, restored);   // 조각 확정 → 펌프의 persist 가 gd: 를 쓰고 gdd: 를 지운다
+            return true;
           }
           // ver2193: 행이 칸 묶음일 수 있다. 매직으로 갈라서 칸이면 디코드까지 끝내 놓는다 —
           // 돌아온 그림을 시드와 저장이 **동기로** 요구하므로, 여기서 안 채우면 그 자리가 빈다
@@ -84281,6 +84370,179 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         arr.push(cb); gengaDeltaWantCallbacks.set(ref, arr);
       }
       gengaKickTileEncodePump();
+    }
+    // ── ver2440 (occupancy P3 · 3-C): delta 의 «변경분 행» — 저장이 붕괴를 기다리지 않는다 ──────
+    // 행 `gdd:<ref>` = GENGA_DELTA_MAGIC + 헤더 JSON + '\n' + 이번 획 창의 PNG 바이트(MTIL1 과 같은
+    // 컨테이너 문법). 자동저장은 참조 delta 를 동기 붕괴(사슬 × 리드백)하는 대신 이 행의 내구화만
+    // 비동기로 기다린다(writeProjectToIndexedDbSlot 의 게시 배리어 — 「변경분을 먼저 내구성 있게 쓰고
+    // 그 뒤 프로젝트 세대를 게시한다」). 리로드·fault-in 은 gd: 행이 없으면 이 사슬로 복원한다
+    // (gengaRestoreDeltaChain). 수명: 그 ref 의 완전체 gd: 행이 디스크에 확정되면 그 자리에서 지운다
+    // (gengaPersistTileSet → gengaDeltaDiskForget) — 남은 고아는 무참조 sweep 이 gd: 와 같은 참조
+    // 판정으로 거둔다(storageKeyBucket 'gdd').
+    const GENGA_DELTA_MAGIC = 'MDLT1\n';
+    const gengaDeltaDiskWrites = new Map();   // ref → 쓰기 완료 프라미스(true/false 로 정착) — 게시 배리어가 스냅숏으로 기다린다
+    const gengaDeltaDiskDone = new Set();     // gdd: 행이 디스크에 있(다고 믿)는 ref — gd: 확정 시 지울 대상
+    function gengaDeltaPersist(ref, v) {
+      if (!gengaDrawingShouldPersist()) return null;   // ver1474: tlTut 그림은 디스크에 안 적는다 — gd: 와 같은 게이트
+      if (gengaDeltaDiskWrites.has(ref) || gengaDeltaDiskDone.has(ref)) return gengaDeltaDiskWrites.get(ref) || null;
+      const job = new Promise(function(resolve) {
+        // toBlob 은 호출 시점에 픽셀을 스냅숏한다(획 창 하나 몫) — 이후 붕괴가 snap 을 반납해도 안전하다.
+        try {
+          v.snap.toBlob(function(png) {
+            if (!png) {
+              console.error('[gengaDelta] delta row encode produced no blob for ' + ref + ' - the durability barrier will fall back to a sync collapse');
+              resolve(false); return;
+            }
+            const hdr = JSON.stringify({ v: 1, base: v.deltaBase, sx: v.sx, sy: v.sy, pw: v.pw, ph: v.ph,
+              x: v.x, y: v.y, w: v.w, h: v.h, depth: v.depth });
+            putWorkspaceDbValue('gdd:' + ref, new Blob([GENGA_DELTA_MAGIC, hdr, '\n', png], { type: 'application/x-moart-delta' }))
+              .then(function(ok) {
+                if (ok !== false) gengaDeltaDiskDone.add(ref);
+                else console.error('[gengaDelta] gdd: write refused for ' + ref + ' (IndexedDB unavailable)');
+                resolve(ok !== false);
+              })
+              .catch(function(err) {
+                console.error('[gengaDelta] gdd: write failed for ' + ref + ' - this stroke will not survive a reload until the collapse lands', err);
+                resolve(false);
+              });
+          }, 'image/png');
+        } catch (e) {
+          console.error('[gengaDelta] delta row encode threw for ' + ref, e);
+          resolve(false);
+        }
+      }).then(function(ok) {
+        if (gengaDeltaDiskWrites.get(ref) === job) gengaDeltaDiskWrites.delete(ref);
+        return ok;
+      });
+      gengaDeltaDiskWrites.set(ref, job);
+      return job;
+    }
+    // gd: 완전체가 디스크에 확정된 ref 의 변경분 행을 지운다 — 쓰기가 in-flight 면 그 뒤에.
+    function gengaDeltaDiskForget(ref) {
+      const drop = function() {
+        if (!gengaDeltaDiskDone.has(ref)) return;
+        gengaDeltaDiskDone.delete(ref);
+        deleteWorkspaceDbValue('gdd:' + ref).catch(function(err) {
+          console.warn('[gengaDelta] stale gdd: row delete failed for ' + ref + ' - the unreferenced sweep will reclaim it', err);
+        });
+      };
+      const pending = gengaDeltaDiskWrites.get(ref);
+      if (pending && typeof pending.then === 'function') pending.then(drop); else drop();
+    }
+    // 게시 배리어 — 지금 in-flight 인 변경분(gdd:) 쓰기와 워커 gd: 쓰기의 «스냅숏»만 기다린다
+    // (await 중에 커밋된 새 획의 ref 는 이 payload 에 없으므로 기다릴 이유가 없고, 기다리면 연타 중
+    // 게시가 영영 안 끝난다). 워커 쓰기는 메인 커넥션과 커밋 순서가 안 묶이므로 여기서 기다려야
+    // 「행 먼저, 게시 나중」이 선다(메인 경로 시절에는 같은 커넥션의 FIFO 가 그 순서를 공짜로 줬다).
+    // 반환: 실패한 delta ref 목록 — 부르는 쪽이 그것만 동기 붕괴로 폴백한다(조용한 소실 금지).
+    function gengaAwaitDeltaDurability() {
+      const waits = [];
+      gengaDeltaDiskWrites.forEach(function(p, ref) {
+        waits.push(p.then(function(ok) { return ok ? null : ref; }));
+      });
+      gengaPersistWorkerJobs.forEach(function(job) {
+        if (job.done) waits.push(job.done.then(function() { return null; }));   // 실패 폴백은 settle 이 이미 했다 — 완료만 기다린다
+      });
+      if (!waits.length) return Promise.resolve([]);
+      return Promise.all(waits).then(function(list) { return list.filter(Boolean); });
+    }
+    async function gengaDeltaFromBlob(b) {
+      let buf = null;
+      try { buf = new Uint8Array(await gengaBlobToArrayBuffer(b)); } catch (e) {
+        console.error('[gengaDelta] delta container read failed', e); return null;
+      }
+      const magicLen = GENGA_DELTA_MAGIC.length;
+      for (let i = 0; i < magicLen; i++) { if (buf[i] !== GENGA_DELTA_MAGIC.charCodeAt(i)) { console.error('[gengaDelta] delta container magic mismatch'); return null; } }
+      let nl = -1;
+      for (let i = magicLen; i < buf.length; i++) { if (buf[i] === 10) { nl = i; break; } }
+      if (nl < 0) { console.error('[gengaDelta] delta container header has no terminator'); return null; }
+      let head = null;
+      try { head = JSON.parse(new TextDecoder('utf-8').decode(buf.subarray(magicLen, nl))); } catch (e) {
+        console.error('[gengaDelta] delta container header parse failed', e); return null;
+      }
+      if (!head || !head.base || !Number.isFinite(Number(head.sx)) || !Number.isFinite(Number(head.sy))) {
+        console.error('[gengaDelta] delta container header is incomplete'); return null;
+      }
+      return { base: String(head.base), sx: Number(head.sx), sy: Number(head.sy),
+        pw: Math.max(1, Number(head.pw) || 1), ph: Math.max(1, Number(head.ph) || 1),
+        x: Number(head.x), y: Number(head.y), w: Number(head.w), h: Number(head.h),
+        png: b.slice(nl + 1, b.size, 'image/png') };
+    }
+    // gd: 행이 없는 ref 를 gdd: 사슬로 복원한다 — 뿌리(gd: 완전체·통짜)까지 내려가 변경분을 위로
+    // 얹고 칸 묶음으로 굽는다. O(사슬 깊이 ≤ GENGA_DELTA_CHAIN_MAX) — 리로드·fault-in 1회의 몫이다.
+    // 반환: GengaTileSet(store 등록·인코드 예약은 부르는 쪽) · null(실패 — 로그는 여기서 남긴다).
+    async function gengaRestoreDeltaChain(ref) {
+      const chain = [];
+      let cur = ref;
+      let baseTs = null, baseWhole = null;
+      let guard = GENGA_DELTA_CHAIN_MAX + 2;
+      while (guard-- > 0) {
+        if (chain.length) {   // ref 자신은 디스크에서만 본다 — store 의 delta 는 지금 복원하려는 그것이다
+          const inStore = gengaDrawStore.get(cur);
+          if (gengaIsTileSet(inStore)) { baseTs = inStore; break; }
+          if (typeof inStore === 'string' && inStore) { baseWhole = inStore; break; }
+        }
+        const row = await getWorkspaceDbValue('gd:' + cur);
+        if (row != null) {
+          if (await gengaBlobIsTileSet(row)) {
+            baseTs = await gengaTileSetFromBlob(row);
+            if (!baseTs) { console.error('[gengaDelta] restore: base gd:' + cur + ' tile parse failed'); return null; }
+          } else baseWhole = row;   // 통짜(문자열/PNG Blob — 레거시)
+          break;
+        }
+        const drow = await getWorkspaceDbValue('gdd:' + cur);
+        if (drow == null) {
+          console.error('[gengaDelta] restore: neither gd: nor gdd: exists for ' + cur + ' - drawing ' + ref + ' cannot be rebuilt');
+          return null;
+        }
+        const d = await gengaDeltaFromBlob(drow);
+        if (!d) return null;
+        chain.push(d);
+        cur = d.base;
+      }
+      if (guard < 0) { console.error('[gengaDelta] restore: chain deeper than the cap for ' + ref); return null; }
+      if (!chain.length) { console.error('[gengaDelta] restore called for ' + ref + ' but its gd: row exists - caller should hydrate normally'); return null; }
+      const pw = chain[0].pw, ph = chain[0].ph;
+      const cv = document.createElement('canvas');
+      cv.width = pw; cv.height = ph;
+      const cx = cv.getContext('2d');
+      if (baseTs) {
+        await gengaTileSetDecode(baseTs);
+        cx.drawImage(gengaTileSetComposeCanvas(baseTs), baseTs.x, baseTs.y);   // 미완 칸은 compose 가 로그한다
+      } else if (baseWhole != null) {
+        const bm = await new Promise(function(res) {
+          if (typeof Blob !== 'undefined' && baseWhole instanceof Blob && typeof createImageBitmap === 'function') {
+            createImageBitmap(baseWhole).then(res).catch(function() { res(null); });
+          } else {
+            const img = new Image();
+            img.onload = function() { res(img); };
+            img.onerror = function() { res(null); };
+            if (typeof baseWhole === 'string') img.src = baseWhole;
+            else gengaBlobToDataUrl(baseWhole).then(function(u) { if (u) img.src = u; else res(null); }).catch(function() { res(null); });
+          }
+        });
+        if (!bm) { console.error('[gengaDelta] restore: whole-raster base decode failed for ' + cur); return null; }
+        cx.drawImage(bm, 0, 0, pw, ph);   // 통짜는 용지 전체 비트맵 계약(gengaDrawDrawingInto 의 레거시 분기와 같다)
+        if (typeof bm.close === 'function') bm.close();
+      }
+      for (let i = chain.length - 1; i >= 0; i--) {   // 뿌리 쪽 변경분부터 순서대로 얹는다
+        const d = chain[i];
+        const bm = await new Promise(function(res) {
+          if (typeof createImageBitmap === 'function') createImageBitmap(d.png).then(res).catch(function() { res(null); });
+          else res(null);
+        });
+        if (!bm) { console.error('[gengaDelta] restore: delta png decode failed on the chain of ' + ref); return null; }
+        cx.drawImage(bm, d.sx, d.sy);   // 스냅은 그 창의 완성 픽셀이다 — pendingBake 의 blit 계약(ver2365)과 같은 무늬
+        if (typeof bm.close === 'function') bm.close();
+      }
+      const ts = gengaTileSetFromCanvas(cv, null, null, false);
+      if (!ts) { console.error('[gengaDelta] restore: rebuilt canvas produced an empty tile set for ' + ref); return null; }
+      // bounds 는 커밋 헤더(끝 delta 의 x/y/w/h — 그림 객체의 dr.x 와 같은 값)가 정본이다 — 재계산으로
+      // 갈아타면 dr.x = ts.x 불변식이 깨져 그림이 민다(gengaTileSetToBlob 의 ver2365 주석과 같은 근거).
+      const d0 = chain[0];
+      if (Number.isFinite(d0.x) && Number.isFinite(d0.y) && d0.w > 0 && d0.h > 0) {
+        ts.x = d0.x; ts.y = d0.y; ts.w = d0.w; ts.h = d0.h;
+      }
+      return ts;
     }
     function gengaDeltaBaseHold(ref, on) {
       if (!ref) return;
@@ -84420,15 +84682,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // (gengaTrimDrawStore 가 두 모양을 같은 자로 재야 예산이 한쪽만 세는 일이 없다).
     // ver2195: 합성본(잉크 상자 전체 RGBA)이 사라지고 디코드된 칸만 재므로, 잉크 상자 안의
     // 빈 공간만큼 이 수치 자체가 준다 — 표시 칸화의 상주 이득이 나오는 자리가 여기다.
+    // 칸 묶음의 «자기 몫» — cells Blob 을 뺀 상주(디코드 RGBA·썸·베이크 스냅). ver2440 장부의 단위:
+    // Blob 몫은 공유되므로 Total 에는 유니크로만 오르고(gengaTileBlobShare), 이 몫만 묶음별로 계상한다.
+    function gengaTileSetOwnBytes(v) {
+      let n = 0;
+      v.decoded.forEach(function(bm) { n += Math.max(1, bm.width) * Math.max(1, bm.height) * 4; });
+      if (v.thumbCanvas) n += v.thumbCanvas.width * v.thumbCanvas.height * 4;
+      if (v.pendingBake && v.pendingBake.snap) n += Math.max(1, v.pendingBake.snap.width) * Math.max(1, v.pendingBake.snap.height) * 4;   // ver2365: 베이크 전 스냅도 상주다
+      return n;
+    }
     function gengaDrawStoreEntryBytes(v) {
       if (typeof v === 'string') return v.length;
       if (gengaIsDrawDelta(v)) return v.snap ? Math.max(1, v.snap.width) * Math.max(1, v.snap.height) * 4 : 0;   // ver2438: delta 는 스냅 픽셀이 상주의 전부다
       if (!gengaIsTileSet(v)) return 0;
-      let n = 0;
+      let n = gengaTileSetOwnBytes(v);
       v.cells.forEach(function(b) { n += (b && b.size) || 0; });
-      v.decoded.forEach(function(bm) { n += Math.max(1, bm.width) * Math.max(1, bm.height) * 4; });
-      if (v.thumbCanvas) n += v.thumbCanvas.width * v.thumbCanvas.height * 4;
-      if (v.pendingBake && v.pendingBake.snap) n += Math.max(1, v.pendingBake.snap.width) * Math.max(1, v.pendingBake.snap.height) * 4;   // ver2365: 베이크 전 스냅도 상주다
       return n;
     }
     // 칸 하나가 덮는 용지 사각형(용지 밖은 잘라 낸다 — 오른쪽·아래 끝 칸은 64 보다 작다).
@@ -84462,13 +84730,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let dropped = 0;
       ts.cells.forEach(function(b, idx) {
         if (b && typeof b.size !== 'number') {   // ver2197: flush 를 안 지난 미확정 조각 — 마지막 그물
-          try { b = gengaTileEncodeCanvas(b); ts.cells.set(idx, b); }
+          try { b = gengaTileEncodeCanvas(b); ts.cells.set(idx, b); gengaTileSetCellBlobSettled(ts, b); }   // ver2440: 공유 장부의 가산 짝
           catch (e) { dropped += 1; console.error('[gengaTile] cell ' + idx + ' encode failed at serialize time - dropped from the row', e); return; }
         }
         index.push([idx, b.size]); parts.push(b);
       });
       if (dropped) console.error('[gengaTile] ' + dropped + ' cell(s) missing from the serialized row - the stored drawing is incomplete');
-      gengaDrawStoreReweighValue(ts); // ver2215: 마지막 그물 인코드(캔버스→Blob)가 일어났을 수 있다 — 장부 미스면 no-op
+      gengaDrawStoreReweighValue(ts); // ver2440: 마지막 그물 인코드의 Blob 몫은 위 settled 가 가산했다 — 여기는 자기 몫 그물(장부 미스면 no-op)
       // ver2365: x/y/w/h 를 싣는다 — 베이크 이월 커밋의 bounds(물려받은 칸 ∪ dirty 창)는 cells
       // 재계산(빈 가장자리 칸이 빠진 값)과 갈릴 수 있고, 리로드가 재계산으로 갈아타면 그림
       // 객체의 x(dr.x = ts.x 불변식)와 어긋나 그림이 민다. 옛 로더는 모르는 필드를 무시한다.
@@ -85112,10 +85380,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (done > 0 && deadline != null && performance.now() >= deadline) break;
         const idx = keys[i];
         done += 1;   // 성공이든 실패든 이번 판의 예산은 썼다 — 실패가 배치를 무한히 붙잡지 않게
-        try { ts.cells.set(idx, gengaTileEncodeCanvas(ts.cells.get(idx))); }
+        try {
+          const settled = gengaTileEncodeCanvas(ts.cells.get(idx));
+          ts.cells.set(idx, settled);
+          gengaTileSetCellBlobSettled(ts, settled);   // ver2440: 캔버스 조각(장부 0) → 새 Blob — 공유 장부의 가산 짝
+        }
         catch (e) { failed += 1; console.error('[gengaTile] cell ' + idx + ' encode failed - will retry', e); }
       }
-      if (done) gengaDrawStoreReweighValue(ts); // ver2215: 캔버스 조각(무게 0)→Blob 확정은 무게 증가 — 펌프·flush 둘 다 여기를 지난다
+      if (done) gengaDrawStoreReweighValue(ts); // ver2440: Blob 확정의 무게 증가는 위 gengaTileSetCellBlobSettled 가 직접 가산했다 — 여기는 자기 몫(decoded 등)의 그물일 뿐이다
       return { done: done, failed: failed };
     }
     function gengaTileCellsAllBlob(ts) {
@@ -85123,15 +85395,121 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ts.cells.forEach(function(v) { if (!v || typeof v.size !== 'number') ok = false; });
       return ok;
     }
-    // 전 칸이 Blob 로 확정된 묶음의 gd: 행 쓰기 — 종전 gengaPutDrawingTiles 의 쓰기와 같은 계약.
-    function gengaPersistTileSet(ref, ts) {
-      if (!gengaDrawingShouldPersist()) return;
+    // ── ver2440 (P3 · 3-C): gd: 직렬화·쓰기의 워커 실행기 ──────────────────────────────────────
+    // 직렬화의 O(칸) 몫(index 조립·JSON.stringify·Blob 결합)과 IndexedDB 트랜잭션을 워커로 내린다 —
+    // 메인에 남는 것은 cells Map 의 구조화 클론(네이티브 — Blob 은 참조 공유라 바이트 복사가 없다)뿐.
+    // 이 함수는 toString() 으로 워커 소스가 된다: 바깥 심볼을 하나도 참조하면 안 된다(죽은 참조가
+    // 아니라 워커 안 ReferenceError 다 — 게이트의 node --check 는 본문 문법까지만 본다).
+    function gengaPersistWorkerMain() {
+      'use strict';
+      var dbName = '', storeName = '', conn = null;
+      function withDb(fn, fail) {
+        if (conn) { fn(conn); return; }
+        var req = indexedDB.open(dbName);   // 버전 미지정 — 메인이 만든 기존 DB 를 그 버전 그대로 연다(업그레이드 경쟁 없음)
+        req.onsuccess = function() { conn = req.result; conn.onclose = function() { conn = null; }; fn(conn); };
+        req.onerror = function() { fail(req.error || new Error('worker db open failed')); };
+      }
+      onmessage = function(ev) {
+        var m = ev.data || {};
+        if (m.op === 'init') { dbName = String(m.dbName || ''); storeName = String(m.storeName || ''); return; }
+        if (m.op !== 'put') return;
+        var fail = function(err) { postMessage({ seq: m.seq, ok: false, message: String((err && err.message) || err) }); };
+        try {
+          var index = [], parts = [];
+          m.cells.forEach(function(b, idx) { index.push([idx, b.size]); parts.push(b); });
+          var hdr = m.hdr; hdr.cells = index;
+          var blob = new Blob([m.magic, JSON.stringify(hdr), '\n'].concat(parts), { type: 'application/x-moart-tiles' });
+          withDb(function(db) {
+            var tx = db.transaction(storeName, 'readwrite');
+            var st = tx.objectStore(storeName);
+            st.put(blob, m.key);
+            if (m.delKey) st.delete(m.delKey);   // 확정된 delta 의 변경분 행 — 같은 트랜잭션이라 gd: 와 원자적으로 바뀐다
+            tx.oncomplete = function() { postMessage({ seq: m.seq, ok: true }); };
+            tx.onabort = function() { fail(tx.error || new Error('worker put aborted')); };
+            tx.onerror = function() { fail(tx.error || new Error('worker put failed')); };
+          }, fail);
+        } catch (e) { fail(e); }
+      };
+    }
+    let gengaPersistWorker = null;              // false = 생성 실패·크래시 — 이후 메인 경로로 산다(재시도 루프 금지)
+    let gengaPersistWorkerSeq = 0;
+    const gengaPersistWorkerJobs = new Map();   // seq → { settle, done } — done 은 게시 배리어가 기다린다
+    function gengaPersistWorkerGet() {
+      if (gengaPersistWorker === false) return null;
+      if (gengaPersistWorker) return gengaPersistWorker;
+      try {
+        const src = '(' + gengaPersistWorkerMain.toString() + ')()';
+        const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+        w.postMessage({ op: 'init', dbName: WORKSPACE_DB_NAME, storeName: WORKSPACE_STORE_NAME });
+        w.onmessage = function(ev) {
+          const m = ev.data || {};
+          const job = gengaPersistWorkerJobs.get(m.seq);
+          if (!job) return;
+          gengaPersistWorkerJobs.delete(m.seq);
+          job.settle(Boolean(m.ok), m.message);
+        };
+        w.onerror = function(err) {
+          // 워커 자체가 죽었다 — 걸려 있던 일은 전부 메인 경로로 넘기고 이후로는 워커를 안 쓴다.
+          console.error('[gengaPersist] worker crashed - falling back to main-thread serialization', (err && err.message) || err);
+          const jobs = Array.from(gengaPersistWorkerJobs.values());
+          gengaPersistWorkerJobs.clear();
+          try { w.terminate(); } catch (e) {}
+          gengaPersistWorker = false;
+          jobs.forEach(function(j) { j.settle(false, 'worker crashed'); });
+        };
+        gengaPersistWorker = w;
+        return w;
+      } catch (e) {
+        console.warn('[gengaPersist] worker unavailable - gd: rows serialize on the main thread', e);
+        gengaPersistWorker = false;
+        return null;
+      }
+    }
+    // 종전 메인 경로 그대로 — 워커가 없거나 실패했을 때의 폴백이기도 하다(마지막 그물 인코드·
+    // pendingBake 방어는 gengaTileSetToBlob 안에 있다). 반환: put 프라미스(폴백 체인용).
+    function gengaPersistTileSetMain(ref, ts) {
       try {
         const put = gengaMarkPersisted(ref, putWorkspaceDbValue('gd:' + ref, gengaTileSetToBlob(ts)));
-        if (put && typeof put.catch === 'function') put.catch(function(err) {
-          console.error('[gengaTile] IndexedDB write failed for gd:' + ref + ' - this drawing will not survive a reload', err);
-        });
-      } catch (e) { console.error('[gengaTile] IndexedDB write threw for gd:' + ref, e); }
+        if (put && typeof put.then === 'function') {
+          put.then(function(ok) { if (ok !== false && ok !== null) gengaDeltaDiskForget(ref); },
+            function(err) { console.error('[gengaTile] IndexedDB write failed for gd:' + ref + ' - this drawing will not survive a reload', err); });
+        }
+        return put;
+      } catch (e) { console.error('[gengaTile] IndexedDB write threw for gd:' + ref, e); return Promise.resolve(false); }
+    }
+    // 전 칸이 Blob 로 확정된 묶음의 gd: 행 쓰기 — 종전 gengaPutDrawingTiles 의 쓰기와 같은 계약.
+    // preferMain: 동기 벽 flush(내보내기·pagehide·스왑) 전용 — 그 경로는 게시 배리어를 안 지나므로
+    // 메인 커넥션의 FIFO(gd: put 이 payload put 보다 먼저)가 유일한 순서 보장이다.
+    function gengaPersistTileSet(ref, ts, preferMain) {
+      if (!gengaDrawingShouldPersist()) return;
+      const w = (!preferMain && !ts.pendingBake && gengaTileCellsAllBlob(ts)) ? gengaPersistWorkerGet() : null;
+      if (w) {
+        const seq = ++gengaPersistWorkerSeq;
+        const canDel = gengaDeltaDiskDone.has(ref) && !gengaDeltaDiskWrites.has(ref);   // in-flight 면 완료 뒤 gengaDeltaDiskForget 가 지운다
+        try {
+          w.postMessage({ op: 'put', seq: seq, key: 'gd:' + ref, delKey: canDel ? 'gdd:' + ref : null,
+            magic: GENGA_TILE_MAGIC,
+            hdr: { v: 1, tile: ts.tile, gw: ts.gw, gh: ts.gh, pw: ts.pw, ph: ts.ph, x: ts.x, y: ts.y, w: ts.w, h: ts.h },
+            cells: ts.cells });
+          const job = { settle: null, done: null };
+          job.done = new Promise(function(resolve) {
+            job.settle = function(ok, message) {
+              if (ok) {
+                if (canDel) gengaDeltaDiskDone.delete(ref); else gengaDeltaDiskForget(ref);
+                resolve(true); return;
+              }
+              console.error('[gengaPersist] worker write failed for gd:' + ref + (message ? ' - ' + message : '') + ' - retrying on the main thread');
+              resolve(gengaPersistTileSetMain(ref, ts));
+            };
+          });
+          gengaPersistWorkerJobs.set(seq, job);
+          gengaMarkPersisted(ref, job.done);
+          return;
+        } catch (e) {
+          console.error('[gengaPersist] worker postMessage threw for gd:' + ref + ' - main-thread fallback', e);
+        }
+      }
+      gengaPersistTileSetMain(ref, ts);
     }
     function gengaTileEncodePump() {
       gengaTileEncodeTimer = 0;
@@ -85152,6 +85530,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaPendingTileEncode.forEach(function(ts, ref) {
         if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); return; }   // 스왑·prune·재커밋 — 펌프의 정리 짝(붕괴는 Map 값을 갱신하므로 안 걸린다)
         if (gengaIsDrawDelta(ts)) {
+          gengaDeltaPersist(ref, ts);   // ver2440 (P3): 변경분 행 내구화 — 인코드는 오프스레드(toBlob)라 잠잠을 안 기다리고 먼저 싼다(중복 발사는 안에서 걸러진다)
           snapN += 1; snapPx += ts.snap.width * ts.snap.height;
           if (!paperPx) paperPx = Math.max(1, ts.pw) * Math.max(1, ts.ph);
           if (gengaDeltaWant.has(ref)) { if (!wantRef) wantRef = ref; }
@@ -85248,7 +85627,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (more && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
     }
     // 동기 flush — 저장·프로젝트 스왑 직전의 마지막 확정. gengaFlushPendingDrawingEncodes 가 부른다.
-    function gengaFlushTileEncodes() {
+    // ver2440 (P3): opts.deltaAsync — 자동저장 경로 전용. 참조 delta 를 동기 붕괴(사슬 × 리드백 — P2 가
+    // 남긴 정직한 잔여 벽)하는 대신 대기에 되돌리고 변경분 행(gdd:) 내구화만 발사한다. 게시는
+    // writeProjectToIndexedDbSlot 의 배리어가 그 쓰기를 기다린 뒤에 한다. 완전체를 동기로 요구하는
+    // 소비처(내보내기·파일 저장·pagehide 마지막 저장·스왑 prune)는 opts 없이 — 종전 그대로 붕괴한다.
+    function gengaFlushTileEncodes(opts) {
       if (!gengaPendingTileEncode.size) return;
       if (gengaTileEncodeTimer) { clearTimeout(gengaTileEncodeTimer); gengaTileEncodeTimer = 0; }
       const entries = Array.from(gengaPendingTileEncode.entries());
@@ -85264,9 +85647,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         //   여기서 굽는 것은 자동저장·스왑 앞의 동기 벽(데스크톱 재현 5 초)만 만든다. undo 로 돌아오면
         //   참조 ref 가 되어 다음 flush·펌프가 확정한다. 스왑 뒤 고아는 펌프의 store 대조가 내린다.
         if (!gengaPendingRefReferenced(ref)) { gengaPendingTileEncode.set(ref, ts); return; }   // 베이크 대기든 인코드 대기든 — 참조 없으면 동기 벽에 안 싣는다(펌프가 idle 에서 잇는다)
-        // ver2438: 참조되는 delta — 저장은 완전체를 요구하므로 사슬을 여기서 동기로 전부 붕괴한다
-        // (P2 의 정직한 잔여 벽 — P3 worker 가 걷는다). 실패하면 재등록하고 안 적는다(부분 그림 금지).
+        // ver2438: 참조되는 delta — 완전체가 필요한 소비처(내보내기·파일·pagehide·스왑)는 사슬을
+        // 여기서 동기로 전부 붕괴한다. 실패하면 재등록하고 안 적는다(부분 그림 금지).
+        // ver2440 (P3): 자동저장(deltaAsync)은 붕괴하지 않는다 — 변경분 행(gdd:)이 리로드를 지키고,
+        // 붕괴는 idle 펌프가 잇는다. 이 갈래가 P2 의 「flush 동기 사슬 붕괴」 벽을 걷는 자리다.
         if (gengaIsDrawDelta(ts)) {
+          if (opts && opts.deltaAsync) {
+            gengaPendingTileEncode.set(ref, ts);
+            gengaDeltaPersist(ref, ts);   // 미발사면 지금 — 게시 배리어(gengaAwaitDeltaDurability)가 이 쓰기를 기다린다
+            return;
+          }
           const collapsed = gengaCollapseDeltaChainSync(ref);
           if (!collapsed) {
             gengaScheduleTileEncode(ref, ts);
@@ -85284,7 +85674,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           return;
         }
         gengaEncodeTileCells(ts, Infinity);
-        if (gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts);
+        // ver2440: 동기 벽 flush(deltaAsync 아님)는 게시 배리어를 안 지나므로 메인 커넥션 FIFO 가
+        // 「gd: 먼저, payload 나중」의 유일한 보장이다 — 워커에 태우지 않는다.
+        if (gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts, !(opts && opts.deltaAsync));
         else console.error('[gengaTile] flush left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
       });
       // ver2430: 참조 없는 묶음을 대기에 되돌렸으면 펌프가 idle 에서 잇는다 — 위에서 타이머를 지웠으므로 여기서
@@ -85544,8 +85936,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 실패분을 pending 에 되돌려 두면 **픽셀이 캔버스로 살아 있고**(gengaResolveDrawing 이 대기분을
     // 그림으로 친다) 다음 flush 가 다시 시도한다. 빈 문자열을 쓰는 것보다 언제나 낫다.
     // 시도 상한은 콘티와 같은 상수 — 영구 실패(타락한 캔버스/OOM)에 무한 재시도하지 않는다.
-    function gengaFlushPendingDrawingEncodes() {
-      gengaFlushTileEncodes();   // ver2197: 칸 인코드 대기분 — 같은 호출부 계약(직렬화·스왑·자동저장 앞)이라 여기 합류한다
+    function gengaFlushPendingDrawingEncodes(opts) {
+      gengaFlushTileEncodes(opts);   // ver2197: 칸 인코드 대기분 — 같은 호출부 계약(직렬화·스왑·자동저장 앞)이라 여기 합류한다. opts 는 ver2440 의 deltaAsync 한 개뿐이다
       if (!gengaPendingDrawingEncode.size) return;
       const entries = Array.from(gengaPendingDrawingEncode.entries());
       gengaPendingDrawingEncode.clear();
@@ -86066,13 +86458,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1893: 행이 Blob 일 수 있다(디스크는 Blob, 메모리는 문자열). 옛 행은 문자열 그대로 온다 —
       // 두 모양을 다 받아야 이 판 이전에 저장한 프로젝트가 열린다.
       const blobRefs = [];
+      const deltaRestoreRefs = [];
       list.forEach(function(ref) {
         const v = values.get('gd:' + ref);
-        if (!v) { missing += 1; return; }   // ver1448: 행이 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
+        if (!v) { deltaRestoreRefs.push(ref); return; }   // ver2440: gd: 없음 = 붕괴 전의 delta 였을 수 있다 — 아래서 gdd: 사슬로 복원(그마저 없으면 missing)
         if (typeof v === 'string') { gengaDrawStorePut(ref, v); gengaPersistedRefs.add(ref); loaded++; gengaScheduleWholeRasterConvert(ref); return; }
         if (typeof Blob !== 'undefined' && v instanceof Blob) { blobRefs.push([ref, v]); return; }
         gengaDrawStorePut(ref, String(v)); gengaPersistedRefs.add(ref); loaded++; gengaScheduleWholeRasterConvert(ref);
       });
+      if (deltaRestoreRefs.length) {
+        const restoredList = await Promise.all(deltaRestoreRefs.map(function(ref) {
+          return gengaRestoreDeltaChain(ref).catch(function(e) { console.error('[gengaDelta] restore threw for ' + ref, e); return null; });
+        }));
+        deltaRestoreRefs.forEach(function(ref, i) {
+          const ts = restoredList[i];
+          if (!ts) { missing += 1; return; }   // ver1448 계약 그대로 — 행이 아예 없다 = 그 코마가 빈 채로 뜬다. 세어서 말한다
+          gengaDrawStorePut(ref, ts);
+          gengaScheduleTileEncode(ref, ts);   // 조각 확정 → 펌프의 persist 가 gd: 를 쓰고 gdd: 를 지운다
+          loaded++;
+        });
+      }
       if (blobRefs.length) {
         // ver2193: 행이 통짜 PNG 인지 칸 묶음인지는 **매직으로** 갈린다(q3=A 라 한 파일에 섞인다).
         const kinds = await Promise.all(blobRefs.map(function(pair) { return gengaBlobIsTileSet(pair[1]); }));
@@ -86302,14 +86707,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       // ver2188: **얼마나 거뒀는지 돌려준다.** 히스토리 경로는 이 수치가 유일한 신호다 —
       // 화면에 아무 변화가 없는 작업이라, 안 세면 「돌고 있다」와 「아무것도 못 거둔다」를 구분할 수 없다.
-      let freedDrawings = 0, freedBytes = 0;
+      let freedDrawings = 0;
+      const totalBefore = gengaDrawStoreTotal;   // ver2440: 회수 바이트는 장부의 실제 차감으로 — 명목 합산은 cells 공유 몫만큼 과대다
       gengaDrawStore.forEach(function(v, ref) {
         if (drawRefs.has(ref)) return;
         freedDrawings += 1;
-        freedBytes += gengaDrawStoreEntryBytes(v); // ver2195: 칸 그림(문자열 아님)의 회수가 0 으로 잡히지 않게 — 예산과 같은 자
         gengaReleaseTileDecodes(v);
         gengaDrawStoreDrop(ref);
       });
+      const freedBytes = Math.max(0, totalBefore - gengaDrawStoreTotal);
       gengaThumbCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbCache.delete(ref); });   // ver2197: 썸 캐시도 같은 경계에서 회수 — 안 하면 ref 당 ~15KB 가 세션 내내 쌓인다
       gengaThumbImageCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbImageCache.delete(ref); });   // ver2239: 헤드 썸 Image 도 같은 경계에서
       gengaAudioStore.forEach(function(_v, ref) { if (!audioRefs.has(ref)) gengaAudioStore.delete(ref); });
