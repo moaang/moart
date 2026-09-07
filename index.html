@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2437</title>
+  <title>MoArt ver2438</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24387,6 +24387,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2438, items: [
+        { ja: '**線を引き終わる瞬間も、絵の込み具合と無関係になりました。**ストロークの確定が「今描いた範囲」だけを'
+            + '記録する方式になり、描き込みが多いコマでも一定の軽さで続けられます。',
+          ko: '**획을 끝내는 순간도 그림의 채워진 정도와 무관해졌습니다.** 획 확정이 「방금 그린 범위」만 기록하는'
+            + ' 방식이 되어, 그림이 많이 그려진 코마에서도 일정한 가벼움으로 이어 그릴 수 있습니다.',
+          en: '**Finishing a stroke no longer depends on how full the drawing is.** Committing now records only the area'
+            + ' you just drew, so even heavily drawn frames keep a constant, light feel.',
+          zh: '**收笔的瞬间也与画面的密度无关了。**笔画确定改为只记录「刚画过的范围」，画得再满的格也能保持稳定的轻快。' } ] },
       { ver: 2437, items: [
         { ja: '**同じコマに続けて描くときの始まりを軽くしました。**描き込みが多い絵でも、次のストロークが前の結果から'
             + 'そのまま始まります（毎回の絵の組み立て直しをやめました）。',
@@ -84045,6 +84053,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const ref = step.value;
         step = it.next();                                   // 지우기 전에 진행시킨다
         if (hot.has(ref) || gengaPendingDrawingEncode.has(ref)) continue;
+        if (gengaDeltaBaseRefs.has(ref)) continue;           // ver2438: delta 사슬이 붕괴 전까지 읽어야 하는 base — 축출하면 사슬이 끊긴다
         if (!gengaPersistedRefs.has(ref)) continue;          // ★디스크에 없는 것은 절대 안 버린다
         gengaReleaseTileDecodes(gengaDrawStore.get(ref));     // ver2195: GPU 비트맵은 그 자리에서 돌려준다
         gengaDrawStoreDrop(ref);                             // 총량 차감은 여기 한 곳
@@ -84244,6 +84253,104 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 통짜 한 장이 꼭 필요한 자리(직렬화·실루엣 소스·스케일 그리기)는 gengaTileSetComposeCanvas 로
     // **그때 만들어 그때 버린다** — 상주로 캐시하는 순간 이 판이 없앤 것이 도로 생긴다.
     function gengaIsTileSet(v) { return Boolean(v && typeof v === 'object' && v.cells instanceof Map); }
+    // ver2438 (occupancy q1=B · P2): **delta 그림** — 커밋이 칸 묶음 대신 「직전 ref + 이번 획 스냅」만
+    // 저장소에 넣는다(기존 잉크 양 N 과 무관한 O(이번 획) 커밋). ref 는 계속 새로 발급되므로 「같은
+    // ref 픽셀 불변」 불변식과 P1 활성 판정이 그대로 산다. 완전체(칸)로의 붕괴는 idle 펌프가 사슬
+    // 바닥부터 한 태스크에 하나씩 — 표시·진입은 활성 캔버스(P1)가 픽셀 정본이라 붕괴를 기다리지
+    // 않고, 저장(flush)만 동기 붕괴를 요구한다(그 벽은 P3 worker 가 걷는다 — occupancy 7-A).
+    function gengaIsDrawDelta(v) { return Boolean(v && typeof v === 'object' && v.deltaBase); }
+    // delta 사슬이 붕괴 전에 base 항목을 store 에서 읽어야 하므로, 그동안 base 를 축출에서 보호한다.
+    // (붕괴가 cells 를 복사한 «뒤»는 Blob 참조가 새 묶음에 살아 있어 base 항목이 내려가도 안전하다.)
+    const gengaDeltaBaseRefs = new Map();   // baseRef → 참조 수
+    // 화면·진입이 delta 의 완전체를 요구했다 — 펌프가 잠잠을 안 기다리고 이 ref(와 그 base 사슬)부터
+    // 붕괴한다. 콜백은 붕괴 완료 시 한 번 불리고 비워진다(그리기 진입의 retry 채널).
+    const gengaDeltaWant = new Set();
+    const gengaDeltaWantCallbacks = new Map();   // ref → [fn]
+    function gengaDeltaWantCollapse(ref, cb) {
+      gengaDeltaWant.add(ref);
+      if (cb) {
+        const arr = gengaDeltaWantCallbacks.get(ref) || [];
+        arr.push(cb); gengaDeltaWantCallbacks.set(ref, arr);
+      }
+      gengaKickTileEncodePump();
+    }
+    function gengaDeltaBaseHold(ref, on) {
+      if (!ref) return;
+      const n = (gengaDeltaBaseRefs.get(ref) || 0) + (on ? 1 : -1);
+      if (n > 0) gengaDeltaBaseRefs.set(ref, n); else gengaDeltaBaseRefs.delete(ref);
+    }
+    // delta 한 단계 붕괴 — base 가 이미 완전체(ts)일 때만 일한다(사슬이면 부르는 쪽이 바닥부터 반복).
+    // 반환: 붕괴 뒤의 ts(성공) · 'chain'(base 가 아직 delta — 바닥부터) · null(실패 — delta 는 그대로 남아
+    // 표시(활성)·재시도가 산다). cells 는 base 와 **구조 공유**(Map 참조 복사 — Blob 은 불변이라 안전),
+    // decoded 는 공유하지 않는다(공유하면 base 축출의 ImageBitmap close 가 이쪽을 깨뜨린다 — ver2216 이
+    // 이관으로 피한 병과 같은 자리). 교체 칸만 cells·decoded 에 캔버스 조각으로 넣고 인코드 펌프에 맡긴다.
+    function gengaCollapseDeltaOnce(ref) {
+      const v = gengaDrawStore.get(ref);
+      if (!gengaIsDrawDelta(v)) return gengaIsTileSet(v) ? v : null;
+      const baseV = gengaDrawStore.get(v.deltaBase);
+      if (gengaIsDrawDelta(baseV)) return 'chain';
+      if (!gengaIsTileSet(baseV)) {
+        // base 소실(축출 보호가 뚫렸거나 프로젝트 경계) — 그림 픽셀은 스냅·활성에만 남는다. 조용히
+        // 삼키지 않는다: gd: 행이 안 써지는 상태다(표시·내보내기는 활성/폴백이 지킨다).
+        console.error('[gengaDelta] base ' + v.deltaBase + ' missing for ' + ref + ' - cannot collapse; the gd: row will not be written');
+        return null;
+      }
+      if (baseV.pendingBake && !gengaTileSetBakePending(baseV)) return null;   // base 창 먼저(리드백) — 실패 시 재시도는 부르는 쪽
+      let scanImg = null;
+      try { scanImg = v.snap.getContext('2d').getImageData(0, 0, v.snap.width, v.snap.height); }
+      catch (e) { console.error('[gengaDelta] snap readback failed for ' + ref + ' - will retry', e); return null; }
+      const ts = { tile: baseV.tile, gw: baseV.gw, gh: baseV.gh, pw: baseV.pw, ph: baseV.ph,
+        cells: new Map(baseV.cells), decoded: baseV.decoded, x: 0, y: 0, w: 1, h: 1 };
+      // decoded 는 base 에서 **이관**한다(참조 이동 — 공유가 아니므로 base 축출의 ImageBitmap close 가
+      // 이쪽을 못 깨뜨린다). base 는 decodedMoved 로 남고, undo 로 재조명되면 보는 자리가 다시 채운다
+      // (ver2216·ver2428 의 기존 계약 그대로). ★이관 없이 빈 Map 으로 두면 붕괴마다 화면 재렌더가
+      // 그림 전체를 재디코드·상주시켜 ver2428 이 걷은 병이 되살아난다 — 첫 실기 A/B 가 그렇게 잡았다
+      // (세트 끝 상주 60 → 527MB · 축출 91 회 · rafOver20 17 → 102).
+      baseV.decoded = new Map();
+      baseV.decodedMoved = true;
+      gengaDrawStoreReweighValue(baseV);   // base 는 store 재류 중 뮤테이션 — ver2215 회계 그대로
+      for (let row = v.r0; row <= v.r1; row++) {
+        for (let col = v.c0; col <= v.c1; col++) {
+          const idx = row * ts.gw + col;
+          const chunk = gengaTileCutCell(v.snap, gengaTileRect(idx, ts), scanImg, v.sx, v.sy);
+          const oldBm = ts.decoded.get(idx);
+          if (oldBm && oldBm !== chunk && typeof oldBm.close === 'function') oldBm.close();   // 창 칸의 이관 비트맵 — 새 픽셀로 덮이므로 GPU 를 그 자리에서 돌려준다
+          if (chunk) { ts.cells.set(idx, chunk); ts.decoded.set(idx, chunk); }
+          else { ts.cells.delete(idx); ts.decoded.delete(idx); }   // 창 안에서 잉크가 사라진 칸(반투명·경계) — 스냅이 그 창의 완성 픽셀이다
+        }
+      }
+      // bounds 는 base ∪ 창 — O(1). 창 안이 비어 «줄었»어도 상위집합 계약(ver2365)이라 그대로 안전하다.
+      const b0 = { x: baseV.x, y: baseV.y, w: baseV.w, h: baseV.h };
+      const wx0 = Math.min(b0.x, v.sx), wy0 = Math.min(b0.y, v.sy);
+      ts.x = wx0; ts.y = wy0;
+      ts.w = Math.max(b0.x + b0.w, v.sx + v.snap.width) - wx0;
+      ts.h = Math.max(b0.y + b0.h, v.sy + v.snap.height) - wy0;
+      gengaDeltaBaseHold(v.deltaBase, false);
+      paintReleaseCanvas(v.snap);
+      gengaDrawStoreDrop(ref);        // delta 회계를 내리고
+      gengaDrawStorePut(ref, ts);     // 같은 ref 로 완전체를 올린다 — 코마·활성·undo 의 ref 는 그대로다
+      if (gengaPendingTileEncode.get(ref) === v) gengaPendingTileEncode.set(ref, ts);   // 펌프·flush 의 「store 와 같은 객체」 대조가 붕괴를 스왑으로 오인하지 않게
+      gengaDeltaWant.delete(ref);
+      const cbs = gengaDeltaWantCallbacks.get(ref);
+      if (cbs) { gengaDeltaWantCallbacks.delete(ref); cbs.forEach(function(fn) { try { fn(); } catch (e) { console.error('[gengaDelta] collapse callback threw', e); } }); }
+      return ts;
+    }
+    // 사슬을 바닥부터 동기로 전부 붕괴한다 — flush(저장 앞의 동기 벽) 전용. 펌프의 idle 붕괴는
+    // 태스크당 한 단계씩이라 이 함수를 쓰지 않는다.
+    function gengaCollapseDeltaChainSync(ref) {
+      let guard = GENGA_DELTA_CHAIN_MAX + 2;
+      while (guard-- > 0) {
+        const r = gengaCollapseDeltaOnce(ref);
+        if (r === 'chain') {
+          const v = gengaDrawStore.get(ref);
+          if (!v || !gengaCollapseDeltaChainSync(v.deltaBase)) return null;
+          continue;
+        }
+        return r;
+      }
+      console.error('[gengaDelta] chain deeper than the cap for ' + ref + ' - refusing to collapse');
+      return null;
+    }
     function gengaTileSetDecodedComplete(ts) {
       if (ts.decoded.size < ts.cells.size) return false;
       let ok = true;
@@ -84272,6 +84379,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 축출·고아 회수에서 디코드 캐시를 그 자리에서 돌려준다(ImageBitmap 은 GPU 메모리를 쥔다).
     // cells(Blob)가 정본이라 잃는 것이 없다 — 다시 필요하면 디스크 fault-in 이 도로 디코드한다.
     function gengaReleaseTileDecodes(v) {
+      // ver2438: delta 회수(프로젝트 스왑 prune 의 몫 — 그 앞의 flush 가 이미 붕괴를 강제했으므로
+      // 여기 오는 delta 는 base 소실 등으로 붕괴가 «못 된» 잔재다) — 스냅을 돌려주고 보호를 푼다.
+      if (gengaIsDrawDelta(v)) {
+        if (v.snap) { paintReleaseCanvas(v.snap); v.snap = null; }
+        gengaDeltaBaseHold(v.deltaBase, false);
+        return;
+      }
       if (!gengaIsTileSet(v)) return;
       v.decoded.forEach(function(bm) { if (bm && typeof bm.close === 'function') bm.close(); });
       v.decoded.clear();
@@ -84285,12 +84399,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaTileGrid(pw, ph) {
       return { gw: Math.max(1, Math.ceil(Math.max(1, pw) / GENGA_TILE_PX)), gh: Math.max(1, Math.ceil(Math.max(1, ph) / GENGA_TILE_PX)) };
     }
+    // ver2438: dirty 상자 → 칸 창(클램프). 뒤집힌 창은 null — 부르는 쪽이 «전체» 또는 «종전 경로»를
+    // 고른다. gengaTileSetFromCanvas 와 delta 커밋 갈래가 같은 산수를 쓰는 한 벌이다.
+    function gengaDirtyCellWindow(dirty, g) {
+      const c0 = Math.max(0, Math.floor(Number(dirty.x) / GENGA_TILE_PX));
+      const r0 = Math.max(0, Math.floor(Number(dirty.y) / GENGA_TILE_PX));
+      const c1 = Math.min(g.gw - 1, Math.floor((Number(dirty.x) + Number(dirty.w) - 1) / GENGA_TILE_PX));
+      const r1 = Math.min(g.gh - 1, Math.floor((Number(dirty.y) + Number(dirty.h) - 1) / GENGA_TILE_PX));
+      return (c1 >= c0 && r1 >= r0) ? { c0: c0, r0: r0, c1: c1, r1: r1 } : null;
+    }
     // 이 맵의 무게. 문자열 그림은 `.length`, 칸 그림은 **칸 바이트 + 디코드된 칸의 RGBA** 다
     // (gengaTrimDrawStore 가 두 모양을 같은 자로 재야 예산이 한쪽만 세는 일이 없다).
     // ver2195: 합성본(잉크 상자 전체 RGBA)이 사라지고 디코드된 칸만 재므로, 잉크 상자 안의
     // 빈 공간만큼 이 수치 자체가 준다 — 표시 칸화의 상주 이득이 나오는 자리가 여기다.
     function gengaDrawStoreEntryBytes(v) {
       if (typeof v === 'string') return v.length;
+      if (gengaIsDrawDelta(v)) return v.snap ? Math.max(1, v.snap.width) * Math.max(1, v.snap.height) * 4 : 0;   // ver2438: delta 는 스냅 픽셀이 상주의 전부다
       if (!gengaIsTileSet(v)) return 0;
       let n = 0;
       v.cells.forEach(function(b) { n += (b && b.size) || 0; });
@@ -84712,6 +84836,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       //   `ink` 가 없는 커밋(도형·변형·이동·스탬프·붙여넣기)은 전부 다시 굽는다 — 종전과 같은 비용이다.
       let c0 = 0, r0 = 0, c1 = g.gw - 1, r1 = g.gh - 1;
       const dirty = (base && scanRect) ? scanRect.ink : null;
+      // (dirty → 칸 창 산수는 gengaDirtyCellWindow 한 벌 — ver2438 이 delta 갈래와 공용화했다)
       // ver2207 (q3=A): **첫 획 갈래의 리드백도 1회로.** 종전에는 ① 잉크 상자(gengaCanvasInkBounds)
       // ② 후보 상자(아래 bulk)를 따로 읽어 같은 캔버스를 두 번 GPU 에서 내렸다 — 그래서 그 코마의
       // 첫 획만 커밋 ~90ms 이고 둘째 획부터 26ms 였다(실기 실측). 이제 스캔 창을 **칸 경계로 먼저
@@ -84721,11 +84846,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       //   ver1196 의 「기존 그림 상자 + 이번 획」이라 그 밖에는 잉크가 없다(없으면 창은 용지 전체다).
       let scanImg = null, sx0 = 0, sy0 = 0;
       if (dirty) {
-        c0 = Math.max(0, Math.floor(Number(dirty.x) / GENGA_TILE_PX));
-        r0 = Math.max(0, Math.floor(Number(dirty.y) / GENGA_TILE_PX));
-        c1 = Math.min(g.gw - 1, Math.floor((Number(dirty.x) + Number(dirty.w) - 1) / GENGA_TILE_PX));
-        r1 = Math.min(g.gh - 1, Math.floor((Number(dirty.y) + Number(dirty.h) - 1) / GENGA_TILE_PX));
-        if (!(c1 >= c0 && r1 >= r0)) { c0 = 0; r0 = 0; c1 = g.gw - 1; r1 = g.gh - 1; }  // 창이 뒤집혔다 = 못 믿는다
+        const cw = gengaDirtyCellWindow(dirty, g);
+        if (cw) { c0 = cw.c0; r0 = cw.r0; c1 = cw.c1; r1 = cw.r1; }
+        else { c0 = 0; r0 = 0; c1 = g.gw - 1; r1 = g.gh - 1; }  // 창이 뒤집혔다 = 못 믿는다
         if (inheritBake) {   // ver2425: 직전 획의 미확정 창을 합친다 — 그 칸들은 base.cells 에 없고 prev 의 스냅에만 있다
           c0 = Math.min(c0, inheritBake.c0); r0 = Math.min(r0, inheritBake.r0);
           c1 = Math.max(c1, inheritBake.c1); r1 = Math.max(r1, inheritBake.r1);
@@ -84901,6 +85024,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 획이 쌓인 큐를 통째로 기다린다(iPad 실측 1.5 초 — R7). 연타 간격 ~120ms 보다 길고, 저장·스왑의
     // 동기 flush(gengaFlushTileEncodes)는 이 게이트를 안 지나므로 소실 창은 안 는다.
     const GENGA_BAKE_QUIET_MS = 350;
+    // ver2438 (P2): delta 의 자발 붕괴는 사람의 획 간격(대개 400ms~1 초) «밖»에서만 — 획 리듬에 리드백이
+    // 끼던 자리(간격 리듬 축 — genga_stroke_rhythm_readback_design)를 구조로 치운다. 자동저장 디바운스
+    // (INDEXED_DB_AUTOSAVE_DELAY_MS = 1600)보다 짧아야 flush 의 동기 벽에 사슬이 통째로 몰리지 않는다.
+    const GENGA_DELTA_QUIET_MS = 1200;
     // ver2430 (q2=A): 잠잠의 기준은 **마지막 커밋 시각 한 벌**이다 — 종전에는 묶음마다 자기 `pendingBake.at`
     //   을 봐서, 연타 중 오래된 prev 가 350ms 를 넘기는 순간 그 베이크(리드백)가 획 사이에 끼었다
     //   (iPad 10 차: 빈 코마 12 획에 리드백 190~220ms 가 획마다 · 데스크톱 재현 8,944 칸).
@@ -85007,17 +85134,51 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       //   대기에 남긴다 — 그 베이크·인코드·gd: 행은 undo 없이는 아무도 안 읽는 일이었다(정본
       //   genga_pending_shared_tiles_design_2026-09-07.md 4-A). 잠잠은 마지막 커밋 기준 한 벌(gengaBakeQuietAt).
       //   대기 스냅의 총 픽셀이 상한을 넘으면 가장 오래된 prev 부터 즉시 굽는다(메모리 그물).
+      // ver2438 (P2): delta 도 이 펌프가 잇는다. 우선순위 — ① want(화면·진입이 요구 — 사슬을 이번
+      //   태스크에 동기로 전부, 사용자가 빈 화면을 보는 중이다) ② 메모리 그물(스냅 총량 초과 — 잠잠
+      //   무시, 사슬 바닥 한 단계) ③ 기존 pendingBake(350ms 잠잠 — 이제 콜드·폴백 커밋만 온다)
+      //   ④ 참조되는 delta 의 자발 붕괴(GENGA_DELTA_QUIET_MS 잠잠 — 사람의 획 리듬 «밖»에서만 굽는다.
+      //   획 창 단위 스냅이라 union 누적이 없고, 자동저장(1600ms 디바운스)보다 먼저 소화하는 값이다).
       let bakeRef = '', bakeTs = null, oldestRef = '', oldestTs = null, snapPx = 0, snapN = 0, paperPx = 0;
+      let wantRef = '', deltaRef = '', oldestDeltaRef = '', oldestDeltaAt = Infinity;
       gengaPendingTileEncode.forEach(function(ts, ref) {
+        if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); return; }   // 스왑·prune·재커밋 — 펌프의 정리 짝(붕괴는 Map 값을 갱신하므로 안 걸린다)
+        if (gengaIsDrawDelta(ts)) {
+          snapN += 1; snapPx += ts.snap.width * ts.snap.height;
+          if (!paperPx) paperPx = Math.max(1, ts.pw) * Math.max(1, ts.ph);
+          if (gengaDeltaWant.has(ref)) { if (!wantRef) wantRef = ref; }
+          else if (gengaPendingRefReferenced(ref)) { if (!deltaRef) deltaRef = ref; }
+          else if ((Number(ts.at) || 0) < oldestDeltaAt) { oldestDeltaAt = Number(ts.at) || 0; oldestDeltaRef = ref; }
+          return;
+        }
         if (!ts.pendingBake) return;
-        if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); return; }   // 스왑·prune·재커밋 — 펌프의 정리 짝
         snapN += 1; snapPx += ts.pendingBake.snap.width * ts.pendingBake.snap.height;
         if (!paperPx) paperPx = Math.max(1, ts.pw) * Math.max(1, ts.ph);
         if (gengaPendingRefReferenced(ref)) { if (!bakeTs) { bakeRef = ref; bakeTs = ts; } }
         else if (!oldestTs || (Number(ts.pendingBake.at) || 0) < (Number(oldestTs.pendingBake.at) || 0)) { oldestRef = ref; oldestTs = ts; }
       });
-      paintDiagIdle.pendSnap = snapN; paintDiagIdle.pendSnapMB = snapPx * 4 / 1048576;   // 진단 줄의 「대기스냅」 — 켜짐과 무관한 값 대입
-      if (oldestTs && snapPx > paperPx * GENGA_PENDING_SNAP_MAX_PAPERS) { bakeRef = oldestRef; bakeTs = oldestTs; }   // 상한 그물 — 잠잠을 안 기다린다
+      paintDiagIdle.pendSnap = snapN; paintDiagIdle.pendSnapMB = snapPx * 4 / 1048576;   // 진단 줄의 「대기스냅」 — 켜짐과 무관한 값 대입(delta 포함)
+      if (wantRef) {
+        if (!gengaCollapseDeltaChainSync(wantRef)) {
+          gengaDeltaWant.delete(wantRef);   // 실패(스냅 리드백 등) — want 를 비워 0ms 루프를 끊는다. 콜백은 남아 다음 성공 때 온다
+          console.error('[gengaDelta] wanted collapse failed for ' + wantRef + ' - will retry on the next pump');
+        }
+        gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+        return;
+      }
+      const overNet = paperPx && snapPx > paperPx * GENGA_PENDING_SNAP_MAX_PAPERS;
+      if (overNet && (oldestDeltaRef || deltaRef)) {
+        // 그물 — 가장 오래된 delta 부터, 사슬 바닥 한 단계(리드백은 획 창 하나 몫이라 얕다).
+        let cur = oldestDeltaRef || deltaRef, guard = GENGA_DELTA_CHAIN_MAX + 2;
+        while (guard-- > 0) {
+          const v = gengaDrawStore.get(cur);
+          if (gengaIsDrawDelta(v) && gengaIsDrawDelta(gengaDrawStore.get(v.deltaBase))) cur = v.deltaBase; else break;
+        }
+        gengaCollapseDeltaOnce(cur);
+        gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+        return;
+      }
+      if (overNet && oldestTs) { bakeRef = oldestRef; bakeTs = oldestTs; }   // 상한 그물(비 delta 스냅) — 잠잠을 안 기다린다
       else if (bakeTs) {
         // ver2425: 잠잠 게이트. 다음 커밋이 더는 동기 베이크를 강제하지 않으므로(inheritBake) 미루는 것이
         //   펜업으로 옮겨가지 않는다 — 종전에는 그래서 미룰 수가 없었다.
@@ -85032,6 +85193,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
         return;
       }
+      if (deltaRef) {
+        const quietLeft = GENGA_DELTA_QUIET_MS - (performance.now() - gengaBakeQuietAt);
+        if (quietLeft > 0) { gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, quietLeft); return; }
+        let cur = deltaRef, guard = GENGA_DELTA_CHAIN_MAX + 2;
+        while (guard-- > 0) {
+          const v = gengaDrawStore.get(cur);
+          if (gengaIsDrawDelta(v) && gengaIsDrawDelta(gengaDrawStore.get(v.deltaBase))) cur = v.deltaBase; else break;
+        }
+        gengaCollapseDeltaOnce(cur);
+        gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+        return;
+      }
       let budget = GENGA_TILE_ENCODE_BATCH;
       const deadline = performance.now() + GENGA_TILE_ENCODE_MS;   // ver2395
       const it = gengaPendingTileEncode.entries();
@@ -85042,6 +85215,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 프로젝트 스왑·prune·tlTut 복귀로 store 에서 밀려난 묶음은 확정할 이유가 없다 —
         // 디스크에 쓰면 고아 행만 는다. 여기서 조용히 내리는 것이 그 경로들의 정리 짝이다.
         if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); continue; }
+        if (gengaIsDrawDelta(ts)) continue;   // ver2438: 붕괴 전 delta — 인코드할 cells 가 아직 없다(붕괴는 위 선택 로직의 몫)
         if (ts.pendingBake) continue;   // ver2430: 대기 중인 prev(참조 없음) — 인코드·persist 하지 않는다(획이 빠진 부분 그림이 된다)
         const r = gengaEncodeTileCells(ts, budget, deadline);   // ver2395: 시간 예산
         budget -= Math.max(1, r.done);
@@ -85059,7 +85233,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2430: 참조 없는 대기 prev 만 남았으면 재예약하지 않는다(0ms 재예약 루프가 된다) — undo/redo 가
       //   그 ref 를 다시 참조하는 순간 gengaKickTileEncodePump 가 깨운다.
       let more = false;
-      gengaPendingTileEncode.forEach(function(ts, ref) { if (!ts.pendingBake || gengaPendingRefReferenced(ref)) more = true; });
+      gengaPendingTileEncode.forEach(function(ts, ref) {
+        if (gengaIsDrawDelta(ts)) { if (gengaDeltaWant.has(ref)) more = true; return; }   // ver2438: 참조 delta 는 잠잠 타이머가, 고아 delta 는 그물·undo 깨움이 잇는다
+        if (!ts.pendingBake || gengaPendingRefReferenced(ref)) more = true;
+      });
       if (more && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
     }
     // 동기 flush — 저장·프로젝트 스왑 직전의 마지막 확정. gengaFlushPendingDrawingEncodes 가 부른다.
@@ -85069,12 +85246,27 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const entries = Array.from(gengaPendingTileEncode.entries());
       gengaPendingTileEncode.clear();
       entries.forEach(function(kv) {
-        const ref = kv[0], ts = kv[1];
-        if (gengaDrawStore.get(ref) !== ts) return;
+        const ref = kv[0];
+        let ts = gengaDrawStore.get(ref);
+        // ver2438: 사본(kv[1])이 아니라 **지금 store 값**으로 판정한다 — 이 forEach 안의 앞선 붕괴가
+        // 같은 사슬의 base 를 이미 완전체로 바꿔 두었을 수 있다(사본 대조면 그 ref 를 스왑으로 오인해
+        // 건너뛰고, gd: 미기록인 채 프로젝트 JSON 이 나간다). 스왑·prune 은 「값이 없다」로 걸린다.
+        if (!ts || (kv[1] !== ts && !gengaIsTileSet(ts))) return;
         // ver2430: 참조 없는 대기 prev 는 확정하지 않고 대기에 되돌린다 — 저장본이 안 가리키는 그림이라
         //   여기서 굽는 것은 자동저장·스왑 앞의 동기 벽(데스크톱 재현 5 초)만 만든다. undo 로 돌아오면
         //   참조 ref 가 되어 다음 flush·펌프가 확정한다. 스왑 뒤 고아는 펌프의 store 대조가 내린다.
         if (!gengaPendingRefReferenced(ref)) { gengaPendingTileEncode.set(ref, ts); return; }   // 베이크 대기든 인코드 대기든 — 참조 없으면 동기 벽에 안 싣는다(펌프가 idle 에서 잇는다)
+        // ver2438: 참조되는 delta — 저장은 완전체를 요구하므로 사슬을 여기서 동기로 전부 붕괴한다
+        // (P2 의 정직한 잔여 벽 — P3 worker 가 걷는다). 실패하면 재등록하고 안 적는다(부분 그림 금지).
+        if (gengaIsDrawDelta(ts)) {
+          const collapsed = gengaCollapseDeltaChainSync(ref);
+          if (!collapsed) {
+            gengaScheduleTileEncode(ref, ts);
+            console.error('[gengaDelta] flush could not collapse ' + ref + ' - the gd: row is not written yet');
+            return;
+          }
+          ts = collapsed;
+        }
         // ver2365: 베이크 대기분을 먼저 확정한다 — 안 하면 물려받은 칸이 전부 Blob 인 묶음이
         // 「완비」로 보여 **획이 빠진 부분 그림**이 gd: 에 박힌다. 실패하면 재등록하고 안 적는다
         // (부분 그림을 적느니 종전 그림이 낫다 — ver1448 계약).
@@ -85189,6 +85381,45 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // 칸 묶음을 새 ref 로 등록한다 — 종전 gengaPutDrawingCanvas 와 **같은 계약**의 그림 객체를 낸다
     // (`tiles` 가 붙는 것만 다르다). ver2197: 인코드·gd: 쓰기는 pump 가 커밋 밖에서 한다.
+    // ver2438 (P2): delta 커밋 — 직전 그림이 칸(또는 delta)이고 잉크를 «더하는» 획이면, 기존 칸을 한 번도
+    // 보지 않고 「base ref + 이번 획 창의 GPU 스냅」만 등록한다(커밋이 기존 잉크 양 N 과 무관해진다).
+    // 성립 못 하면 null — 부르는 쪽이 종전 경로(gengaTileSetFromCanvas)로 간다: 통짜·벡터·격자/용지
+    // 불일치·소거 획·ink 없는 커밋(도형·변형·붙여넣기)·사슬 깊이 상한(콜드 스냅이 사슬을 리셋한다).
+    const GENGA_DELTA_CHAIN_MAX = 8;
+    function gengaTryCommitDelta(cv, scanRect, prevDrawing) {
+      const prevRef = prevDrawing && prevDrawing.ref;
+      if (!prevRef || !scanRect || !scanRect.ink || !scanRect.addsInk) return null;
+      const pv = gengaDrawStore.get(prevRef);
+      const isTs = gengaIsTileSet(pv), isD = gengaIsDrawDelta(pv);
+      if (!isTs && !isD) return null;
+      const pw = Math.max(1, cv.width), ph = Math.max(1, cv.height);
+      if (!(pv.pw === pw && pv.ph === ph)) return null;                       // 용지가 바뀌었다 — 격자가 다르다
+      if (isTs && pv.tile !== GENGA_TILE_PX) return null;                     // 옛 격자 크기의 저장본
+      const depth = isD ? (Number(pv.depth) || 1) + 1 : 1;
+      if (depth > GENGA_DELTA_CHAIN_MAX) return null;
+      const g = gengaTileGrid(pw, ph);
+      const cw = gengaDirtyCellWindow(scanRect.ink, g);
+      if (!cw) return null;                                                   // 뒤집힌 창 — 못 믿는다
+      const wx0 = cw.c0 * GENGA_TILE_PX, wy0 = cw.r0 * GENGA_TILE_PX;         // 칸 정렬 창(CutCell 의 scanImg 경로 전제)
+      const wx1 = Math.min(pw, (cw.c1 + 1) * GENGA_TILE_PX), wy1 = Math.min(ph, (cw.r1 + 1) * GENGA_TILE_PX);
+      const snap = document.createElement('canvas');
+      snap.width = wx1 - wx0; snap.height = wy1 - wy0;
+      snap.getContext('2d').drawImage(cv, wx0, wy0, snap.width, snap.height, 0, 0, snap.width, snap.height);   // GPU→GPU — 동기화 0
+      const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
+      // bounds = base ∪ 창 (O(1)) — 그림 객체의 트림 배치와 썸 절단이 이 상자를 쓴다(상위집합 계약).
+      const bx = Math.min(Number(pv.x) || 0, wx0), by = Math.min(Number(pv.y) || 0, wy0);
+      const bw = Math.max((Number(pv.x) || 0) + (Number(pv.w) || 1), wx1) - bx;
+      const bh = Math.max((Number(pv.y) || 0) + (Number(pv.h) || 1), wy1) - by;
+      const v = { deltaBase: prevRef, snap: snap, sx: wx0, sy: wy0, c0: cw.c0, r0: cw.r0, c1: cw.c1, r1: cw.r1,
+        pw: pw, ph: ph, x: bx, y: by, w: bw, h: bh, depth: depth, at: performance.now() };
+      gengaDeltaBaseHold(prevRef, true);
+      gengaDrawStorePut(ref, v);
+      gengaScheduleTileEncode(ref, v);                                        // 붕괴·인코드는 펌프가 잇는다
+      gengaBakeQuietAt = performance.now();                                   // ver2430 계약 그대로 — 잠잠 기준은 마지막 커밋 한 벌
+      gengaTrimDrawStore(ref);
+      return { drawing: { ref: ref, w: Math.max(1, Math.round(bw)), h: Math.max(1, Math.round(bh)), x: Math.round(bx), y: Math.round(by) },
+        bounds: { x: bx, y: by, w: bw, h: bh } };
+    }
     function gengaPutDrawingTiles(ts) {
       const ref = 'gd_' + Date.now().toString(36) + '_' + (gengaDrawRefSeq++).toString(36);
       gengaDrawStorePut(ref, ts);
@@ -85392,7 +85623,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 공유 안내·충돌 판정이 벡터 레이어를 없는 셈 친다.
     // ver2192: `evicted` 도 **그림 있음**이다 — 픽셀이 잠시 자리를 비웠을 뿐 디스크에 있다.
     // 여기서 false 를 내면 그 코마가 「빈 칸」으로 취급돼 다음 커밋이 기존 그림을 덮어쓴다.
-    function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas || d.tileSet || d.evicted || gengaDrawingStrokes(d))); } // ver2195: 칸 그림은 tileSet 으로 온다
+    function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas || d.tileSet || d.evicted || d.deltaPending || gengaDrawingStrokes(d))); } // ver2195: 칸 그림은 tileSet 으로 온다 · ver2438: 붕괴 대기 delta 도 존재한다
     function gengaResolveDrawing(d) {
       if (!d) return null;
       const u = gengaDrawingUrl(d);
@@ -85412,6 +85643,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
         if (d.strokes) out.strokes = d.strokes;
         return out;
+      }
+      // ver2438: **delta 그림** — 픽셀 정본은 P1 활성 캔버스다(같은 ref = 같은 픽셀). 활성이 이 ref 를
+      // 쥐고 있으면 용지 전체 canvas 로 나간다(x/y 를 안 실어 full-paper 1:1 — dr.canvas 소비처의 기존
+      // 분기 그대로). 활성 미스(undo 로 돌아온 옛 delta·리로드)는 「없다」가 아니라 **「아직 없다」** —
+      // deltaPending 을 달아 존재를 유지하고 펌프에 우선 붕괴를 예약한다(evicted 의 무늬와 같다).
+      if (d.ref) {
+        const dv = gengaDrawStore.get(d.ref);
+        if (gengaIsDrawDelta(dv)) {
+          if (typeof gengaActiveCanvas !== 'undefined' && gengaActiveCanvas && gengaActiveCanvas.ref === d.ref) {
+            return { ref: d.ref, w: dv.pw, h: dv.ph, canvas: gengaActiveCanvas.canvas };
+          }
+          const out = { ref: d.ref, w: d.w, h: d.h, deltaPending: true };
+          if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
+          // want 는 여기서 걸지 않는다 — resolve 는 썸 캐시 히트처럼 픽셀이 필요 없는 자리에서도
+          // 자주 불린다. 픽셀을 실제로 요구하는 소비처(표시 커널·ImageSource·그리기 진입)가 건다.
+          return out;
+        }
       }
       if (d.ref && gengaPendingDrawingEncode.has(d.ref)) { // ver1324: encode in flight — hand out the pixels
         const out = { ref: d.ref, w: d.w, h: d.h, canvas: gengaPendingDrawingEncode.get(d.ref).canvas };
@@ -85612,6 +85860,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (onReady) p.then(function() { onReady(); });
         return null;
       }
+      // ver2438: 붕괴 대기 delta — 「디코드 전」과 같은 계약(null + onReady 재호출). 우선 붕괴를 예약한다.
+      if (dr.deltaPending && dr.ref) { gengaDeltaWantCollapse(dr.ref, onReady || null); return null; }
       if (typeof dr.dataUrl === 'string' && dr.dataUrl) return gengaImageFor(dr, onReady);
       const st = gengaDrawingStrokes(dr);
       return st ? gengaVectorBakedCanvas(st, Math.max(1, pw), Math.max(1, ph)) : null;
@@ -85622,6 +85872,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // dr.w/h 가 이미지 자연 크기와 어긋나는 그림에서 픽셀이 달라진다. 동작 불변이 먼저다.
       const place = gengaDrawingPlacement(dr, pw, ph);
       if (dr.tileSet) return gengaDrawTileSetInto(ctx, dr.tileSet, place, pw, ph, onReady); // ver2195
+      // ver2438: 붕괴 대기 delta — 이번 프레임은 못 그린다(빈 자리). 우선 붕괴를 예약하고 onReady 로
+      // 다시 부르게 한다 — 「아직 없다」 계약(디코드 전 래스터·evicted 와 같은 무늬).
+      if (dr.deltaPending && dr.ref) { gengaDeltaWantCollapse(dr.ref, onReady || null); return false; }
       if (dr.canvas) { // ver1324: pending-encode drawing — draw the pixels directly (no decode round-trip)
         if (place.placed) ctx.drawImage(dr.canvas, Math.round(place.x), Math.round(place.y));
         else ctx.drawImage(dr.canvas, 0, 0, pw, ph);
@@ -103100,11 +103353,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const liveLayer = gengaLayerById(layerId);
         const liveExp = liveLayer && gengaExposureAt(liveLayer, frame);
         const prevDrawing = liveExp ? gengaExposureDrawing(liveLayer, liveExp) : null;
+        // ver2438 (P2): delta 갈래 먼저 — 잉크를 더하는 획이고 직전이 칸/delta 면 기존 칸을 안 본다.
+        // committedTs 자리에는 bounds 모양({x,y,w,h})을 넣는다 — 아래 썸 절단이 읽는 네 필드가 전부다.
+        const deltaOut = gengaTryCommitDelta(cv, scanRect, prevDrawing);
+        if (deltaOut) {
+          drawing = deltaOut.drawing;
+          committedTs = deltaOut.bounds;
+          tiled = true;
+        } else {
         const prevTiles = prevDrawing ? gengaDrawingTiles(prevDrawing) : null;
         const ts = gengaTileSetFromCanvas(cv, scanRect, prevTiles, true);   // ver2365: 획 커밋 갈래만 칸 베이크를 이월한다
         drawing = ts ? gengaPutDrawingTiles(ts) : null;   // null = 빈 그림(종전 트림이 내던 답과 같다)
         committedTs = ts;
         tiled = true;
+        }
         // ver2428 (q1=A): 여기 있던 직전 그림의 재수화(ver2216 B 안 — 이관으로 비운 base 의 decoded 를
         // 커밋 밖에서 도로 채우던 것)를 걷었다. 그 재디코드가 **획마다 그림 전체 크기**의 일이었다 —
         // 잉크 칸 수에 비례해 idle 한 태스크가 자라고(1577 칸에서 99ms), 직전 그림의 RGBA 한 벌이
@@ -103445,6 +103707,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaCamDrag = null; gengaExpDrag = null; gengaCelDrag = null;
       gengaLastStrokeCanvas = null;              // ★실측된 누수 — 이전 프로젝트의 용지 캔버스
       gengaActiveCanvas = null;                  // ver2437: 같은 근거 — 활성 캔버스도 이전 프로젝트의 용지다
+      gengaDeltaWant.clear();                    // ver2438: 이전 프로젝트의 붕괴 요청·콜백 — 고아가 되면 엉뚱한 재렌더를 부른다
+      gengaDeltaWantCallbacks.clear();
       gengaDrawSession = null;                   // 진행 중 스트로크(옛 레이어 대상)
       gengaFxLive = null;                        // 라이브 FX 미리보기 값(옛 레이어)
       gengaFxGizmoDrag = null;
@@ -106407,6 +106671,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2192: 축출된 그림은 **디스크에서 돌아올 때까지 그리기를 막는다.** 여기서 통과시키면
       // 빈 시드 위에 그려 그 코마의 기존 그림이 사라진다 — 이 판에서 가장 위험한 자리다.
       if (dr && dr.evicted && dr.ref) { gengaDrawStoreFaultIn(dr.ref, retry); return false; }
+      // ver2438: 붕괴 대기 delta(활성 미스 — undo 로 돌아온 옛 delta) — 완전체가 될 때까지 그리기를
+      // 막고(빈 시드가 덮어쓰는 병은 evicted 와 같다), 펌프에 우선 붕괴를 예약한다. retry 는 붕괴
+      // 완료 콜백으로 온다.
+      if (dr && dr.deltaPending && dr.ref) { gengaDeltaWantCollapse(dr.ref, retry); return false; }
       // ver2195 그물: store 진입 세 경로가 디코드까지 마치므로 여기 걸리면 그 불변식이 깨진 것이다 —
       // 그래도 통과시키면 빈 시드가 기존 그림을 덮어쓰므로(위 evicted 와 같은 병) 막고 소리 낸다.
       // ver2216: 이관(decodedMoved)이 남긴 미완은 병이 아니라 설계다 — 획 undo 로 되돌아온 직전 그림
