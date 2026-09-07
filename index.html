@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2438</title>
+  <title>MoArt ver2439</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24387,6 +24387,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2439, items: [
+        { ja: '**描くたびに画面が一瞬白く点滅する問題を直しました。**ver2438 の変更で、線を確定した瞬間の再描画が'
+            + '絵を一コマだけ見失っていました。',
+          ko: '**그을 때마다 화면이 한순간 하얗게 번쩍이던 문제를 고쳤습니다.** ver2438 의 변경에서, 획을 확정하는'
+            + ' 순간의 재렌더가 그림을 한 프레임 놓치고 있었습니다.',
+          en: '**Fixed the screen flashing blank for an instant on every stroke.** A ver2438 change made the redraw at'
+            + ' commit time lose sight of the drawing for one frame.',
+          zh: '**修复了每画一笔画面就闪白一瞬的问题。**ver2438 的改动让确定笔画瞬间的重绘丢失了一帧图像。' } ] },
       { ver: 2438, items: [
         { ja: '**線を引き終わる瞬間も、絵の込み具合と無関係になりました。**ストロークの確定が「今描いた範囲」だけを'
             + '記録する方式になり、描き込みが多いコマでも一定の軽さで続けられます。',
@@ -85652,7 +85660,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const dv = gengaDrawStore.get(d.ref);
         if (gengaIsDrawDelta(dv)) {
           if (typeof gengaActiveCanvas !== 'undefined' && gengaActiveCanvas && gengaActiveCanvas.ref === d.ref) {
-            return { ref: d.ref, w: dv.pw, h: dv.ph, canvas: gengaActiveCanvas.canvas };
+            // deltaLive: 이 canvas 는 「인코드 대기」가 아니라 살아 있는 픽셀 정본이다 — 썸 패치의
+            // pending-encode 스킵 가드(ver1324)가 이것을 대기로 오인하면 썸이 영영 안 갱신된다.
+            return { ref: d.ref, w: dv.pw, h: dv.ph, canvas: gengaActiveCanvas.canvas, deltaLive: true };
           }
           const out = { ref: d.ref, w: d.w, h: d.h, deltaPending: true };
           if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
@@ -103355,11 +103365,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const prevDrawing = liveExp ? gengaExposureDrawing(liveLayer, liveExp) : null;
         // ver2438 (P2): delta 갈래 먼저 — 잉크를 더하는 획이고 직전이 칸/delta 면 기존 칸을 안 본다.
         // committedTs 자리에는 bounds 모양({x,y,w,h})을 넣는다 — 아래 썸 절단이 읽는 네 필드가 전부다.
-        const deltaOut = gengaTryCommitDelta(cv, scanRect, prevDrawing);
+        const deltaOut = (liveLayer && !gengaLayerDrawsVector(liveLayer)) ? gengaTryCommitDelta(cv, scanRect, prevDrawing) : null;   // ver2439: 벡터 레이어는 아래 gengaVectorRejectsRaster 가 거부한다 — 헛 delta 를 만들지 않는다
         if (deltaOut) {
           drawing = deltaOut.drawing;
           committedTs = deltaOut.bounds;
           tiled = true;
+          // ★ver2439: 활성 캔버스를 **여기서 선등록**한다(ref + canvas — expId 는 커밋 뒤 본등록이
+          // 채운다). gengaCommitDrawing 안의 프리뷰·썸 재렌더가 이 delta ref 를 resolve 하는데, 등록이
+          // 그 «뒤»면 활성 미스 → deltaPending(빈 그림)이 한 프레임 그려지고 want 가 즉시 사슬을
+          // 붕괴시켰다 — 획마다 그림 전체가 번쩍이고(제보 「번쩍번쩍, 그림 못 그림」) delta 의 이점도
+          // 획마다 반납됐다(재현: 획당 want 1 회, 대상이 방금 커밋한 그 ref).
+          gengaActiveCanvas = { layerId: layerId, expId: null, ref: drawing.ref, canvas: cv };
         } else {
         const prevTiles = prevDrawing ? gengaDrawingTiles(prevDrawing) : null;
         const ts = gengaTileSetFromCanvas(cv, scanRect, prevTiles, true);   // ver2365: 획 커밋 갈래만 칸 베이크를 이월한다
@@ -103421,7 +103437,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const resolved = gengaExposureDrawing(layer, e);
       // ver2193→ver2195: 칸 그림은 tileSet 으로 오므로 이 문에 안 걸린다 — 인코드 대기(canvas 만
       // 있고 문자열이 아직 없는 그림)만 건너뛴다(settle 이 다시 부른다).
-      if (resolved && resolved.canvas && !resolved.dataUrl) return;
+      if (resolved && resolved.canvas && !resolved.dataUrl && !resolved.deltaLive) return;   // ver2439: 활성 delta 의 canvas 는 대기가 아니라 정본 — 스킵하면 썸이 영영 안 갱신된다
       // ver2202: 커밋의 코마 썸 인코드(toBlob) 대기 — 같은 계약이다: 스킵하면 옛 썸이 잠시 남고,
       // 완료 콜백이 반드시 재호출한다. 여기서 스킵 없이 gengaThumbUrlFor 로 가면 미스 경로가
       // 「합성 + 동기 PNG 인코드」를 물어 인코드를 밖으로 뺀 뜻이 없어진다.
