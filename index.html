@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2452</title>
+  <title>MoArt ver2453</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -20292,7 +20292,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const lenBeforePush = state.undoStack.length;
       state.undoStack.push(command);
       trimCommandStack(state.undoStack, MAX_UNDO_HISTORY);
-      if (!(options && options.historyTraversal)) trimUndoStackToMemoryBudget();
+      if (!(options && options.historyTraversal)) {
+        state.redoStack.forEach(releaseHistoryPixels);
+        trimHistoryPixels();
+        trimUndoStackToMemoryBudget();
+      }
       // ver2188: 그림을 붙잡던 스냅샷이 사라지는 두 경우에만 회수를 예약한다. ① push 로 +1 했는데
       // 길이가 안 늘었다 = 상한이나 예산이 최소 하나를 밀어냈다. ② redo 스택이 차 있다 = 이 편집이
       // 곧 그것을 통째로 버린다(호출부가 바로 다음 줄에서 비운다). **이동(historyTraversal)은 아니다** —
@@ -20320,7 +20324,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!Array.isArray(stack)) return;
       const limit = Math.max(1, Math.round(Number(maxItems) || 1));
       if (stack.length <= limit) return;
-      stack.splice(0, stack.length - limit);
+      stack.splice(0, stack.length - limit).forEach(releaseHistoryPixels);
     }
 
     // -- ver1064: undo/redo MEMORY budget (docs/memory_budget_audit_2026-07-24.md P2) ------------------
@@ -20440,6 +20444,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           for (let i = 0; i < cost.canvases.length; i += 1) {
             const canvas = cost.canvases[i];
             if (!canvas || counted.has(canvas) || liveResident.has(canvas)) continue;
+            // An extra owner means the delta store still prices this exact snapshot.
+            // After its release, the remaining history owner pays without scanning the store.
+            if (paintCanvasRetainers.get(canvas) > 0) continue;
             counted.add(canvas);
             bytes += (Number(canvas.width) || 0) * (Number(canvas.height) || 0) * 4; // RGBA, the house convention
           }
@@ -20502,7 +20509,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // for zero bytes.
         const nextTotal = historyStacksBytes([stack.slice(1)]).total;
         if (nextTotal >= total) break;
-        stack.shift();
+        releaseHistoryPixels(stack.shift());
         dropped += 1;
         total = nextTotal;
       }
@@ -20842,7 +20849,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const after = snapshotProject();
       const gengaRenderPlan = gengaRenderPlanForProjects(before, after);
       // ver1314: refreshOptions.selectionRider 가 있으면 선택 스냅샷이 같은 undo 스텝에 함께 실린다.
-      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaRenderPlan: gengaRenderPlan }, refreshOptions && refreshOptions.selectionRider));
+      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaPixels: refreshOptions && refreshOptions.gengaPixels, gengaRenderPlan: gengaRenderPlan }, refreshOptions && refreshOptions.selectionRider));
       if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } } // ver1138: タイムライン練習 detects real ops
       state.redoStack = [];
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
@@ -21869,7 +21876,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 적용하기 위해서다. 분기마다 손으로 넣으면 14곳을 맞게 유지해야 하고, 새 커맨드 종류가 생길 때
       // 잊는 쪽이 기본이 된다(이 파일이 반복해서 겪은 미러 드리프트 그 자체). 선택 복원은 프로젝트
       // 복원 **뒤**여야 한다 — 복원 함수가 새 프로젝트 상태 위에서 다시 그리기 때문.
+      const restoredPixels = gengaApplyHistoryPixels(command, undoing);
       applyHistoryCommandPayload(command, undoing, pushOther);
+      if (restoredPixels && gengaActiveCanvas) {
+        const layer = gengaLayerById(gengaActiveCanvas.layerId);
+        const exp = layer && gengaExposureAt(layer, command.gengaPixels.frame);
+        gengaActiveCanvas.expId = exp && exp.id || null;
+      }
       applySelectionRider(command, undoing);
     }
     function applyHistoryCommandPayload(command, undoing, pushOther) {
@@ -24430,6 +24443,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2453, items: [{ ja: '原画の取り消し・やり直しを高速化し、画面更新と描画データの準備処理を整理しました。描画中の更新を待たせず、最近の変更範囲を直接復元します。', ko: '원화의 되돌리기·다시 실행을 빠르게 하고 화면 갱신과 그림 준비 처리를 정리했습니다. 그리기 중 화면 갱신을 늦추지 않고 최근 변경 영역을 직접 복원합니다.', en: 'Faster genga undo and redo, with clearer rendering and drawing preparation. Recent edited regions restore directly without adding a wait to live drawing updates.', zh: '加快原画撤销与重做，并整理画面更新和绘画准备流程。直接恢复最近修改的区域，不增加绘画更新的等待。' }] },
       { ver: 2452, items: [{ ja: '描画・取り消し時の画面更新を改善しました。復元途中の絵を表示せず、完成した画面を一度に反映します。', ko: '그리기·되돌리기 때의 화면 갱신을 개선했습니다. 복원 중인 부분 그림을 표시하지 않고 완성된 화면을 한 번에 반영합니다.', en: 'Improved drawing and undo display updates. Incomplete restored artwork is held back until a complete frame can be presented.', zh: '改善绘画和撤销时的画面更新。恢复中的不完整图像不再显示，完整画面准备好后一次更新。' }] },
       { ver: 2451, items: [{ ja: 'TVPaint出力で、後続の未作画コマに別の絵が現れる問題を修正しました。新しいインスタンスごとに完全な画像を記録します。', ko: 'TVPaint 출력에서 뒤쪽의 미작화 코마에 다른 그림이 나타나는 문제를 고쳤습니다. 새 인스턴스마다 완전한 이미지를 기록합니다.', en: 'Fixed later undrawn cels displaying other artwork in TVPaint exports. Each new instance now contains a complete image.', zh: '修正TVPaint导出中后续未作画的格出现其他图画的问题。每个新实例现在都记录完整图像。' }] },
       { ver: 2450, items: [{ ja: 'TVPaint出力の「x」を、コマが存在しない空セル区間だけに限定しました。絵を描いていない通常のコマは通常のインスタンスとして残ります。', ko: 'TVPaint 출력의 x를 코마가 없는 빈 구간에만 붙이도록 고쳤습니다. 그림을 그리지 않은 일반 코마는 일반 인스턴스로 남습니다.', en: 'TVPaint export now names only gaps without cels x. Existing cels with no drawing remain ordinary instances.', zh: 'TVPaint导出现在仅将不存在格的空档命名为x。已有但未绘制内容的格保持为普通实例。' }] },
@@ -58273,7 +58287,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (paintRasterOpCurvePending()) did = paintCancelPendingCurveRaster() || did;
       if (state.memoPageCurvePending) did = cancelPendingCurvePage() || did;
       if (typeof gengaDrawSession !== 'undefined' && gengaDrawSession && gengaDrawSession.shape === 'curve' && gengaDrawSession.curveChord) {
-        gengaDrawSession = null;
+        gengaEndDrawSession();
         if (typeof drawGengaPreview === 'function') drawGengaPreview();
         did = true;
       }
@@ -79544,14 +79558,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver682 (P0-b): the two REACTIVE safety nets that used to live here are GONE — see the
       // tool-state architecture review §3.6. Rule: NEVER write state.paintEditTool directly.
       // ver608 sweeper: a pending curve chord dies when the tool changes.
-      if (state.paintTool !== 'curve') {
-        if (paintRasterOpCurvePending()) paintCancelPendingCurveRaster();
-        if (state.memoPageCurvePending) cancelPendingCurvePage();
-        if (typeof gengaDrawSession !== 'undefined' && gengaDrawSession && gengaDrawSession.shape === 'curve' && gengaDrawSession.curveChord) {
-          gengaDrawSession = null;
-          if (typeof drawGengaPreview === 'function') drawGengaPreview();
-        }
-      }
+      if (state.paintTool !== 'curve') cancelAnyPendingCurve();
       renderCameraFrameOverlay(document.getElementById('conteVideoStage'));
       const eraser = document.getElementById('paintEraserBtn');
       const eyedropper = document.getElementById('paintEyedropperBtn');
@@ -85334,7 +85341,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaDeltaWant.add(ref);
       if (cb) {
         const arr = gengaDeltaWantCallbacks.get(ref) || [];
-        arr.push(cb); gengaDeltaWantCallbacks.set(ref, arr);
+        if (arr.indexOf(cb) < 0) arr.push(cb); gengaDeltaWantCallbacks.set(ref, arr);
       }
       gengaKickTileEncodePump();
     }
@@ -85654,6 +85661,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       paintReleaseCanvas(v.snap);
       gengaDrawStoreDrop(ref);        // delta 회계를 내리고
       gengaDrawStorePut(ref, ts);     // 같은 ref 로 완전체를 올린다 — 코마·활성·undo 의 ref 는 그대로다
+      trimHistoryPixels(); // shared snapshot ownership moved to history; recheck its existing budget
       if (gengaPendingTileEncode.get(ref) === v) gengaPendingTileEncode.set(ref, ts);   // 펌프·flush 의 「store 와 같은 객체」 대조가 붕괴를 스왑으로 오인하지 않게
       gengaDeltaWant.delete(ref);
       const cbs = gengaDeltaWantCallbacks.get(ref);
@@ -86386,7 +86394,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     //   저장할 이유가 없다. 순회는 있는 것(gengaFindDrawingByRef)을 재사용한다.
     function gengaPendingRefReferenced(ref) { return Boolean(gengaFindDrawingByRef(ref)); }
     function gengaKickTileEncodePump() {
-      if (gengaPendingTileEncode.size && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+      if (!gengaPendingTileEncode.size) return;
+      // A visible drawing request preempts the background quiet timer.
+      if (gengaDeltaWant.size && gengaTileEncodeTimer) { clearTimeout(gengaTileEncodeTimer); gengaTileEncodeTimer = 0; }
+      if (!gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
     }
     // ver2365 (q1=A): 커밋이 미룬 칸 베이크 — 스냅에서 리드백 1회 + 빈 판정 + 칸 자르기.
     // 커밋의 동기 구간이 하던 픽셀 일 그대로다(gengaTileCutCell 재사용 — 판정식·memcpy 등가.
@@ -87099,6 +87110,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaDrawingHasArt(d) { return Boolean(d && (d.dataUrl || d.canvas || d.tileSet || d.evicted || d.deltaPending || gengaDrawingStrokes(d))); } // ver2195: 칸 그림은 tileSet 으로 온다 · ver2438: 붕괴 대기 delta 도 존재한다
     function gengaResolveDrawing(d) {
       if (!d) return null;
+      if (d.ref && gengaActiveCanvas && d.ref === gengaActiveCanvas.ref && !d.strokes) {
+        const cv = gengaActiveCanvas.canvas;
+        return { ref: d.ref, w: cv.width, h: cv.height, canvas: cv, active: true,
+          inkBounds: gengaDrawingPlacement(d, cv.width, cv.height), deltaLive: gengaIsDrawDelta(gengaDrawStore.get(d.ref)) };
+      }
       const u = gengaDrawingUrl(d);
       // ver2032: **strokes 를 떼지 않는다.** 종전에는 캐시(ref)가 있으면 여기서 래스터만 돌려줘
       // 하이브리드 그림이 「벡터가 아닌 것」이 됐다 — 벡터 배지가 붙었는데도 획이 래스터 경로로
@@ -87117,18 +87133,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (d.strokes) out.strokes = d.strokes;
         return out;
       }
-      // ver2438: **delta 그림** — 픽셀 정본은 P1 활성 캔버스다(같은 ref = 같은 픽셀). 활성이 이 ref 를
-      // 쥐고 있으면 용지 전체 canvas 로 나간다(x/y 를 안 실어 full-paper 1:1 — dr.canvas 소비처의 기존
-      // 분기 그대로). 활성 미스(undo 로 돌아온 옛 delta·리로드)는 「없다」가 아니라 **「아직 없다」** —
-      // deltaPending 을 달아 존재를 유지하고 펌프에 우선 붕괴를 예약한다(evicted 의 무늬와 같다).
+      // Delta references without active pixels retain their identity and bounds.
+      // Resolve only describes them; gengaPrepareDrawing owns collapse/decode requests.
       if (d.ref) {
         const dv = gengaDrawStore.get(d.ref);
         if (gengaIsDrawDelta(dv)) {
-          if (typeof gengaActiveCanvas !== 'undefined' && gengaActiveCanvas && gengaActiveCanvas.ref === d.ref) {
-            // deltaLive: 이 canvas 는 「인코드 대기」가 아니라 살아 있는 픽셀 정본이다 — 썸 패치의
-            // pending-encode 스킵 가드(ver1324)가 이것을 대기로 오인하면 썸이 영영 안 갱신된다.
-            return { ref: d.ref, w: dv.pw, h: dv.ph, canvas: gengaActiveCanvas.canvas, deltaLive: true };
-          }
           const out = { ref: d.ref, w: d.w, h: d.h, deltaPending: true };
           if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
           // want 는 여기서 걸지 않는다 — resolve 는 썸 캐시 히트처럼 픽셀이 필요 없는 자리에서도
@@ -87146,7 +87155,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 그리기 진입은 `gengaEnsureDrawingReady` 가 막는다. 이 표시가 없으면 그 코마 위에 그리는 순간
       // 빈 시드가 기존 그림을 덮어써 작업물이 사라진다.
       if (d.ref && gengaPersistedRefs.has(d.ref)) {
-        gengaDrawStoreFaultIn(d.ref, gengaFrameStackOnArtReady); // ver2209: 완료 = 그림 등장 — 프레임 캐시를 버리고 다시 그린다(종전 drawGengaPreview 만으로는 빈 캐시가 히트로 살아남는다)
+        // Resolving a reference does not start I/O; pixel consumers request readiness.
         const out = { ref: d.ref, w: d.w, h: d.h, evicted: true };
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
         if (d.strokes) out.strokes = d.strokes;
@@ -87323,73 +87332,83 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 래스터는 종전대로 디코드 이미지 - 아직 디코드 전이면 null 이고 호출부가 'pending' 으로 다룬다.
     // **순서는 gengaDrawDrawingInto 와 같아야 한다** - 같은 그림이 화면과 실루엣에서 다른 소스를
     // 쓰면 그 순간 둘이 갈린다.
-    function gengaDrawingImageSource(dr, pw, ph, onReady) {
-      if (!dr) return null;
-      if (dr.canvas) return dr.canvas;
-      // ver2195: 칸 그림 — 통짜 한 장을 그때 합쳐 준다(호출부는 전부 결과를 자기 캐시에 넣는
-      // 저빈도 자리다: 실루엣·진단·FX 베이크). 디코드가 덜 끝났으면 래스터의 「디코드 전」과
-      // 같은 계약으로 null 을 내고 onReady 로 다시 부르게 한다.
+    // One readiness owner per source; renderers do not register their own decode listeners.
+    const gengaDrawingReadyJobs = new Map();
+    function gengaPrepareDrawing(dr, onReady) {
+      if (!dr) return { status: 'empty' };
+      if ((dr.evicted || dr.deltaPending) && dr.ref && gengaDrawStore.has(dr.ref)) dr = gengaResolveDrawing(dr);
+      if (dr.canvas) return { status: 'ready', drawing: dr, source: dr.canvas };
+      let start = null;
       if (dr.tileSet) {
-        if (gengaTileSetDecodedComplete(dr.tileSet)) return gengaTileSetComposeCanvas(dr.tileSet);
-        const p = gengaTileSetDecode(dr.tileSet);
-        if (onReady) p.then(function() { onReady(); });
-        return null;
+        if (gengaTileSetDecodedComplete(dr.tileSet)) return { status: 'ready', drawing: dr, tileSet: dr.tileSet };
+        start = function() { return gengaTileSetDecode(dr.tileSet).then(function() { return gengaTileSetDecodedComplete(dr.tileSet); }); };
+      } else if (dr.evicted) {
+        start = function() { return gengaDrawStoreFaultIn(dr.ref, null); };
+      } else if (dr.deltaPending) {
+        start = function() { return new Promise(function(resolve) { gengaDeltaWantCollapse(dr.ref, function() { resolve(true); }); }); };
+      } else if (typeof dr.dataUrl === 'string' && dr.dataUrl) {
+        const image = gengaImageFor(dr, null);
+        if (image && image.naturalWidth) return { status: 'ready', drawing: dr, source: image };
+        if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) {
+          return { status: 'ready', drawing: { ref: dr.ref }, source: gengaLastStrokeCanvas.canvas };
+        }
+        const pending = gengaImageCache.get(gengaRasterCacheKey(dr));
+        if (!pending || pending.complete) return { status: 'error' };
+        start = function() { return new Promise(function(resolve) {
+          pending.addEventListener('load', function() { resolve(Boolean(pending.naturalWidth)); }, { once: true });
+          pending.addEventListener('error', function() { resolve(false); }, { once: true });
+        }); };
+      } else {
+        const strokes = gengaDrawingStrokes(dr);
+        return strokes ? { status: 'ready', drawing: dr, strokes: strokes } : { status: 'error' };
       }
-      // ver2438: 붕괴 대기 delta — 「디코드 전」과 같은 계약(null + onReady 재호출). 우선 붕괴를 예약한다.
-      if (dr.deltaPending && dr.ref) { gengaDeltaWantCollapse(dr.ref, onReady || null); return null; }
-      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return gengaImageFor(dr, onReady);
-      const st = gengaDrawingStrokes(dr);
-      return st ? gengaVectorBakedCanvas(st, Math.max(1, pw), Math.max(1, ph)) : null;
+      const key = dr.ref || dr.tileSet || dr.dataUrl;
+      let job = gengaDrawingReadyJobs.get(key);
+      if (!job) {
+        job = { callbacks: new Set(), promise: null };
+        gengaDrawingReadyJobs.set(key, job);
+        job.promise = Promise.resolve().then(start).then(function(ok) {
+          if (gengaDrawingReadyJobs.get(key) !== job) return;
+          gengaDrawingReadyJobs.delete(key);
+          if (!ok) { console.error('[genga] drawing pixels could not be prepared', dr.ref || 'inline'); return; }
+          job.callbacks.forEach(function(fn) {
+            try { fn(); } catch (error) { console.error('[genga] drawing ready consumer failed', error); }
+          });
+        }, function(error) {
+          if (gengaDrawingReadyJobs.get(key) === job) gengaDrawingReadyJobs.delete(key);
+          console.error('[genga] drawing preparation failed', error);
+        });
+      }
+      if (onReady) job.callbacks.add(onReady);
+      return { status: 'pending', promise: job.promise };
+    }
+    function gengaDrawingImageSource(dr, pw, ph, onReady) {
+      const pixels = gengaPrepareDrawing(dr, onReady);
+      if (pixels.status !== 'ready') return null;
+      if (pixels.tileSet) return gengaTileSetComposeCanvas(pixels.tileSet);
+      if (pixels.strokes) return gengaVectorBakedCanvas(pixels.strokes, Math.max(1, pw), Math.max(1, ph));
+      return pixels.source;
     }
     function gengaDrawDrawingInto(ctx, dr, pw, ph, onReady) {
-      if (!dr) return false;
-      // ver1470: 위치 판정은 커널이 한다. **크기는 계속 안 넘긴다**(3인자 = 원본 크기) — 5인자로 바꾸면
-      // dr.w/h 가 이미지 자연 크기와 어긋나는 그림에서 픽셀이 달라진다. 동작 불변이 먼저다.
-      const place = gengaDrawingPlacement(dr, pw, ph);
-      if (dr.tileSet) return gengaDrawTileSetInto(ctx, dr.tileSet, place, pw, ph, onReady); // ver2195
-      // ver2438: 붕괴 대기 delta — 이번 프레임은 못 그린다(빈 자리). 우선 붕괴를 예약하고 onReady 로
-      // 다시 부르게 한다 — 「아직 없다」 계약(디코드 전 래스터·evicted 와 같은 무늬).
-      if (dr.deltaPending && dr.ref) { gengaDeltaWantCollapse(dr.ref, onReady || null); return false; }
-      if (dr.canvas) { // ver1324: pending-encode drawing — draw the pixels directly (no decode round-trip)
-        if (place.placed) ctx.drawImage(dr.canvas, Math.round(place.x), Math.round(place.y));
-        else ctx.drawImage(dr.canvas, 0, 0, pw, ph);
-        return true;
-      }
-      if (!dr.dataUrl) {
-        // ver2023: 벡터 그림 — 구운 캐시를 1:1 로 얹는다. 스트로크 좌표는 이미 용지 좌표계라
-        // placement 를 지나지 않는다(트리밍 개념이 없다). 여기서 false 를 돌려주던 것이
-        // 「CLIP 벡터가 에러 없이 빈 화면」의 마지막 관문이었다.
-        const strokes = gengaDrawingStrokes(dr);
-        if (strokes) {
-          // ver2034: **확대 중이면 그 자리에서 패스를 긋는다** — 구운 비트맵을 확대하면 벡터가
-          // 래스터와 똑같이 깨진다(제보). 등배·축소는 캐시가 더 곱고 빠르므로 종전대로.
-          const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
-          const sc = m ? Math.max(Math.abs(m.a), Math.abs(m.d)) : 1;
-          if (sc > 1.05 && strokes.length <= GENGA_VECTOR_DIRECT_MAX) {
-            ctx.save();                       // 이 커널은 strokeStyle/fillStyle/lineWidth 를 바꾼다
-            gengaDrawVectorStrokes(ctx, strokes);
-            ctx.restore();
-            return true;
-          }
-          ctx.drawImage(gengaVectorBakedCanvas(strokes, pw, ph), 0, 0);
-          return true;
-        }
-        return false;
-      }
-      const img = gengaImageFor(dr, onReady);
-      if (!img) {
-        if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) { ctx.drawImage(gengaLastStrokeCanvas.canvas, 0, 0); return true; }
-        return false;
-      }
-      if (place.placed) ctx.drawImage(img, Math.round(place.x), Math.round(place.y));
-      else ctx.drawImage(img, 0, 0, pw, ph);
+      const pixels = gengaPrepareDrawing(dr, onReady);
+      if (pixels.status !== 'ready') return false;
+      const place = gengaDrawingPlacement(pixels.drawing, pw, ph);
+      if (pixels.tileSet) return gengaDrawTileSetInto(ctx, pixels.tileSet, place, pw, ph);
+      if (pixels.strokes) {
+        const m = typeof ctx.getTransform === 'function' ? ctx.getTransform() : null;
+        const sc = m ? Math.max(Math.abs(m.a), Math.abs(m.d)) : 1;
+        if (sc > 1.05 && pixels.strokes.length <= GENGA_VECTOR_DIRECT_MAX) {
+          ctx.save(); gengaDrawVectorStrokes(ctx, pixels.strokes); ctx.restore();
+        } else ctx.drawImage(gengaVectorBakedCanvas(pixels.strokes, pw, ph), 0, 0);
+      } else if (place.placed) ctx.drawImage(pixels.source, Math.round(place.x), Math.round(place.y));
+      else ctx.drawImage(pixels.source, 0, 0, pw, ph);
       return true;
     }
     // ver2195: 칸 그림을 그리는 커널. **ctx 변환이 항등(평행이동은 무방)일 때만 칸을 낱장으로
     // 그린다** — 스케일·회전이 걸린 ctx 에 낱장을 그리면 칸마다 가장자리 안티에일리어싱이 따로
     // 생겨 경계가 줄로 남는다(어니언 고스트가 정확히 그 ctx 다). 그때는 통짜 한 장을 합쳐 한 번에
-    // 그린다. 디코드가 덜 끝났으면 있는 칸만 그리고 마저 디코드를 예약한다 — false 를 돌려주므로
-    // 어니언 캐시는 빈 고스트를 박제하지 않고, onReady 가 끝난 그림으로 다시 그린다.
+    // 그린다. 미완이면 픽셀 준비 경계에 합류하고 false를 돌려준다.
+    // 부분 그림은 그리지 않으며 onReady가 완성된 그림으로 다시 그린다.
     // ver2199: ts 의 좌표계가 **둘**이다 — 커밋 그림은 용지(그림 객체의 x/y = ts.x/y 라 dx 가 0),
     // 통짜에서 변환된 그림은 그림(트림 상자) 좌표계(ts.x≈0, dx = 그림 객체의 x — 배치를 dx 가
     // 옮긴다). 아래 dx/dy 식과 compose 의 place 배치는 두 경우를 같은 식으로 처리한다 —
@@ -87397,8 +87416,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaDrawTileSetInto(ctx, ts, place, pw, ph, onReady) {
       const complete = gengaTileSetDecodedComplete(ts);
       if (!complete) {
-        const p = gengaTileSetDecode(ts);
-        if (onReady) p.then(function() { if (gengaTileSetDecodedComplete(ts)) onReady(); });
+        gengaPrepareDrawing({ tileSet: ts }, onReady);
+        return false;
       }
       const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
       const identityScale = !m || (m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1);
@@ -87449,8 +87468,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ★ `canvas.width = canvas.width` 로는 **해제되지 않는다** — WebKit 은 크기가 실제로 **바뀔 때만**
     //   버퍼를 놓는다(`didUpdateCanvasSizeProperties(sizeChanged)`). 0 을 넣어야 즉시 동기 해제된다.
     // ★ 해제해도 iOS 는 IOSurfacePool 에 최대 64MB/2초 물고 있으므로, 빡빡한 루프에서는 여전히 겹친다.
+    // A crop shared by pending persistence and history is released by its last owner.
+    const paintCanvasRetainers = new WeakMap();
+    function paintRetainCanvas(cv) {
+      paintCanvasRetainers.set(cv, (paintCanvasRetainers.get(cv) || 0) + 1);
+      return cv;
+    }
     function paintReleaseCanvas(cv) {
       if (!cv || typeof cv.width !== 'number') return;
+      const retained = paintCanvasRetainers.get(cv) || 0;
+      if (retained) { paintCanvasRetainers.set(cv, retained - 1); return; }
+      paintCanvasRetainers.delete(cv);
       try { cv.width = 0; cv.height = 0; } catch (err) {}
     }
     function gengaTrimCanvasToDrawing(cv, scanRect, deferEncode, mime, quality) {
@@ -100931,7 +100959,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // composite all visible layers at `frame` → a paper-res offscreen canvas (live stroke uses the working canvas).
     // During an active draw session the layers BELOW the drawing layer are composited once and cached
     // (they can't change mid-stroke), so fast strokes don't recomposite the whole stack per pointermove.
-    let gengaCompositeScratch = null; // ver657 (PERF-10): reused output canvas for the per-frame preview composite
+    const gengaPreviewRender = { composite: null, stack: null, clip: null, camera: null, viewState: null, scene: null }; // ver657 (PERF-10): reused output canvas for the per-frame preview composite
     // ver2209: 획 세션에 살던 below/above 스택 캐시를 **프레임 캐시**로 승격 — 획 시작의 재구축
     // 37~56ms 와 커밋 뒤 버림→전 레이어 재합성 42~56ms 가 사라진다(연타 씹힘의 최대 몫,
     // docs/genga_burst_stroke_wall_2026-08-25.md 3절 · q1=A). 한 벌만 산다: 중심(세션/선택) 레이어가
@@ -100943,29 +100971,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 서명 = 「그 스택이 이 프레임에 무엇을 그리는가」의 프레임 의존 축 전부(그림 식별자+배치, above 는
     // FX 평가값도 — 축 전수는 docs/genga_scrub_key_commit_cut_2026-08-25.md 2절). 프레임 무관 축
     // (표시·불투명도·blend·순서·용지)은 종전대로 명령 경계·라이브 게이지의 무효화 담당이다.
-    let gengaFrameStack = null; // { layerId(중심), fxOpen, belowSig, aboveSig, belowCache(용지 크기), aboveCache(pad 포함), aboveFoldable }
+
     // ver2300 (F4): 더티 클립의 구성 서명 — 세션 전체 합성이 끝날 때만 세워지고, 전체 경로를 탄
     // 모든 합성 호출이 무효화한다(스크래치 내용이 바뀌므로). 동일성은 전부 **객체 참조**로 본다 —
     // 캐시가 다시 구워지면 참조가 갈리므로 값 비교가 필요 없다.
-    let gengaCompositeClipSig = null;
+
     function gengaCompositeClipCheck(cv, cw, ch, pad, frame, sess) {
-      const sig = gengaCompositeClipSig;
+      const sig = gengaPreviewRender.clip;
       if (!sig || !sig.eligible) return null;
       if (sig.cv !== cv || sig.cw !== cw || sig.ch !== ch || sig.pad !== pad || sig.frame !== frame) return null;
       if (!sess || sig.sessCanvas !== sess.canvas || sig.centerId !== String(sess.layerId)) return null;
       if (sess.shape || sess.vectorErase || !(sess.penOutline || sess.penBufMode)) return null;
       const store = sig.store;
       if (!store || store.belowCache !== sig.below || store.aboveCache !== sig.above || store.aboveFoldable !== true) return null;
-      if (store === gengaFrameStack || store === sess) { /* 살아 있는 컨테이너 */ } else return null;
+      if (store !== gengaPreviewRender.stack) return null;
       return gengaScanClamp(sess.inkScan, sess.canvas);
     }
     let gengaHydrateInFlight = false; // ver2209: gengaHydrateDrawStore 진행 중 — 이 동안은 캐시를 쓰지도 굽지도 않는다(미수화 스택이 박제된다). 완료가 무효화+재렌더로 닫는다
-    function gengaFrameStackInvalidate() { gengaFrameStack = null; }
+    function gengaFrameStackInvalidate() { gengaPreviewRender.stack = null; }
     // ver2214: 벡터 그림(ref 없음)의 서명 식별자 — strokes 배열 참조에 일련번호를 발급한다
     // (gengaResolveDrawing 은 매번 새 객체를 내지만 strokes 는 저장본 배열 그대로라 참조가 안정적이다.
     // 벡터 획 커밋은 full runCommand 라 배열이 갈리는 변경은 어차피 명령 경계 무효화를 지난다).
-    let gengaStrokesSigSeq = 0;
-    const gengaStrokesSigIds = new WeakMap();
+
     // 레이어 하나가 이 프레임에 그리는 내용의 서명. 해석된 노출(pre/post behavior·링크 노출·공유풀
     // 포함 — gengaResolveExposureSample→gengaExposureDrawing 이 hold/repeat 를 흡수한다)의 그림
     // 식별자(ref, 벡터는 strokes 일련번호)+배치(x,y), 그리고 FX 평가값(키프레임 트랙이라 프레임 의존).
@@ -100976,9 +101003,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (dr) {
         if (dr.ref) id = String(dr.ref);
         else if (dr.strokes) {
-          let n = gengaStrokesSigIds.get(dr.strokes);
-          if (n == null) { n = ++gengaStrokesSigSeq; gengaStrokesSigIds.set(dr.strokes, n); }
-          id = 'v' + n;
+          id = gengaVectorStrokesKey(dr.strokes);
         } else id = '?';
         if (Number.isFinite(Number(dr.x)) && Number.isFinite(Number(dr.y))) id += '@' + dr.x + ',' + dr.y;
       }
@@ -100999,8 +101024,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver2210: 획 커밋과 그 undo/redo 가 공유하는 keep 판정식 한 벌(컬링 재판정 a1) — 대상 레이어
     // 전부가 캐시 중심 레이어면 below/above 캐시는 정의상 유효하다(중심 레이어는 어느 캐시에도 없다).
     function gengaFrameStackStrokeKeepOk(layerIds) {
-      return Boolean(gengaFrameStack && layerIds && layerIds.length
-        && layerIds.every(function(id) { return String(id) === gengaFrameStack.layerId; }));
+      return Boolean(gengaPreviewRender.stack && !gengaPreviewRender.stack.session && layerIds && layerIds.length
+        && layerIds.every(function(id) { return String(id) === gengaPreviewRender.stack.layerId; }));
     }
     // 캐시 구축 중 디코드 미완 그림(칸 fault-in · 이미지 미스)을 만나면 onReady 가 이것을 부른다 —
     // 부분만 담긴 캐시를 버리고 완전한 그림으로 다시 굽는다. 미완이면 onReady 는 반드시 온다
@@ -101014,11 +101039,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaFrameStackOnArtReady() {
       const sess = gengaDrawSession;
       const partial = function(store) { return store && ((store.belowCache && store.belowCache._complete === false) || (store.aboveCache && store.aboveCache._complete === false)); };
-      if (sess && !partial(sess) && !partial(gengaFrameStack)) {
+      if (sess && !partial(gengaPreviewRender.stack)) {
         if (!gengaFrameStackArtDefer) gengaFrameStackArtDefer = setTimeout(function() { gengaFrameStackArtDefer = 0; gengaFrameStackOnArtReady(); }, GENGA_BG_STROKE_DEFER_MS);
         return;
       }
-      if (partial(sess)) { sess.belowCache = null; sess.aboveCache = null; }
       gengaFrameStackInvalidate(); scheduleGengaPreviewRedraw();
     }
     // 캐시를 쓰고 구워도 되는 문맥인가. 아래 상태들은 composite 픽셀을 그 자리 상태로 바꾸므로
@@ -101040,13 +101064,33 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ## SECTION: GENGA: PREVIEW RENDER ............. frame composite, preview draw, onion skin, auto-douga/silhouette morph engine
 
+    function gengaCompositeScene(layers, frame, sess, noFx, reuse) {
+      const centerId = sess ? sess.layerId : state.gengaSelectedLayerId;
+      const centerIdx = layers.findIndex(function(l) { return String(l.id) === String(centerId); });
+      let stackable = centerIdx >= 0 && gengaFrameStackUsable(noFx, reuse, centerId);
+      let fxFree = true, onion = false, aboveFoldable = centerIdx > 0 && !gengaDougaFillActive();
+      for (let i = 0; i < layers.length; i++) {
+        const visible = gengaLayerDrawsInComposite(layers[i]);
+        if (!visible && i !== centerIdx) continue;
+        const fx = !noFx && gengaFxAt(layers[i], frame);
+        if (fx && i >= centerIdx) stackable = false;
+        if (!visible) continue;
+        if (fx) fxFree = false;
+        if (layers[i].onion) onion = true;
+        if (i < centerIdx && (layers[i].blend || 'source-over') !== 'source-over') aboveFoldable = false;
+      }
+      return { centerIdx: centerIdx, stackable: stackable, fxFree: fxFree,
+        aboveFoldable: aboveFoldable, regionEligible: stackable && fxFree && !onion };
+    }
     function gengaCompositeFrame(frame, pad, noFx, reuse) {
       const gt = state.project && state.project.gengaTimeline; if (!gt) return null;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       const layers = gt.layers || [];
       const sess = (gengaDrawSession && frame === gengaDrawSession.frame) ? gengaDrawSession : null;
       let missingArt = 0;
-      let stackBuilding = false; // 스택/세션 캐시 구축 중 — 완료 콜백은 두 소유자의 미완 캐시를 무효화한다
+      let stackBuilding = false; // 아래/위 캐시의 소유자는 previewRender.stack 하나다
+      const scene = gengaCompositeScene(layers, frame, sess, noFx, reuse);
+      if (reuse) gengaPreviewRender.scene = scene;
       // FX transforms can push content OUTSIDE the paper (zoom/move) — the preview passes a pad so those
       // pixels aren't clipped. This also applies DURING a stroke (else the live line drawn in the margin under
       // an FX offset was invisible until release); the caller caps pad to the visible viewport margin, so the
@@ -101055,7 +101099,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const cw = pw + 2 * pad, ch = ph + 2 * pad;
       let cv; // ver657 (PERF-10): the render path reuses one scratch (guarded resize); export / one-shot paths stay fresh
       if (reuse) {
-        cv = gengaCompositeScratch || (gengaCompositeScratch = document.createElement('canvas'));
+        cv = gengaPreviewRender.composite || (gengaPreviewRender.composite = document.createElement('canvas'));
         if (cv.width !== cw) cv.width = cw;
         if (cv.height !== ch) cv.height = ch;
       } else {
@@ -101064,7 +101108,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       cv._pad = pad;
       cv._complete = !gengaHydrateInFlight;
       const cx2 = cv.getContext('2d');
-      const sessIdx = sess ? layers.findIndex(function(l) { return String(l.id) === String(sess.layerId); }) : -1;
       // ver2300 (F4): 획 중 더티 클립 — 직전 합성과 **같은 구성**(같은 스크래치·프레임·pad·세션
       // 캔버스·얼어 있는 below/above 캐시)이면 이번 획의 누적 상자(inkScan)만 다시 그린다.
       // 창 밖이 프레임 사이에 불변인 근거: 중심은 sess.canvas 인데 펜 경로의 모든 붓질이
@@ -101072,7 +101115,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 나머지 전 레이어는 캐시 두 장에서 오므로(자격 조건 — aboveFoldable 필수) 획 중 디코드
       // 도착이 창 밖에만 반영되는 찢김이 구조적으로 없다. 구성이 하나라도 갈리면 종전 전체 경로.
       const clipInk = gengaCompositeClipCheck(cv, cw, ch, pad, frame, sess);
-      if (!clipInk) gengaCompositeClipSig = null; // 이 호출이 스크래치를 전체 경로로 덮는다 — 세션 전체 합성만이 아래에서 다시 세운다
+      if (!clipInk) gengaPreviewRender.clip = null; // 이 호출이 스크래치를 전체 경로로 덮는다 — 세션 전체 합성만이 아래에서 다시 세운다
       cx2.setTransform(1, 0, 0, 1, 0, 0);
       if (!clipInk) cx2.clearRect(0, 0, cw, ch); // reused canvas retains prior content (fresh one is a no-op clear)
       if (pad) cx2.setTransform(1, 0, 0, 1, pad, pad); // draw everything in paper coords; the pad frames it
@@ -101253,7 +101296,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2300 (F4): 더티 클립 빠른 길 — 자격은 gengaCompositeClipCheck 가 이미 봤다(구성 동일성
       // 전부 객체 참조 대조). 아래·중심·위를 같은 순서로, 누적 상자 안만 다시 그린다.
       if (clipInk) {
-        const cs = gengaCompositeClipSig;
+        const cs = gengaPreviewRender.clip;
         cx2.save();
         cx2.beginPath(); cx2.rect(clipInk.x, clipInk.y, clipInk.w, clipInk.h); cx2.clip();
         cx2.clearRect(clipInk.x, clipInk.y, clipInk.w, clipInk.h);
@@ -101264,29 +101307,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         cx2.restore();
         return cv;
       }
-      // ver2209: 스택 캐시의 중심 = 세션 레이어, 세션 밖에서는 **선택 레이어** — 획은 선택 레이어에서
-      // 시작되므로 커밋 직후 재렌더와 다음 획 첫 렌더가 같은 캐시를 히트한다(연타 벽 제거의 본체).
-      // 문맥이 캐시 불가(gengaFrameStackUsable=false)면: 세션 중엔 종전대로 세션 로컬에 굽고(수명이
-      // 획 하나라 종전 동작 그대로), 세션 밖엔 캐시 없이 종전 전체 합성으로 간다.
-      let centerIdx = sessIdx;
-      let stackable = false;
-      if (sess && sessIdx >= 0) {
-        stackable = gengaFrameStackUsable(noFx, reuse, sess.layerId);
-      } else if (!sess && state.gengaSelectedLayerId != null && gengaFrameStackUsable(noFx, reuse, state.gengaSelectedLayerId)) {
-        centerIdx = layers.findIndex(function(l) { return String(l.id) === String(state.gengaSelectedLayerId); });
-        stackable = centerIdx >= 0;
-      }
-      // ver2209 (비평 반영): 중심 또는 그 **아래** 스택에 활성 FX 가 있으면 프레임 캐시를 쓰지 않는다.
-      // ① 중심에 FX 가 있으면 인접 레이어와의 병합 배치(ver1933 — 병합 픽셀이 정본)가 캐시 경계에서
-      //    끊겨 정지 화면이 export 와 갈린다. ② 아래 스택의 FX 스필(용지 밖)은 belowCache 가 용지
-      //    크기라 잘리는데, 세션 갈래에서는 획 중 한정이던 잘림이 정지 화면에 상시화된다. 위 스택만은
-      //    캐시 가능 — aboveCache 가 pad 를 포함해 스필을 담고, 병합도 범위 안에서 그대로 일어난다.
-      if (stackable) {
-        for (let i = centerIdx; i < layers.length; i++) {
-          if (i > centerIdx && !gengaLayerDrawsInComposite(layers[i])) continue; // 안 그리는 레이어의 FX 는 캐시를 못 끈다(비평가 ckpt1 — 중심은 종전대로 무조건 본다)
-          if (gengaFxAt(layers[i], frame)) { stackable = false; break; }
-        }
-      }
+      const centerIdx = scene.centerIdx, stackable = scene.stackable;
       if (centerIdx >= 0 && (sess || stackable)) {
         let store;
         if (stackable) {
@@ -101298,14 +101319,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // 빈 값으로 만든다(안 그리는 레이어는 양쪽 다 건너뛴다 — 비평가 ckpt1·ckpt2).
           const belowSig = gengaFrameStackRangeSig(layers, centerIdx + 1, layers.length - 1, frame);
           const aboveSig = gengaFrameStackRangeSig(layers, 0, centerIdx - 1, frame);
-          if (!gengaFrameStack || gengaFrameStack.layerId !== cid || gengaFrameStack.fxOpen !== fxOpen) {
-            gengaFrameStack = { layerId: cid, fxOpen: fxOpen, belowSig: belowSig, aboveSig: aboveSig, belowCache: null, aboveCache: null, aboveFoldable: undefined };
+          if (!gengaPreviewRender.stack || gengaPreviewRender.stack.session || gengaPreviewRender.stack.layerId !== cid || gengaPreviewRender.stack.fxOpen !== fxOpen) {
+            gengaPreviewRender.stack = { layerId: cid, fxOpen: fxOpen, belowSig: belowSig, aboveSig: aboveSig, belowCache: null, aboveCache: null, aboveFoldable: undefined };
           } else {
-            if (gengaFrameStack.belowSig !== belowSig) { gengaFrameStack.belowSig = belowSig; gengaFrameStack.belowCache = null; }
-            if (gengaFrameStack.aboveSig !== aboveSig) { gengaFrameStack.aboveSig = aboveSig; gengaFrameStack.aboveCache = null; gengaFrameStack.aboveFoldable = undefined; }
+            if (gengaPreviewRender.stack.belowSig !== belowSig) { gengaPreviewRender.stack.belowSig = belowSig; gengaPreviewRender.stack.belowCache = null; }
+            if (gengaPreviewRender.stack.aboveSig !== aboveSig) { gengaPreviewRender.stack.aboveSig = aboveSig; gengaPreviewRender.stack.aboveCache = null; gengaPreviewRender.stack.aboveFoldable = undefined; }
           }
-          store = gengaFrameStack;
-        } else store = sess;
+          store = gengaPreviewRender.stack;
+        } else {
+          if (!gengaPreviewRender.stack || gengaPreviewRender.stack.session !== sess) {
+            gengaPreviewRender.stack = { session: sess, layerId: String(sess.layerId), belowCache: null, aboveCache: null };
+          }
+          store = gengaPreviewRender.stack;
+        }
         // below-stack cache (layers array is top-first → indices AFTER centerIdx are below)
         if (!store.belowCache || store.belowCache.width !== pw || store.belowCache.height !== ph) {
           const bc = document.createElement('canvas'); bc.width = pw; bc.height = ph;
@@ -101331,15 +101357,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ② **캔버스가 pad 를 포함한다** — 위 레이어의 FX 는 용지 밖 pad 영역에 그려지고 있어서,
         //    belowCache 처럼 용지 크기로 접으면 그 스필이 잘린다(아래 스택의 잘림은 종전 동작이라
         //    그대로 둔다 — 위에 같은 잘림을 새로 만들지 않는다).
-        if (store.aboveFoldable === undefined) { // 컨테이너(프레임 캐시/세션)당 한 번만 판정한다
-          let foldable = centerIdx > 0 && !gengaDougaFillActive();
-          for (let i = centerIdx - 1; foldable && i >= 0; i--) {
-            const l = layers[i];
-            if (!gengaLayerDrawsInComposite(l)) continue;
-            if ((l.blend || 'source-over') !== 'source-over') foldable = false;
-          }
-          store.aboveFoldable = foldable;
-        }
+        store.aboveFoldable = scene.aboveFoldable;
         if (store.aboveFoldable) {
           if (!store.aboveCache || store.aboveCache.width !== cw || store.aboveCache.height !== ch) {
             const ac = document.createElement('canvas'); ac.width = cw; ac.height = ch;
@@ -101362,16 +101380,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver2300 (F4): 다음 프레임의 더티 클립 자격을 세운다 — **비중심이 전부 얼어 있는 캐시 두
         // 장에서 왔을 때만**(aboveFoldable 필수 · 획 중 디코드 도착이 창 밖에 새는 찢김 방지) ·
         // 펜 세션 · FX/動画フィル/실루엣 진단/뜬 선택 없음. 조건 밖이면 서명 없음 = 늘 전체 경로.
-        gengaCompositeClipSig = null;
+        gengaPreviewRender.clip = null;
         if (cv._complete && sess && (sess.penOutline || sess.penBufMode) && !sess.shape && !sess.vectorErase
             && store.aboveFoldable === true && store.belowCache && store.aboveCache
             && !gengaDougaFillActive() && !state.gengaSilDebug && !gengaSelLifted(gengaSel)) {
-          let fxFree = true;
-          for (let i = 0; i < layers.length && fxFree; i++) {
-            if (gengaLayerDrawsInComposite(layers[i]) && gengaFxAt(layers[i], frame)) fxFree = false;
-          }
-          if (fxFree) {
-            gengaCompositeClipSig = { eligible: true, cv: cv, cw: cw, ch: ch, pad: pad, frame: frame,
+          if (scene.fxFree) {
+            gengaPreviewRender.clip = { eligible: true, cv: cv, cw: cw, ch: ch, pad: pad, frame: frame,
               sessCanvas: sess.canvas, centerId: String(sess.layerId), centerIdx: centerIdx, store: store,
               below: store.belowCache, above: store.aboveCache };
           }
@@ -102497,9 +102511,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ver1453: 콘티 drawPaintStageOverlay 와 같은 래퍼 — 마퀴를 그린 **뒤**에 런처를 놓는다.
     function drawGengaPreview(boxHint) {
-      const surface = drawGengaPreviewInner(boxHint);
+      const result = drawGengaPreviewInner(boxHint);
       const canvas = document.getElementById('gengaPreviewCanvas');
-      if (canvas && surface && surface._complete) {
+      if (canvas && result.status === 'ready') {
+        const surface = result.surface;
         if (canvas.width !== surface.width) canvas.width = surface.width;
         if (canvas.height !== surface.height) canvas.height = surface.height;
         gengaPreviewCtx(canvas);
@@ -102511,14 +102526,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // frameStack의 수명 + 이웃 캐시/서명 + 뷰/카메라 값이 모두 같아야 창 밖이 불변이다.
     // 시작은 세션의 원본 서명, 끝은 등록된 활성 캔버스로 연결한다. 취소/undo는 연결되지 않는다.
     function gengaPreviewStrokeRegion(surface, frame, W, H, ox, oy, scale, vrot, vfl) {
-      const gt = state.project.gengaTimeline, layer = ensureGengaSelectedLayer(), stack = gengaFrameStack;
-      if (!layer || !stack || gengaLayerDrawsVector(layer) || !gengaFrameStackUsable(false, true, layer.id)
+      const gt = state.project.gengaTimeline, layer = ensureGengaSelectedLayer(), stack = gengaPreviewRender.stack;
+      if (!layer || !stack || !gengaPreviewRender.scene || !gengaPreviewRender.scene.regionEligible || gengaLayerDrawsVector(layer)
           || gengaSel || gengaLasso || gengaStampDrag || gengaStampPt || gengaViewLockToken()
           || state.paintEditTool === 'camera' || state.gengaFxOpenId || state.gengaCamFxLive) return null;
-      for (let i = 0; i < gt.layers.length; i++) {
-        const l = gt.layers[i];
-        if (gengaLayerDrawsInComposite(l) && (l.onion || gengaFxAt(l, frame))) return null;
-      }
       const sess = gengaDrawSession;
       if (sess && (sess.frame !== frame || String(sess.layerId) !== String(layer.id)
           || sess.shape || sess.vector || sess.vectorErase || !sess.inkScan)) return null;
@@ -102530,7 +102541,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const drawing = resolved ? resolved.ref : null; // 픽셀 ref는 deltaLive/trimmed 표현이 바뀌어도 같다
       const next = { key: key, stack: stack, below: stack.belowCache, above: stack.aboveCache,
         aboveSig: stack.aboveSig, drawing: drawing, session: sess };
-      const prev = surface && surface._previewState;
+      const prev = surface && gengaPreviewRender.viewState;
       let ink = null, unchanged = false;
       if (prev && surface.width === W && surface.height === H && prev.key === key && prev.stack === stack
           && prev.below === next.below && prev.above === next.above && prev.aboveSig === next.aboveSig) {
@@ -102565,13 +102576,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return { state: next, rect: rect, unchanged: unchanged };
     }
-    function drawGengaPreviewInner(boxHint) {
-      if (gengaPreviewRedrawRaf) { cancelAnimationFrame(gengaPreviewRedrawRaf); gengaPreviewRedrawRaf = 0; } // ver1438: 직접 호출이 대기분을 흡수
-      paintMarqueeBoxBegin(document.getElementById('gengaPreviewCanvas')); // ver1453: 이 프레임의 마퀴 상자
-      cameraFxInlineUpdate(); // keep the カメラ window numbers in sync with the genga camera-work frame (no-op if closed/scrubbing)
-      tfqWindowUpdate(); // ver948: transform/perspective numeric rows follow the genga selection quad
-      gengaRetargetSelectionForPreview(); // ver1318: 미확정 변형의 미리보기는 **지금 보는 그림** 위에 뜬다
-
+    function gengaReadPreviewView(boxHint) {
       const canvas = document.getElementById('gengaPreviewCanvas');
       if (!canvas) return;
       const wrap = canvas.parentElement; if (!wrap) return;
@@ -102619,37 +102624,342 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // render-identical — the margin is transparent and the blit below compensates through composite._pad.
       const padRaw = state.gengaPlaying ? 0 : Math.min(gengaPreviewPad(frame), visPad);
       const pad = padRaw > 0 ? Math.ceil(padRaw / 128) * 128 : 0;
-      // ver1044 perf: while dragging the camera FRAME, the layer composite is INVARIANT (the camera is an overlay
-      // drawn below; nothing about the layers/FX/onion changes). Snapshot it at the drag's first frame into a
-      // private canvas (gengaCompositeFrame hands back a SHARED scratch — holding its ref would tear) and reuse it
-      // for the rest of the gesture, so the whole per-move composite (cached-blur blit + per-layer FX transforms)
-      // collapses to one blit. token === gengaCamDrag ties the cache to THIS drag; a new drag rebuilds.
+      return { canvas, gt, W, H, pw, ph, frame, onionShow, scale, dw, dh, ox, oy, vrot, vfl, pad };
+    }
+    function gengaPreparePreviewComposite(view) {
+      const { frame, pad } = view;
       let composite;
       const viewTok = state.gengaPlaying ? null : gengaViewLockToken(); // ver1133: camera drag / pan / rotate / wheel-burst all reuse the composite
-      if (viewTok && gengaCamDragComposite && gengaCamDragComposite.token === viewTok
-          && gengaCamDragComposite.frame === frame && gengaCamDragComposite.pad === pad) {
-        composite = gengaCamDragComposite.canvas;
+      if (viewTok && gengaPreviewRender.camera && gengaPreviewRender.camera.token === viewTok
+          && gengaPreviewRender.camera.frame === frame && gengaPreviewRender.camera.pad === pad) {
+        composite = gengaPreviewRender.camera.canvas;
       } else {
         composite = gengaCompositeFrame(frame, pad, false, true); // ver657 (PERF-10): reuse the scratch on the render path
         if (viewTok && composite && composite._complete) {
           const src = composite;
-          let snap = (gengaCamDragComposite && gengaCamDragComposite.canvas) || document.createElement('canvas');
+          let snap = (gengaPreviewRender.camera && gengaPreviewRender.camera.canvas) || document.createElement('canvas');
           if (snap.width !== src.width) snap.width = src.width;
           if (snap.height !== src.height) snap.height = src.height;
           const sctx = snap.getContext('2d');
           sctx.clearRect(0, 0, snap.width, snap.height); sctx.drawImage(src, 0, 0);
           snap._pad = src._pad; snap._complete = true;
-          gengaCamDragComposite = { canvas: snap, token: viewTok, frame: frame, pad: pad };
+          gengaPreviewRender.camera = { canvas: snap, token: viewTok, frame: frame, pad: pad };
           composite = snap;
         }
       }
-      if (!composite || !composite._complete) return;
+      return composite && composite._complete
+        ? { status: 'ready', canvas: composite } : { status: 'pending' };
+    }
+    function gengaDrawPreviewOverlays(ctx, view) {
+      const { gt, W, H, pw, ph, frame, scale, dw, dh, ox, oy } = view;
+      {
+        const SC = function(px2, py2) { return { x: ox + px2 * scale, y: oy + py2 * scale }; };
+        const bcam = gt.camera;                                  // BLACK = fixed output/composition frame
+        const wcam = gengaCamDrag ? gengaCamDrag.live : (state.gengaCamFxLive || gengaCameraWorkAt(gt, frame)); // RED = camera-work frame (keyframe-interpolated; live buffer while dragging gizmo OR scrubbing the カメラ window)
+        const camEdit = (state.paintEditTool === 'camera');
+        const corners = cameraRectCorners(wcam).map(function(pt) { return SC(pt.x, pt.y); });
+        // red camera-work frame = thin CORNER BRACKETS (「 」) only — the full outline read as too heavy
+        const camCornerMarks = function() {
+          const e01 = Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y);
+          const e12 = Math.hypot(corners[2].x - corners[1].x, corners[2].y - corners[1].y);
+          const baseLen = cameraBracketArms(e01, e12).base; // ver1071 (A9): shared rule
+          ctx.beginPath();
+          for (let i = 0; i < 4; i++) {
+            const c = corners[i], nb = [corners[(i + 1) % 4], corners[(i + 3) % 4]];
+            for (let j = 0; j < 2; j++) { const n = nb[j], dx = n.x - c.x, dy = n.y - c.y, d = Math.hypot(dx, dy) || 1, len = Math.min(baseLen, d * CAMERA_BRACKET.edgeCap); ctx.moveTo(c.x, c.y); ctx.lineTo(c.x + dx / d * len, c.y + dy / d * len); }
+          }
+          ctx.stroke();
+        };
+        ctx.save();
+        // (button) dim everything outside the red camera-work frame — previews what the camera captures
+        if (state.gengaCamDim) {
+          const cvr2 = gengaViewCoverRect(W, H); // ver1005: same corner coverage as the playback dim above
+          ctx.beginPath(); ctx.rect(cvr2.x, cvr2.y, cvr2.w, cvr2.h);
+          ctx.moveTo(corners[0].x, corners[0].y); ctx.lineTo(corners[1].x, corners[1].y); ctx.lineTo(corners[2].x, corners[2].y); ctx.lineTo(corners[3].x, corners[3].y); ctx.closePath();
+          ctx.fillStyle = CAMERA_DIM_FILL; ctx.fill('evenodd'); // ver1066 (B1)
+        }
+        // black fixed output frame (axis-aligned, no handles) — thin + faint so it reads as a light guide
+        ctx.strokeStyle = 'rgba(0,0,0,0.2)'; ctx.lineWidth = 1; ctx.strokeRect(ox + bcam.x * scale, oy + bcam.y * scale, bcam.w * scale, bcam.h * scale);
+        // ver1037 hybrid: the WHOLE crop outlined at a whisper of opacity, with the corner brackets kept at full
+        // strength on top. Brackets alone read cleanly but left the frame's extent to be inferred between them,
+        // which is the one thing a camera frame has to state; a solid outline said it but drowned the artwork.
+        ctx.strokeStyle = CAMERA_BOX_EDGE.color; ctx.lineWidth = CAMERA_BOX_EDGE.w; // ver1072 (A10) / ver1076: width shared too
+        ctx.beginPath();
+        ctx.moveTo(corners[0].x, corners[0].y);
+        for (let ci = 1; ci < 4; ci += 1) ctx.lineTo(corners[ci].x, corners[ci].y);
+        ctx.closePath(); ctx.stroke();
+        ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 1; camCornerMarks();
+        // ver1037: camera-work path, conte's model ported over (renderCameraFramePath / renderCameraFrameKeyDots):
+        // a line through the key CENTRES with both ends called out. genga draws to canvas and conte to a DOM
+        // overlay, so only the model crosses — the applier stays per-surface, as ver1005 did for the view maths.
+        if (camEdit) {
+          const camPathKeys = gengaCamOverlayKeyframes(gt); // ver1060: the dragged key travels with the frame
+          gengaCamKeyCenterScreenCache = [];
+          if (camPathKeys.length >= 2) {
+            const pts = camPathKeys.map(function(k) { const c = cameraRectCenter(gengaCamKfRect(k)); return SC(c.x, c.y); });
+            gengaCamKeyCenterScreenCache = camPathKeys.map(function(k, i) { return { frame: Math.max(1, Math.round(Number(k.frame) || 1)), point: pts[i] }; }); // ver1043 ①: click a trajectory dot → jump
+            ctx.save();
+            // ver1049 (K2): the LINE follows the per-frame sampled path (shared cameraTrajectorySamples kernel),
+            // so the live overlay draws the same curve the exported instruction image does. The DOTS below still
+            // sit on the committed key centres (`pts`) — they mark keys, not the path.
+            // ver1065: sample the SAME list the dots are drawn from (camPathKeys = gengaCamOverlayKeyframes,
+            // ver1060's live view of the keys) instead of gengaCameraWorkAt's committed re-read. Handing the key
+            // ARRAY to the sampler is exactly what conte's renderCameraFramePath does; genga's sampler went
+            // behind the array's back, so the dots and the frame followed the drag while the dashed path between
+            // them stayed anchored where the drag started and only caught up at the commit.
+            const traj = cameraTrajectorySamples(
+              camPathKeys.map(function(k) { return k.frame; }),
+              function(f) { const c = cameraRectCenter(gengaCamRectAtFromKeys(camPathKeys, wcam, f)); return SC(c.x, c.y); }
+            );
+            const linePts = traj.length ? traj : pts;
+            ctx.strokeStyle = CAMERA_PATH.color; ctx.lineWidth = CAMERA_PATH.width; ctx.setLineDash(CAMERA_PATH.dash.slice()); ctx.lineCap = CAMERA_PATH.cap; // ver1066 (B2)
+            ctx.beginPath();
+            linePts.forEach(function(p, i) { if (i) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y); });
+            ctx.stroke();
+            ctx.setLineDash([]);
+            const curLocalT = gengaCurrentFrame();
+            pts.forEach(function(p, i) {
+              const sel = gengaCamKeyVivid(camPathKeys[i].frame, curLocalT); // ver1047: selected OR on the playhead
+              ctx.beginPath(); ctx.arc(p.x, p.y, cameraKeyMarkerSize(i, pts.length, sel) / 2, 0, Math.PI * 2); // ver1051: shared size rule
+              ctx.fillStyle = cameraKeyMarkerFill(i, pts.length, sel);
+              ctx.strokeStyle = CAMERA_MARK.keyDotStroke.color; ctx.lineWidth = sel ? CAMERA_MARK.keyDotStroke.vivid : CAMERA_MARK.keyDotStroke.rest; // ver1070 (A5b)
+              ctx.fill(); ctx.stroke();
+            });
+            ctx.restore();
+          }
+        }
+        if (camEdit) {
+          const center = SC(cameraRectCenter(wcam).x, cameraRectCenter(wcam).y);
+          const rightMidP = cameraRectLocalToPaper(wcam, wcam.w / 2, 0), rightMid = SC(rightMidP.x, rightMidP.y); // ver1039: right-edge midpoint
+          const rhP = gengaCamRotateHandlePaper(wcam, scale), rh = SC(rhP.x, rhP.y);
+          const curLocal = gengaCurrentFrame();
+          // ver1044: the gizmo centre doubles as the SELECTED key's dot — colour it by the current key's POSITION
+          // (start green / end blue / middle red) so it stops reading as an arbitrary "selected = red". Falls back
+          // to red only when the playhead isn't on a key (dragging there mints a new one — a distinct state).
+          const camKeysC = gengaCamKeyframes(gt);
+          const curIdxC = camKeysC.findIndex(function(k) { return Math.round(Number(k.frame) || 1) === curLocal; });
+          const centerColor = (camKeysC.length >= 2 && curIdxC >= 0) ? cameraKeyColor(curIdxC, camKeysC.length) : CAMERA_RED;
+          ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(rightMid.x, rightMid.y); ctx.lineTo(rh.x, rh.y); ctx.stroke();
+          corners.forEach(function(pt) { const M = CAMERA_MARK.corner, s = M.size; ctx.fillStyle = M.fill; ctx.strokeStyle = M.stroke; ctx.lineWidth = M.w; ctx.beginPath(); ctx.rect(pt.x - s / 2, pt.y - s / 2, s, s); ctx.fill(); ctx.stroke(); }); // ver1070 (A5b)
+          ctx.beginPath(); ctx.arc(rh.x, rh.y, CAMERA_MARK.rotate.size / 2, 0, Math.PI * 2); ctx.fillStyle = CAMERA_MARK.rotate.fill; ctx.strokeStyle = CAMERA_MARK.rotate.stroke; ctx.lineWidth = CAMERA_MARK.rotate.w; ctx.fill(); ctx.stroke(); // ver1070 (A5b)
+          ctx.beginPath(); ctx.arc(center.x, center.y, CAMERA_MARK.centre.size / 2, 0, Math.PI * 2); ctx.fillStyle = centerColor; ctx.strokeStyle = CAMERA_MARK.centre.stroke; ctx.lineWidth = CAMERA_MARK.centre.w; ctx.fill(); ctx.stroke();
+          // ver1042: bottom-left pick handles — one small square per keyframe (green start, blue last), so a stack
+          // of coincident keys can each be selected. Cached in screen px for gengaCameraPointerDown's hit test.
+          const camKeyHandles = gengaCamKeyHandleScreens(gt, SC);
+          gengaCamKeyHandleScreenCache = camKeyHandles;
+          camKeyHandles.forEach(function(h) {
+            const isCur = gengaCamKeyVivid(h.keyframe.frame, curLocal); // ver1047: selected OR on the playhead
+            const kh = cameraKeyHandleStyle(isCur), sz = kh.size; // ver1070 (A5): shared spec
+            ctx.fillStyle = cameraKeyMarkerFill(h.index, camKeyHandles.length, isCur);
+            ctx.strokeStyle = kh.stroke; ctx.lineWidth = kh.width;
+            ctx.beginPath(); ctx.rect(h.point.x - sz / 2, h.point.y - sz / 2, sz, sz); ctx.fill(); ctx.stroke();
+          });
+        } else { gengaCamKeyHandleScreenCache = []; gengaCamKeyCenterScreenCache = []; }
+        ctx.restore();
+      }
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1;
+      ctx.strokeRect(ox + 0.5, oy + 0.5, Math.max(1, dw - 1), Math.max(1, dh - 1));
+      // ---- tool overlays (match conte memo: marching-ants white+blue, 8px square handles) ----
+      // ver1204: S is the DRAWING→screen projector, so it composes the edited layer's FX exactly as
+      // gengaPreviewPointerXY inverts it — same layer (the selected one), same gengaFxAt call, same master-switch
+      // gate. gengaCurrentFrame() rather than this function's `frame`: during a parapara flip `frame` is another
+      // frame's view and nothing is editable, and the pointer side always reads the current one, so this keeps
+      // the two halves exact inverses. Identity FX takes the original one-line path untouched.
+      const ovFx = (function() {
+        const ol = ensureGengaSelectedLayer(); if (!ol) return null;
+        const f = gengaFxAt(ol, gengaCurrentFrame());
+        return (f && (f.x || f.y || f.scale !== 1 || f.rot)) ? f : null;
+      })();
+      const S = ovFx
+        ? function(px2, py2) { const t = gengaFxForwardXY(px2, py2, ovFx, pw, ph); return { x: ox + t.x * scale, y: oy + t.y * scale }; }
+        : function(px2, py2) { return { x: ox + px2 * scale, y: oy + py2 * scale }; };
+      // The same map as a canvas MATRIX, for the one overlay that draws an image rather than points (the stamp):
+      //   screen = (ox,oy) + scale · [C + T + R(a)·s·(p − C)]
+      // Handles and dashes must NOT scale with it, which is why everything else projects per point through S.
+      const ovApplyMatrix = function() {
+        if (!ovFx) { ctx.translate(ox, oy); ctx.scale(scale, scale); return; }
+        const cxp = pw / 2, cyp = ph / 2, sc = Math.max(1e-4, Number(ovFx.scale) || 1);
+        ctx.translate(ox + (cxp + (Number(ovFx.x) || 0)) * scale, oy + (cyp + (Number(ovFx.y) || 0)) * scale);
+        ctx.rotate((Number(ovFx.rot) || 0) * Math.PI / 180);
+        ctx.scale(scale * sc, scale * sc);
+        ctx.translate(-cxp, -cyp);
+      };
+      // lasso path while drawing (open marching-ants polyline)
+      // ver619 revert: open polyline while dragging (artifact demo never closePath's during drag —
+      // close+fill happens in one step at release), for both lasso-select and 投げ縄塗りつぶし.
+      if (gengaLasso && gengaLasso.pts.length > 1) {
+        // ver1442: 콘티와 **같은 커널** — 실선 빨강 1 device px, 안티 0. 라쏘선택·라쏘스탬프 공통이다
+        // (gengaLasso 는 둘 다 쓰는 세션이다: stamp 플래그만 다르다).
+        drawCrispMarqueePolyline(ctx, gengaLasso.pts.map(function(pt) { return S(pt[0], pt[1]); }),
+          MARQUEE_COLOR_PENDING, false, false);
+      }
+      if (gengaDrawSession && gengaDrawSession.shape === 'lasso-fill' && gengaDrawSession.shapeMoved && gengaDrawSession.shapeLassoPts.length > 1) {
+        const lfPts = gengaDrawSession.shapeLassoPts;
+        drawCrispMarqueePolyline(ctx, lfPts.map(function(pt) { return S(pt.x, pt.y); }),
+          MARQUEE_COLOR_PENDING, false, false); // ver1442: 위와 같은 커널
+      }
+      // ver1313: **선택(스텐실)은 전역이고, 떠 있는 픽셀만 자기 레이어·프레임 것이다** — 콘티가
+      // ver1283 에 세운 그 모델(전역 스텐실)로 통일한다. 종전에는 마퀴까지 frame 에 묶여 있어서,
+      // 다음 프레임으로 넘어가면 선택이 사라진 것처럼 보였다(사용자 보고). 데이터는 살아 있었고
+      // 표시만 묶여 있었다.
+      // ver1314: **기즈모도 전역이다.** ver1313 은 기즈모를 자기 대상에만 그렸는데, 좌표가 툴 상태가
+      // 된 뒤로는 그게 반쪽이었다 — 다른 프레임에 가면 값은 살아 있는데 화면에는 아무 상자도 없어서
+      // "좌표가 저기서는 적용이 안 돼 있다"로 읽혔다(사용자 보고). 콘티는 대상이 바뀌면 박스의
+      // drawingRef 가 따라오면서 quad 를 그대로 이어받아 새 대상 위에 같은 자리로 그린다 — 그 파리티다.
+      // ver1316: 앤츠도 마찬가지로 대상을 가리지 않는다 — 스텐실의 위치를 정하는 것은 quad 이고,
+      // 다른 프레임에서 상자만 옮겨져 있고 점선은 제자리인 그림이 바로 "선택영역이 이동 안 됨"으로
+      // 읽혔다(사용자 보고). 판정은 gengaDrawSelEdge 안에 하나만 남았다.
+      if (gengaSel) {
+        const tool = state.paintEditTool;
+        gengaDrawSelEdge(ctx, gengaSel, S); // the ACTUAL selection shape (marching ants), unified for every tool
+        const ovQuad = gengaResolveQuad(gengaSel); // ver1314: 기즈모가 그리는 좌표 = 툴 상태의 실효 quad
+        // ver1319: **미확정이면 빨강** — 콘티가 ver1282 에 세운 규칙(paintTransformBoxColor)의 원화 쪽 절반이
+        // 통째로 비어 있었다. 원화 상자는 늘 같은 색이라 "지금 이 변형은 아직 안 구워졌다"를 화면이
+        // 말해 주지 않았다. TVPaint 도 같은 것을 색으로 말한다(빨강 HUD = 옮겼지만 미적용, 초록 = 적용됨).
+        // 판정은 각 엔진이 이미 가진 술어를 쓴다 — 콘티는 quad vs baseQuad, 원화는 quad vs bounds 항등.
+        const ovPending = !gengaSelIsPristine(gengaSel);
+        if (!ovQuad) { /* 아직 아무 좌표도 없다 */ }
+        else if (tool === 'perspective') { // ver751 (quad-only): the quad always exists
+          const q = ovQuad.map(function(pt) { return S(pt[0], pt[1]); });
+          gengaOverlayStroke(ctx, function() { ctx.beginPath(); ctx.moveTo(q[0].x, q[0].y); ctx.lineTo(q[1].x, q[1].y); ctx.lineTo(q[2].x, q[2].y); ctx.lineTo(q[3].x, q[3].y); ctx.closePath(); }, ovPending ? MARQUEE_COLOR_PENDING : MARQUEE_COLOR_PERSP, [MARQUEE_DASH_ON, MARQUEE_DASH_OFF]); // ver655: unified
+          q.forEach(function(pt) { gengaOverlayHandle(ctx, pt.x, pt.y); });
+          paintQuadHandlePoints(ovQuad, scale).edgeMids.forEach(function(m) { const pt = S(m.x, m.y); gengaOverlayHandle(ctx, pt.x, pt.y); }); // ver948: edge handles
+        } else if (tool === 'transform') {
+          const H = gengaSelHandlesPaper(gengaSel, scale);
+          const c = H.corners.map(function(pt) { return S(pt.x, pt.y); }), rot = S(H.rotate.x, H.rotate.y), tm = S(H.rotateBase.x, H.rotateBase.y); // ver948: arm rides the RIGHT edge
+          const ovColor = ovPending ? MARQUEE_COLOR_PENDING : MARQUEE_COLOR;
+          gengaOverlayStroke(ctx, function() { ctx.beginPath(); ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[1].x, c[1].y); ctx.lineTo(c[2].x, c[2].y); ctx.lineTo(c[3].x, c[3].y); ctx.closePath(); }, ovColor, [MARQUEE_DASH_ON, MARQUEE_DASH_OFF]); // ver655: unified (was rogue '#7aa8e6',[3,3])
+          ctx.save(); ctx.strokeStyle = ovColor; ctx.lineWidth = MARQUEE_LINE_PX; ctx.setLineDash([]); ctx.beginPath(); ctx.moveTo(tm.x, tm.y); ctx.lineTo(rot.x, rot.y); ctx.stroke(); ctx.restore();
+          c.forEach(function(pt) { gengaOverlayHandle(ctx, pt.x, pt.y); });
+          gengaOverlayHandle(ctx, rot.x, rot.y, MARQUEE_KNOB_FILL); // ver1066 (B5)
+        }
+      }
+      // ver771: 드래그 중 이미 찍힌 도장들. gengaStamp.work에는 들어갔지만 커밋은 pointerup 1회라 아직
+      // 레이어 그림이 아니다 — 제스처가 끝날 때까지 여기서 불투명하게 보여준다(콘티는 라이브 레이어
+      // 캔버스에 직접 그려서 이 단계가 필요 없다).
+      if (gengaStamp && gengaStampDrag && state.paintEditTool === 'lasso-stamp') {
+        ctx.save();
+        ovApplyMatrix(); // ver1204: the placed stamps ride the layer's FX (rotation/scale included)
+        gengaStampDrag.pts.forEach(function(pt) {
+          ctx.drawImage(gengaStamp.patch, pt.x - gengaStamp.w / 2, pt.y - gengaStamp.h / 2, gengaStamp.w, gengaStamp.h);
+        });
+        ctx.restore();
+      }
+      // lasso-stamp preview: the captured stamp follows the cursor (semi-transparent + dashed bbox)
+      if (gengaStamp && gengaStampPt && state.paintEditTool === 'lasso-stamp') {
+        // ver1204: the patch itself goes through the FX matrix; its dashed box is stroked from four PROJECTED
+        // corners instead of strokeRect, so the outline follows a rotation without the line width scaling too.
+        const sx0 = gengaStampPt.x - gengaStamp.w / 2, sy0 = gengaStampPt.y - gengaStamp.h / 2;
+        const sx1 = sx0 + gengaStamp.w, sy1 = sy0 + gengaStamp.h;
+        ctx.save();
+        ovApplyMatrix();
+        ctx.globalAlpha = STAMP_PREVIEW_ALPHA; ctx.drawImage(gengaStamp.patch, sx0, sy0, gengaStamp.w, gengaStamp.h); ctx.globalAlpha = 1; // ver1066 (B3)
+        ctx.restore();
+        const sq = [S(sx0, sy0), S(sx1, sy0), S(sx1, sy1), S(sx0, sy1)];
+        ctx.save();
+        ctx.setLineDash([MARQUEE_DASH_ON, MARQUEE_DASH_OFF]); ctx.strokeStyle = MARQUEE_COLOR; ctx.lineWidth = MARQUEE_LINE_PX; // ver655: unified stamp box
+        ctx.beginPath(); ctx.moveTo(sq[0].x, sq[0].y); ctx.lineTo(sq[1].x, sq[1].y); ctx.lineTo(sq[2].x, sq[2].y); ctx.lineTo(sq[3].x, sq[3].y); ctx.closePath(); ctx.stroke();
+        ctx.restore();
+      }
+      // FX box gizmo (FX window open): transform box + corner (scale) + top-knob (rotate) handles on that layer
+      if (state.gengaFxOpenId && !state.gengaPlaying) {
+        const gl = gengaLayerById(state.gengaFxOpenId);
+        const g = gl ? gengaFxGizmoScreen(gl) : null;
+        if (g) {
+          const c = g.corners;
+          ctx.save();
+          const G = FX_GIZMO, half = G.corner / 2; // ver1067 (A1): the shared spec, applied to ctx
+          ctx.strokeStyle = G.accent; ctx.lineWidth = G.line; ctx.setLineDash(G.dash.slice());
+          ctx.beginPath(); ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[1].x, c[1].y); ctx.lineTo(c[2].x, c[2].y); ctx.lineTo(c[3].x, c[3].y); ctx.closePath(); ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.beginPath(); ctx.moveTo(g.topMid.x, g.topMid.y); ctx.lineTo(g.rotKnob.x, g.rotKnob.y); ctx.stroke();
+          c.forEach(function(pt) { ctx.fillStyle = G.halo; ctx.strokeStyle = G.accent; ctx.lineWidth = G.line; ctx.beginPath(); ctx.rect(pt.x - half, pt.y - half, G.corner, G.corner); ctx.fill(); ctx.stroke(); });
+          ctx.beginPath(); ctx.arc(g.rotKnob.x, g.rotKnob.y, G.knobR, 0, Math.PI * 2); ctx.fillStyle = G.accent; ctx.strokeStyle = G.halo; ctx.lineWidth = G.knobHalo; ctx.fill(); ctx.stroke();
+          // ver1200: the pivot dot is NOT drawn. It marked the sheet centre (what applyLayerFx rotates/scales
+          // about) and was never a hit target — the hit test only knows the rot knob, the 4 corners and the quad
+          // interior. Once ver1036 shrank the box onto the ink, the dot was left floating away from the box with
+          // nothing grabbable under it, which is exactly why it read as a stray artifact. g.center stays in the
+          // returned object: the scale/rotate drag maths measures from it (gengaFxGizmoPointerDown d0/a0).
+          ctx.restore();
+          // ver1035: the 目盛り origin and the track it rides — the same thing the exported instruction image
+          // draws, shown live so the reference point can be judged (and Shift-dragged) against the real path.
+          const track = gengaFxOriginTrack(gl, g); // ver1043 #2: reuse the gizmo `g` computed just above
+          if (track && track.length > 1) {
+            ctx.save();
+            ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+            ctx.beginPath();
+            track.forEach(function(p, i) { if (i) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y); });
+            ctx.stroke();
+            ctx.lineWidth = 1.2;
+            track.forEach(function(p, i) {   // ver1036: ends included, so the ruler is closed at both stops
+              const a = track[Math.max(0, i - 1)], b = track[Math.min(track.length - 1, i + 1)];
+              const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+              const nx = -dy / len * 4, ny = dx / len * 4;
+              ctx.beginPath(); ctx.moveTo(p.x - nx, p.y - ny); ctx.lineTo(p.x + nx, p.y + ny); ctx.stroke();
+            });
+            ctx.restore();
+          }
+          ctx.save();
+          ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 2; ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(g.origin.x - 9, g.origin.y); ctx.lineTo(g.origin.x + 9, g.origin.y);
+          ctx.moveTo(g.origin.x, g.origin.y - 9); ctx.lineTo(g.origin.x, g.origin.y + 9);
+          ctx.stroke();
+          ctx.beginPath(); ctx.arc(g.origin.x, g.origin.y, 3.5, 0, Math.PI * 2);
+          ctx.fillStyle = '#fff'; ctx.lineWidth = 1.6; ctx.fill(); ctx.stroke();
+          ctx.restore();
+        }
+      } else if (!state.gengaPlaying) {
+        // FX window CLOSED but the drawing layer still has an active transform: a thin pale dashed outline
+        // shows where its real (possibly off-paper) canvas bounds are now, so it's clear where a stroke lands.
+        const dl = ensureGengaSelectedLayer();
+        const dfx = dl && gengaFxAt(dl, frame);
+        if (dfx) {
+          const g = gengaFxGizmoScreen(dl); // ver1200: the layer's CANVAS, not its ink (ver1770: that is the only mode now)
+          if (g) {
+            const c = g.corners;
+            ctx.save();
+            // ver1072 (A10): this is the FX box shown while its window is CLOSED, so it wears the FX accent at
+            // half strength - not rgba(224,60,60,0.5), which was a FOURTH red (#e03c3c) left over from the days
+            // when the FX gizmo itself was red. ver1067 made that gizmo blue; this is the same box.
+            ctx.strokeStyle = fxAccentFaded(0.5); ctx.lineWidth = 1; ctx.setLineDash(FX_GIZMO.dash.slice());
+            ctx.beginPath(); ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[1].x, c[1].y); ctx.lineTo(c[2].x, c[2].y); ctx.lineTo(c[3].x, c[3].y); ctx.closePath(); ctx.stroke();
+            // ver1228: corner label — which layer this box belongs to, so several FX'd layers' boxes don't
+            // read as ambiguous. Same "Aセル" tag the FX panel's own title uses (a サブレイヤー has no letter
+            // of its own, so fall back to its group parent's — gengaLayerGroupParent), plus the layer name.
+            ctx.setLineDash([]);
+            const fxBoxTagOwner = dl.cellGroupId ? (gengaLayerGroupParent(gt, dl.cellGroupId) || dl) : dl; // only resolve a group parent when dl IS grouped — cellGroupId:'' would otherwise match every ungrouped layer's '' too
+            const fxBoxTag = gengaLayerTags(gt)[fxBoxTagOwner.id];
+            const fxBoxLabel = (fxBoxTag ? t('project.genga.celLabel', fxBoxTag) : '') + '(' + (dl.name || 'Layer') + ')';
+            ctx.font = '700 11px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
+            ctx.textBaseline = 'bottom';
+            ctx.lineWidth = 3; ctx.strokeStyle = '#ffffff';
+            ctx.strokeText(fxBoxLabel, c[0].x + 4, c[0].y - 4);
+            ctx.fillStyle = fxAccentFaded(0.9);
+            ctx.fillText(fxBoxLabel, c[0].x + 4, c[0].y - 4);
+            ctx.restore();
+          }
+        }
+      }
+    }
+    function drawGengaPreviewInner(boxHint) {
+      if (gengaPreviewRedrawRaf) { cancelAnimationFrame(gengaPreviewRedrawRaf); gengaPreviewRedrawRaf = 0; } // ver1438: 직접 호출이 대기분을 흡수
+      paintMarqueeBoxBegin(document.getElementById('gengaPreviewCanvas')); // ver1453: 이 프레임의 마퀴 상자
+      cameraFxInlineUpdate(); // keep the カメラ window numbers in sync with the genga camera-work frame (no-op if closed/scrubbing)
+      tfqWindowUpdate(); // ver948: transform/perspective numeric rows follow the genga selection quad
+      gengaRetargetSelectionForPreview(); // ver1318: 미확정 변형의 미리보기는 **지금 보는 그림** 위에 뜬다
+
+      const view = gengaReadPreviewView(boxHint); if (!view) return { status: 'empty' };
+      const { canvas, gt, W, H, pw, ph, frame, onionShow, scale, dw, dh, ox, oy, vrot, vfl, pad } = view;
+      const prepared = gengaPreparePreviewComposite(view);
+      if (prepared.status !== 'ready') return prepared;
+      const composite = prepared.canvas;
       const oldSurface = canvas.paintScratch && canvas.paintScratch.preview;
       const region = gengaPreviewStrokeRegion(oldSurface, frame, W, H, ox, oy, scale, vrot, vfl);
-      if (region && region.unchanged) { oldSurface._previewState = region.state; return; }
+      if (region && region.unchanged) { gengaPreviewRender.viewState = region.state; return { status: 'unchanged' }; }
       const surface = region && region.rect ? oldSurface : paintScratchCanvas(canvas, 'preview', W, H);
-      surface._complete = false; surface._previewState = null;
-      const ctx = surface.getContext('2d'); if (!ctx) return;
+      surface._complete = false; gengaPreviewRender.viewState = null;
+      const ctx = surface.getContext('2d'); if (!ctx) return { status: 'error' };
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
       ctx.save();
@@ -102697,7 +103007,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           ctx.restore();
           ctx.strokeStyle = CAMERA_PLAYBACK.edge; ctx.lineWidth = CAMERA_PLAYBACK.edgeW; ctx.strokeRect(fx, fy, fw, fh);
           surface._complete = !!comp && comp._complete;
-          return surface;
+          return { status: 'ready', surface: surface };
         }
         // PER-LAYER onion skin: no global on/off — each layer with its bulb (layer.onion) on ghosts ITS OWN
         // previous/next koma. The top-bar window only holds shared settings (opacity + which neighbors 前/後).
@@ -102725,297 +103035,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 선 끝이 매 프레임 앞뒤로 튄다("선이 요동친다"). 지연을 몇 ms 감추자고 실제 잉크가 아닌 획을 화면에
         // 그리는 것은 그림 도구에서 잘못된 교환이다. 다시 시도한다면 필수 조건 셋: 앵커는 RAW 포인터가 아니라
         // 실제로 그어진 마지막 점(sess.lastX/lastY), 예측 구간은 짧게 클램프, pen 한정(마우스 예측은 더 거칠다).
-        {
-          const SC = function(px2, py2) { return { x: ox + px2 * scale, y: oy + py2 * scale }; };
-          const bcam = gt.camera;                                  // BLACK = fixed output/composition frame
-          const wcam = gengaCamDrag ? gengaCamDrag.live : (state.gengaCamFxLive || gengaCameraWorkAt(gt, frame)); // RED = camera-work frame (keyframe-interpolated; live buffer while dragging gizmo OR scrubbing the カメラ window)
-          const camEdit = (state.paintEditTool === 'camera');
-          const corners = cameraRectCorners(wcam).map(function(pt) { return SC(pt.x, pt.y); });
-          // red camera-work frame = thin CORNER BRACKETS (「 」) only — the full outline read as too heavy
-          const camCornerMarks = function() {
-            const e01 = Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y);
-            const e12 = Math.hypot(corners[2].x - corners[1].x, corners[2].y - corners[1].y);
-            const baseLen = cameraBracketArms(e01, e12).base; // ver1071 (A9): shared rule
-            ctx.beginPath();
-            for (let i = 0; i < 4; i++) {
-              const c = corners[i], nb = [corners[(i + 1) % 4], corners[(i + 3) % 4]];
-              for (let j = 0; j < 2; j++) { const n = nb[j], dx = n.x - c.x, dy = n.y - c.y, d = Math.hypot(dx, dy) || 1, len = Math.min(baseLen, d * CAMERA_BRACKET.edgeCap); ctx.moveTo(c.x, c.y); ctx.lineTo(c.x + dx / d * len, c.y + dy / d * len); }
-            }
-            ctx.stroke();
-          };
-          ctx.save();
-          // (button) dim everything outside the red camera-work frame — previews what the camera captures
-          if (state.gengaCamDim) {
-            const cvr2 = gengaViewCoverRect(W, H); // ver1005: same corner coverage as the playback dim above
-            ctx.beginPath(); ctx.rect(cvr2.x, cvr2.y, cvr2.w, cvr2.h);
-            ctx.moveTo(corners[0].x, corners[0].y); ctx.lineTo(corners[1].x, corners[1].y); ctx.lineTo(corners[2].x, corners[2].y); ctx.lineTo(corners[3].x, corners[3].y); ctx.closePath();
-            ctx.fillStyle = CAMERA_DIM_FILL; ctx.fill('evenodd'); // ver1066 (B1)
-          }
-          // black fixed output frame (axis-aligned, no handles) — thin + faint so it reads as a light guide
-          ctx.strokeStyle = 'rgba(0,0,0,0.2)'; ctx.lineWidth = 1; ctx.strokeRect(ox + bcam.x * scale, oy + bcam.y * scale, bcam.w * scale, bcam.h * scale);
-          // ver1037 hybrid: the WHOLE crop outlined at a whisper of opacity, with the corner brackets kept at full
-          // strength on top. Brackets alone read cleanly but left the frame's extent to be inferred between them,
-          // which is the one thing a camera frame has to state; a solid outline said it but drowned the artwork.
-          ctx.strokeStyle = CAMERA_BOX_EDGE.color; ctx.lineWidth = CAMERA_BOX_EDGE.w; // ver1072 (A10) / ver1076: width shared too
-          ctx.beginPath();
-          ctx.moveTo(corners[0].x, corners[0].y);
-          for (let ci = 1; ci < 4; ci += 1) ctx.lineTo(corners[ci].x, corners[ci].y);
-          ctx.closePath(); ctx.stroke();
-          ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 1; camCornerMarks();
-          // ver1037: camera-work path, conte's model ported over (renderCameraFramePath / renderCameraFrameKeyDots):
-          // a line through the key CENTRES with both ends called out. genga draws to canvas and conte to a DOM
-          // overlay, so only the model crosses — the applier stays per-surface, as ver1005 did for the view maths.
-          if (camEdit) {
-            const camPathKeys = gengaCamOverlayKeyframes(gt); // ver1060: the dragged key travels with the frame
-            gengaCamKeyCenterScreenCache = [];
-            if (camPathKeys.length >= 2) {
-              const pts = camPathKeys.map(function(k) { const c = cameraRectCenter(gengaCamKfRect(k)); return SC(c.x, c.y); });
-              gengaCamKeyCenterScreenCache = camPathKeys.map(function(k, i) { return { frame: Math.max(1, Math.round(Number(k.frame) || 1)), point: pts[i] }; }); // ver1043 ①: click a trajectory dot → jump
-              ctx.save();
-              // ver1049 (K2): the LINE follows the per-frame sampled path (shared cameraTrajectorySamples kernel),
-              // so the live overlay draws the same curve the exported instruction image does. The DOTS below still
-              // sit on the committed key centres (`pts`) — they mark keys, not the path.
-              // ver1065: sample the SAME list the dots are drawn from (camPathKeys = gengaCamOverlayKeyframes,
-              // ver1060's live view of the keys) instead of gengaCameraWorkAt's committed re-read. Handing the key
-              // ARRAY to the sampler is exactly what conte's renderCameraFramePath does; genga's sampler went
-              // behind the array's back, so the dots and the frame followed the drag while the dashed path between
-              // them stayed anchored where the drag started and only caught up at the commit.
-              const traj = cameraTrajectorySamples(
-                camPathKeys.map(function(k) { return k.frame; }),
-                function(f) { const c = cameraRectCenter(gengaCamRectAtFromKeys(camPathKeys, wcam, f)); return SC(c.x, c.y); }
-              );
-              const linePts = traj.length ? traj : pts;
-              ctx.strokeStyle = CAMERA_PATH.color; ctx.lineWidth = CAMERA_PATH.width; ctx.setLineDash(CAMERA_PATH.dash.slice()); ctx.lineCap = CAMERA_PATH.cap; // ver1066 (B2)
-              ctx.beginPath();
-              linePts.forEach(function(p, i) { if (i) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y); });
-              ctx.stroke();
-              ctx.setLineDash([]);
-              const curLocalT = gengaCurrentFrame();
-              pts.forEach(function(p, i) {
-                const sel = gengaCamKeyVivid(camPathKeys[i].frame, curLocalT); // ver1047: selected OR on the playhead
-                ctx.beginPath(); ctx.arc(p.x, p.y, cameraKeyMarkerSize(i, pts.length, sel) / 2, 0, Math.PI * 2); // ver1051: shared size rule
-                ctx.fillStyle = cameraKeyMarkerFill(i, pts.length, sel);
-                ctx.strokeStyle = CAMERA_MARK.keyDotStroke.color; ctx.lineWidth = sel ? CAMERA_MARK.keyDotStroke.vivid : CAMERA_MARK.keyDotStroke.rest; // ver1070 (A5b)
-                ctx.fill(); ctx.stroke();
-              });
-              ctx.restore();
-            }
-          }
-          if (camEdit) {
-            const center = SC(cameraRectCenter(wcam).x, cameraRectCenter(wcam).y);
-            const rightMidP = cameraRectLocalToPaper(wcam, wcam.w / 2, 0), rightMid = SC(rightMidP.x, rightMidP.y); // ver1039: right-edge midpoint
-            const rhP = gengaCamRotateHandlePaper(wcam, scale), rh = SC(rhP.x, rhP.y);
-            const curLocal = gengaCurrentFrame();
-            // ver1044: the gizmo centre doubles as the SELECTED key's dot — colour it by the current key's POSITION
-            // (start green / end blue / middle red) so it stops reading as an arbitrary "selected = red". Falls back
-            // to red only when the playhead isn't on a key (dragging there mints a new one — a distinct state).
-            const camKeysC = gengaCamKeyframes(gt);
-            const curIdxC = camKeysC.findIndex(function(k) { return Math.round(Number(k.frame) || 1) === curLocal; });
-            const centerColor = (camKeysC.length >= 2 && curIdxC >= 0) ? cameraKeyColor(curIdxC, camKeysC.length) : CAMERA_RED;
-            ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(rightMid.x, rightMid.y); ctx.lineTo(rh.x, rh.y); ctx.stroke();
-            corners.forEach(function(pt) { const M = CAMERA_MARK.corner, s = M.size; ctx.fillStyle = M.fill; ctx.strokeStyle = M.stroke; ctx.lineWidth = M.w; ctx.beginPath(); ctx.rect(pt.x - s / 2, pt.y - s / 2, s, s); ctx.fill(); ctx.stroke(); }); // ver1070 (A5b)
-            ctx.beginPath(); ctx.arc(rh.x, rh.y, CAMERA_MARK.rotate.size / 2, 0, Math.PI * 2); ctx.fillStyle = CAMERA_MARK.rotate.fill; ctx.strokeStyle = CAMERA_MARK.rotate.stroke; ctx.lineWidth = CAMERA_MARK.rotate.w; ctx.fill(); ctx.stroke(); // ver1070 (A5b)
-            ctx.beginPath(); ctx.arc(center.x, center.y, CAMERA_MARK.centre.size / 2, 0, Math.PI * 2); ctx.fillStyle = centerColor; ctx.strokeStyle = CAMERA_MARK.centre.stroke; ctx.lineWidth = CAMERA_MARK.centre.w; ctx.fill(); ctx.stroke();
-            // ver1042: bottom-left pick handles — one small square per keyframe (green start, blue last), so a stack
-            // of coincident keys can each be selected. Cached in screen px for gengaCameraPointerDown's hit test.
-            const camKeyHandles = gengaCamKeyHandleScreens(gt, SC);
-            gengaCamKeyHandleScreenCache = camKeyHandles;
-            camKeyHandles.forEach(function(h) {
-              const isCur = gengaCamKeyVivid(h.keyframe.frame, curLocal); // ver1047: selected OR on the playhead
-              const kh = cameraKeyHandleStyle(isCur), sz = kh.size; // ver1070 (A5): shared spec
-              ctx.fillStyle = cameraKeyMarkerFill(h.index, camKeyHandles.length, isCur);
-              ctx.strokeStyle = kh.stroke; ctx.lineWidth = kh.width;
-              ctx.beginPath(); ctx.rect(h.point.x - sz / 2, h.point.y - sz / 2, sz, sz); ctx.fill(); ctx.stroke();
-            });
-          } else { gengaCamKeyHandleScreenCache = []; gengaCamKeyCenterScreenCache = []; }
-          ctx.restore();
-        }
-        ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1;
-        ctx.strokeRect(ox + 0.5, oy + 0.5, Math.max(1, dw - 1), Math.max(1, dh - 1));
-        // ---- tool overlays (match conte memo: marching-ants white+blue, 8px square handles) ----
-        // ver1204: S is the DRAWING→screen projector, so it composes the edited layer's FX exactly as
-        // gengaPreviewPointerXY inverts it — same layer (the selected one), same gengaFxAt call, same master-switch
-        // gate. gengaCurrentFrame() rather than this function's `frame`: during a parapara flip `frame` is another
-        // frame's view and nothing is editable, and the pointer side always reads the current one, so this keeps
-        // the two halves exact inverses. Identity FX takes the original one-line path untouched.
-        const ovFx = (function() {
-          const ol = ensureGengaSelectedLayer(); if (!ol) return null;
-          const f = gengaFxAt(ol, gengaCurrentFrame());
-          return (f && (f.x || f.y || f.scale !== 1 || f.rot)) ? f : null;
-        })();
-        const S = ovFx
-          ? function(px2, py2) { const t = gengaFxForwardXY(px2, py2, ovFx, pw, ph); return { x: ox + t.x * scale, y: oy + t.y * scale }; }
-          : function(px2, py2) { return { x: ox + px2 * scale, y: oy + py2 * scale }; };
-        // The same map as a canvas MATRIX, for the one overlay that draws an image rather than points (the stamp):
-        //   screen = (ox,oy) + scale · [C + T + R(a)·s·(p − C)]
-        // Handles and dashes must NOT scale with it, which is why everything else projects per point through S.
-        const ovApplyMatrix = function() {
-          if (!ovFx) { ctx.translate(ox, oy); ctx.scale(scale, scale); return; }
-          const cxp = pw / 2, cyp = ph / 2, sc = Math.max(1e-4, Number(ovFx.scale) || 1);
-          ctx.translate(ox + (cxp + (Number(ovFx.x) || 0)) * scale, oy + (cyp + (Number(ovFx.y) || 0)) * scale);
-          ctx.rotate((Number(ovFx.rot) || 0) * Math.PI / 180);
-          ctx.scale(scale * sc, scale * sc);
-          ctx.translate(-cxp, -cyp);
-        };
-        // lasso path while drawing (open marching-ants polyline)
-        // ver619 revert: open polyline while dragging (artifact demo never closePath's during drag —
-        // close+fill happens in one step at release), for both lasso-select and 投げ縄塗りつぶし.
-        if (gengaLasso && gengaLasso.pts.length > 1) {
-          // ver1442: 콘티와 **같은 커널** — 실선 빨강 1 device px, 안티 0. 라쏘선택·라쏘스탬프 공통이다
-          // (gengaLasso 는 둘 다 쓰는 세션이다: stamp 플래그만 다르다).
-          drawCrispMarqueePolyline(ctx, gengaLasso.pts.map(function(pt) { return S(pt[0], pt[1]); }),
-            MARQUEE_COLOR_PENDING, false, false);
-        }
-        if (gengaDrawSession && gengaDrawSession.shape === 'lasso-fill' && gengaDrawSession.shapeMoved && gengaDrawSession.shapeLassoPts.length > 1) {
-          const lfPts = gengaDrawSession.shapeLassoPts;
-          drawCrispMarqueePolyline(ctx, lfPts.map(function(pt) { return S(pt.x, pt.y); }),
-            MARQUEE_COLOR_PENDING, false, false); // ver1442: 위와 같은 커널
-        }
-        // ver1313: **선택(스텐실)은 전역이고, 떠 있는 픽셀만 자기 레이어·프레임 것이다** — 콘티가
-        // ver1283 에 세운 그 모델(전역 스텐실)로 통일한다. 종전에는 마퀴까지 frame 에 묶여 있어서,
-        // 다음 프레임으로 넘어가면 선택이 사라진 것처럼 보였다(사용자 보고). 데이터는 살아 있었고
-        // 표시만 묶여 있었다.
-        // ver1314: **기즈모도 전역이다.** ver1313 은 기즈모를 자기 대상에만 그렸는데, 좌표가 툴 상태가
-        // 된 뒤로는 그게 반쪽이었다 — 다른 프레임에 가면 값은 살아 있는데 화면에는 아무 상자도 없어서
-        // "좌표가 저기서는 적용이 안 돼 있다"로 읽혔다(사용자 보고). 콘티는 대상이 바뀌면 박스의
-        // drawingRef 가 따라오면서 quad 를 그대로 이어받아 새 대상 위에 같은 자리로 그린다 — 그 파리티다.
-        // ver1316: 앤츠도 마찬가지로 대상을 가리지 않는다 — 스텐실의 위치를 정하는 것은 quad 이고,
-        // 다른 프레임에서 상자만 옮겨져 있고 점선은 제자리인 그림이 바로 "선택영역이 이동 안 됨"으로
-        // 읽혔다(사용자 보고). 판정은 gengaDrawSelEdge 안에 하나만 남았다.
-        if (gengaSel) {
-          const tool = state.paintEditTool;
-          gengaDrawSelEdge(ctx, gengaSel, S); // the ACTUAL selection shape (marching ants), unified for every tool
-          const ovQuad = gengaResolveQuad(gengaSel); // ver1314: 기즈모가 그리는 좌표 = 툴 상태의 실효 quad
-          // ver1319: **미확정이면 빨강** — 콘티가 ver1282 에 세운 규칙(paintTransformBoxColor)의 원화 쪽 절반이
-          // 통째로 비어 있었다. 원화 상자는 늘 같은 색이라 "지금 이 변형은 아직 안 구워졌다"를 화면이
-          // 말해 주지 않았다. TVPaint 도 같은 것을 색으로 말한다(빨강 HUD = 옮겼지만 미적용, 초록 = 적용됨).
-          // 판정은 각 엔진이 이미 가진 술어를 쓴다 — 콘티는 quad vs baseQuad, 원화는 quad vs bounds 항등.
-          const ovPending = !gengaSelIsPristine(gengaSel);
-          if (!ovQuad) { /* 아직 아무 좌표도 없다 */ }
-          else if (tool === 'perspective') { // ver751 (quad-only): the quad always exists
-            const q = ovQuad.map(function(pt) { return S(pt[0], pt[1]); });
-            gengaOverlayStroke(ctx, function() { ctx.beginPath(); ctx.moveTo(q[0].x, q[0].y); ctx.lineTo(q[1].x, q[1].y); ctx.lineTo(q[2].x, q[2].y); ctx.lineTo(q[3].x, q[3].y); ctx.closePath(); }, ovPending ? MARQUEE_COLOR_PENDING : MARQUEE_COLOR_PERSP, [MARQUEE_DASH_ON, MARQUEE_DASH_OFF]); // ver655: unified
-            q.forEach(function(pt) { gengaOverlayHandle(ctx, pt.x, pt.y); });
-            paintQuadHandlePoints(ovQuad, scale).edgeMids.forEach(function(m) { const pt = S(m.x, m.y); gengaOverlayHandle(ctx, pt.x, pt.y); }); // ver948: edge handles
-          } else if (tool === 'transform') {
-            const H = gengaSelHandlesPaper(gengaSel, scale);
-            const c = H.corners.map(function(pt) { return S(pt.x, pt.y); }), rot = S(H.rotate.x, H.rotate.y), tm = S(H.rotateBase.x, H.rotateBase.y); // ver948: arm rides the RIGHT edge
-            const ovColor = ovPending ? MARQUEE_COLOR_PENDING : MARQUEE_COLOR;
-            gengaOverlayStroke(ctx, function() { ctx.beginPath(); ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[1].x, c[1].y); ctx.lineTo(c[2].x, c[2].y); ctx.lineTo(c[3].x, c[3].y); ctx.closePath(); }, ovColor, [MARQUEE_DASH_ON, MARQUEE_DASH_OFF]); // ver655: unified (was rogue '#7aa8e6',[3,3])
-            ctx.save(); ctx.strokeStyle = ovColor; ctx.lineWidth = MARQUEE_LINE_PX; ctx.setLineDash([]); ctx.beginPath(); ctx.moveTo(tm.x, tm.y); ctx.lineTo(rot.x, rot.y); ctx.stroke(); ctx.restore();
-            c.forEach(function(pt) { gengaOverlayHandle(ctx, pt.x, pt.y); });
-            gengaOverlayHandle(ctx, rot.x, rot.y, MARQUEE_KNOB_FILL); // ver1066 (B5)
-          }
-        }
-        // ver771: 드래그 중 이미 찍힌 도장들. gengaStamp.work에는 들어갔지만 커밋은 pointerup 1회라 아직
-        // 레이어 그림이 아니다 — 제스처가 끝날 때까지 여기서 불투명하게 보여준다(콘티는 라이브 레이어
-        // 캔버스에 직접 그려서 이 단계가 필요 없다).
-        if (gengaStamp && gengaStampDrag && state.paintEditTool === 'lasso-stamp') {
-          ctx.save();
-          ovApplyMatrix(); // ver1204: the placed stamps ride the layer's FX (rotation/scale included)
-          gengaStampDrag.pts.forEach(function(pt) {
-            ctx.drawImage(gengaStamp.patch, pt.x - gengaStamp.w / 2, pt.y - gengaStamp.h / 2, gengaStamp.w, gengaStamp.h);
-          });
-          ctx.restore();
-        }
-        // lasso-stamp preview: the captured stamp follows the cursor (semi-transparent + dashed bbox)
-        if (gengaStamp && gengaStampPt && state.paintEditTool === 'lasso-stamp') {
-          // ver1204: the patch itself goes through the FX matrix; its dashed box is stroked from four PROJECTED
-          // corners instead of strokeRect, so the outline follows a rotation without the line width scaling too.
-          const sx0 = gengaStampPt.x - gengaStamp.w / 2, sy0 = gengaStampPt.y - gengaStamp.h / 2;
-          const sx1 = sx0 + gengaStamp.w, sy1 = sy0 + gengaStamp.h;
-          ctx.save();
-          ovApplyMatrix();
-          ctx.globalAlpha = STAMP_PREVIEW_ALPHA; ctx.drawImage(gengaStamp.patch, sx0, sy0, gengaStamp.w, gengaStamp.h); ctx.globalAlpha = 1; // ver1066 (B3)
-          ctx.restore();
-          const sq = [S(sx0, sy0), S(sx1, sy0), S(sx1, sy1), S(sx0, sy1)];
-          ctx.save();
-          ctx.setLineDash([MARQUEE_DASH_ON, MARQUEE_DASH_OFF]); ctx.strokeStyle = MARQUEE_COLOR; ctx.lineWidth = MARQUEE_LINE_PX; // ver655: unified stamp box
-          ctx.beginPath(); ctx.moveTo(sq[0].x, sq[0].y); ctx.lineTo(sq[1].x, sq[1].y); ctx.lineTo(sq[2].x, sq[2].y); ctx.lineTo(sq[3].x, sq[3].y); ctx.closePath(); ctx.stroke();
-          ctx.restore();
-        }
-        // FX box gizmo (FX window open): transform box + corner (scale) + top-knob (rotate) handles on that layer
-        if (state.gengaFxOpenId && !state.gengaPlaying) {
-          const gl = gengaLayerById(state.gengaFxOpenId);
-          const g = gl ? gengaFxGizmoScreen(gl) : null;
-          if (g) {
-            const c = g.corners;
-            ctx.save();
-            const G = FX_GIZMO, half = G.corner / 2; // ver1067 (A1): the shared spec, applied to ctx
-            ctx.strokeStyle = G.accent; ctx.lineWidth = G.line; ctx.setLineDash(G.dash.slice());
-            ctx.beginPath(); ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[1].x, c[1].y); ctx.lineTo(c[2].x, c[2].y); ctx.lineTo(c[3].x, c[3].y); ctx.closePath(); ctx.stroke();
-            ctx.setLineDash([]);
-            ctx.beginPath(); ctx.moveTo(g.topMid.x, g.topMid.y); ctx.lineTo(g.rotKnob.x, g.rotKnob.y); ctx.stroke();
-            c.forEach(function(pt) { ctx.fillStyle = G.halo; ctx.strokeStyle = G.accent; ctx.lineWidth = G.line; ctx.beginPath(); ctx.rect(pt.x - half, pt.y - half, G.corner, G.corner); ctx.fill(); ctx.stroke(); });
-            ctx.beginPath(); ctx.arc(g.rotKnob.x, g.rotKnob.y, G.knobR, 0, Math.PI * 2); ctx.fillStyle = G.accent; ctx.strokeStyle = G.halo; ctx.lineWidth = G.knobHalo; ctx.fill(); ctx.stroke();
-            // ver1200: the pivot dot is NOT drawn. It marked the sheet centre (what applyLayerFx rotates/scales
-            // about) and was never a hit target — the hit test only knows the rot knob, the 4 corners and the quad
-            // interior. Once ver1036 shrank the box onto the ink, the dot was left floating away from the box with
-            // nothing grabbable under it, which is exactly why it read as a stray artifact. g.center stays in the
-            // returned object: the scale/rotate drag maths measures from it (gengaFxGizmoPointerDown d0/a0).
-            ctx.restore();
-            // ver1035: the 目盛り origin and the track it rides — the same thing the exported instruction image
-            // draws, shown live so the reference point can be judged (and Shift-dragged) against the real path.
-            const track = gengaFxOriginTrack(gl, g); // ver1043 #2: reuse the gizmo `g` computed just above
-            if (track && track.length > 1) {
-              ctx.save();
-              ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
-              ctx.beginPath();
-              track.forEach(function(p, i) { if (i) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y); });
-              ctx.stroke();
-              ctx.lineWidth = 1.2;
-              track.forEach(function(p, i) {   // ver1036: ends included, so the ruler is closed at both stops
-                const a = track[Math.max(0, i - 1)], b = track[Math.min(track.length - 1, i + 1)];
-                const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
-                const nx = -dy / len * 4, ny = dx / len * 4;
-                ctx.beginPath(); ctx.moveTo(p.x - nx, p.y - ny); ctx.lineTo(p.x + nx, p.y + ny); ctx.stroke();
-              });
-              ctx.restore();
-            }
-            ctx.save();
-            ctx.strokeStyle = CAMERA_RED; ctx.lineWidth = 2; ctx.lineCap = 'round';
-            ctx.beginPath();
-            ctx.moveTo(g.origin.x - 9, g.origin.y); ctx.lineTo(g.origin.x + 9, g.origin.y);
-            ctx.moveTo(g.origin.x, g.origin.y - 9); ctx.lineTo(g.origin.x, g.origin.y + 9);
-            ctx.stroke();
-            ctx.beginPath(); ctx.arc(g.origin.x, g.origin.y, 3.5, 0, Math.PI * 2);
-            ctx.fillStyle = '#fff'; ctx.lineWidth = 1.6; ctx.fill(); ctx.stroke();
-            ctx.restore();
-          }
-        } else if (!state.gengaPlaying) {
-          // FX window CLOSED but the drawing layer still has an active transform: a thin pale dashed outline
-          // shows where its real (possibly off-paper) canvas bounds are now, so it's clear where a stroke lands.
-          const dl = ensureGengaSelectedLayer();
-          const dfx = dl && gengaFxAt(dl, frame);
-          if (dfx) {
-            const g = gengaFxGizmoScreen(dl); // ver1200: the layer's CANVAS, not its ink (ver1770: that is the only mode now)
-            if (g) {
-              const c = g.corners;
-              ctx.save();
-              // ver1072 (A10): this is the FX box shown while its window is CLOSED, so it wears the FX accent at
-              // half strength - not rgba(224,60,60,0.5), which was a FOURTH red (#e03c3c) left over from the days
-              // when the FX gizmo itself was red. ver1067 made that gizmo blue; this is the same box.
-              ctx.strokeStyle = fxAccentFaded(0.5); ctx.lineWidth = 1; ctx.setLineDash(FX_GIZMO.dash.slice());
-              ctx.beginPath(); ctx.moveTo(c[0].x, c[0].y); ctx.lineTo(c[1].x, c[1].y); ctx.lineTo(c[2].x, c[2].y); ctx.lineTo(c[3].x, c[3].y); ctx.closePath(); ctx.stroke();
-              // ver1228: corner label — which layer this box belongs to, so several FX'd layers' boxes don't
-              // read as ambiguous. Same "Aセル" tag the FX panel's own title uses (a サブレイヤー has no letter
-              // of its own, so fall back to its group parent's — gengaLayerGroupParent), plus the layer name.
-              ctx.setLineDash([]);
-              const fxBoxTagOwner = dl.cellGroupId ? (gengaLayerGroupParent(gt, dl.cellGroupId) || dl) : dl; // only resolve a group parent when dl IS grouped — cellGroupId:'' would otherwise match every ungrouped layer's '' too
-              const fxBoxTag = gengaLayerTags(gt)[fxBoxTagOwner.id];
-              const fxBoxLabel = (fxBoxTag ? t('project.genga.celLabel', fxBoxTag) : '') + '(' + (dl.name || 'Layer') + ')';
-              ctx.font = '700 11px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
-              ctx.textBaseline = 'bottom';
-              ctx.lineWidth = 3; ctx.strokeStyle = '#ffffff';
-              ctx.strokeText(fxBoxLabel, c[0].x + 4, c[0].y - 4);
-              ctx.fillStyle = fxAccentFaded(0.9);
-              ctx.fillText(fxBoxLabel, c[0].x + 4, c[0].y - 4);
-              ctx.restore();
-            }
-          }
-        }
-        surface._complete = true; surface._previewState = region ? region.state : null;
-        return surface;
+        gengaDrawPreviewOverlays(ctx, view);
+        surface._complete = true; gengaPreviewRender.viewState = region ? region.state : null;
+        return { status: 'ready', surface: surface };
       } finally { ctx.restore(); }
     }
     // how far FX pushes any visible layer's content past the paper edge at `frame` → preview canvas padding
@@ -103476,6 +103498,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // can be re-keyed or re-committed in between (gengaCommitSelection alone does it), and a stale footprint
     // is exactly the silent-crop bug. null = the seed put no ink down, so the session's own ink is the union.
     function gengaDrawingSeedRect(dr, pw, ph) {
+      if (dr && dr.inkBounds) return dr.inkBounds; // full active pixels keep the stored ink footprint
       // ver2028: **벡터 그림을 여기서 열어야 한다.** ver2023 은 「null 이면 전체 스캔이라 잉크가
       // 안 잘린다」고 적고 벡터를 안 열었는데, 그 전제가 거짓이었다 — gengaScanSeed(null) 은
       // 전체가 아니라 **빈 상자**를 만들고 그 뒤 그린 획만큼만 자란다. 그래서 벡터 레이어에 선을
@@ -103521,6 +103544,91 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (y - r < s.y0) s.y0 = y - r;
       if (x + r > s.x1) s.x1 = x + r;
       if (y + r > s.y1) s.y1 = y + r;
+    }
+    function paintCopyCanvasRegion(source, rect) {
+      const cv = document.createElement('canvas'); cv.width = rect.w; cv.height = rect.h;
+      cv.getContext('2d').drawImage(source, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+      return cv;
+    }
+    // Direct pen writes have no immutable stroke base. Capture each affected tile once,
+    // before the first write, using the same conservative bounds as the stroke scan.
+    function gengaEndDrawSession(keepHistory) {
+      const sess = gengaDrawSession;
+      gengaDrawSession = null;
+      if (!keepHistory) gengaReleaseHistoryBefore(sess);
+      return sess;
+    }
+    function gengaReleaseHistoryBefore(sess) {
+      if (!sess || !sess.historyBefore) return;
+      sess.historyBefore.forEach(function(tile) { paintReleaseCanvas(tile.canvas); });
+      sess.historyBefore.clear();
+    }
+    function gengaCaptureHistoryBefore(sess, rect) {
+      if (!sess || sess.shapeBase || sess.vector || sess.vectorErase || !rect) return;
+      const grid = gengaTileGrid(sess.canvas.width, sess.canvas.height);
+      const clipped = gengaScanClamp({ x0: rect.x, y0: rect.y, x1: rect.x + rect.w, y1: rect.y + rect.h }, sess.canvas);
+      const window = clipped && gengaDirtyCellWindow(clipped, grid); if (!window) return;
+      const tiles = sess.historyBefore || (sess.historyBefore = new Map());
+      for (let y = window.r0; y <= window.r1; y++) for (let x = window.c0; x <= window.c1; x++) {
+        const index = y * grid.gw + x;
+        if (tiles.has(index)) continue;
+        const tileRect = gengaTileRect(index, { gw: grid.gw, tile: GENGA_TILE_PX, pw: sess.canvas.width, ph: sess.canvas.height });
+        tiles.set(index, { rect: tileRect, canvas: paintCopyCanvasRegion(sess.canvas, tileRect) });
+      }
+    }
+    function gengaHistoryPixels(sess, drawing, rect) {
+      if (!sess || !rect || sess.vector || sess.vectorErase || (!sess.shapeBase && !sess.historyBefore)) return null;
+      const cv = sess.canvas, grid = gengaTileGrid(cv.width, cv.height), window = gengaDirtyCellWindow(rect, grid);
+      if (!window) return null;
+      const x = window.c0 * GENGA_TILE_PX, y = window.r0 * GENGA_TILE_PX;
+      const r = { x: x, y: y, w: Math.min(cv.width, (window.c1 + 1) * GENGA_TILE_PX) - x,
+        h: Math.min(cv.height, (window.r1 + 1) * GENGA_TILE_PX) - y };
+      const before = paintCopyCanvasRegion(sess.shapeBase || cv, r);
+      if (sess.historyBefore) {
+        const ctx = before.getContext('2d');
+        sess.historyBefore.forEach(function(tile) {
+          ctx.save(); ctx.beginPath(); ctx.rect(tile.rect.x - r.x, tile.rect.y - r.y, tile.rect.w, tile.rect.h); ctx.clip();
+          ctx.globalCompositeOperation = 'copy'; ctx.drawImage(tile.canvas, tile.rect.x - r.x, tile.rect.y - r.y); ctx.restore();
+        });
+        gengaReleaseHistoryBefore(sess);
+      }
+      const value = drawing && gengaDrawStore.get(drawing.ref);
+      const shared = gengaIsDrawDelta(value) && value.sx === r.x && value.sy === r.y
+        && value.snap.width === r.w && value.snap.height === r.h;
+      const after = shared ? paintRetainCanvas(value.snap) : paintCopyCanvasRegion(cv, r);
+      return { layerId: sess.layerId, frame: sess.frame, width: cv.width, height: cv.height,
+        beforeRef: sess.previewBaseRef || null, afterRef: drawing && drawing.ref || null, rect: r, before: before, after: after };
+    }
+    function gengaApplyHistoryPixels(command, undoing) {
+      const pixels = command.gengaPixels, active = gengaActiveCanvas;
+      if (!pixels || !active || state.project.kind !== 'genga' || gengaDrawSession
+          || String(active.layerId) !== String(pixels.layerId)
+          || active.ref !== (undoing ? pixels.afterRef : pixels.beforeRef)
+          || active.canvas.width !== pixels.width || active.canvas.height !== pixels.height) return false;
+      const cv = active.canvas, ctx = cv.getContext('2d'), r = pixels.rect;
+      ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = 'none';
+      ctx.beginPath(); ctx.rect(r.x, r.y, r.w, r.h); ctx.clip(); ctx.globalCompositeOperation = 'copy';
+      ctx.drawImage(undoing ? pixels.before : pixels.after, r.x, r.y); ctx.restore();
+      active.ref = undoing ? pixels.beforeRef : pixels.afterRef;
+      return true;
+    }
+    function releaseHistoryPixels(command) {
+      const pixels = command && command.gengaPixels; if (!pixels) return;
+      paintReleaseCanvas(pixels.before); paintReleaseCanvas(pixels.after);
+      delete command.gengaPixels; delete command.__historyCost;
+    }
+    function trimHistoryPixels() {
+      // Fast pixels are disposable, the existing commands are not. Account them in
+      // the existing history budget and discard fast data before trimming commands.
+      const stacks = [state.undoStack, state.redoStack];
+      const budget = Math.round(historyMemoryBudgetBytes() * (pixelCachePressure() ? HISTORY_PRESSURE_FACTOR : 1));
+      if (historyStacksBytes(stacks).total <= budget) return;
+      const commands = state.undoStack.concat(state.redoStack).sort(function(a, b) { return a.histSeq - b.histSeq; });
+      for (const command of commands) {
+        if (!command.gengaPixels) continue;
+        releaseHistoryPixels(command);
+        if (historyStacksBytes(stacks).total <= budget) break;
+      }
     }
     function gengaScanMark(sess, x, y, pad) {
       const s = sess && sess.scan; if (!s) return;
@@ -103642,7 +103750,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           ev.preventDefault();
           return;
         }
-        gengaDrawSession = null;
+        gengaEndDrawSession();
         drawGengaPreview();
       }
       const p = gengaPreviewPointerXY(ev); if (!p) return;
@@ -103797,7 +103905,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // ver1712: 이 세션을 소유한 포인터. 콘티의 state.paintPointerId 와 같은 뜻이고, 같은 파일의
           // 원화 형제들(gengaStampDrag · gengaLasso · gengaCamDrag · gengaSelDrag)이 이미 쓰는 규약이다.
           pointerId: ev.pointerId,
-          layerId: layer.id, frame: frame, canvas: cv, ctx: c,
+          layerId: layer.id, frame: frame, canvas: cv, ctx: c, previewBaseRef: activeDr && activeDr.ref || null,
           shape: gengaShapeKind, shapeBase: shapeBase, shapeBuf: shapeBuf,
           shapeAnchor: { x: p.x, y: p.y }, shapeLassoPts: [{ x: p.x, y: p.y }], shapeMoved: false,
           vector: vectorDraw,   // ver2043: 이 도형을 스트로크로 남길 것인가(위에서 못 담는 것은 이미 걸렀다)
@@ -104073,6 +104181,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (twoFingerTapCandidate && !twoFingerTapCandidate.moved) return; // ver1672: conte 와 같은 가드
       const f = s.pendingFirstDab;
       s.pendingFirstDab = null;   // 먼저 비운다 — 재진입해도 두 번 찍히지 않는다
+      gengaCaptureHistoryBefore(s, gengaScanClamp(s.inkScan, s.canvas));
       f();
     }
     function gengaPenOutlineRedraw(sess) {
@@ -104245,6 +104354,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // was marked with its own (possibly narrower) width, and lineWidth is constant along a segment.
         gengaScanMark(penSess, penSess.lastX, penSess.lastY, segWidth / 2 + 1);
         gengaScanMark(penSess, p.x, p.y, segWidth / 2 + 1);
+        const historyPad = segWidth / 2 + 1 + GENGA_SCAN_PAD;
+        gengaCaptureHistoryBefore(penSess, { x: Math.min(penSess.lastX, p.x) - historyPad,
+          y: Math.min(penSess.lastY, p.y) - historyPad, w: Math.abs(p.x - penSess.lastX) + historyPad * 2,
+          h: Math.abs(p.y - penSess.lastY) + historyPad * 2 });
         target.save();
         target.globalAlpha = target.globalAlpha * segAlpha;
         if (penSess.pxStamp) { // AA off: hard pixel stamping, per-width stamps cached
@@ -104320,7 +104433,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 사본이라 버리면 그만이고, 화면에서 지우는 것은 프리뷰 재합성 한 번이다.
       // (올가미·스탬프·변형은 양 엔진 모두 cancel 에서 커밋한다 — 갈리는 것은 프리핸드 획 하나다.)
       if (ev.type === 'pointercancel') {
-        gengaDrawSession = null;
+        gengaEndDrawSession();
         drawGengaPreview();
         try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
         return;
@@ -104349,7 +104462,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
           return;
         }
-        gengaDrawSession = null;
+        gengaEndDrawSession(true);
         if (shapeSess.vector) {
           // ver2043: 도형을 **스트로크로** 남긴다. 점은 미리보기가 만든 그대로, 굵기는 미리보기가
           // 쓰는 규칙 그대로(도형은 필압이 없어 균일하다 — paintVariableWidthRadii 에 계수 1).
@@ -104386,7 +104499,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             gengaShapeComposite(shapeSess);
           }
           if (paintToolBinarizeOn(shapeSess.shape)) { paintBinarizeCanvasAlpha(shapeSess.shapeBuf); gengaShapeComposite(shapeSess); } // ver614: per-tool 2値化
-          gengaCommitCanvas(shapeSess.layerId, shapeSess.frame, shapeSess.canvas, '図形描画', gengaScanRectFor(shapeSess, shapeSess.canvas)); // ver1196
+          gengaCommitCanvas(shapeSess.layerId, shapeSess.frame, shapeSess.canvas, '図形描画', gengaScanRectFor(shapeSess, shapeSess.canvas), null, shapeSess); // ver1196
         } else {
           drawGengaPreview(); // degenerate tap: the layer is untouched, just drop the session preview
         }
@@ -104409,7 +104522,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       const sess = gengaDrawSession;
       if (!sess) return;   // replay 중에 세션이 정리됐다면(방어) 여기서 끝낸다
-      gengaDrawSession = null;
+      gengaEndDrawSession(true);
       // ver1720: 아웃라인이 아니면 **버퍼 재합성의 대기분**을 흡수한다(위 gengaPenCompositeFlush).
       // 버퍼 모드가 아니면 그 함수가 그 자리에서 되돌아가므로 조건을 여기 또 적지 않는다.
       if (!sess.penOutline) gengaPenCompositeFlush(sess);
@@ -104442,7 +104555,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
         return;
       }
-      gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas)); // ink-bbox trimmed + decode-race fallback; ver1196 union scan
+      gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas), null, sess); // ink-bbox trimmed + decode-race fallback; ver1196 union scan
       try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
     }
     // ── ver581: document-level gesture-state janitor — THE intermittent iPad lockup, finally caught
@@ -104570,7 +104683,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 곡선 1단계 대기(pointerId === null)는 여기 안 걸린다 — 콘티의 pending raster op 과 같다.
         if (gengaDrawSession && gengaDrawSession.pointerId === id) {
           requestAnimationFrame(function() {
-            if (gengaDrawSession && gengaDrawSession.pointerId === id) { gengaDrawSession = null; drawGengaPreview(); }
+            if (gengaDrawSession && gengaDrawSession.pointerId === id) { gengaEndDrawSession(); drawGengaPreview(); }
           });
         }
       };
@@ -104621,8 +104734,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       renderGengaView();
       return true;
     }
-    function gengaCommitDrawing(layerId, frame, drawing, label, selectionRider) {
-      if (gengaVectorRejectsRaster(layerId, drawing)) return;
+    function gengaCommitDrawing(layerId, frame, drawing, label, selectionRider, pixels) {
+      if (gengaVectorRejectsRaster(layerId, drawing)) { releaseHistoryPixels({ gengaPixels: pixels }); return; }
       // drawing onto an EXISTING koma only changes pixels → skip the full genga stage rebuild (innerHTML swap of
       // the whole dopesheet per stroke = the visible mid-drawing flash) and patch the thumb/preview directly.
       // A commit that CREATES a koma still does the full render (new .genga-exp element needed).
@@ -104671,13 +104784,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // two things a commit actually invalidates. (Tool/color/window state can't change here — those all
       // funnel through selectPaintTool / updatePaintUI on their own.)
       if (partial) {
-        runGengaLayerEdit(label || '原画描画', layerId, mutate, { skipStage: true, skipInspector: true, skipChrome: true, selectionRider: selectionRider || null, gengaStrokeCommit: true }); // ver2209: 이 커밋은 프레임 캐시를 살린다 (scope 불가로 full runCommand 로 넘어가면 그쪽 무효화가 이긴다)
+        runGengaLayerEdit(label || '原画描画', layerId, mutate, { skipStage: true, skipInspector: true, skipChrome: true, selectionRider: selectionRider || null, gengaStrokeCommit: true, gengaPixels: pixels }); // ver2209: 이 커밋은 프레임 캐시를 살린다 (scope 불가로 full runCommand 로 넘어가면 그쪽 무효화가 이긴다)
           updatePaintUndoRedoButtonsOnly();
         // ver2204 (q2=A): 헤드 썸 재드로를 커밋 레이어로 좁힌다. 셀그룹 멤버는 여기 못 온다 —
         // gengaLayerPatchScopeOk 가 2+ 멤버를 full runCommand 로 보내고(SCOPE RULES ①), 그 sync 도
         // 타이밍·FX 만 미러하지 그림은 복사하지 않으므로 다른 레이어의 헤드 썸 픽셀은 안 변한다.
         gengaUpdateExpDom(layerId, frame); drawGengaLayerThumbs([layerId]); drawGengaPreview();
-      } else runCommand(label || '原画描画', mutate, { selectionRider: selectionRider || null });
+      } else runCommand(label || '原画描画', mutate, { selectionRider: selectionRider || null, gengaPixels: pixels });
     }
     // trim a paper-res canvas to its ink bbox and commit it (all drawing-type commits route here). The full
     // canvas is kept as the decode-race fallback so the preview never blinks while the new PNG decodes.
@@ -104819,7 +104932,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       next.push(stroke);
       gengaCommitDrawing(layerId, frame, { w: gt.paper.w, h: gt.paper.h, strokes: next }, label || '原画描画');
     }
-    function gengaCommitCanvas(layerId, frame, cv, label, scanRect, selectionRider) {
+    function gengaCommitCanvas(layerId, frame, cv, label, scanRect, selectionRider, historySession) {
       // ver1324 (F2): trim stays sync (bounded by the ver1196 union scan window), the PNG encode does not —
       // gengaPutDrawingCanvas returns {ref,...} at once and settles store/IDB/thumbs/lastStroke async. The
       // old sync gengaLastStrokeCanvas + gengaImageFor prefetch here MOVED into gengaSettleDrawingEncode
@@ -104878,15 +104991,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (tiled && drawing && drawing.ref && !gengaLayerDrawsVector(gengaLayerById(layerId))) {
         gengaActiveCanvas = { layerId: layerId, expId: null, ref: drawing.ref, canvas: cv };
       }
-      gengaCommitDrawing(layerId, frame, drawing, label, selectionRider); // ver1314: 선택을 같은 undo 스텝에 태울 때만 전달
-      // ver2437 (occupancy q1=B · P1): 이 커밋의 용지 캔버스를 다음 획의 시작점으로 쥔다 — 칸 커밋만
-      // (통짜 폴백은 gengaLastStrokeCanvas 가 그 역할, 벡터 레이어는 픽셀이 정본이 아니다). expId 는
-      // 커밋이 코마를 «만든» 경우가 있어 지금 다시 읽는다. 그 밖의 결과(빈 그림·폴백)는 활성을 비운다 —
-      // 미스는 언제나 종전 재조립이라 비우는 쪽이 항상 안전하다.
+      const pixels = gengaHistoryPixels(historySession, drawing, scanRect && scanRect.ink);
+      gengaReleaseHistoryBefore(historySession);
+      gengaCommitDrawing(layerId, frame, drawing, label, selectionRider, pixels);
+      // The committed full canvas is the next stroke/Undo target, including a blank drawing.
+      // Vector layers retain their separate authoritative representation.
       const activeLayer = gengaLayerById(layerId);
       const committedExp = activeLayer && gengaExposureAt(activeLayer, frame);
-      if (tiled && drawing && drawing.ref && committedExp && activeLayer && !gengaLayerDrawsVector(activeLayer)) {
-        gengaActiveCanvas = { layerId: layerId, expId: committedExp.id, ref: drawing.ref, canvas: cv };
+      if (committedExp && activeLayer && !gengaLayerDrawsVector(activeLayer)) {
+        gengaActiveCanvas = { layerId: layerId, expId: committedExp.id, ref: drawing && drawing.ref || null, canvas: cv };
       } else {
         gengaActiveCanvas = null;
       }
@@ -104908,7 +105021,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const resolved = gengaExposureDrawing(layer, e);
       // ver2193→ver2195: 칸 그림은 tileSet 으로 오므로 이 문에 안 걸린다 — 인코드 대기(canvas 만
       // 있고 문자열이 아직 없는 그림)만 건너뛴다(settle 이 다시 부른다).
-      if (resolved && resolved.canvas && !resolved.dataUrl && !resolved.deltaLive) return;   // ver2439: 활성 delta 의 canvas 는 대기가 아니라 정본 — 스킵하면 썸이 영영 안 갱신된다
+      if (resolved && resolved.canvas && !resolved.dataUrl && !resolved.active && !resolved.deltaLive) return;   // ver2439: 활성 delta 의 canvas 는 대기가 아니라 정본 — 스킵하면 썸이 영영 안 갱신된다
       // ver2202: 커밋의 코마 썸 인코드(toBlob) 대기 — 같은 계약이다: 스킵하면 옛 썸이 잠시 남고,
       // 완료 콜백이 반드시 재호출한다. 여기서 스킵 없이 gengaThumbUrlFor 로 가면 미스 경로가
       // 「합성 + 동기 PNG 인코드」를 물어 인코드를 밖으로 뺀 뜻이 없어진다.
@@ -105201,11 +105314,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaActiveCanvas = null;                  // ver2437: 같은 근거 — 활성 캔버스도 이전 프로젝트의 용지다
       gengaDeltaWant.clear();                    // ver2438: 이전 프로젝트의 붕괴 요청·콜백 — 고아가 되면 엉뚱한 재렌더를 부른다
       gengaDeltaWantCallbacks.clear();
-      gengaDrawSession = null;                   // 진행 중 스트로크(옛 레이어 대상)
+      gengaDrawingReadyJobs.clear();
+      [state.undoStack, state.redoStack].forEach(function(stack) { (stack || []).forEach(releaseHistoryPixels); });
+      gengaPreviewRender.scene = null;
+      gengaEndDrawSession();                   // 진행 중 스트로크(옛 레이어 대상)
       gengaFxLive = null;                        // 라이브 FX 미리보기 값(옛 레이어)
       gengaFxGizmoDrag = null;
       gengaFxOriginTrackCache = null;            // 옛 레이어/카메라 기준 캐시
-      gengaCamDragComposite = null;              // 옛 프로젝트 합성 비트맵
+      gengaPreviewRender.camera = null;
+      gengaPreviewRender.viewState = null;
       gengaCamKeyHandleScreenCache = []; gengaCamKeyCenterScreenCache = [];
       gengaPointerCanvasRect = null; gengaPointerGestureOpen = false;
       gengaFlipTouch = null; gengaPinch = null; gengaPointers = new Map();
@@ -105298,7 +105415,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (pan && pan.inGenga) return pan.mode !== 'rotate';
       return Boolean(gengaWheelViewToken);
     }
-    let gengaCamDragComposite = null; // ver1044 perf: { canvas, token, frame, pad } — the layer composite snapshotted at the drag's first frame and reused for the rest (a camera-frame drag never touches layer pixels, so recompositing every move — blur + per-layer FX transforms — was pure waste)
+
     let gengaCamKeyHandleScreenCache = []; // ver1042: [{keyframe,index,point:{x,y}}] in SCREEN px, refreshed each camera-mode draw, read by the pointerdown hit test
     let gengaCamKeyCenterScreenCache = []; // ver1043 ①: [{frame,point:{x,y}}] the trajectory key CENTRE dots, in the same local px — click one to jump the playhead to that keyframe (coexists with the bottom-left handles)
     let gengaParaparaFrame = null; // when set, drawGengaPreview shows this frame instead of the current one (parapara/yubipara flip)
@@ -107317,7 +107434,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // a 2nd finger arriving cancels whatever single-finger op finger 1 started (no stray stroke / stuck flip)
     function gengaCancelSingleFingerOps() {
-      gengaDrawSession = null;
+      gengaEndDrawSession();
       paintDiscardPendingBucketFill();      // ver1736: 아직 안 칠한 통도 여기서 버린다
       if (gengaFlipTouch) { gengaFlipTouch = null; gengaSetParaparaFrame(null); }
     }
@@ -107494,7 +107611,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const fxSeqShifted = gengaFxRunCountShifted(layerIds.map(function(id) {
         return { before: layerBefore.get(id), after: byId.get(id) };
       }), gt.totalFrames);
-      if (!(options && options.skipStage)) {
+      if (options && options.gengaStrokeCommit && !fxSeqShifted) {
+        layerIds.forEach(function(id) {
+          const layer = byId.get(id), before = layerBefore.get(id), seen = new Set();
+          const oldExposures = new Map((before && before.exposures || []).map(function(exp) { return [exp.id, exp]; }));
+          (layer && layer.exposures || []).forEach(function(exp) {
+            const key = gengaValueKey(exp.instanceValue), token = key === null ? 'e:' + exp.id : 'k:' + key;
+            if (seen.has(token)) return;
+            seen.add(token);
+            const oldExp = oldExposures.get(exp.id);
+            const oldDrawing = key === null ? oldExp && oldExp.drawing : before && before.sharedDrawings && before.sharedDrawings[key];
+            const drawing = key === null ? exp.drawing : layer.sharedDrawings && layer.sharedDrawings[key];
+            if ((oldDrawing && oldDrawing.ref) !== (drawing && drawing.ref)) gengaUpdateExpDom(id, exp.startFrame);
+          });
+        });
+        drawGengaLayerThumbs(layerIds); drawGengaPreview();
+        gengaTimesheetUpdate(); updatePaintUndoRedoButtonsOnly();
+      } else if (!(options && options.skipStage)) {
         // ver1234: route through refresh() instead of poking guardedRender('stage') directly — that bypass is
         // why an undone/redone FX key left the open timesheet window stale (refresh() is what calls
         // gengaTimesheetUpdate). renderGengaView's own tail still repaints the canvas, so nothing else changes.
@@ -107542,7 +107675,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gengaRenderPlan = fxSeqShifted
         ? { scope: 'all', reason: 'fx-label-seq' }
         : { scope: 'partial', layerIds: ids, audio: false };
-      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaLayerPatchEdit: true, gengaStrokeCommit: isStrokeCommit, gengaRenderPlan: gengaRenderPlan }, refreshOptions && refreshOptions.selectionRider)); // ver1314: 선택 라이더 · ver2210: 획 커밋 표시 — undo/redo 의 캐시 keep 판정(a1)이 읽는다
+      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaLayerPatchEdit: true, gengaStrokeCommit: isStrokeCommit, gengaPixels: refreshOptions && refreshOptions.gengaPixels, gengaRenderPlan: gengaRenderPlan }, refreshOptions && refreshOptions.selectionRider)); // ver1314: 선택 라이더 · ver2210: 획 커밋 표시 — undo/redo 의 캐시 keep 판정(a1)이 읽는다
       if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } } // ver1148: layer-patch ops (post/preBehavior, onion, eye…) are detectable too
       state.redoStack = [];
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
@@ -107951,7 +108084,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (gengaCamRaf) { cancelAnimationFrame(gengaCamRaf); gengaCamRaf = 0; }
       gengaCamLatest = null; // 취소는 대기 중인 틱을 **버린다**(FX 짝 gengaFxGizmoUp 과 같은 계약)
       gengaCamDrag = null;
-      gengaCamDragComposite = null; // ver1044: drop the drag-time composite snapshot (next drag rebuilds; frees the bitmap)
+      gengaPreviewRender.camera = null; // ver1044: drop the drag-time composite snapshot (next drag rebuilds; frees the bitmap)
     }
     function gengaCameraPointerEnd(ev) {
       if (!gengaCamDrag) return;
@@ -108160,35 +108293,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // register a one-shot retry for when it finishes and report not-ready.
     function gengaEnsureDrawingReady(layer, frame, retry) {
       const dr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
-      // ver2192: 축출된 그림은 **디스크에서 돌아올 때까지 그리기를 막는다.** 여기서 통과시키면
-      // 빈 시드 위에 그려 그 코마의 기존 그림이 사라진다 — 이 판에서 가장 위험한 자리다.
-      if (dr && dr.evicted && dr.ref) { gengaDrawStoreFaultIn(dr.ref, retry); return false; }
-      // ver2438: 붕괴 대기 delta(활성 미스 — undo 로 돌아온 옛 delta) — 완전체가 될 때까지 그리기를
-      // 막고(빈 시드가 덮어쓰는 병은 evicted 와 같다), 펌프에 우선 붕괴를 예약한다. retry 는 붕괴
-      // 완료 콜백으로 온다.
-      if (dr && dr.deltaPending && dr.ref) { gengaDeltaWantCollapse(dr.ref, retry); return false; }
-      // ver2195 그물: store 진입 세 경로가 디코드까지 마치므로 여기 걸리면 그 불변식이 깨진 것이다 —
-      // 그래도 통과시키면 빈 시드가 기존 그림을 덮어쓰므로(위 evicted 와 같은 병) 막고 소리 낸다.
-      // ver2216: 이관(decodedMoved)이 남긴 미완은 병이 아니라 설계다 — 획 undo 로 되돌아온 직전 그림
-      // 위에 바로 긋는 경우가 여기다(ver2428 부터 그것을 미리 채우는 펌프가 없으므로 이 자리가 채운다).
-      // 기록은 남기되(조용한 실패 금지) error 는 진짜 파괴에만 쓴다.
-      if (dr && dr.tileSet && !gengaTileSetDecodedComplete(dr.tileSet)) {
-        if (dr.tileSet.decodedMoved) console.warn('[gengaTile] edit entry on a moved-out base - decoding before the stroke');
-        else console.error('[gengaTile] undecoded cell(s) at edit entry - the store invariant is broken');
-        gengaTileSetDecode(dr.tileSet).then(function() { retry(); });
-        return false;
-      }
-      if (!dr || !dr.dataUrl) return true; // no bitmap → nothing to wait for
-      if (gengaLastStrokeCanvas && gengaLastStrokeCanvas.dataUrl === dr.dataUrl) return true; // sync fallback covers it
-      const readyKey = gengaRasterCacheKey(dr);
-      let img = gengaImageCache.get(readyKey);
-      if (!img) { gengaImageFor(dr, null); img = gengaImageCache.get(readyKey); }
-      if (!img) return true; // request failed outright → let the op no-op
-      if (img.complete) return true;
-      // ver750 (fix_design P3-B): the retry ran inside a silent catch — self-defeating for a function whose
-      // whole purpose is preventing silent no-ops. A throwing retry now surfaces as a normal global error.
-      img.addEventListener('load', function() { retry(); }, { once: true });
-      return false;
+      const pixels = gengaPrepareDrawing(dr, retry);
+      return pixels.status === 'empty' || pixels.status === 'ready';
     }
     function gengaLiftSelection(layer, frame, pts) {
       if (!pts || pts.length < 3) return false;
@@ -111914,16 +112020,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       // keep the preview canvas in sync with its container size (layout settle / window resize) so it never
       // stretches/distorts — the canvas internal resolution is re-set to the live wrap size on every change.
-      if (gengaPreviewRO) { try { gengaPreviewRO.disconnect(); } catch (e) {} gengaPreviewRO = null; }
       const pvWrap = stageEl.querySelector('.genga-preview');
-      if (pvWrap && typeof ResizeObserver !== 'undefined') {
-        gengaPreviewRO = new ResizeObserver(function() { drawGengaPreview(); });
-        gengaPreviewRO.observe(pvWrap);
+      if (!gengaPreviewRO || gengaPreviewRO.previewElement !== pvWrap) {
+        if (gengaPreviewRO) gengaPreviewRO.disconnect();
+        gengaPreviewRO = null;
+        if (pvWrap && typeof ResizeObserver !== 'undefined') {
+          gengaPreviewRO = new ResizeObserver(scheduleGengaPreviewRedraw);
+          gengaPreviewRO.previewElement = pvWrap;
+          gengaPreviewRO.observe(pvWrap);
+        }
       }
       // (pinch is handled in gengaPreviewPointerDown/Move/End via Pointer Events — no separate TouchEvent binding)
-      // redraw after layout settles (e.g. the create modal closing reflows the stage) — setTimeout fires
-      // regardless of tab visibility, so the canvas resolution re-syncs to the final wrap size.
-      setTimeout(function() { if (state.project && state.project.kind === 'genga') drawGengaPreview(); }, 60);
+      // Preview size changes are observed for the lifetime of this DOM element.
       gengaShowNodes('.genga-exp[data-genga-exp]').forEach(function(block) {
         block.addEventListener('pointerdown', gengaExpPointerDown);
         block.addEventListener('contextmenu', gengaExpContextMenu);
