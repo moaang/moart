@@ -122,3 +122,15 @@ self.addEventListener('fetch', function (e) {
     })
   );
 });
+
+// Read-only census for conservative cleanup. Include older/uncontrolled windows on this origin.
+self.addEventListener('message', function (event) {
+  if (!event.data || event.data.type !== 'moart-storage-clients' || !event.ports[0]) return;
+  const port = event.ports[0];
+  event.waitUntil(self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(function (clients) {
+    port.postMessage({ type: 'moart-storage-clients', onlyCaller: clients.length === 1 && !!event.source && clients[0].id === event.source.id });
+  }).catch(function (error) {
+    console.warn('[sw] storage client census failed', error);
+    port.postMessage({ type: 'moart-storage-clients', onlyCaller: false });
+  }));
+});
