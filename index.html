@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2454</title>
+  <title>MoArt ver2455</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24448,6 +24448,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2455, items: [{
+        ja: '半透明ペン・図形の作業バッファを再利用し、連続描画での大きなメモリ割り当てを減らしました。取り消し・キャンセル時の絵を保ち、描画表示の待ち時間は追加していません。',
+        ko: '반투명 펜·도형의 작업 버퍼를 재사용해 연속 그리기 때 큰 메모리 할당을 줄였습니다. 되돌리기·취소 때의 그림을 유지하며 획 표시 대기를 추가하지 않았습니다.',
+        en: 'Reuse temporary buffers for translucent strokes and shapes to reduce large allocations during repeated drawing. Undo and cancellation preserve pixels without adding a wait to stroke display.',
+        zh: '复用半透明笔画和图形的临时缓冲区，减少连续绘画时的大块内存分配。保留撤销与取消时的像素效果，不增加笔画显示等待。'
+      }] },
       { ver: 2454, items: [{
         ja: '**保存の保護。** 別タブの古い編集による上書きを防ぎ、音源の保存完了を確認します。音源を書けないときは元データを保持し、他のタブの状態が不明な間は保存領域の整理を保留します。',
         ko: '**저장 보호 개선.** 다른 탭의 오래된 편집이 최신 저장본을 덮지 않도록 하고 음원 저장 완료를 확인합니다. 음원을 쓰지 못하면 원본을 보관하며, 다른 탭의 상태를 모르는 동안 저장 공간 정리를 보류합니다.',
@@ -58448,22 +58454,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return (op && op.type === 'draw' && op.shapeKind === 'curve' && op.curveChord && state.paintPointerId == null) ? op : null;
     }
     function paintCancelPendingCurveRaster() {
-      const op = paintRasterOpCurvePending();
-      if (!op) return false;
-      if (op.canvas && op.canvas.isConnected && op.modeBaseCanvas) {
-        const ctx = op.canvas.getContext('2d');
-        ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.globalCompositeOperation = 'source-over';
-        ctx.clearRect(0, 0, op.canvas.width, op.canvas.height);
-        ctx.drawImage(op.modeBaseCanvas, 0, 0);
-        ctx.restore();
+      const endingStroke = state.paintRasterOp;
+      try {
+        const op = paintRasterOpCurvePending();
+        if (!op) return false;
+        if (op.canvas && op.canvas.isConnected && op.modeBaseCanvas) {
+          const ctx = op.canvas.getContext('2d');
+          ctx.save();
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.clearRect(0, 0, op.canvas.width, op.canvas.height);
+          ctx.drawImage(op.modeBaseCanvas, 0, 0);
+          ctx.restore();
+        }
+        state.paintRasterOp = null;
+        state.paintCurrentStroke = null;
+        state.paintCurrentLayerRect = null;
+        clearActiveLayerCanvasTargets();
+        return true;
+      } finally {
+        if (endingStroke && state.paintRasterOp !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
       }
-      state.paintRasterOp = null;
-      state.paintCurrentStroke = null;
-      state.paintCurrentLayerRect = null;
-      clearActiveLayerCanvasTargets();
-      return true;
     }
     // ver1722: 用紙 획을 `page.strokes` 에서 걷어낸다 — 취소의 정본. 같은 splice 가 두 곳에 손으로
     // 적혀 있었고(여기 · endPaintStroke 의 퇴화 도형) 이 판이 세 번째(취소 경로)를 필요로 했다.
@@ -68640,7 +68651,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const stroke = op.stroke;
       const w = op.canvas.width, h = op.canvas.height;
       // clean stroke shape (opaque brush color, one path → no self-overlap seams)
-      const buf = paintScratchCanvas(op, 'stroke', w, h);
+      const buf = paintBorrowStrokeCanvas(op, 'stroke', w, h);
       const bctx = buf.getContext('2d');
       const drawStroke = Object.assign({}, paintStrokeLineView(stroke), { tool: 'pen', mode: 'normal', opacity: 1 }); // force plain opaque render into the buffer (alpha applied ONCE at composite) // ver1695: Shift 직선 얼굴로
       if (options.skipStroke) {
@@ -68884,6 +68895,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         nextBase.width = op.canvas.width;
         nextBase.height = op.canvas.height;
         nextBase.getContext('2d').drawImage(op.modeBaseCanvas, rect.x - nextRect.x, rect.y - nextRect.y);
+        if (op.strokeBuffers && op.strokeBuffers.base === op.modeBaseCanvas) op.strokeBuffers.base = nextBase;
         op.modeBaseCanvas = nextBase;
       }
       return true;
@@ -68946,6 +68958,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 크기의 정본은 호출부가 준다: conte 는 ensurePaintRasterOpBounds 가 **제스처 도중** op.canvas 를
     // 키우므로 매번 대조해야 하고, 재사용 캔버스는 앞 회차의 컨텍스트 상태(변환·합성모드·알파)를 물고
     // 있으므로 되돌린 뒤 넘긴다. 크기를 대입하면 캔버스가 초기화되니 그때는 clear 가 필요 없다.
+    // Only temporary stroke base/ink surfaces enter this pool. Display, drawing,
+    // history and persistence snapshots keep their existing owners.
+    const paintStrokeBufferPool = { base: null, stroke: null };
+    function paintBorrowStrokeCanvas(owner, key, w, h) {
+      const held = owner.strokeBuffers || (owner.strokeBuffers = {});
+      if (!held[key]) {
+        const canvas = paintStrokeBufferPool[key] || document.createElement('canvas');
+        paintStrokeBufferPool[key] = null;
+        held[key] = canvas;
+        // A new gesture must not inherit paths, clip, filters or a save stack.
+        const ctx = canvas.getContext('2d');
+        if (canvas.width === w && canvas.height === h && ctx.reset) ctx.reset();
+        else { canvas.width = w; canvas.height = h; }
+        return canvas;
+      }
+      return paintScratchCanvas({ paintScratch: held }, key, w, h);
+    }
+    function paintReleaseStrokeBuffers(owner) {
+      if (!owner || !owner.strokeBuffers) return;
+      for (const key of ['base', 'stroke']) {
+        const canvas = owner.strokeBuffers[key]; if (!canvas) continue;
+        if (paintStrokeBufferPool[key]) paintReleaseCanvas(paintStrokeBufferPool[key]);
+        paintStrokeBufferPool[key] = canvas;
+      }
+      delete owner.strokeBuffers;
+      owner.modeBaseCanvas = null; owner.shapeBase = null; owner.shapeBuf = null;
+    }
+    function paintClearStrokeBufferPool() {
+      for (const key of ['base', 'stroke']) {
+        paintReleaseCanvas(paintStrokeBufferPool[key]); paintStrokeBufferPool[key] = null;
+      }
+    }
     function paintScratchCanvas(owner, key, w, h) {
       const store = owner.paintScratch || (owner.paintScratch = {});
       let buf = store[key];
@@ -72521,9 +72565,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintEnsureModeBaseCanvas(op, sourceCanvas) {
       const cv = sourceCanvas || (op && op.canvas);
       if (!op || op.modeBaseCanvas || !cv || !cv.width || !cv.height) return;
-      const base = document.createElement('canvas');
-      base.width = cv.width;
-      base.height = cv.height;
+      const base = paintBorrowStrokeCanvas(op, 'base', cv.width, cv.height);
       base.getContext('2d').drawImage(cv, 0, 0);
       op.modeBaseCanvas = base;
     }
@@ -75587,108 +75629,113 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function endPaintStroke(event) {
-      paintDiagEnd();   // ver2411: 콘티·用紙 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
-      const canvas = document.getElementById('memoCanvas');
-      if (endPaintSpacePan(event, canvas)) return;
-      if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) return;
-      event.preventDefault();
-      paintStabilizeCatchupReplay(state.paintRasterOp, event, continuePaintStroke, state.paintCurrentStroke);   // ver2373/2374: 랙을 수렴 방출 — 직결 세그먼트 제거, 필압은 보간(커널 배너 참조)
-      continuePaintStroke(event);
-      cancelScheduledMemoCanvasRedraw();
-      paintFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
-      const op = state.paintRasterOp;
-      const pointerId = event.pointerId;
-      state.paintPointerId = null;
-      state.paintCurrentStroke = null;
-      state.paintRasterOp = null;
-      state.paintPointerCanvasRect = null;
-      if (canvas.releasePointerCapture) {
-        try { canvas.releasePointerCapture(pointerId); } catch (error) {}
-      }
-      if (op.type === 'page-draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
-        // ver608 page curve phase 1: the chord stroke stays in page.strokes as the visible ghost;
-        // the next pointerdown with the curve tool becomes the bend gesture (see beginPaintStroke).
-        state.memoPageCurvePending = {
-          stroke: op.stroke,
-          a: { x: op.shapeAnchor.x, y: op.shapeAnchor.y },
-          b: op.stroke.points[op.stroke.points.length - 1],
-          pixelW: op.pixelW, pixelH: op.pixelH,
-          pageStrokes: op.pageStrokes
-        };
-        redrawMemoCanvas();
+      const endingStroke = state.paintRasterOp;
+      try {
+        paintDiagEnd();   // ver2411: 콘티·用紙 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
+        const canvas = document.getElementById('memoCanvas');
+        if (endPaintSpacePan(event, canvas)) return;
+        if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) return;
+        event.preventDefault();
+        paintStabilizeCatchupReplay(state.paintRasterOp, event, continuePaintStroke, state.paintCurrentStroke);   // ver2373/2374: 랙을 수렴 방출 — 직결 세그먼트 제거, 필압은 보간(커널 배너 참조)
+        continuePaintStroke(event);
+        cancelScheduledMemoCanvasRedraw();
+        paintFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
+        const op = state.paintRasterOp;
+        const pointerId = event.pointerId;
+        state.paintPointerId = null;
+        state.paintCurrentStroke = null;
+        state.paintRasterOp = null;
+        state.paintPointerCanvasRect = null;
+        if (canvas.releasePointerCapture) {
+          try { canvas.releasePointerCapture(pointerId); } catch (error) {}
+        }
+        if (op.type === 'page-draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
+          // ver608 page curve phase 1: the chord stroke stays in page.strokes as the visible ghost;
+          // the next pointerdown with the curve tool becomes the bend gesture (see beginPaintStroke).
+          state.memoPageCurvePending = {
+            stroke: op.stroke,
+            a: { x: op.shapeAnchor.x, y: op.shapeAnchor.y },
+            b: op.stroke.points[op.stroke.points.length - 1],
+            pixelW: op.pixelW, pixelH: op.pixelH,
+            pageStrokes: op.pageStrokes
+          };
+          redrawMemoCanvas();
+          state.paintCurrentLayerRect = null;
+          updatePaintUndoRedoButtonsOnly();
+          return;
+        }
+        if (op.type === 'draw' && op.shapeKind && !op.shapeMoved) {
+          // ver606: shape tap without a drag — nothing was previewed or baked, skip the commit entirely
+        } else if (op.type === 'draw') {
+          // ver541: blend/hard-edge strokes → clean composite over the pre-stroke base.
+          // ver606 의 도형 bake 는 ver721 에 이 함수 위임 한 줄이 됐는데 if/else 만 남아 **양쪽 가지가
+          // 같은 코드**였다 — ver2259 에 가지와 위임 함수를 함께 걷었다(도형도 같은 합성이다).
+          paintRecompositeStrokeForMode(op);
+          const merged = mergedPaintFixedDrawCanvas(op);
+          const saveCanvas = merged && merged.canvas || op.canvas;
+          const saveRect = merged && merged.rect || paintRasterOpRect(op);
+          setLayerDrawingBitmapFromCanvas(op.drawingRef, saveCanvas, op.beforeDataUrl, {
+            bitmapX: saveRect.x,
+            bitmapY: saveRect.y,
+            bitmapWidth: saveRect.w,
+            bitmapHeight: saveRect.h,
+            preserveActiveCanvas: true,
+            preserveActiveCanvasRect: op.fixedVisibleCanvas ? paintRasterOpRect(op) : null,
+            skipMemoRedraw: true,
+            skipThumbnails: true,
+            autosaveDelay: INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS
+          });
+        } else if (op.type === 'stamp') {
+          if (op.stampChanged) setLayerDrawingBitmapFromCanvas(op.drawingRef, op.canvas, op.beforeDataUrl, {
+            bitmapX: op.bitmapX,
+            bitmapY: op.bitmapY,
+            bitmapWidth: op.canvas.width,
+            bitmapHeight: op.canvas.height,
+            trimAlpha: true,
+            preserveActiveCanvas: true,
+            skipMemoRedraw: true,
+            skipThumbnails: true
+          });
+          clearPaintStampPreview();
+        } else if (op.type === 'transform-edit') {
+          finishPaintTransformOp(op);
+        } else if (op.type === 'lasso-stamp') {
+          if (!finishPaintLassoStamp(op)) {
+            state.paintLassoPreview = null;
+            updatePaintEditOverlays(op.drawingRef);
+          }
+          redrawActiveLayerCanvasTargets(op.drawingRef);
+        } else if (op.type === 'lasso-select') {
+          if (!finishPaintLassoSelect(op)) {
+            state.paintLassoPreview = null;
+            // ver1436: 3점 미만 = **드래그 없이 톡 눌렀다**. 종전에는 프리뷰만 지우고 끝나 아무 일도
+            // 일어나지 않았다 — 원화는 같은 조작에서 선택이 해제된다(gengaSelectPointerDown 이 먼저
+            // 커밋한다). 페인트 앱의 표준 제스처이기도 하다: 선택 바깥을 누르면 선택이 풀린다.
+            // 새 선택(replace)을 만들려던 손짓일 때만 — 追加/部分解除 중이면 기존 선택을 건드리지 않는다.
+            if (state.paintSelection && state.paintSelectionMode === 'replace') clearPaintSelection();
+            updatePaintEditOverlays(op.drawingRef);
+          }
+          redrawActiveLayerCanvasTargets(op.drawingRef);
+        } else if (op.type === 'page-draw') {
+          // ver606: degenerate shape (tap without drag / lasso-fill under 3 points) → drop the stroke it pushed
+          if (op.shapeKind && (!op.shapeMoved || (op.shapeKind === 'lasso-fill' && op.stroke.points.length < 3))) {
+            paintRemovePageStroke(op); // ver1722: 위 커널
+          }
+          if (op.shapeKind === 'curve' && op.curveChord) state.memoPageCurvePending = null; // ver608: bend finalized
+          redrawMemoCanvas();
+          scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+        }
+        if (op.type === 'draw' && op.shapeKind === 'lasso-fill' && state.paintLassoPreview) { // ver651: drop the overlay marquee once baked
+          state.paintLassoPreview = null;
+          updatePaintEditOverlays(op.drawingRef);
+        }
         state.paintCurrentLayerRect = null;
+        clearActiveLayerCanvasTargets();
+        updateAfterAutoCreatedLayerKomaDraw(op);
         updatePaintUndoRedoButtonsOnly();
-        return;
+      } finally {
+        if (endingStroke && state.paintRasterOp !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
       }
-      if (op.type === 'draw' && op.shapeKind && !op.shapeMoved) {
-        // ver606: shape tap without a drag — nothing was previewed or baked, skip the commit entirely
-      } else if (op.type === 'draw') {
-        // ver541: blend/hard-edge strokes → clean composite over the pre-stroke base.
-        // ver606 의 도형 bake 는 ver721 에 이 함수 위임 한 줄이 됐는데 if/else 만 남아 **양쪽 가지가
-        // 같은 코드**였다 — ver2259 에 가지와 위임 함수를 함께 걷었다(도형도 같은 합성이다).
-        paintRecompositeStrokeForMode(op);
-        const merged = mergedPaintFixedDrawCanvas(op);
-        const saveCanvas = merged && merged.canvas || op.canvas;
-        const saveRect = merged && merged.rect || paintRasterOpRect(op);
-        setLayerDrawingBitmapFromCanvas(op.drawingRef, saveCanvas, op.beforeDataUrl, {
-          bitmapX: saveRect.x,
-          bitmapY: saveRect.y,
-          bitmapWidth: saveRect.w,
-          bitmapHeight: saveRect.h,
-          preserveActiveCanvas: true,
-          preserveActiveCanvasRect: op.fixedVisibleCanvas ? paintRasterOpRect(op) : null,
-          skipMemoRedraw: true,
-          skipThumbnails: true,
-          autosaveDelay: INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS
-        });
-      } else if (op.type === 'stamp') {
-        if (op.stampChanged) setLayerDrawingBitmapFromCanvas(op.drawingRef, op.canvas, op.beforeDataUrl, {
-          bitmapX: op.bitmapX,
-          bitmapY: op.bitmapY,
-          bitmapWidth: op.canvas.width,
-          bitmapHeight: op.canvas.height,
-          trimAlpha: true,
-          preserveActiveCanvas: true,
-          skipMemoRedraw: true,
-          skipThumbnails: true
-        });
-        clearPaintStampPreview();
-      } else if (op.type === 'transform-edit') {
-        finishPaintTransformOp(op);
-      } else if (op.type === 'lasso-stamp') {
-        if (!finishPaintLassoStamp(op)) {
-          state.paintLassoPreview = null;
-          updatePaintEditOverlays(op.drawingRef);
-        }
-        redrawActiveLayerCanvasTargets(op.drawingRef);
-      } else if (op.type === 'lasso-select') {
-        if (!finishPaintLassoSelect(op)) {
-          state.paintLassoPreview = null;
-          // ver1436: 3점 미만 = **드래그 없이 톡 눌렀다**. 종전에는 프리뷰만 지우고 끝나 아무 일도
-          // 일어나지 않았다 — 원화는 같은 조작에서 선택이 해제된다(gengaSelectPointerDown 이 먼저
-          // 커밋한다). 페인트 앱의 표준 제스처이기도 하다: 선택 바깥을 누르면 선택이 풀린다.
-          // 새 선택(replace)을 만들려던 손짓일 때만 — 追加/部分解除 중이면 기존 선택을 건드리지 않는다.
-          if (state.paintSelection && state.paintSelectionMode === 'replace') clearPaintSelection();
-          updatePaintEditOverlays(op.drawingRef);
-        }
-        redrawActiveLayerCanvasTargets(op.drawingRef);
-      } else if (op.type === 'page-draw') {
-        // ver606: degenerate shape (tap without drag / lasso-fill under 3 points) → drop the stroke it pushed
-        if (op.shapeKind && (!op.shapeMoved || (op.shapeKind === 'lasso-fill' && op.stroke.points.length < 3))) {
-          paintRemovePageStroke(op); // ver1722: 위 커널
-        }
-        if (op.shapeKind === 'curve' && op.curveChord) state.memoPageCurvePending = null; // ver608: bend finalized
-        redrawMemoCanvas();
-        scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
-      }
-      if (op.type === 'draw' && op.shapeKind === 'lasso-fill' && state.paintLassoPreview) { // ver651: drop the overlay marquee once baked
-        state.paintLassoPreview = null;
-        updatePaintEditOverlays(op.drawingRef);
-      }
-      state.paintCurrentLayerRect = null;
-      clearActiveLayerCanvasTargets();
-      updateAfterAutoCreatedLayerKomaDraw(op);
-      updatePaintUndoRedoButtonsOnly();
     }
 
     // ver718 (Stage4 flip): the glass canvas is gone — the pointer-capture / input surface is the
@@ -76015,154 +76062,164 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function endVideoPaintStroke(event) {
-      paintDiagEnd();   // ver2411: 映像 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
-      paintFlushPendingBucketFill(event); // ver1736: 유예해 둔 통은 여기서 칠해진다 (아래 조기 반환들보다 앞이어야 한다 — 통은 op 도 pointerId 도 안 남긴다)
-      if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return; } // ver727: end the parapara flip
-      const canvas = document.getElementById('conteVideoStage'); // ver718: capture surface = viewport
-      if (endPaintSpacePan(event, canvas)) return;
-      if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) return;
-      event.preventDefault();
-      event.stopPropagation();
-      paintStabilizeCatchupReplay(state.paintRasterOp, event, continueVideoPaintStroke, state.paintCurrentStroke);   // ver2373/2374: 랙을 수렴 방출 — 직결 세그먼트 제거, 필압은 보간(커널 배너 참조)
-      continueVideoPaintStroke(event);
-      paintFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
-      const op = state.paintRasterOp;
-      const pointerId = event.pointerId;
-      state.paintPointerId = null;
-      state.paintCurrentStroke = null;
-      state.paintRasterOp = null;
-      state.videoPaintPointerCanvasRect = null;
-      if (canvas && canvas.releasePointerCapture) {
-        try { canvas.releasePointerCapture(pointerId); } catch (error) {}
-      }
-      if (op.type === 'draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
-        // ver608 curve phase 1 done: keep the op alive as a PENDING chord (the ghost stays painted).
-        // paintPointerId stays null → nothing is blocked, the ver581 janitor ignores it, and the active
-        // canvas list stays set so async repaints can't wipe the ghost (paintCanvasHasActiveStroke).
-        op.curveChord = {
-          a: { x: op.shapeAnchor.x, y: op.shapeAnchor.y },
-          b: op.stroke.points[op.stroke.points.length - 1]
-        };
-        state.paintRasterOp = op;
-        return;
-      }
-      if (op.type === 'draw' && op.shapeKind && !op.shapeMoved) {
-        // ver606: shape tap without a drag — nothing was previewed or baked, skip the commit entirely
-      } else if (op.type === 'draw') {
-        // ver541: blend/hard-edge strokes → clean composite over the pre-stroke base.
-        // ver606 의 도형 bake 는 ver721 에 이 함수 위임 한 줄이 됐는데 if/else 만 남아 **양쪽 가지가
-        // 같은 코드**였다 — ver2259 에 가지와 위임 함수를 함께 걷었다(도형도 같은 합성이다).
-        paintRecompositeStrokeForMode(op);
-        const merged = mergedPaintFixedDrawCanvas(op);
-        const saveCanvas = merged && merged.canvas || op.canvas;
-        const saveRect = merged && merged.rect || paintRasterOpRect(op);
-        setLayerDrawingBitmapFromCanvas(op.drawingRef, saveCanvas, op.beforeDataUrl, {
-          bitmapX: saveRect.x,
-          bitmapY: saveRect.y,
-          bitmapWidth: saveRect.w,
-          bitmapHeight: saveRect.h,
-          preserveActiveCanvas: true,
-          preserveActiveCanvasRect: op.fixedVisibleCanvas ? paintRasterOpRect(op) : null,
-          skipMemoRedraw: true,
-          skipThumbnails: true,
-          autosaveDelay: INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS
-        });
-      } else if (op.type === 'stamp') {
-        if (op.stampChanged) setLayerDrawingBitmapFromCanvas(op.drawingRef, op.canvas, op.beforeDataUrl, {
-          bitmapX: op.bitmapX,
-          bitmapY: op.bitmapY,
-          bitmapWidth: op.canvas.width,
-          bitmapHeight: op.canvas.height,
-          trimAlpha: true,
-          preserveActiveCanvas: true,
-          skipMemoRedraw: true,
-          skipThumbnails: true
-        });
-        clearPaintStampPreview();
-      } else if (op.type === 'transform-edit') {
-        finishPaintTransformOp(op);
-      } else if (op.type === 'lasso-stamp') {
-        if (!finishPaintLassoStamp(op)) {
+      const endingStroke = state.paintRasterOp;
+      try {
+        paintDiagEnd();   // ver2411: 映像 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
+        paintFlushPendingBucketFill(event); // ver1736: 유예해 둔 통은 여기서 칠해진다 (아래 조기 반환들보다 앞이어야 한다 — 통은 op 도 pointerId 도 안 남긴다)
+        if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return; } // ver727: end the parapara flip
+        const canvas = document.getElementById('conteVideoStage'); // ver718: capture surface = viewport
+        if (endPaintSpacePan(event, canvas)) return;
+        if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) return;
+        event.preventDefault();
+        event.stopPropagation();
+        paintStabilizeCatchupReplay(state.paintRasterOp, event, continueVideoPaintStroke, state.paintCurrentStroke);   // ver2373/2374: 랙을 수렴 방출 — 직결 세그먼트 제거, 필압은 보간(커널 배너 참조)
+        continueVideoPaintStroke(event);
+        paintFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
+        const op = state.paintRasterOp;
+        const pointerId = event.pointerId;
+        state.paintPointerId = null;
+        state.paintCurrentStroke = null;
+        state.paintRasterOp = null;
+        state.videoPaintPointerCanvasRect = null;
+        if (canvas && canvas.releasePointerCapture) {
+          try { canvas.releasePointerCapture(pointerId); } catch (error) {}
+        }
+        if (op.type === 'draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
+          // ver608 curve phase 1 done: keep the op alive as a PENDING chord (the ghost stays painted).
+          // paintPointerId stays null → nothing is blocked, the ver581 janitor ignores it, and the active
+          // canvas list stays set so async repaints can't wipe the ghost (paintCanvasHasActiveStroke).
+          op.curveChord = {
+            a: { x: op.shapeAnchor.x, y: op.shapeAnchor.y },
+            b: op.stroke.points[op.stroke.points.length - 1]
+          };
+          state.paintRasterOp = op;
+          return;
+        }
+        if (op.type === 'draw' && op.shapeKind && !op.shapeMoved) {
+          // ver606: shape tap without a drag — nothing was previewed or baked, skip the commit entirely
+        } else if (op.type === 'draw') {
+          // ver541: blend/hard-edge strokes → clean composite over the pre-stroke base.
+          // ver606 의 도형 bake 는 ver721 에 이 함수 위임 한 줄이 됐는데 if/else 만 남아 **양쪽 가지가
+          // 같은 코드**였다 — ver2259 에 가지와 위임 함수를 함께 걷었다(도형도 같은 합성이다).
+          paintRecompositeStrokeForMode(op);
+          const merged = mergedPaintFixedDrawCanvas(op);
+          const saveCanvas = merged && merged.canvas || op.canvas;
+          const saveRect = merged && merged.rect || paintRasterOpRect(op);
+          setLayerDrawingBitmapFromCanvas(op.drawingRef, saveCanvas, op.beforeDataUrl, {
+            bitmapX: saveRect.x,
+            bitmapY: saveRect.y,
+            bitmapWidth: saveRect.w,
+            bitmapHeight: saveRect.h,
+            preserveActiveCanvas: true,
+            preserveActiveCanvasRect: op.fixedVisibleCanvas ? paintRasterOpRect(op) : null,
+            skipMemoRedraw: true,
+            skipThumbnails: true,
+            autosaveDelay: INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS
+          });
+        } else if (op.type === 'stamp') {
+          if (op.stampChanged) setLayerDrawingBitmapFromCanvas(op.drawingRef, op.canvas, op.beforeDataUrl, {
+            bitmapX: op.bitmapX,
+            bitmapY: op.bitmapY,
+            bitmapWidth: op.canvas.width,
+            bitmapHeight: op.canvas.height,
+            trimAlpha: true,
+            preserveActiveCanvas: true,
+            skipMemoRedraw: true,
+            skipThumbnails: true
+          });
+          clearPaintStampPreview();
+        } else if (op.type === 'transform-edit') {
+          finishPaintTransformOp(op);
+        } else if (op.type === 'lasso-stamp') {
+          if (!finishPaintLassoStamp(op)) {
+            state.paintLassoPreview = null;
+            updatePaintEditOverlays(op.drawingRef);
+          }
+          redrawActiveLayerCanvasTargets(op.drawingRef);
+        } else if (op.type === 'lasso-select') {
+          if (!finishPaintLassoSelect(op)) {
+            state.paintLassoPreview = null;
+            // ver1436: 3점 미만 = **드래그 없이 톡 눌렀다**. 종전에는 프리뷰만 지우고 끝나 아무 일도
+            // 일어나지 않았다 — 원화는 같은 조작에서 선택이 해제된다(gengaSelectPointerDown 이 먼저
+            // 커밋한다). 페인트 앱의 표준 제스처이기도 하다: 선택 바깥을 누르면 선택이 풀린다.
+            // 새 선택(replace)을 만들려던 손짓일 때만 — 追加/部分解除 중이면 기존 선택을 건드리지 않는다.
+            if (state.paintSelection && state.paintSelectionMode === 'replace') clearPaintSelection();
+            updatePaintEditOverlays(op.drawingRef);
+          }
+          redrawActiveLayerCanvasTargets(op.drawingRef);
+        }
+        if (op.type === 'draw' && op.shapeKind === 'lasso-fill' && state.paintLassoPreview) { // ver651: drop the overlay marquee once baked
           state.paintLassoPreview = null;
           updatePaintEditOverlays(op.drawingRef);
         }
-        redrawActiveLayerCanvasTargets(op.drawingRef);
-      } else if (op.type === 'lasso-select') {
-        if (!finishPaintLassoSelect(op)) {
-          state.paintLassoPreview = null;
-          // ver1436: 3점 미만 = **드래그 없이 톡 눌렀다**. 종전에는 프리뷰만 지우고 끝나 아무 일도
-          // 일어나지 않았다 — 원화는 같은 조작에서 선택이 해제된다(gengaSelectPointerDown 이 먼저
-          // 커밋한다). 페인트 앱의 표준 제스처이기도 하다: 선택 바깥을 누르면 선택이 풀린다.
-          // 새 선택(replace)을 만들려던 손짓일 때만 — 追加/部分解除 중이면 기존 선택을 건드리지 않는다.
-          if (state.paintSelection && state.paintSelectionMode === 'replace') clearPaintSelection();
-          updatePaintEditOverlays(op.drawingRef);
+        state.paintCurrentLayerRect = null;
+        clearActiveLayerCanvasTargets();
+        updateAfterAutoCreatedLayerKomaDraw(op);
+        updatePaintUndoRedoButtonsOnly();
+        if (state.videoPreviewRebuildDeferred) {
+          state.videoPreviewRebuildDeferred = false;
+          scheduleVideoPreviewRefresh(0);
         }
-        redrawActiveLayerCanvasTargets(op.drawingRef);
-      }
-      if (op.type === 'draw' && op.shapeKind === 'lasso-fill' && state.paintLassoPreview) { // ver651: drop the overlay marquee once baked
-        state.paintLassoPreview = null;
-        updatePaintEditOverlays(op.drawingRef);
-      }
-      state.paintCurrentLayerRect = null;
-      clearActiveLayerCanvasTargets();
-      updateAfterAutoCreatedLayerKomaDraw(op);
-      updatePaintUndoRedoButtonsOnly();
-      if (state.videoPreviewRebuildDeferred) {
-        state.videoPreviewRebuildDeferred = false;
-        scheduleVideoPreviewRefresh(0);
+      } finally {
+        if (endingStroke && state.paintRasterOp !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
       }
     }
 
     function cancelActivePaintRasterStroke(event) {
-      paintFlushPendingBucketFill(event); // ver1736: pointerup 이 아니므로 파기된다 (cancel = drop)
-      if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return true; } // ver727: cancel = end the parapara flip
-      const op = state.paintRasterOp;
-      if (!op || state.paintPointerId !== event.pointerId) return false;
-      // ver1722 (파리티 P0-5, 판정 q1=A): **用紙 획도 파기한다.** 종전에는 아래 `op.type !== 'draw'` 가
-      // 이것을 **커밋 함수로 되던져**, 핀치가 확정되거나 OS 가 제스처를 가져가면 긋던 선이 종이에
-      // 남았다. 영상은 파기하고 원화는 세션을 버리는데(ver837) 用紙만 반대였다.
-      // 用紙 획은 래스터가 아니라 페이지 벡터라, 파기 = 그 배열에서 걷어내고 다시 그리기다.
-      if (op.type === 'page-draw') {
+      const endingStroke = state.paintRasterOp;
+      try {
+        paintFlushPendingBucketFill(event); // ver1736: pointerup 이 아니므로 파기된다 (cancel = drop)
+        if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return true; } // ver727: cancel = end the parapara flip
+        const op = state.paintRasterOp;
+        if (!op || state.paintPointerId !== event.pointerId) return false;
+        // ver1722 (파리티 P0-5, 판정 q1=A): **用紙 획도 파기한다.** 종전에는 아래 `op.type !== 'draw'` 가
+        // 이것을 **커밋 함수로 되던져**, 핀치가 확정되거나 OS 가 제스처를 가져가면 긋던 선이 종이에
+        // 남았다. 영상은 파기하고 원화는 세션을 버리는데(ver837) 用紙만 반대였다.
+        // 用紙 획은 래스터가 아니라 페이지 벡터라, 파기 = 그 배열에서 걷어내고 다시 그리기다.
+        if (op.type === 'page-draw') {
+          if (event.cancelable) event.preventDefault();
+          event.stopPropagation();
+          const memoCanvas = document.getElementById('memoCanvas');
+          if (memoCanvas && memoCanvas.releasePointerCapture && event.type !== 'lostpointercapture') {
+            try { memoCanvas.releasePointerCapture(event.pointerId); } catch (error) {}
+          }
+          paintRemovePageStroke(op);
+          // 곡선 1단계로 남겨 둔 코드가 이 획이면 그것도 함께 버린다(고스트가 남는다).
+          if (state.memoPageCurvePending && state.memoPageCurvePending.stroke === op.stroke) state.memoPageCurvePending = null;
+          state.paintPointerId = null;
+          state.paintCurrentStroke = null;
+          state.paintRasterOp = null;
+          state.paintPointerCanvasRect = null;
+          state.paintCurrentLayerRect = null;
+          redrawMemoCanvas(); // ver1721: 대기분을 스스로 흡수한다
+          updatePaintUndoRedoButtonsOnly();
+          return true;
+        }
+        if (op.type !== 'draw') return endActivePaintRasterStrokeFromDocument(event);
         if (event.cancelable) event.preventDefault();
         event.stopPropagation();
-        const memoCanvas = document.getElementById('memoCanvas');
-        if (memoCanvas && memoCanvas.releasePointerCapture && event.type !== 'lostpointercapture') {
-          try { memoCanvas.releasePointerCapture(event.pointerId); } catch (error) {}
+        const target = op.target || {};
+        const canvas = target.type === 'video-conte-layer'
+          ? document.getElementById('conteVideoStage') // ver718: capture surface = viewport
+          : document.getElementById('memoCanvas');
+        if (canvas && canvas.releasePointerCapture && event.type !== 'lostpointercapture') {
+          try { canvas.releasePointerCapture(event.pointerId); } catch (error) {}
         }
-        paintRemovePageStroke(op);
-        // 곡선 1단계로 남겨 둔 코드가 이 획이면 그것도 함께 버린다(고스트가 남는다).
-        if (state.memoPageCurvePending && state.memoPageCurvePending.stroke === op.stroke) state.memoPageCurvePending = null;
+        const drawingRef = op.drawingRef;
         state.paintPointerId = null;
         state.paintCurrentStroke = null;
         state.paintRasterOp = null;
         state.paintPointerCanvasRect = null;
+        state.videoPaintPointerCanvasRect = null;
         state.paintCurrentLayerRect = null;
-        redrawMemoCanvas(); // ver1721: 대기분을 스스로 흡수한다
+        cancelScheduledMemoCanvasRedraw();
+        redrawActiveLayerCanvasTargets(drawingRef);
+        clearActiveLayerCanvasTargets();
         updatePaintUndoRedoButtonsOnly();
         return true;
+      } finally {
+        if (endingStroke && state.paintRasterOp !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
       }
-      if (op.type !== 'draw') return endActivePaintRasterStrokeFromDocument(event);
-      if (event.cancelable) event.preventDefault();
-      event.stopPropagation();
-      const target = op.target || {};
-      const canvas = target.type === 'video-conte-layer'
-        ? document.getElementById('conteVideoStage') // ver718: capture surface = viewport
-        : document.getElementById('memoCanvas');
-      if (canvas && canvas.releasePointerCapture && event.type !== 'lostpointercapture') {
-        try { canvas.releasePointerCapture(event.pointerId); } catch (error) {}
-      }
-      const drawingRef = op.drawingRef;
-      state.paintPointerId = null;
-      state.paintCurrentStroke = null;
-      state.paintRasterOp = null;
-      state.paintPointerCanvasRect = null;
-      state.videoPaintPointerCanvasRect = null;
-      state.paintCurrentLayerRect = null;
-      cancelScheduledMemoCanvasRedraw();
-      redrawActiveLayerCanvasTargets(drawingRef);
-      clearActiveLayerCanvasTargets();
-      updatePaintUndoRedoButtonsOnly();
-      return true;
     }
 
     function endActivePaintRasterStrokeFromDocument(event) {
@@ -79881,6 +79938,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 진행 중인 포인터 제스처. 툴과 무관한 공통 세션이라 콘티·원화 양쪽이 같은 커널을 쓴다.
     // (applyContePaperMemoArmed와 resetProjectTransientRuntime이 이 목록을 손복사해 갖고 있던 것을 하나로 합쳤다.)
     function paintAbortGestureSession() {
+      paintReleaseStrokeBuffers(state.paintRasterOp);
       state.paintPointerId = null;
       state.paintCurrentStroke = null;
       state.paintRasterOp = null;
@@ -103783,7 +103841,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaEndDrawSession(keepHistory) {
       const sess = gengaDrawSession;
       gengaDrawSession = null;
-      if (!keepHistory) gengaReleaseHistoryBefore(sess);
+      if (!keepHistory) { gengaReleaseHistoryBefore(sess); paintReleaseStrokeBuffers(sess); }
       return sess;
     }
     function gengaReleaseHistoryBefore(sess) {
@@ -103991,8 +104049,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 뜬 선택도 제외(아래 확정이 픽셀을 바꾼다).
       const activeExp = gengaExposureAt(layer, frame);
       const activeDr = gengaExposureDrawing(layer, activeExp);
-      const reuseActive = Boolean(gengaActiveCanvas && activeExp && activeDr && activeDr.ref
-        && gengaActiveCanvas.ref === activeDr.ref
+      const reuseActive = Boolean(gengaActiveCanvas && activeExp && (!activeDr || activeDr.ref)
+        && gengaActiveCanvas.ref === (activeDr && activeDr.ref || null)
         && String(gengaActiveCanvas.layerId) === String(layer.id)
         && String(gengaActiveCanvas.expId) === String(activeExp.id)
         && gengaActiveCanvas.canvas.width === pw && gengaActiveCanvas.canvas.height === ph
@@ -104126,15 +104184,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return;
       }
       if (gengaShapeKind) {
-        const shapeBase = document.createElement('canvas'); shapeBase.width = pw; shapeBase.height = ph;
-        shapeBase.getContext('2d').drawImage(cv, 0, 0);
-        const shapeBuf = document.createElement('canvas'); shapeBuf.width = pw; shapeBuf.height = ph;
         gengaDrawSession = {
           // ver1712: 이 세션을 소유한 포인터. 콘티의 state.paintPointerId 와 같은 뜻이고, 같은 파일의
           // 원화 형제들(gengaStampDrag · gengaLasso · gengaCamDrag · gengaSelDrag)이 이미 쓰는 규약이다.
           pointerId: ev.pointerId,
           layerId: layer.id, frame: frame, canvas: cv, ctx: c, previewBaseRef: activeDr && activeDr.ref || null,
-          shape: gengaShapeKind, shapeBase: shapeBase, shapeBuf: shapeBuf,
+          shape: gengaShapeKind,
           shapeAnchor: { x: p.x, y: p.y }, shapeLassoPts: [{ x: p.x, y: p.y }], shapeMoved: false,
           vector: vectorDraw,   // ver2043: 이 도형을 스트로크로 남길 것인가(위에서 못 담는 것은 이미 걸렀다)
           shapeEraser: eraser, shapeAlphaLock: Boolean(!eraser && layer.alphaLock),
@@ -104145,6 +104200,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           scan: scanEligible ? gengaScanSeed(seedRect) : null, // ver1196
           inkScan: scanEligible ? gengaScanSeed(null) : null   // ver2193: 시드 없이 **획만** 모은다(칸 갱신용)
         };
+        gengaDrawSession.shapeBase = paintBorrowStrokeCanvas(gengaDrawSession, 'base', pw, ph);
+        gengaDrawSession.shapeBase.getContext('2d').drawImage(cv, 0, 0);
+        gengaDrawSession.shapeBuf = paintBorrowStrokeCanvas(gengaDrawSession, 'stroke', pw, ph);
         // ver1706: 도형에도 팁·종이결을 싣는다 — 펜 세션과 같은 커널, 같은 순서.
         // ver1710: 혼색도 같은 자리에서(펜 세션 82167 과 같은 세 줄이 된다). 혼색은 팁이 있는 붓에만
         // 걸리므로 ver1706 이 도형에 팁을 실은 순간부터 뜻이 생겼다.
@@ -104362,9 +104420,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver621: outline mode always buffers (the whole outline re-renders each move).
         // ver767: an active selection buffers too — that is the only place the stroke can be masked before it
         // reaches the layer, and it makes the live preview already clipped instead of snapping at commit.
-        const penBase = document.createElement('canvas'); penBase.width = pw; penBase.height = ph;
+        const penBase = paintBorrowStrokeCanvas(gengaDrawSession, 'base', pw, ph);
         penBase.getContext('2d').drawImage(cv, 0, 0);
-        const penBuf = document.createElement('canvas'); penBuf.width = pw; penBuf.height = ph;
+        const penBuf = paintBorrowStrokeCanvas(gengaDrawSession, 'stroke', pw, ph);
         const pb = penBuf.getContext('2d');
         pb.lineCap = 'round'; pb.lineJoin = 'round';
         pb.lineWidth = c.lineWidth;
@@ -104637,154 +104695,159 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps); // ver1104 / ver1667
     }
     function gengaPreviewPointerEnd(ev) {
-      paintDiagEnd();   // ver2399: 이 획의 진단을 확정한다(커밋 경로 어디로 가든 여기를 지난다)
-      gengaFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
-      paintFlushPendingBucketFill(ev); // ver1736: 유예해 둔 통도 여기서 (pointercancel 이면 파기된다)
-      if (ev.pointerType === 'touch') gengaPointers.delete(ev.pointerId);
-      if (gengaPinch) {
-        if (gengaPointers.size < 2) teardownGengaPinch(ev.type); // ver840: shared teardown (tap decision lives there)
-        try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
-        return;
-      }
-      if (gengaFlipTouch && gengaFlipTouch.pointerId === ev.pointerId) { gengaFlipTouchEnd(ev); return; }
-      if (endPaintSpacePan(ev, ev.target)) return; // ver747: shared with conte (was inline gengaPanDrag cleanup)
-      if (gengaCamDrag) { gengaCameraPointerEnd(ev); return; }
-      if (gengaSelDrag || gengaLasso) { gengaSelectPointerEnd(ev); return; }
-      if (gengaStampDrag && gengaStampDrag.pointerId === ev.pointerId) { gengaStampPointerEnd(); return; } // ver771: 제스처 끝 = 커밋 1회
-      if (state.paintEditTool === 'lasso-stamp' && gengaStamp) { if (gengaStampPt) { gengaStampPt = null; drawGengaPreview(); } return; } // stamp placed on down; drop the ghost on release (no iPad leftover)
-      if (!gengaDrawSession) return;
-      if (gengaDrawSession.pointerId !== ev.pointerId) return; // ver1712 (P0-2): 남의 포인터가 남의 획을 확정하지 못한다
-      // ver1712 (P0-3): **cancel = 파기, 절대 커밋하지 않는다.** 이 파일에 명문화된 계약이고
-      // (「ver853: cancel = drop, never commit (ver749 contract)」) 카메라·FX·오디오 드래그가 전부
-      // 그것을 따르는데, 원화 프리핸드 획만 pointercancel 을 그대로 gengaPreviewPointerEnd 로 보내 굽고 있었다.
-      // OS 제스처 탈취·손바닥 오인식이 반쯤 그은 선을 그림에 남기는 경로다. 세션 캔버스는 레이어
-      // 사본이라 버리면 그만이고, 화면에서 지우는 것은 프리뷰 재합성 한 번이다.
-      // (올가미·스탬프·변형은 양 엔진 모두 cancel 에서 커밋한다 — 갈리는 것은 프리핸드 획 하나다.)
-      if (ev.type === 'pointercancel') {
-        gengaEndDrawSession();
-        drawGengaPreview();
-        try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
-        return;
-      }
-      const sess0 = gengaDrawSession;   // ver1636: replay 전후로 같은 세션인지 확인하기 위한 신원
-      if (gengaDrawSession.shape) { // ver606: bake the shape once (AA off → hard edge via buffer binarize)
-        const shapeSess = gengaDrawSession;
-        // ver1464: **대기 중인 프레임을 먼저 흘려보낸다.** 원화는 버퍼 자체가 커밋 소스라(콘티는 stroke
-        // 데이터에서 다시 그린다) 마지막 이동이 버퍼에 안 들어간 채 커밋되면 **손 뗀 자리와 다른 도형**이
-        // 확정된다. ver622 가 gengaPenOutlineRedraw 에 세운 것과 같은 계약이다. 곡선 1단계(chord)로 빠지는
-        // 아래 return 경로도 이 뒤라, 그 고스트도 마지막 좌표로 남는다.
-        gengaShapeFlushPending(shapeSess);
-        if (shapeSess.shape === 'curve' && shapeSess.shapeMoved && !shapeSess.curveChord) {
-          // ver608 curve phase 1: keep the session alive as the pending chord — the preview keeps
-          // compositing the session canvas, so the ghost stays visible until the bend gesture.
-          shapeSess.curveChord = {
-            a: { x: shapeSess.shapeAnchor.x, y: shapeSess.shapeAnchor.y },
-            b: shapeSess.lastShapePt || { x: shapeSess.shapeAnchor.x, y: shapeSess.shapeAnchor.y }
-          };
-          shapeSess.curveBending = false;
-          // ver1712: **대기 중인 코드는 어떤 포인터도 소유하지 않는다.** 콘티의 같은 상태가 쓰는 규칙
-          // 그대로다(paintRasterOpCurvePending: 「pending 은 paintPointerId = null 이라 janitor 가
-          // 무시한다」). 이 한 줄이 없으면 아래 janitor 가 방금 끝난 phase-1 의 pointerup 을 leak 으로
-          // 읽고 대기 중인 코드를 지운다.
-          shapeSess.pointerId = null;
-          try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+      const endingStroke = gengaDrawSession;
+      try {
+        paintDiagEnd();   // ver2399: 이 획의 진단을 확정한다(커밋 경로 어디로 가든 여기를 지난다)
+        gengaFlushPendingFirstDab(); // ver1669: 움직임 없이 뗀 탭 — 여기서 점 하나가 된다
+        paintFlushPendingBucketFill(ev); // ver1736: 유예해 둔 통도 여기서 (pointercancel 이면 파기된다)
+        if (ev.pointerType === 'touch') gengaPointers.delete(ev.pointerId);
+        if (gengaPinch) {
+          if (gengaPointers.size < 2) teardownGengaPinch(ev.type); // ver840: shared teardown (tap decision lives there)
+          try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
           return;
         }
-        gengaEndDrawSession(true);
-        if (shapeSess.vector) {
-          // ver2043: 도형을 **스트로크로** 남긴다. 점은 미리보기가 만든 그대로, 굵기는 미리보기가
-          // 쓰는 규칙 그대로(도형은 필압이 없어 균일하다 — paintVariableWidthRadii 에 계수 1).
-          // **커밋 직전에 한 번 확정한다** — 점 열을 채우는 미리보기가 rAF 로 접혀 있어서
-          // (gengaShapeScheduleRedraw) 아주 빠른 드래그면 한 번도 안 돌 수 있다. 래스터는 그때
-          // 「마지막 이동이 빠진 채」 구워지지만 벡터는 **아무것도 안 남는다.** ver1720 이 펜에
-          // 대해 남긴 규약과 같은 자리다. shapePending 을 읽으므로 세션을 비운 뒤에도 안전하다.
-          gengaShapeRedraw(shapeSess);
-          const shapeVecPts = shapeSess.lastShapePts;
-          if (shapeSess.shapeMoved && shapeVecPts && shapeVecPts.length > 1) {
-            gengaCommitVectorStroke(shapeSess.layerId, shapeSess.frame,
-              { pts: shapeVecPts, color: shapeSess.shapeColor,
-                radius: Math.max(PAINT_RADII_FLOOR, (Number(shapeSess.shapeLineWidth) || 2) / 2) }, '図形描画');
+        if (gengaFlipTouch && gengaFlipTouch.pointerId === ev.pointerId) { gengaFlipTouchEnd(ev); return; }
+        if (endPaintSpacePan(ev, ev.target)) return; // ver747: shared with conte (was inline gengaPanDrag cleanup)
+        if (gengaCamDrag) { gengaCameraPointerEnd(ev); return; }
+        if (gengaSelDrag || gengaLasso) { gengaSelectPointerEnd(ev); return; }
+        if (gengaStampDrag && gengaStampDrag.pointerId === ev.pointerId) { gengaStampPointerEnd(); return; } // ver771: 제스처 끝 = 커밋 1회
+        if (state.paintEditTool === 'lasso-stamp' && gengaStamp) { if (gengaStampPt) { gengaStampPt = null; drawGengaPreview(); } return; } // stamp placed on down; drop the ghost on release (no iPad leftover)
+        if (!gengaDrawSession) return;
+        if (gengaDrawSession.pointerId !== ev.pointerId) return; // ver1712 (P0-2): 남의 포인터가 남의 획을 확정하지 못한다
+        // ver1712 (P0-3): **cancel = 파기, 절대 커밋하지 않는다.** 이 파일에 명문화된 계약이고
+        // (「ver853: cancel = drop, never commit (ver749 contract)」) 카메라·FX·오디오 드래그가 전부
+        // 그것을 따르는데, 원화 프리핸드 획만 pointercancel 을 그대로 gengaPreviewPointerEnd 로 보내 굽고 있었다.
+        // OS 제스처 탈취·손바닥 오인식이 반쯤 그은 선을 그림에 남기는 경로다. 세션 캔버스는 레이어
+        // 사본이라 버리면 그만이고, 화면에서 지우는 것은 프리뷰 재합성 한 번이다.
+        // (올가미·스탬프·변형은 양 엔진 모두 cancel 에서 커밋한다 — 갈리는 것은 프리핸드 획 하나다.)
+        if (ev.type === 'pointercancel') {
+          gengaEndDrawSession();
+          drawGengaPreview();
+          try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
+          return;
+        }
+        const sess0 = gengaDrawSession;   // ver1636: replay 전후로 같은 세션인지 확인하기 위한 신원
+        if (gengaDrawSession.shape) { // ver606: bake the shape once (AA off → hard edge via buffer binarize)
+          const shapeSess = gengaDrawSession;
+          // ver1464: **대기 중인 프레임을 먼저 흘려보낸다.** 원화는 버퍼 자체가 커밋 소스라(콘티는 stroke
+          // 데이터에서 다시 그린다) 마지막 이동이 버퍼에 안 들어간 채 커밋되면 **손 뗀 자리와 다른 도형**이
+          // 확정된다. ver622 가 gengaPenOutlineRedraw 에 세운 것과 같은 계약이다. 곡선 1단계(chord)로 빠지는
+          // 아래 return 경로도 이 뒤라, 그 고스트도 마지막 좌표로 남는다.
+          gengaShapeFlushPending(shapeSess);
+          if (shapeSess.shape === 'curve' && shapeSess.shapeMoved && !shapeSess.curveChord) {
+            // ver608 curve phase 1: keep the session alive as the pending chord — the preview keeps
+            // compositing the session canvas, so the ghost stays visible until the bend gesture.
+            shapeSess.curveChord = {
+              a: { x: shapeSess.shapeAnchor.x, y: shapeSess.shapeAnchor.y },
+              b: shapeSess.lastShapePt || { x: shapeSess.shapeAnchor.x, y: shapeSess.shapeAnchor.y }
+            };
+            shapeSess.curveBending = false;
+            // ver1712: **대기 중인 코드는 어떤 포인터도 소유하지 않는다.** 콘티의 같은 상태가 쓰는 규칙
+            // 그대로다(paintRasterOpCurvePending: 「pending 은 paintPointerId = null 이라 janitor 가
+            // 무시한다」). 이 한 줄이 없으면 아래 janitor 가 방금 끝난 phase-1 의 pointerup 을 leak 으로
+            // 읽고 대기 중인 코드를 지운다.
+            shapeSess.pointerId = null;
+            try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+            return;
+          }
+          gengaEndDrawSession(true);
+          if (shapeSess.vector) {
+            // ver2043: 도형을 **스트로크로** 남긴다. 점은 미리보기가 만든 그대로, 굵기는 미리보기가
+            // 쓰는 규칙 그대로(도형은 필압이 없어 균일하다 — paintVariableWidthRadii 에 계수 1).
+            // **커밋 직전에 한 번 확정한다** — 점 열을 채우는 미리보기가 rAF 로 접혀 있어서
+            // (gengaShapeScheduleRedraw) 아주 빠른 드래그면 한 번도 안 돌 수 있다. 래스터는 그때
+            // 「마지막 이동이 빠진 채」 구워지지만 벡터는 **아무것도 안 남는다.** ver1720 이 펜에
+            // 대해 남긴 규약과 같은 자리다. shapePending 을 읽으므로 세션을 비운 뒤에도 안전하다.
+            gengaShapeRedraw(shapeSess);
+            const shapeVecPts = shapeSess.lastShapePts;
+            if (shapeSess.shapeMoved && shapeVecPts && shapeVecPts.length > 1) {
+              gengaCommitVectorStroke(shapeSess.layerId, shapeSess.frame,
+                { pts: shapeVecPts, color: shapeSess.shapeColor,
+                  radius: Math.max(PAINT_RADII_FLOOR, (Number(shapeSess.shapeLineWidth) || 2) / 2) }, '図形描画');
+            } else {
+              drawGengaPreview();   // 탭만 하고 끝났다 — 레이어는 그대로다
+            }
+            try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+            return;
+          }
+          if (shapeSess.shapeMoved && !(shapeSess.shape === 'lasso-fill' && shapeSess.shapeLassoPts.length < 3)) {
+            if (shapeSess.shape === 'lasso-fill') {
+              // ver617: the drag only showed a dashed marquee (buffer left empty) — build the actual
+              // filled polygon into the buffer now, then composite/binarize/commit as usual.
+              const lfPts = shapeSess.shapeLassoPts;
+              const lfCtx = shapeSess.shapeBuf.getContext('2d');
+              lfCtx.save();
+              lfCtx.setTransform(1, 0, 0, 1, 0, 0);
+              lfCtx.clearRect(0, 0, shapeSess.shapeBuf.width, shapeSess.shapeBuf.height);
+              lfCtx.fillStyle = shapeSess.shapeColor;
+              lfCtx.beginPath();
+              traceSmoothedLassoPath(lfCtx, lfPts, true); // ver621: smoothed region (matches the marquee)
+              lfCtx.fill();
+              lfCtx.restore();
+              gengaShapeComposite(shapeSess);
+            }
+            if (paintToolBinarizeOn(shapeSess.shape)) { paintBinarizeCanvasAlpha(shapeSess.shapeBuf); gengaShapeComposite(shapeSess); } // ver614: per-tool 2値化
+            gengaCommitCanvas(shapeSess.layerId, shapeSess.frame, shapeSess.canvas, '図形描画', gengaScanRectFor(shapeSess, shapeSess.canvas), null, shapeSess); // ver1196
           } else {
-            drawGengaPreview();   // 탭만 하고 끝났다 — 레이어는 그대로다
+            drawGengaPreview(); // degenerate tap: the layer is untouched, just drop the session preview
           }
           try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
           return;
         }
-        if (shapeSess.shapeMoved && !(shapeSess.shape === 'lasso-fill' && shapeSess.shapeLassoPts.length < 3)) {
-          if (shapeSess.shape === 'lasso-fill') {
-            // ver617: the drag only showed a dashed marquee (buffer left empty) — build the actual
-            // filled polygon into the buffer now, then composite/binarize/commit as usual.
-            const lfPts = shapeSess.shapeLassoPts;
-            const lfCtx = shapeSess.shapeBuf.getContext('2d');
-            lfCtx.save();
-            lfCtx.setTransform(1, 0, 0, 1, 0, 0);
-            lfCtx.clearRect(0, 0, shapeSess.shapeBuf.width, shapeSess.shapeBuf.height);
-            lfCtx.fillStyle = shapeSess.shapeColor;
-            lfCtx.beginPath();
-            traceSmoothedLassoPath(lfCtx, lfPts, true); // ver621: smoothed region (matches the marquee)
-            lfCtx.fill();
-            lfCtx.restore();
-            gengaShapeComposite(shapeSess);
-          }
-          if (paintToolBinarizeOn(shapeSess.shape)) { paintBinarizeCanvasAlpha(shapeSess.shapeBuf); gengaShapeComposite(shapeSess); } // ver614: per-tool 2値化
-          gengaCommitCanvas(shapeSess.layerId, shapeSess.frame, shapeSess.canvas, '図形描画', gengaScanRectFor(shapeSess, shapeSess.canvas), null, shapeSess); // ver1196
-        } else {
-          drawGengaPreview(); // degenerate tap: the layer is untouched, just drop the session preview
+        // ★ver1636: 손 뗀 자리까지 선을 끌어온다(catch-up). conte 는 endPaintStroke 가 pointerup 을
+        // continuePaintStroke 로 **replay** 해서 이 일이 공짜로 일어나는데(그 파일의 ver750 주석이
+        // 「TVPaint 의 Catch Up」이라 부르는 것), 원화에는 그 replay 가 없었다. 그래서 손떨림 보정을
+        // 켜면 pulled string 의 반경만큼 **선 끝이 커서에 못 미친 채** 확정됐고, 보정을 크게 할수록
+        // (레벨 10 = 화면 35px) 「선이 제대로 안 그어지는」 조작감이 됐다 — 사용자 실사용 보고.
+        // 커널(paintStabilizePoint)은 처음부터 공용이었고 pointerup 을 받으면 raw 좌표를 돌려준다.
+        // 빠져 있던 것은 **호출부 파리티** 하나다(code_map 「콘티만 보고 원화를 빠뜨린다」 계열).
+        // 도형은 위에서 gengaShapeFlushPending 이 이미 같은 일을 한다 — 여기는 펜 경로 전용이다.
+        // 보정이 꺼져 있으면 커널이 point 를 그대로 돌려주므로 이 replay 는 아무것도 바꾸지 않는다
+        // (dead zone 이 0 이라 마지막 move 와 같은 자리이고, 걷기가 거기서 dab 을 더 찍지 않는다).
+        if (gengaDrawSession === sess0) {
+          paintStabilizeCatchupReplay(sess0, ev, gengaPreviewPointerMove, sess0);   // ver2373/2374: 랙을 수렴 방출 — 직결 세그먼트 제거, 필압은 보간(원화는 필압 사슬도 세션에 산다)
+          gengaPreviewPointerMove(ev);
         }
+        const sess = gengaDrawSession;
+        if (!sess) return;   // replay 중에 세션이 정리됐다면(방어) 여기서 끝낸다
+        gengaEndDrawSession(true);
+        // ver1720: 아웃라인이 아니면 **버퍼 재합성의 대기분**을 흡수한다(위 gengaPenCompositeFlush).
+        // 버퍼 모드가 아니면 그 함수가 그 자리에서 되돌아가므로 조건을 여기 또 적지 않는다.
+        if (!sess.penOutline) gengaPenCompositeFlush(sess);
+        if (sess.penOutline) {
+          // ver622: flush — a batched rAF may still be pending (it will skip itself: session is null),
+          // so render the final outline synchronously before committing.
+          // ver1717: 여기 「Outline mode is AA-only since ver943 — no commit binarize exists here」가
+          // 붙어 있었는데 **ver1617 부터 거짓**이다. 2値化라도 팁·종이결이 있으면 아웃라인으로 오고
+          // (원반 스탬프는 그 둘을 표현할 수 없다) 그때는 sess.binarizeOutline 이 서서
+          // gengaPenOutlineRedraw 안에서 알파를 임계화한다 — 커밋 임계화가 **여기 있다.**
+          // ver2372 (감사 — 꼬리 걷어내기): 리샘플 carry 에 남은 마지막 raw 점(리프트 최저압)을
+          // 회수해 싣는다 — 바로 아래 최종 재렌더(래스터)와 벡터 커밋이 이 점을 포함한다.
+          // 이동 없는 up(급단 리프트)은 carry 0 이라 no-op — 그 케이스는 OS 가 하강 자체를 안
+          // 준 결손이고(up 코얼레스드 실측 0건) 여기서 지어내지 않는다.
+          const tailQ = sess.arc ? paintArcResampleFlush(sess.arc) : null;
+          if (tailQ && sess.pts) { sess.pts.push(tailQ); gengaScanMark(sess, tailQ.x, tailQ.y, (sess.penBaseWidth || 1) / 2 + 1); }
+          gengaPenOutlineRedraw(sess);
+        }
+        // ver2030 (A-3b): 벡터 지우개는 **삭제**로 끝난다.
+        if (sess.vectorErase) {
+          gengaCommitVectorErase(sess);
+          drawGengaPreview();
+          try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+          return;
+        }
+        // ver2029 (A-3a): 벡터 세션은 픽셀이 아니라 **스트로크**를 커밋한다. 세션 캔버스는
+        // 화면에 보여 준 미리보기였을 뿐이라 그대로 버린다.
+        if (sess.vector) {
+          gengaCommitVectorStroke(sess.layerId, sess.frame, gengaSessionToVectorStroke(sess), '原画描画');
+          try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+          return;
+        }
+        gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas), null, sess); // ink-bbox trimmed + decode-race fallback; ver1196 union scan
         try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
-        return;
+      } finally {
+        if (endingStroke && gengaDrawSession !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
       }
-      // ★ver1636: 손 뗀 자리까지 선을 끌어온다(catch-up). conte 는 endPaintStroke 가 pointerup 을
-      // continuePaintStroke 로 **replay** 해서 이 일이 공짜로 일어나는데(그 파일의 ver750 주석이
-      // 「TVPaint 의 Catch Up」이라 부르는 것), 원화에는 그 replay 가 없었다. 그래서 손떨림 보정을
-      // 켜면 pulled string 의 반경만큼 **선 끝이 커서에 못 미친 채** 확정됐고, 보정을 크게 할수록
-      // (레벨 10 = 화면 35px) 「선이 제대로 안 그어지는」 조작감이 됐다 — 사용자 실사용 보고.
-      // 커널(paintStabilizePoint)은 처음부터 공용이었고 pointerup 을 받으면 raw 좌표를 돌려준다.
-      // 빠져 있던 것은 **호출부 파리티** 하나다(code_map 「콘티만 보고 원화를 빠뜨린다」 계열).
-      // 도형은 위에서 gengaShapeFlushPending 이 이미 같은 일을 한다 — 여기는 펜 경로 전용이다.
-      // 보정이 꺼져 있으면 커널이 point 를 그대로 돌려주므로 이 replay 는 아무것도 바꾸지 않는다
-      // (dead zone 이 0 이라 마지막 move 와 같은 자리이고, 걷기가 거기서 dab 을 더 찍지 않는다).
-      if (gengaDrawSession === sess0) {
-        paintStabilizeCatchupReplay(sess0, ev, gengaPreviewPointerMove, sess0);   // ver2373/2374: 랙을 수렴 방출 — 직결 세그먼트 제거, 필압은 보간(원화는 필압 사슬도 세션에 산다)
-        gengaPreviewPointerMove(ev);
-      }
-      const sess = gengaDrawSession;
-      if (!sess) return;   // replay 중에 세션이 정리됐다면(방어) 여기서 끝낸다
-      gengaEndDrawSession(true);
-      // ver1720: 아웃라인이 아니면 **버퍼 재합성의 대기분**을 흡수한다(위 gengaPenCompositeFlush).
-      // 버퍼 모드가 아니면 그 함수가 그 자리에서 되돌아가므로 조건을 여기 또 적지 않는다.
-      if (!sess.penOutline) gengaPenCompositeFlush(sess);
-      if (sess.penOutline) {
-        // ver622: flush — a batched rAF may still be pending (it will skip itself: session is null),
-        // so render the final outline synchronously before committing.
-        // ver1717: 여기 「Outline mode is AA-only since ver943 — no commit binarize exists here」가
-        // 붙어 있었는데 **ver1617 부터 거짓**이다. 2値化라도 팁·종이결이 있으면 아웃라인으로 오고
-        // (원반 스탬프는 그 둘을 표현할 수 없다) 그때는 sess.binarizeOutline 이 서서
-        // gengaPenOutlineRedraw 안에서 알파를 임계화한다 — 커밋 임계화가 **여기 있다.**
-        // ver2372 (감사 — 꼬리 걷어내기): 리샘플 carry 에 남은 마지막 raw 점(리프트 최저압)을
-        // 회수해 싣는다 — 바로 아래 최종 재렌더(래스터)와 벡터 커밋이 이 점을 포함한다.
-        // 이동 없는 up(급단 리프트)은 carry 0 이라 no-op — 그 케이스는 OS 가 하강 자체를 안
-        // 준 결손이고(up 코얼레스드 실측 0건) 여기서 지어내지 않는다.
-        const tailQ = sess.arc ? paintArcResampleFlush(sess.arc) : null;
-        if (tailQ && sess.pts) { sess.pts.push(tailQ); gengaScanMark(sess, tailQ.x, tailQ.y, (sess.penBaseWidth || 1) / 2 + 1); }
-        gengaPenOutlineRedraw(sess);
-      }
-      // ver2030 (A-3b): 벡터 지우개는 **삭제**로 끝난다.
-      if (sess.vectorErase) {
-        gengaCommitVectorErase(sess);
-        drawGengaPreview();
-        try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
-        return;
-      }
-      // ver2029 (A-3a): 벡터 세션은 픽셀이 아니라 **스트로크**를 커밋한다. 세션 캔버스는
-      // 화면에 보여 준 미리보기였을 뿐이라 그대로 버린다.
-      if (sess.vector) {
-        gengaCommitVectorStroke(sess.layerId, sess.frame, gengaSessionToVectorStroke(sess), '原画描画');
-        try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
-        return;
-      }
-      gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas), null, sess); // ink-bbox trimmed + decode-race fallback; ver1196 union scan
-      try { if (ev.pointerId != null) ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
     }
     // ── ver581: document-level gesture-state janitor — THE intermittent iPad lockup, finally caught
     // live by the #perf HUD (2026-07-10 screenshot; the HUD itself was removed in ver1454): gengaPinch stayed true forever while every
@@ -105546,6 +105609,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       [state.undoStack, state.redoStack].forEach(function(stack) { (stack || []).forEach(releaseHistoryPixels); });
       gengaPreviewRender.scene = null;
       gengaEndDrawSession();                   // 진행 중 스트로크(옛 레이어 대상)
+      paintClearStrokeBufferPool();
       gengaFxLive = null;                        // 라이브 FX 미리보기 값(옛 레이어)
       gengaFxGizmoDrag = null;
       gengaFxOriginTrackCache = null;            // 옛 레이어/카메라 기준 캐시
