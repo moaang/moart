@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2465</title>
+  <title>MoArt ver2466</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24414,6 +24414,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2466, items: [{
+        ja: '広い単色の塗りで、描画を保存用の画像に変換する処理を軽くしました。',
+        ko: '넓은 단색 채색을 저장용 이미지로 변환하는 처리 비용을 줄였습니다.',
+        en: 'Reduced the work needed to prepare broad, solid-color fills for saving.',
+        zh: '减少了大面积纯色填充转换为保存用图像时的处理开销。'
+      }] },
       { ver: 2465, items: [{
         ja: '広い領域のアニメーション塗りつぶしで、色を再合成する計算を軽くしました。',
         ko: '넓은 영역의 애니메이션 채색에서 색을 재합성하는 계산을 줄였습니다.',
@@ -87038,8 +87044,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // delta 한 단계 붕괴 — base 가 이미 완전체(ts)일 때만 일한다(사슬이면 부르는 쪽이 바닥부터 반복).
     // 반환: 붕괴 뒤의 ts(성공) · 'chain'(base 가 아직 delta — 바닥부터) · null(실패 — delta 는 그대로 남아
     // 표시(활성)·재시도가 산다). cells 는 base 와 **구조 공유**(Map 참조 복사 — Blob 은 불변이라 안전),
-    // decoded 는 공유하지 않는다(공유하면 base 축출의 ImageBitmap close 가 이쪽을 깨뜨린다 — ver2216 이
-    // 이관으로 피한 병과 같은 자리). 교체 칸만 cells·decoded 에 캔버스 조각으로 넣고 인코드 펌프에 맡긴다.
+    // decoded 는 base 에서 이관한다(공유하면 base 축출의 ImageBitmap close 가 이쪽을 깨뜨린다).
+    // 교체 칸만 cells·decoded 에 캔버스 조각으로 넣고 인코드 펌프에 맡긴다.
     function gengaCollapseDeltaOnce(ref) {
       const v = gengaDrawStore.get(ref);
       if (!gengaIsDrawDelta(v)) return gengaIsTileSet(v) ? v : null;
@@ -87241,9 +87247,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (ts.pendingBake && !gengaTileSetBakePending(ts)) {
         throw new Error('serialize-time bake failed - the newest stroke would be missing from the row');
       }
+      const solidBlobs = new Map();
       ts.cells.forEach(function(b, idx) {
         if (b && typeof b.size !== 'number') {   // ver2197: flush 를 안 지난 미확정 조각 — 마지막 그물
-          const enc = gengaTileEncodeCanvas(b);
+          const enc = gengaTileEncodeCanvas(b, solidBlobs);
           ts.cells.set(idx, enc); gengaTileSetCellBlobSettled(ts, enc);   // ver2440: 공유 장부의 가산 짝
         }
       });
@@ -87554,6 +87561,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             dst.set(src.subarray(so, so + rowBytes), y * rowBytes);
           }
           tctx.putImageData(cell, 0, 0);
+          t._tileSolidKey = gengaTileSolidKey(cell);
           return t;
         }
         // 창 밖으로 걸친 칸(정상 경로에서는 안 나온다 — 창이 칸 정렬이다): 종전 drawImage 로.
@@ -87576,17 +87584,32 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return false;
     }
+    // 자른 칸의 RGBA8 버퍼로 단색을 증명한다. 크기·알파까지 같아야 같은 PNG를 쓸 수 있다.
+    // 추가 readback 없이 검사하며, 픽셀 버퍼는 보관하지 않는다.
+    function gengaTileSolidKey(cell) {
+      const pixels = new Uint32Array(cell.data.buffer, cell.data.byteOffset, cell.data.byteLength / 4);
+      const color = pixels[0];
+      for (let i = 1; i < pixels.length; i++) { if (pixels[i] !== color) return null; }
+      return cell.width + ',' + cell.height + ',' + color;
+    }
     // 조각 캔버스 → PNG Blob. ★실패는 null 이 아니라 예외 — null 은 「빈 칸」이라 그 자리의 그림이
     //   조용히 사라진다(옛 gengaTileEncodeCell 의 계약 그대로. 부르는 쪽이 잡아서 재시도·폴백한다).
-    function gengaTileEncodeCanvas(t) {
+    function gengaTileEncodeCanvas(t, solidBlobs) {
       // ver2430: **한 조각은 한 번만 굽는다.** 베이크가 자른 조각 캔버스는 이후 그림들이 cells 값으로 그대로
       //   물려받는데(ver2216 이관), 묶음마다 인코드 루프가 각자 굽고 있었다 — 12 획 연타 뒤 자동저장 flush 에서
       //   잘린 칸 2,014 개에 인코드 7,859 회(같은 계산 네 벌). 결과를 조각에 붙여 두면 뒤 묶음은 그대로 쓴다.
       if (t._tileBlob) return t._tileBlob;
+      // 호출 묶음 안에서만 불변 PNG를 재사용한다. decoded 캔버스와 저장/Undo 소유는 그대로다.
+      const key = t._tileSolidKey;
+      if (solidBlobs && key != null && solidBlobs.has(key)) {
+        t._tileBlob = solidBlobs.get(key);
+        return t._tileBlob;
+      }
       const url = t.toDataURL('image/png');
       const blob = gengaDataUrlToBlob(url);
       if (!blob) throw new Error('tile encode produced no blob');
       t._tileBlob = blob;
+      if (solidBlobs && key != null) solidBlobs.set(key, blob);
       return blob;
     }
     // 커밋된 통짜 캔버스 → 칸 묶음. `prev` 가 같은 격자의 칸 묶음이면 **안 닿은 칸을 그대로 물려받고**
@@ -87884,6 +87907,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 부르는 쪽 소관이고, 저장 직전의 gengaTileSetToBlob 방어가 마지막 그물이다.
     function gengaEncodeTileCells(ts, n, deadline) {
       let done = 0, failed = 0;
+      const solidBlobs = new Map();
       const keys = [];
       ts.cells.forEach(function(v, idx) { if (v && typeof v.size !== 'number') keys.push(idx); });
       for (let i = 0; i < keys.length && done < n; i++) {
@@ -87892,7 +87916,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const idx = keys[i];
         done += 1;   // 성공이든 실패든 이번 판의 예산은 썼다 — 실패가 배치를 무한히 붙잡지 않게
         try {
-          const settled = gengaTileEncodeCanvas(ts.cells.get(idx));
+          const settled = gengaTileEncodeCanvas(ts.cells.get(idx), solidBlobs);
           ts.cells.set(idx, settled);
           gengaTileSetCellBlobSettled(ts, settled);   // ver2440: 캔버스 조각(장부 0) → 새 Blob — 공유 장부의 가산 짝
         }
