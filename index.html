@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2461</title>
+  <title>MoArt ver2462</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24485,6 +24485,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 3개 국어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2462, items: [{
+        ja: '原画画面の更新と描画開始の内部処理を整理しました。',
+        ko: '원화 화면 갱신과 그리기 시작의 내부 처리를 정리했습니다.',
+        en: 'Simplified the internal handling of animation view updates and drawing starts.',
+        zh: '整理了原画界面更新和开始绘画的内部处理。'
+      }] },
       { ver: 2461, items: [{
         ja: '広い領域のアニメーション塗りつぶしで、結果を確定する際の待ち時間を短縮しました。',
         ko: '넓은 영역의 애니메이션 채색에서 결과를 확정할 때의 대기 시간을 줄였습니다.',
@@ -105268,6 +105274,57 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaEndDrawSession();
         drawGengaPreview();
       }
+      const target = gengaPrepareDrawTarget(ev, layer, diagDownT);
+      if (!target) return;
+      const c = target.c;
+      // Reuse the conte memo tool state (pen/eraser + color + size). GENGA brush size = PAPER PIXELS (1 = one
+      // real pixel on the paper bitmap), unlike the conte memo's reference-space unit — true pixel control.
+      // ver956 P4④: styled by the shared applyPaintStrokeStyle kernel (was an inline copy; alphaLock =
+      // 透明度保護 source-atop, ver869 G0 背面描画 parity comes from stroke.mode).
+      // ver2433: 透明色이 켜져 있어도 지운다 — 이 한 변수가 아래 합성 op·alphaLock·addsInk·벡터 지우개 세션·
+      // 도형 세션(shapeEraser)을 전부 정하므로 여기 한 곳에 OR 한다. **설정 슬롯(2値化 키)은 도구 기준**이라 따로 본다.
+      const eraser = paintToolErases();
+      // ver2029 (A-3a): 이 레이어를 벡터로 그릴 것인가. 벡터로 못 담는 효과는 **묻지 않고 끈다**
+      // (사용자 판정) — 레이어 선택에서 이미 꺼졌지만, 선택을 거치지 않고 바로 그은 경우의 안전망.
+      // ver2043: 이 판정을 **버킷·도형 분기보다 위로** 올렸다. 종전에는 아래에 있어 그 둘이 판정에
+      // 닿기 전에 return 했고, 그래서 ver2038 은 커밋 자리에서 막는 수밖에 없었다. 효과 끄기도
+      // 여기가 맞다 — 바로 아래 applyPaintStrokeStyle 이 그 설정을 읽어 붓을 세운다.
+      const vectorDraw = gengaLayerDrawsVector(layer);
+      if (vectorDraw && !eraser) gengaDisableVectorUnsupportedEffects();
+      applyPaintStrokeStyle(c, {
+        tool: eraser ? 'eraser' : 'pen',
+        size: (typeof activePaintSize === 'function' ? activePaintSize() : 4),
+        color: eraser ? 'rgba(0,0,0,1)' : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
+        mode: paintBrushModeVal()
+      }, { alphaLock: Boolean(!eraser && layer.alphaLock), fill: true });
+      if (state.paintTool === 'bucket') { gengaBeginBucketFill(ev, target, vectorDraw); return; }
+      // ver606 shape tools (直線/四角/円/投げ縄塗りつぶし): buffer strategy — the shape renders into its own
+      // transparent buffer each move, and cv is rebuilt = seeded base + buffer composited with the session's
+      // op (eraser destination-out / alphaLock source-atop / normal). AA off binarizes the buffer at commit.
+      const gengaShapeKind = paintShapeToolKind();
+      // ver2043: 벡터 레이어에서 **선으로 담을 수 없는 도형**은 여기서 끝낸다 — 올가미 채우기는
+      // 도구 자체가 채우기이고, 도형 지우개는 아직 벡터 규칙이 없다(벡터 지우개는 선 단위라 다르다).
+      // 조용히 아무 일도 안 하면 「고장」으로 보이므로 ver2038 과 같은 문구로 사유를 말한다.
+      if (gengaShapeKind && vectorDraw && (gengaShapeKind === 'lasso-fill' || eraser)) {
+        gengaShowStatus(t('status.genga.vector.rasterBlocked'), { warn: true });
+        renderGengaView();
+        ev.preventDefault();
+        return;
+      }
+      if (gengaShapeKind) gengaBeginShapeSession(ev, target, gengaShapeKind, vectorDraw, eraser);
+      else if (vectorDraw && eraser) {
+        if (!gengaBeginVectorEraseSession(ev, target)) { ev.preventDefault(); return; }
+      } else gengaBeginPenSession(ev, target, vectorDraw, eraser);
+      // All three sessions take capture, reveal a retargeted layer, and present in the same order.
+      try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
+      if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); } // ver994: drawing retargeted the layer — show which one
+      drawGengaPreview();
+      ev.preventDefault();
+    }
+
+    // One transient prepared target: paper coordinates, seeded canvas, and its owner/scan metadata.
+    // It does not register an active canvas or create a draw session; commit keeps that ownership.
+    function gengaPrepareDrawTarget(ev, layer, diagDownT) {
       const p = gengaPreviewPointerXY(ev); if (!p) return;
       const gt = state.project.gengaTimeline;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
@@ -105349,138 +105406,100 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const ts = dr && gengaDrawingTiles(dr);
         diagStart.cellsN = ts ? ts.cells.size : (dr ? -1 : 0);
       } catch (err) { diagStart.cellsN = -2; }
-      // Reuse the conte memo tool state (pen/eraser + color + size). GENGA brush size = PAPER PIXELS (1 = one
-      // real pixel on the paper bitmap), unlike the conte memo's reference-space unit — true pixel control.
-      // ver956 P4④: styled by the shared applyPaintStrokeStyle kernel (was an inline copy; alphaLock =
-      // 透明度保護 source-atop, ver869 G0 背面描画 parity comes from stroke.mode).
-      // ver2433: 透明色이 켜져 있어도 지운다 — 이 한 변수가 아래 합성 op·alphaLock·addsInk·벡터 지우개 세션·
-      // 도형 세션(shapeEraser)을 전부 정하므로 여기 한 곳에 OR 한다. **설정 슬롯(2値化 키)은 도구 기준**이라 따로 본다.
-      const eraser = paintToolErases();
-      // ver2029 (A-3a): 이 레이어를 벡터로 그릴 것인가. 벡터로 못 담는 효과는 **묻지 않고 끈다**
-      // (사용자 판정) — 레이어 선택에서 이미 꺼졌지만, 선택을 거치지 않고 바로 그은 경우의 안전망.
-      // ver2043: 이 판정을 **버킷·도형 분기보다 위로** 올렸다. 종전에는 아래에 있어 그 둘이 판정에
-      // 닿기 전에 return 했고, 그래서 ver2038 은 커밋 자리에서 막는 수밖에 없었다. 효과 끄기도
-      // 여기가 맞다 — 바로 아래 applyPaintStrokeStyle 이 그 설정을 읽어 붓을 세운다.
-      const vectorDraw = gengaLayerDrawsVector(layer);
-      if (vectorDraw && !eraser) gengaDisableVectorUnsupportedEffects();
-      applyPaintStrokeStyle(c, {
-        tool: eraser ? 'eraser' : 'pen',
-        size: (typeof activePaintSize === 'function' ? activePaintSize() : 4),
-        color: eraser ? 'rgba(0,0,0,1)' : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
-        mode: paintBrushModeVal()
-      }, { alphaLock: Boolean(!eraser && layer.alphaLock), fill: true });
+      return { layer, frame, p, pw, ph, cv, c, activeDr, seedRect, scanEligible, diagStart };
+    }
+
+    function gengaBeginBucketFill(ev, target, vectorDraw) {
+      const { layer, frame, p, cv } = target;
       // ver607: bucket fill — instant op on the seeded session canvas (current layer reference, Q2)
       // ver2048: 벡터 레이어에서는 **여기서 끝낸다.** 채우기는 선으로 담을 수 없다(ver2043 이 도형에
       // 대해 내린 것과 같은 판정). 종전에는 픽셀을 다 칠한 뒤 커밋(ver2038)에서 거부돼 결과는 맞지만
       // 계산이 통째로 버려졌고, 막는 자리가 두 군데로 읽혔다. ver2043 이 vectorDraw 판정을 위로
       // 올려 둔 덕에 이제 여기서 볼 수 있다.
-      if (state.paintTool === 'bucket' && vectorDraw) {
+      if (vectorDraw) {
         gengaShowStatus(t('status.genga.vector.rasterBlocked'), { warn: true });
         renderGengaView();
         ev.preventDefault();
         return;
       }
-      if (state.paintTool === 'bucket') {
-        // 입력 옵션은 touch 유예 전 고정한다. 원화의 pending은 기존 재시도 안내를 유지한다.
-        const input = paintBucketCaptureInput(gengaSelectionClip(), { alphaLock: Boolean(layer.alphaLock) });
-        paintDeferBucketFill(ev, function() {
-          if (input.options.animation) {
-            paintBucketApply({ project: state.project, generation: state.paintBucketGeneration || 0,
-              layerId: String(layer.id), frame: frame, x: p.x, y: p.y, input: input,
-              paper: { x: 0, y: 0, w: cv.width, h: cv.height } },
-              { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit });
-            return;
-          }
-          const ref = gengaBucketReferenceCanvas(layer, frame, input.mode, cv);
-          if (ref && ref.failed) { gengaShowStatus(t('paint.bucketRef.failed'), { warn: true }); drawGengaPreview(); return; }
-          if (ref && ref.pending) { gengaShowStatus(t('paint.bucketRef.pending'), { warn: true }); drawGengaPreview(); return; }
-          // ver1356: 透明度保護를 버킷 커널에 **명시적으로** 넘긴다. 위 applyPaintStrokeStyle이 c에
-          // source-atop을 세워도 커널이 자체 GCO로 덮어쓰므로(그 함수 주석 참고) ctx 상태로는 전달되지 않는다.
-          const bucketChanged = paintBucketFillCanvas(cv, p.x, p.y, input.color,
-            Object.assign({}, input.options, { clip: input.clip, reference: ref ? ref.canvas : null }));
-          if (bucketChanged) gengaCommitCanvas(layer.id, frame, cv, '塗りつぶし');
-          else drawGengaPreview();
-        });
-        ev.preventDefault();
-        return;
-      }
-      // ver606 shape tools (直線/四角/円/投げ縄塗りつぶし): buffer strategy — the shape renders into its own
-      // transparent buffer each move, and cv is rebuilt = seeded base + buffer composited with the session's
-      // op (eraser destination-out / alphaLock source-atop / normal). AA off binarizes the buffer at commit.
-      const gengaShapeKind = paintShapeToolKind();
-      // ver2043: 벡터 레이어에서 **선으로 담을 수 없는 도형**은 여기서 끝낸다 — 올가미 채우기는
-      // 도구 자체가 채우기이고, 도형 지우개는 아직 벡터 규칙이 없다(벡터 지우개는 선 단위라 다르다).
-      // 조용히 아무 일도 안 하면 「고장」으로 보이므로 ver2038 과 같은 문구로 사유를 말한다.
-      if (gengaShapeKind && vectorDraw && (gengaShapeKind === 'lasso-fill' || eraser)) {
-        gengaShowStatus(t('status.genga.vector.rasterBlocked'), { warn: true });
-        renderGengaView();
-        ev.preventDefault();
-        return;
-      }
-      if (gengaShapeKind) {
-        gengaDrawSession = {
-          // ver1712: 이 세션을 소유한 포인터. 콘티의 state.paintPointerId 와 같은 뜻이고, 같은 파일의
-          // 원화 형제들(gengaStampDrag · gengaLasso · gengaCamDrag · gengaSelDrag)이 이미 쓰는 규약이다.
-          pointerId: ev.pointerId,
-          layerId: layer.id, frame: frame, canvas: cv, ctx: c, previewBaseRef: activeDr && activeDr.ref || null,
-          shape: gengaShapeKind,
-          closedFillInput: gengaShapeKind === 'lasso-fill' ? paintFillClosedInput(gengaSelectionClip()) : null,
-          shapeAnchor: { x: p.x, y: p.y }, shapeLassoPts: [{ x: p.x, y: p.y }], shapeMoved: false,
-          vector: vectorDraw,   // ver2043: 이 도형을 스트로크로 남길 것인가(위에서 못 담는 것은 이미 걸렀다)
-          shapeEraser: eraser, shapeAlphaLock: Boolean(!eraser && layer.alphaLock),
-          shapeColor: eraser ? '#000000' : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
-          shapeLineWidth: c.lineWidth,
-          shapeOpacity: paintBrushOpacityVal(), // ver609: shapes honor the brush opacity too
-          strokeKey: 'gs-' + Date.now().toString(36) + '-' + (gengaStrokeSeq += 1), // ver1702
-          scan: scanEligible ? gengaScanSeed(seedRect) : null, // ver1196
-          inkScan: scanEligible ? gengaScanSeed(null) : null   // ver2193: 시드 없이 **획만** 모은다(칸 갱신용)
-        };
-        gengaDrawSession.shapeBase = paintBorrowStrokeCanvas(gengaDrawSession, 'base', pw, ph);
-        gengaDrawSession.shapeBase.getContext('2d').drawImage(cv, 0, 0);
-        gengaDrawSession.shapeBuf = paintBorrowStrokeCanvas(gengaDrawSession, 'stroke', pw, ph);
-        // ver1706: 도형에도 팁·종이결을 싣는다 — 펜 세션과 같은 커널, 같은 순서.
-        // ver1710: 혼색도 같은 자리에서(펜 세션 82167 과 같은 세 줄이 된다). 혼색은 팁이 있는 붓에만
-        // 걸리므로 ver1706 이 도형에 팁을 실은 순간부터 뜻이 생겼다.
-        paintAttachTip(gengaDrawSession);
-        paintAttachPaperTex(gengaDrawSession);
-        paintAttachWaterEdge(gengaDrawSession);   // ver2393
-        paintDiagStart(diagStart);   // ver2429 A: 도형도 같은 시드 구간
-        paintAttachMix(gengaDrawSession);
-        paintAttachFlow(gengaDrawSession);   // ver1784
-        paintAttachTaper(gengaDrawSession);  // ver2359: 入り抜き — 세션도 같은 정본 필드 이름을 쓴다(ver1345 규격)
-        gengaScanMark(gengaDrawSession, p.x, p.y, c.lineWidth / 2); // ver1196: every shape grows out of its anchor
-        try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
-        if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); } // ver994: drawing retargeted the layer — show which one
-        drawGengaPreview();
-        ev.preventDefault();
-        return;
-      }
-      // ver2030 (A-3b): 벡터 레이어 + 지우개 = **선 단위 삭제**(판정). 픽셀을 파는 래스터 경로로
-      // 보내면 커밋이 그림을 통째로 래스터로 바꾼다. 여기서 전용 세션으로 갈라 나간다.
-      // (ver2029 는 지우개에도 sess.vector 를 세워, 지우개 획이 검은 선으로 **추가**됐다 — 그 결함도 여기서 끝난다.)
-      if (vectorDraw && eraser) {
-        const eDr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
-        const eStrokes = eDr && gengaDrawingStrokes(eDr);
-        // 빈 벡터 레이어면 지울 것이 없다 — 세션을 세우지 않고 그대로 돌아간다(래스터 지우개로
-        // 흘려보내면 벡터 레이어에 래스터 획이 들어간다).
-        if (!eStrokes) { ev.preventDefault(); return; }
-        {
-          const eRadius = Math.max(1, c.lineWidth) / 2;
-          gengaDrawSession = {
-            pointerId: ev.pointerId, layerId: layer.id, frame: frame,
-            canvas: cv, ctx: c, vectorErase: true,
-            eraseAll: eStrokes, eraseHits: new Set(), eraseRadius: eRadius,
-            lastX: p.x, lastY: p.y, scan: null
-          };
-          gengaVectorEraseHit(eStrokes, p.x, p.y, eRadius, gengaDrawSession.eraseHits);
-          gengaVectorEraseRepaint(gengaDrawSession);
-          try { ev.target.setPointerCapture(ev.pointerId); } catch (e2) {}
-          if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); }
-          drawGengaPreview();
-          ev.preventDefault();
+      // 입력 옵션은 touch 유예 전 고정한다. 원화의 pending은 기존 재시도 안내를 유지한다.
+      const input = paintBucketCaptureInput(gengaSelectionClip(), { alphaLock: Boolean(layer.alphaLock) });
+      paintDeferBucketFill(ev, function() {
+        if (input.options.animation) {
+          paintBucketApply({ project: state.project, generation: state.paintBucketGeneration || 0,
+            layerId: String(layer.id), frame: frame, x: p.x, y: p.y, input: input,
+            paper: { x: 0, y: 0, w: cv.width, h: cv.height } },
+            { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit });
           return;
         }
-      }
+        const ref = gengaBucketReferenceCanvas(layer, frame, input.mode, cv);
+        if (ref && ref.failed) { gengaShowStatus(t('paint.bucketRef.failed'), { warn: true }); drawGengaPreview(); return; }
+        if (ref && ref.pending) { gengaShowStatus(t('paint.bucketRef.pending'), { warn: true }); drawGengaPreview(); return; }
+        // 透明度保護는 ctx 상태가 아니라 버킷 커널의 입력 옵션으로 전달한다.
+        const bucketChanged = paintBucketFillCanvas(cv, p.x, p.y, input.color,
+          Object.assign({}, input.options, { clip: input.clip, reference: ref ? ref.canvas : null }));
+        if (bucketChanged) gengaCommitCanvas(layer.id, frame, cv, '塗りつぶし');
+        else drawGengaPreview();
+      });
+      ev.preventDefault();
+    }
+
+    function gengaBeginShapeSession(ev, target, gengaShapeKind, vectorDraw, eraser) {
+      const { layer, frame, p, pw, ph, cv, c, activeDr, seedRect, scanEligible, diagStart } = target;
+      gengaDrawSession = {
+        // ver1712: 이 세션을 소유한 포인터. 콘티의 state.paintPointerId 와 같은 뜻이고, 같은 파일의
+        // 원화 형제들(gengaStampDrag · gengaLasso · gengaCamDrag · gengaSelDrag)이 이미 쓰는 규약이다.
+        pointerId: ev.pointerId,
+        layerId: layer.id, frame: frame, canvas: cv, ctx: c, previewBaseRef: activeDr && activeDr.ref || null,
+        shape: gengaShapeKind,
+        closedFillInput: gengaShapeKind === 'lasso-fill' ? paintFillClosedInput(gengaSelectionClip()) : null,
+        shapeAnchor: { x: p.x, y: p.y }, shapeLassoPts: [{ x: p.x, y: p.y }], shapeMoved: false,
+        vector: vectorDraw,   // ver2043: 이 도형을 스트로크로 남길 것인가(위에서 못 담는 것은 이미 걸렀다)
+        shapeEraser: eraser, shapeAlphaLock: Boolean(!eraser && layer.alphaLock),
+        shapeColor: eraser ? '#000000' : (typeof activePaintColor === 'function' ? activePaintColor() : '#111111'),
+        shapeLineWidth: c.lineWidth,
+        shapeOpacity: paintBrushOpacityVal(), // ver609: shapes honor the brush opacity too
+        strokeKey: 'gs-' + Date.now().toString(36) + '-' + (gengaStrokeSeq += 1), // ver1702
+        scan: scanEligible ? gengaScanSeed(seedRect) : null, // ver1196
+        inkScan: scanEligible ? gengaScanSeed(null) : null   // ver2193: 시드 없이 **획만** 모은다(칸 갱신용)
+      };
+      gengaDrawSession.shapeBase = paintBorrowStrokeCanvas(gengaDrawSession, 'base', pw, ph);
+      gengaDrawSession.shapeBase.getContext('2d').drawImage(cv, 0, 0);
+      gengaDrawSession.shapeBuf = paintBorrowStrokeCanvas(gengaDrawSession, 'stroke', pw, ph);
+      // ver1706: 도형에도 팁·종이결을 싣는다 — 펜 세션과 같은 커널, 같은 순서.
+      // 혼색도 gengaBeginPenSession과 같은 순서로 싣는다. 혼색은 팁이 있는 붓에만
+      // 걸리므로 ver1706 이 도형에 팁을 실은 순간부터 뜻이 생겼다.
+      paintAttachTip(gengaDrawSession);
+      paintAttachPaperTex(gengaDrawSession);
+      paintAttachWaterEdge(gengaDrawSession);   // ver2393
+      paintDiagStart(diagStart);   // ver2429 A: 도형도 같은 시드 구간
+      paintAttachMix(gengaDrawSession);
+      paintAttachFlow(gengaDrawSession);   // ver1784
+      paintAttachTaper(gengaDrawSession);  // ver2359: 入り抜き — 세션도 같은 정본 필드 이름을 쓴다(ver1345 규격)
+      gengaScanMark(gengaDrawSession, p.x, p.y, c.lineWidth / 2); // ver1196: every shape grows out of its anchor
+    }
+
+    function gengaBeginVectorEraseSession(ev, target) {
+      const { layer, frame, p, cv, c } = target;
+      const eDr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
+      const eStrokes = eDr && gengaDrawingStrokes(eDr);
+      // 빈 벡터 레이어면 지울 것이 없다 — 세션을 세우지 않고 그대로 돌아간다(래스터 지우개로
+      // 흘려보내면 벡터 레이어에 래스터 획이 들어간다).
+      if (!eStrokes) return false;
+      const eRadius = Math.max(1, c.lineWidth) / 2;
+      gengaDrawSession = {
+        pointerId: ev.pointerId, layerId: layer.id, frame: frame,
+        canvas: cv, ctx: c, vectorErase: true,
+        eraseAll: eStrokes, eraseHits: new Set(), eraseRadius: eRadius,
+        lastX: p.x, lastY: p.y, scan: null
+      };
+      gengaVectorEraseHit(eStrokes, p.x, p.y, eRadius, gengaDrawSession.eraseHits);
+      gengaVectorEraseRepaint(gengaDrawSession);
+      return true;
+    }
+
+    function gengaBeginPenSession(ev, target, vectorDraw, eraser) {
+      const { layer, frame, p, pw, ph, cv, c, activeDr, seedRect, scanEligible, diagStart } = target;
       const pxStamp = paintToolBinarizeOn(state.paintTool === 'eraser' ? 'eraser' : 'pen') ? paintPixelStampRows(c.lineWidth) : null; // 2値化 on → hard-edged pixel stamping (ver617: eraser has its own key / ver2433: 透明色 펜은 펜의 설정을 읽는다)
       const penOpacity = paintBrushOpacityVal(); // ver609 brush settings (shared with conte)
       const penPressure = paintStrokeWantsPressure(ev);
@@ -105683,19 +105702,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       } else {
         gengaFirstDab = function() { c.beginPath(); c.arc(p.x, p.y, startWidth / 2, 0, Math.PI * 2); c.fill(); };
       }
-      // ver1669: **입력은 즉시, 출력만 유예** — 아래 setPointerCapture·preventDefault 는 종전 그대로
+      // **입력은 즉시, 출력만 유예** — 호출부의 setPointerCapture·preventDefault 는 종전 그대로
       // 이 프레임에서 끝난다(iOS 의 터치 소유권 판정 창을 놓치지 않는다). 화면에 찍는 첫 dab 만
       // 첫 move 까지 미룬다. 두 손가락 탭이면 그 사이 세션이 폐기되어 **그린 적이 없다**.
       gengaDrawSession.pendingFirstDab = gengaFirstDab;   // ver2364: pen·마우스도 유예 — 1점 렌더는 head clamp·taper-in 을 못 받아 placeholder 필압 원이 한 프레임 보인다(동그라미 잔상). flush(첫 move·탭 종료)는 ver1669 그대로
-      try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
-      if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); } // ver994: drawing retargeted the layer — show which one
-      drawGengaPreview();
-      ev.preventDefault();
     }
-    // ver621: whole-outline re-render for pressure pen strokes — clear the session buffer, trace the
-    // variable-width outline from every accumulated point, fill once, composite over the base.
-    // ver1669: genga 쪽 유예분 흡수. conte 의 paintFlushPendingFirstDab 과 같은 계약이다 —
-    // 세그먼트를 긋기 **전에** 불러야 첫 점이 빠지지 않는다. 두 엔진이 같은 시점에 같은 일을 한다.
+
     function gengaFlushPendingFirstDab() {
       const s = gengaDrawSession;
       if (!s || typeof s.pendingFirstDab !== 'function') return;
@@ -112603,7 +112615,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const project = state.project;
       const gt = project && project.gengaTimeline;
       if (!gt) { stageEl.innerHTML = '<div class="genga-info"><span class="genga-ph">' + escapeHtml(t('project.genga.noTimeline')) + '</span></div>'; return; }
-      const layers = Array.isArray(gt.layers) ? gt.layers : [];
       let partialRender = Boolean(renderPlan && renderPlan.scope === 'partial');
       if (partialRender && !stageEl.querySelector('.genga-preview') && !stageEl.querySelector('.genga-timeline-panel')) {
         // A keyed patch cannot be the first construction. Promote only this explicit mount boundary to the
@@ -112611,7 +112622,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         renderPlan = { scope: 'all', reason: 'mount' };
         partialRender = false;
       }
-      const fps = gt.fps || 24;
       const total = gengaShownFrames(); // viewport-filling + chunk-extended (no blank un-tiled area)
       if (partialRender && total !== Math.max(0, Math.round(Number(state.gengaShownRendered) || 0))) {
         // A geometry change must update ruler/content width before a keyed command can claim the new extent.
@@ -112619,6 +112629,42 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         renderPlan = { scope: 'all', reason: 'geometry' };
         partialRender = false;
       }
+      const gengaViewHtml = gengaBuildViewHtml(project, renderPlan, total, partialRender);
+      // ver1810: ★**patch 가 죽으면 화면이 반만 갱신된 채 멈춘다.** 사용자 제보의 NotFoundError
+      //   (`replaceWith` 가 행 루프 도중 죽음)가 실제로 그랬다 — 첫 행만 바뀜 채 예외가 위로
+      //   전파돼 나머지 행과 뒤처리가 통째로 안 돌았다. patch 는 **최적화지 정답이 아니다** —
+      //   이 앱은 이미 「partial 을 못 하겠으면 all 로 승격」을 관례로 갖고 있다(mount·geometry).
+      //   실패도 같은 승격으로 받는다. 조용히 넘기지 않는다 — 무엇이 어긋나는지 남겨야
+      //   다음에 원인을 잡는다. all 이 또 죽으면 그대로 던진다(무한재귀 없음).
+      let gengaPatchMode;
+      try {
+        gengaPatchMode = patchGengaViewDom(stageEl, gengaViewHtml, renderPlan);
+      } catch (patchError) {
+        if (!partialRender) throw patchError;
+        console.error('[genga] 부분 패치 실패 — 전체 렌더로 다시 그린다', patchError,
+          { layerIds: (renderPlan && renderPlan.layerIds) || [], audio: Boolean(renderPlan && renderPlan.audio) });
+        renderGengaView(stageEl, { scope: 'all', reason: 'patch-failed' });
+        return;
+      }
+      if (!partialRender) state.gengaShownRendered = total;
+      applyGengaTimelineDockState();
+      if (gengaPatchMode === 'mounted') {
+        reapplyPhoneGengaTimelineSheet();
+        if (!isPhoneLayout()) applyGengaTimelineViewportState(stageEl);
+      }
+      // ver994: sites that create/remove a layer set the selection BEFORE runCommand's refresh, so the row they
+      // want centred does not exist yet when they ask. They park the id and it is consumed here — after the
+      // viewport restore above, which would otherwise put the old scrollTop straight back.
+      gengaConsumePendingCenterLayer();
+      mountOnionSkinInto(stageEl.querySelector('.genga-onion-slot')); // ver1141: onion button lives in the genga layer-column header
+      gengaBindView(stageEl, renderPlan, partialRender);
+    }
+
+    // HTML generation owns no DOM replacement or event-listener lifetime.
+    function gengaBuildViewHtml(project, renderPlan, total, partialRender) {
+      const gt = project.gengaTimeline;
+      const layers = Array.isArray(gt.layers) ? gt.layers : [];
+      const fps = gt.fps || 24;
       const partialLayerIdSet = new Set(partialRender && Array.isArray(renderPlan.layerIds)
         ? renderPlan.layerIds.map(function(id) { return String(id); })
         : []);
@@ -113186,47 +113232,40 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           '<div id="gengaHScrollbar" class="timeline-scrollbar genga-hscroll" hidden aria-label="' + escapeAttr(t('ui.timelineScrollAria')) + '"><div id="gengaHScrollThumb" class="timeline-scrollbar-thumb"></div></div>' +
         '</div>' +
         '</div>'; /* /.genga-timeline-panel */
-      // ver1810: ★**patch 가 죽으면 화면이 반만 갱신된 채 멈춘다.** 사용자 제보의 NotFoundError
-      //   (`replaceWith` 가 행 루프 도중 죽음)가 실제로 그랬다 — 첫 행만 바뀜 채 예외가 위로
-      //   전파돼 나머지 행과 뒤처리가 통째로 안 돌았다. patch 는 **최적화지 정답이 아니다** —
-      //   이 앱은 이미 「partial 을 못 하겠으면 all 로 승격」을 관례로 갖고 있다(mount·geometry).
-      //   실패도 같은 승격으로 받는다. 조용히 넘기지 않는다 — 무엇이 어긋나는지 남겨야
-      //   다음에 원인을 잡는다. all 이 또 죽으면 그대로 던진다(무한재귀 없음).
-      let gengaPatchMode;
-      try {
-        gengaPatchMode = patchGengaViewDom(stageEl, gengaViewHtml, renderPlan);
-      } catch (patchError) {
-        if (!partialRender) throw patchError;
-        console.error('[genga] 부분 패치 실패 — 전체 렌더로 다시 그린다', patchError,
-          { layerIds: (renderPlan && renderPlan.layerIds) || [], audio: Boolean(renderPlan && renderPlan.audio) });
-        renderGengaView(stageEl, { scope: 'all', reason: 'patch-failed' });
-        return;
-      }
-      if (!partialRender) state.gengaShownRendered = total;
-      applyGengaTimelineDockState();
-      if (gengaPatchMode === 'mounted') {
-        reapplyPhoneGengaTimelineSheet();
-        if (!isPhoneLayout()) applyGengaTimelineViewportState(stageEl);
-      }
-      // ver994: sites that create/remove a layer set the selection BEFORE runCommand's refresh, so the row they
-      // want centred does not exist yet when they ask. They park the id and it is consumed here — after the
-      // viewport restore above, which would otherwise put the old scrollTop straight back.
-      gengaConsumePendingCenterLayer();
-      mountOnionSkinInto(stageEl.querySelector('.genga-onion-slot')); // ver1141: onion button lives in the genga layer-column header
+      return gengaViewHtml;
+    }
+
+    // Mark after every binding pass: the same fresh node can receive several distinct listeners.
+    function gengaBindView(stageEl, renderPlan, partialRender) {
       const newlyBoundNodes = new Set();
-      const gengaShowOne = function(selector) {
-        const el = stageEl.querySelector(selector);
+      const gengaUnboundNode = function(el) {
         if (!el || el.dataset.gengaRenderBound === '1') return null;
         newlyBoundNodes.add(el);
         return el;
       };
-      const gengaShowNodes = function(selector) {
-        return Array.from(stageEl.querySelectorAll(selector)).filter(function(el) {
-          if (el.dataset.gengaRenderBound === '1') return false;
-          newlyBoundNodes.add(el);
-          return true;
-        });
+      const gengaShowOne = function(selector) {
+        return gengaUnboundNode(stageEl.querySelector(selector));
       };
+      const gengaShowNodes = function(selector) {
+        return Array.from(stageEl.querySelectorAll(selector)).filter(gengaUnboundNode);
+      };
+      gengaBindLayerControls(stageEl, gengaShowOne, gengaShowNodes);
+      gengaBindTimelineNavigation(stageEl, gengaShowOne, gengaShowNodes);
+      const partialLayerIds = partialRender && Array.isArray(renderPlan.layerIds) ? renderPlan.layerIds : null;
+      if (!partialRender || (partialLayerIds && partialLayerIds.length)) drawGengaPreview();
+      drawGengaLayerThumbs(partialLayerIds);
+      gengaUpdateZoomHeader(); // shared-header label + camera-frame active state for this project
+      gengaHydrateDrawStore(state.project); // load any {ref} drawings missing from memory (autosave restore) → re-render
+      gengaHydrateAudioStore(state.project); // load any {ref} audio missing from memory
+      clearTimeout(gengaDougaPrewarmTimer); gengaDougaPrewarmTimer = setTimeout(gengaDougaPrewarm, 250); // idle pre-warm → first scrub over ・cells doesn't stutter
+
+      gengaBindPreview(stageEl);
+      gengaBindExposureControls(gengaShowNodes);
+      newlyBoundNodes.forEach(function(el) { el.dataset.gengaRenderBound = '1'; });
+      gengaUpdateLiveExposure(true);   // ver1808: 카드가 새로 그려졌다 — 캐시와 무관하게 다시 붙인다
+    }
+
+    function gengaBindLayerControls(stageEl, gengaShowOne, gengaShowNodes) {
       const addBtn = gengaShowOne('.genga-add-layer');
       if (addBtn) addBtn.addEventListener('click', gengaAddLayerMenu);
       const vscrollHeads = gengaShowOne('.genga-vscroll-heads');
@@ -113361,6 +113400,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           ignore: function(e) { return !!(e.target && e.target.closest && e.target.closest('.genga-ltag')); }
         });
       });
+    }
+
+    function gengaBindTimelineNavigation(stageEl, gengaShowOne, gengaShowNodes) {
       const goStart = gengaShowOne('#gengaGoStartBtn'); if (goStart) goStart.addEventListener('click', function() { stopGengaPlayback(); setGengaFrame(1); });
       const sBack = gengaShowOne('#gengaStepBackBtn'); if (sBack) sBack.addEventListener('click', function() { stopGengaPlayback(); stepGengaFrame(-1); });
       const playBtn = gengaShowOne('#gengaPlayPauseBtn'); if (playBtn) playBtn.addEventListener('click', toggleGengaPlayback);
@@ -113485,14 +113527,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         hWrap.scrollLeft = clampInt(hWrap.scrollLeft + delta, 0, maxScroll, hWrap.scrollLeft);
       }, { passive: false });
       gengaUpdateHScrollbar();
-      const partialLayerIds = renderPlan && renderPlan.scope === 'partial' && Array.isArray(renderPlan.layerIds) ? renderPlan.layerIds : null;
-      if (!renderPlan || renderPlan.scope !== 'partial' || (partialLayerIds && partialLayerIds.length)) drawGengaPreview();
-      drawGengaLayerThumbs(partialLayerIds);
-      gengaUpdateZoomHeader(); // shared-header label + camera-frame active state for this project
-      gengaHydrateDrawStore(state.project); // load any {ref} drawings missing from memory (autosave restore) → re-render
-      gengaHydrateAudioStore(state.project); // load any {ref} audio missing from memory
-      clearTimeout(gengaDougaPrewarmTimer); gengaDougaPrewarmTimer = setTimeout(gengaDougaPrewarm, 250); // idle pre-warm → first scrub over ・cells doesn't stutter
+    }
 
+    function gengaBindPreview(stageEl) {
       const pv = stageEl.querySelector('#gengaPreviewCanvas');
       if (pv && pv.dataset.gengaPreviewBound !== '1') {
         pv.dataset.gengaPreviewBound = '1';
@@ -113565,6 +113602,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       // (pinch is handled in gengaPreviewPointerDown/Move/End via Pointer Events — no separate TouchEvent binding)
       // Preview size changes are observed for the lifetime of this DOM element.
+    }
+
+    function gengaBindExposureControls(gengaShowNodes) {
+      function bindGengaEmptyAreaMenu(el) {
+        const open = function(ev) { gengaOpenEmptyAreaMenu(ev, el.getAttribute('data-genga-layer')); };
+        el.addEventListener('contextmenu', open);
+        bindTouchLongPressContextMenu(el, function(ev) { gengaCelSelLongPressed = true; open(ev); });
+      }
       gengaShowNodes('.genga-exp[data-genga-exp]').forEach(function(block) {
         block.addEventListener('pointerdown', gengaExpPointerDown);
         block.addEventListener('contextmenu', gengaExpContextMenu);
@@ -113603,11 +113648,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // strip). リピート is gone from here: it is a LEFT-click toggle on the mid-gap notation now (the old
       // right-click リピート was the leftover the user flagged). The notation overlaying the number strip carries
       // the same menu (bound below), so the whole cell reads one way.
-      gengaShowNodes('.genga-exp.genga-exp-empty[data-genga-layer]').forEach(function(card) {
-        const open = function(ev) { gengaOpenEmptyAreaMenu(ev, card.getAttribute('data-genga-layer')); };
-        card.addEventListener('contextmenu', open);
-        bindTouchLongPressContextMenu(card, function(ev) { gengaCelSelLongPressed = true; open(ev); });
-      });
+      gengaShowNodes('.genga-exp.genga-exp-empty[data-genga-layer]').forEach(bindGengaEmptyAreaMenu);
       // ver858: the old .genga-repeat-strip right-click-to-release handler is gone with the strip — release now
       // happens via the same click-toggle / empty-cell menu that adds it (see gengaCelSelUp + the menu above).
       // ver1500: 번호띠는 이제 **실제 코마에만** 있다(빈 셀 카드의 빈 띠를 없앴다) — 셀렉터에
@@ -113630,12 +113671,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // (レイヤーFX + 貼り付け…, NOT リピート — that toggle is the left click).
       gengaShowNodes('.genga-midbehavior[data-genga-layer]').forEach(function(el) {
         el.addEventListener('pointerdown', gengaCelSelPointerDown);
-        const open = function(ev) { gengaOpenEmptyAreaMenu(ev, el.getAttribute('data-genga-layer')); };
-        el.addEventListener('contextmenu', open);
-        bindTouchLongPressContextMenu(el, function(ev) { gengaCelSelLongPressed = true; open(ev); });
+        bindGengaEmptyAreaMenu(el);
       });
-      newlyBoundNodes.forEach(function(el) { el.dataset.gengaRenderBound = '1'; });
-      gengaUpdateLiveExposure(true);   // ver1808: 카드가 새로 그려졌다 — 캐시와 무관하게 다시 붙인다
     }
 
     // ## SECTION: CORE UTILS + REFRESH .............. escapeHtml/escapeAttr, drop helpers, guardedRender/refresh
