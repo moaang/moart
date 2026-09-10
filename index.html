@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2485</title>
+  <title>MoArt ver2486</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24433,6 +24433,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2486, items: [{ ja: '筆圧補正で変わらなくなった区間を再描画せず、鉛筆などの描画負荷を減らしました。', ko: '필압 보정으로 더 이상 바뀌지 않는 구간은 다시 그리지 않아 연필 등의 그리기 부담을 줄였습니다.', en: 'Reduced drawing work for pencils and other brushes by redrawing only the part still affected by pressure correction.', zh: '只重绘仍受笔压校正影响的部分，减少铅笔等笔刷的绘制负担。' }] },
       { ver: 2485, items: [{ ja: 'コンテでも、空の選択範囲をレイヤー全体の変形に置き換えず維持します。変形の座標表示も現在の対象に合わせて更新します。', ko: '콘티에서도 빈 선택 영역을 레이어 전체 변형으로 바꾸지 않고 유지합니다. 변형 좌표 표시도 현재 대상에 맞춰 갱신합니다.', en: 'Conte keeps empty explicit selections instead of transforming the whole layer. Transform coordinates now update with the current target.', zh: '分镜模式保留空的手动选区，不再改为变形整个图层。变形坐标随当前目标同步更新。' }] },
       { ver: 2484, items: [{ ja: '描画の元に戻す・やり直しで、編集したフレームとレイヤーに戻るようにしました。選択がないときの変形・パース枠は現在の絵に追従し、手動の選択範囲は維持します。', ko: '그림 Undo·Redo 시 실제 편집한 프레임과 레이어로 돌아갑니다. 선택이 없을 때 변형·퍼스펙티브 상자는 현재 그림을 따르고, 직접 만든 선택 영역은 유지합니다.', en: 'Drawing Undo/Redo now returns to the edited frame and layer. Without a selection, Transform and Perspective bounds follow the current drawing; explicit selections stay in place.', zh: '绘画撤销和重做现在会返回编辑时的帧和图层。未选择区域时，变形和透视框跟随当前画面，手动选区保持不变。' }] },
       { ver: 2483, items: [{ ja: '原画プロジェクト設定で基本カメラ枠を変更すると、既存のカメラワークも位置・サイズ・比率に合わせて連動するようになりました。キーの時刻と回転角は維持します。', ko: '원화 프로젝트 설정에서 기본 카메라 프레임을 바꾸면 기존 카메라워크도 위치·크기·비율에 맞춰 함께 조정됩니다. 키 시점과 회전각은 유지됩니다.', en: 'Changing the base camera frame in Genga project settings now adjusts existing camera work to its new position, size and aspect ratio. Key times and rotation angles are preserved.', zh: '在原画项目设置中更改基本摄影机框时，现有摄影机运动会随位置、尺寸和比例一同调整。关键帧时间和旋转角度保持不变。' }] },
@@ -61899,8 +61900,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return PAINT_MEDIAN_BUF[(n - 1) >> 1];
     }
-    function paintSmoothStrokePressures(pts, emaK) {
+    const PAINT_PRESSURE_HEAD_SKIP = 4;
+    const PAINT_PRESSURE_HEAD_SAMPLES = 8;
+    const PAINT_PRESSURE_MEDIAN_RADIUS = 2;
+    function paintSmoothStrokePressures(pts, emaK, stability) {
       const n = pts.length;
+      if (stability) stability.count = 0;
       const raw = new Array(n);
       for (let i = 0; i < n; i += 1) raw[i] = Math.max(0, Number(pts[i] && pts[i].p) || 0);
       // ver643: iOS reports a PLACEHOLDER pressure on the leading sample(s) of a Pencil stroke —
@@ -61909,20 +61914,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // (documented: Apple forum 734203 = first 2–6 samples read a constant like 0.333; this
       // device's HUD shows first=0.08 on EVERY capture while the body sits at ~0.01). Rendering
       // the placeholder literally IS the ink-pool blob at the stroke head. Web-side remedy =
-      // clamp the leading samples DOWN to the settled body pressure (median of samples 2..7).
+      // clamp the leading samples DOWN to the settled pressure from the body window below.
       // Down-only, so a deliberately light start stays light, a firm start (settled is equally
       // high) passes unchanged, and Windows-Ink's literal-0 first sample stays 0.
       if (n >= 5) {
         // Settle = the real body pressure, read from a window PAST the placeholder head so the estimate
         // isn't pulled up by the placeholder itself. The plateau is 1–4 samples depending on Bluetooth
         // latency (this device's HUD shows first=2nd=0.08), so the settle window starts at sample 4.
-        const bodyStart = Math.min(4, n - 3);
-        const settled = paintMedianOfRange(raw, bodyStart, Math.min(n, bodyStart + 8) - 1);   // ver2376: 창 미디언 한 벌 // ver2410: 할당 없이
+        const bodyStart = Math.min(PAINT_PRESSURE_HEAD_SKIP, n - 3);
+        const settled = paintMedianOfRange(raw, bodyStart, Math.min(n, bodyStart + PAINT_PRESSURE_HEAD_SAMPLES) - 1);
         // ver644: clamp the LEADING RUN of samples above the settled body, not a fixed 2 — a 3–4 sample
         // placeholder plateau left a residual blob at ver643's fixed width of 2. Down-only: a firm start
         // (settled equally high) and a light→firm entry (head already below body) are both untouched;
         // only the placeholder plateau, which by definition sits above the settled body, is pulled down.
-        const maxHead = Math.min(4, n - 2);
+        const maxHead = Math.min(PAINT_PRESSURE_HEAD_SKIP, n - 2);
         for (let i = 0; i < maxHead; i += 1) { if (raw[i] > settled) raw[i] = settled; }
       }
       if (n < 3) return raw;
@@ -61933,7 +61938,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 꼬리가 한 단계 굵게 끝남). 위로 튀는 리프트 스파이크는 rise-limit 이 이미 상한을
         // 걸어 두었고, 끝 «한 점»의 잔여 위험은 dab 하나 크기다.
         if (i === n - 1) { med[i] = raw[i]; continue; }
-        const a = Math.max(0, i - 2), b = Math.min(n - 1, i + 2);
+        const a = Math.max(0, i - PAINT_PRESSURE_MEDIAN_RADIUS), b = Math.min(n - 1, i + PAINT_PRESSURE_MEDIAN_RADIUS);
         med[i] = paintMedianOfRange(raw, a, b);   // ver2376: 창 미디언 한 벌 // ver2410: 할당 없이
       }
       const out = med.slice();
@@ -61947,6 +61952,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         for (let i = 0; i < n; i += 1) { acc += (out[i] - acc) * k; out[i] = acc; }
         acc = out[n - 1];
         for (let i = n - 1; i >= 0; i -= 1) { acc += (out[i] - acc) * k; out[i] = acc; }
+      }
+      // 양방향 EMA는 미래 점의 영향이 끝까지 닿는다. EMA가 없을 때만 머리 추정과
+      // 중앙값 창을 벗어난 압력을 확정한다. 저장된 압력·보정값 자체는 바꾸지 않는다.
+      if (stability && k === 1 && n >= PAINT_PRESSURE_HEAD_SKIP + PAINT_PRESSURE_HEAD_SAMPLES) {
+        stability.count = n - PAINT_PRESSURE_MEDIAN_RADIUS;
       }
       return out;
     }
@@ -62039,10 +62049,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 같은 명제라 같은 상수를 쓴다(종전 17곳 인라인 — 감사에서 「같은 산수 사본」으로 지목).
     // 필압 0 = radii 0 = 잉크 없음(ver2369)은 이 하한 «앞»의 별도 판정이다.
     const PAINT_RADII_FLOOR = 0.15;
-    function paintVariableWidthRadii(pts, baseWidthPx, factorFor, emaK) {
+    function paintVariableWidthRadii(pts, baseWidthPx, factorFor, emaK, stability) {
       const n = pts.length;
       const radii = new Array(n);
-      const sp = paintSmoothStrokePressures(pts, emaK); // ver642: reject Apple-Pencil pressure spikes before width mapping // ver2328: EMA 강도는 호출부가 접어 넘긴다
+      const sp = paintSmoothStrokePressures(pts, emaK, stability);
       // ver637: floor 0.15px (was 0.35) so 最小サイズ 0% strokes can taper to a near-point hairline at
       // the ends instead of bottoming out at a visible stub. 0.15 keeps a sub-pixel hairline (never a
       // literal 0-area pinch that could make a light stroke vanish mid-line).
@@ -62070,6 +62080,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
         if (radii[i - 1] > 0 && radii[i] > radii[i - 1] + slew * d) radii[i] = radii[i - 1] + slew * d;
       }
+      if (stability) {
+        const pressureEnd = stability.count;
+        stability.count = 0;
+        // 미래의 양수 굵기는 FLOOR 이상이고 0은 slew를 끊는다. 그 최저 굵기가
+        // 뒤에서 전파되어도 전진 계산값을 낮추지 못하는 점부터 앞은 확정할 수 있다.
+        let lower = PAINT_RADII_FLOOR;
+        for (let i = pressureEnd - 1; i >= 0; i -= 1) {
+          lower += slew * Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+          if (radii[i] === 0 || radii[i] <= lower) { stability.count = i + 1; break; }
+        }
+      }
       for (let i = n - 2; i >= 0; i -= 1) {
         const d = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
         if (radii[i + 1] > 0 && radii[i] > radii[i + 1] + slew * d) radii[i] = radii[i + 1] + slew * d;
@@ -62079,13 +62100,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver2359: CSP 「入り抜き」 — 획 양끝에서 폭을 길이 램프로 감쇠시킨다(선형, 최소값 0 — 표본 두
     // 붓의 影響先 blob 이 전부 기본값이라 크기 한 축·최소 0 이 실측 사양이다). radii 를 제자리에서
     // 곱한다: 크기의 정본은 radii 하나이므로(ver1345 걷기 계약) 여기 곱으면 라이브·커밋·콘티·원화가
-    // 같은 수학을 지난다. 라이브의 抜き는 ver2341 의 「꼬리를 굳히지 않는다」 창이 매 프레임 다시
-    // 찍으므로 현재 끝을 따라 움직이고, 커밋은 총 길이로 최종 램프를 놓는다 — outLen 이 그 창보다
-    // 길면 굳은 구간은 커밋에서 정정된다(굵기 자체가 ver2341 전에 그랬던 것과 같은 계열의 한계).
+    // 같은 수학을 지난다. 일반 팁 라이브는 빼기가 닿는 길이까지 확정을 미뤄 현재 끝을 따른다.
     // 획이 in+out 보다 짧으면 min 결합으로 양끝이 만나 잎사귀 모양이 된다(CSP 도 짧은 획은 그렇다).
     // ver628 의 taper-in(터치다운 스파이크 방어)과는 목적이 다른 별개 층이다 — 그쪽은 필압 스트림의
     // 방어라 항상 걸리고, 이쪽은 브러시가 고른 스타일 감쇠다.
-    function paintTaperRadii(pts, radii, inLen, outLen) {
+    function paintTaperRadii(pts, radii, inLen, outLen, stability) {
       const n = pts.length;
       const hasIn = Number(inLen) > 0, hasOut = Number(outLen) > 0;
       if (n < 2 || (!hasIn && !hasOut)) return radii;
@@ -62093,7 +62112,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       acc[0] = 0;
       for (let i = 1; i < n; i += 1) acc[i] = acc[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
       const total = acc[n - 1];
-      if (!(total > 0)) return radii;
+      if (!(total > 0)) { if (stability) stability.count = 0; return radii; }
+      // 빼기는 점 개수가 아니라 거리로 움직인다. 종점이 늘어도 불변인 구간만 남긴다.
+      if (stability && hasOut) {
+        while (stability.count > 0 && total - acc[stability.count - 1] < outLen) stability.count -= 1;
+      }
       for (let i = 0; i < n; i += 1) {
         let f = 1;
         if (hasIn && acc[i] < inLen) f = acc[i] / inLen;
@@ -62106,6 +62129,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintStrokeTaperOf(src) {
       return { tIn: Number(src && src.taperIn) > 0 ? Number(src.taperIn) : 0,
                tOut: Number(src && src.taperOut) > 0 ? Number(src.taperOut) : 0 };
+    }
+    // 좌표·폭을 그릴 곳의 px로 맞춘 뒤 부른다. 값과 확정 범위를 같은 계산에서 얻는다.
+    // stability는 이번 호출의 정보이며 획이나 저장 데이터에 붙이지 않는다.
+    function paintStrokeRadii(pts, width, stroke, emaK, liveHost) {
+      const stability = liveHost ? { count: 0 } : null;
+      const widthEma = stroke.pressure && stroke.pressureSize ? emaK : 1;
+      const radii = paintVariableWidthRadii(pts, width, function(p, t) {
+        return paintPressureWidthFactor(stroke, p, t);
+      }, widthEma, stability);
+      const taper = paintStrokeTaperOf(stroke);
+      paintTaperRadii(pts, radii, Math.max(taper.tIn, paintSpeedTaperInLen(stroke, pts)), taper.tOut, stability);
+      // 속도 들어가기를 측정 중이면 길이가 늘어 이미 그린 머리에도 다시 적용된다.
+      if (stability && stroke.taperBySpeed === true && stroke.pressure && !liveHost.tSpdDone) stability.count = 0;
+      return { radii: radii, confirmedCount: stability ? stability.count : pts.length };
     }
     // ── ver2366 (q1=A): 속도 연동 들어가기 합성 — docs/pressure_head_taper_2026-09-03.md ─────────
     // 브라우저 스트림에는 필압 램프업이 없다(호버 p=0 · 접촉 후 0~2샘플 — 그 문서 §0 실기 캡처).
@@ -64535,7 +64572,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintWalkTipDabs(pts, radii, tip, cb, resume) {
       const n = pts.length;
-      if (!n) return false;
+      const end = resume && Number.isInteger(resume.pointLimit) ? Math.min(n, resume.pointLimit) : n;
+      if (!n || end <= 0) return false;
       const sf = (tip && tip.spacing > 0) ? tip.spacing : 0.15;
       const baseRad = (tip && tip.angle) ? (Number(tip.angle) || 0) * Math.PI / 180 : 0;
       const rotMode = (tip && tip.rotate) || 'off';
@@ -64608,7 +64646,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 세그먼트당 1스탬프가 우연히 정답과 일치했기 때문에 통과했다. 스탬프는 이제 입력 점 밀도와 무관하게
       // 정확히 spacing마다 놓인다(첫 스탬프는 시작점, 이후 carry 기준).
       let carry = resume ? (Number(resume.carry) || 0) : 0;
-      for (let i = resume ? (resume.seg >>> 0) : 0; i < n - 1; i += 1) {
+      for (let i = resume ? (resume.seg >>> 0) : 0; i < end - 1; i += 1) {
         const a = pts[i], b = pts[i + 1], ra = radii[i], rb = radii[i + 1];
         // ver2379: 한쪽이 잉크 0 인 세그먼트는 걷지 않는다(원반 trace 와 같은 계약 — 0 은 종료·재개
         // 신호). 재개 첫 캡은 직접 찍고, carry 는 새 잉크 구간에서 다시 시작한다(잉크 밖 이동은
@@ -64649,7 +64687,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         carry = carry + len - k * spacing;
       }
       if (resume) {
-        resume.seg = Math.max(0, n - 1);
+        resume.seg = Math.max(0, end - 1);
         resume.carry = carry;
         resume.dabIndex = dabIndex;
         resume.firstEmitted = true;
@@ -66816,29 +66854,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // host가 있으면(라이브) 그 스트로크의 세션을 이어 쓰고, 없으면(커밋·재베이크) 공용 스크래치에
     // 처음부터 한 번 만든다 — **두 경우가 같은 함수를 지나므로** 미리보기와 커밋이 코드로 갈라질 수 없다.
     let paintInkOneShotSession = null;
-    // ── ver2341 (판정 q2=A): 라이브는 **꼬리를 확정하지 않는다** ─────────────────────────────
-    // 굵기(paintVariableWidthRadii)는 점 목록 **전체**의 함수다 — 머리 클램프 · 5창 미디언 ·
-    // **역방향** EMA · **후진 slew** 넷이 뒤를 본다. 그래서 꼬리 쪽 굵기는 점이 더 들어오면 값이
-    // 바뀌는데, 증분 걷기는 **이미 찍은 dab 을 다시 안 고친다** — 그 프레임 시점의 굵기로 찍고
-    // 넘어간다. 프레임 경계는 rAF 와 이벤트 묶음(getCoalescedEvents)이 정하므로 회차마다 다르고,
-    // dab 간격이 굵기에서 나오니 **찍히는 개수까지** 갈렸다(실측: 분할만 바꿔 dab 331 vs 327,
-    // 최대 위치차 15.3px). 같은 이유로 **라이브와 커밋도 갈렸다** — 벡터·콘티 획은 스트로크를
-    // 저장해 다시 그리므로 손을 떼면 굵기 프로파일이 바뀐다.
-    // 정본 docs/drawing_frame_budget_2026-09-02.md 5 절.
-    //
-    // 처방: 뒤에서 이만큼의 점은 **잉크 장에 굳히지 않는다.** 확정 구간만 이어 찍고, 꼬리는 매
-    // 프레임 지웠다 다시 찍는다 — 화면에는 그대로 보이므로 **지연이 없고**, 굳은 픽셀은
-    // 결정적이다.
-    // ★값은 **픽셀로 정했다.** 0.01px 수렴 거리(중앙값 5 · 최대 8)로는 모자란다 — dab 좌표는
-    //  float 이라 0.001px 차이도 AA 를 바꾸므로 **완전 수렴**이 필요하고, EMA 는 지수 감쇠라
-    //  (1−k)^K 가 float 잡음 아래로 내려가야 한다(k=0.385 → 12 점 1.6e-3 · 40 점 1.3e-9).
-    //  실측이 그대로 말했다: 12 에서는 분할을 바꾸면 여전히 갈렸고(diff 4,860) **40 에서 PNG
-    //  바이트가 완전히 같아졌다**(분할 1/5/15 셋 다). 라이브와 커밋의 차이도 22,670 → 4 px.
-    // ★대가는 **꼬리 재생성**이다 — 프레임당 점 하나만 들어오는 최악 조건에서 획당 dab 방출이
-    //  1,108 → 3,113(2.8 배), 실제 밀도(프레임당 5~15 점)에서는 1.07~1.28 배다. ver2339 가 dab
-    //  하나의 값을 18 배 낮춰 둔 뒤라 감당되는 거래다(그 순서가 아니면 못 냈다).
-    // 혼색은 잉크·색 장과 mixer 상태를 함께 백업한다. 임시 꼬리가 다음 dab의 색을 오염시키지 않는다.
-    const PAINT_LIVE_TAIL_HOLD = 40;
+    // 라이브는 paintStrokeRadii가 보장한 구간만 확정하고 나머지는 매번 다시 그린다.
+    // 일반 팁의 방향 계산은 전체 이웃을 보되 실제 방출만 pointLimit까지 진행한다.
+    // 혼색은 잉크·색 장과 mixer 상태를 함께 백업해 임시 꼬리가 다음 색을 오염시키지 않는다.
+    // 리본은 GPU 묶음 경계가 픽셀 반올림에 영향을 주므로 기존 분할을 유지한다.
+    // 근거: docs/pencil_composite_reuse_design_2026-09-11.md의 리본 대조.
+    const PAINT_RIBBON_TAIL_HOLD = 40;
     // 상자 합집합({x,y,w,h} — paintStrokeScratchBox 가 내는 꼴). 한쪽이 없으면 다른 쪽.
     function paintBoxUnion(a, b) {
       if (!a) return b || null;
@@ -67014,8 +67035,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       s.grainPD = grainPD;   // ver2303: 소비자(paintFillVariableWidthBody)가 획 단위 마스크 생략을 이것으로 판정한다
       // 확정 상한. 커밋(host 없음)은 전체가 확정이다.
       // 첫 점도 아직 방향·들어가기 굵기가 바뀔 수 있으므로 임시 꼬리에 포함한다.
-      const confirmN = host ? Math.max(0, n - PAINT_LIVE_TAIL_HOLD) : n;
+      const ribbon = Boolean(opts.tip && opts.tip.ribbon);
+      const confirmN = host ? (ribbon ? Math.max(0, n - PAINT_RIBBON_TAIL_HOLD)
+        : Math.max(0, Math.min(n, Number(opts.confirmedCount) || 0))) : n;
       const tailHold = confirmN < n;
+      const confirmedPts = ribbon && tailHold ? pts.slice(0, confirmN) : pts;
+      const confirmedRadii = ribbon && tailHold ? radii.slice(0, confirmN) : radii;
       const grew = n > s.done;
       // ver2302: 「이번 호출이 s.cv 를 실제로 바꿨는가」를 세션에 남긴다 — 소비자(그레인/잉크
       // 합성의 변화 없는 프레임 스킵)의 판정 근거다. s.newBox 로 대신 읽으면 어긋난다:
@@ -67045,14 +67070,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (grew) {
           // ver2341: 지난 프레임 꼬리를 되돌리고 → 확정 구간만 이어 찍고 → 꼬리를 새로 찍는다.
           const prevTail = paintInkTailRestore(s, cx);
-          const cPts = tailHold ? pts.slice(0, confirmN) : pts;
-          const cRadii = tailHold ? radii.slice(0, confirmN) : radii;
-          const b = paintStampInkField(cx, cPts, cRadii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);   // ver1784 // ver2303: grainPD
+          // 계산에 필요한 뒤 이웃은 보존하고, 실제로 찍을 끝만 제한한다.
+          s.walk.pointLimit = confirmN;
+          const b = paintStampInkField(cx, confirmedPts, confirmedRadii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);
           let tb = null;
           if (tailHold) {
             paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
             // 진행량은 복사한다. 점에서 유도한 접선 캐시는 공유해 확정 구간도 뒤 이웃의 방향을 본다.
-            tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk), s.mixTipFor, s.colorCtx, flow, grainPD);
+            tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk, { pointLimit: n }), s.mixTipFor, s.colorCtx, flow, grainPD);
           }
           const b2 = (b && tb)
             ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) }
@@ -67087,11 +67112,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver1625: 혼색이면 dab 마다 틴트하므로 **원본 팁**을 넘긴다(미리 틴트하면 그 색을 다시
         // 덮어쓰는 헛일이 된다). 아니면 종전대로 한 번 틴트한 한 장.
         const tipSrc = s.mixTipFor ? tipImage : paintTintedTip(tipImage, color);
-        paintStampTexturedPath(cx, tailHold ? pts.slice(0, confirmN) : pts,
-          tailHold ? radii.slice(0, confirmN) : radii, tipSrc, opts.tip, s.walk, s.mixTipFor, flow);   // ver1784
+        s.walk.pointLimit = confirmN;
+        paintStampTexturedPath(cx, confirmedPts, confirmedRadii, tipSrc, opts.tip, s.walk, s.mixTipFor, flow);
         if (tailHold) {
           paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
-          paintStampTexturedPath(cx, pts, radii, tipSrc, opts.tip, Object.assign({}, s.walk), s.mixTipFor, flow);
+          paintStampTexturedPath(cx, pts, radii, tipSrc, opts.tip, Object.assign({}, s.walk, { pointLimit: n }), s.mixTipFor, flow);
           s.newBox = paintBoxUnion(s.newBox, s.tailBox);
           cvChanged = true;
         }
@@ -69479,9 +69504,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // (genga와 마찬가지로) 처음부터 아무 일도 하지 않았다. ver1329가 .t로 겪은 사고와 같은 자리,
         // 같은 원인 — 점에 필드를 추가하는 사람은 이 map을 반드시 같이 고쳐야 한다.
         const ptsPx = points.map(function(pt) { return { x: pt.x * width - ox, y: pt.y * height - oy, p: pt.p, t: pt.t, a: pt.a }; });
-        const radii = paintVariableWidthRadii(ptsPx, ctx.lineWidth, function(p, t) { return paintPressureWidthFactor(stroke, p, t); }, paintStrokeEmaKOf(stroke)); // ver1329: the callback used to be function(p) and silently DROPPED the tilt arg — conte got no tilt at all // ver2328: 획이 실은 레벨
-        const taper = paintStrokeTaperOf(stroke);   // ver2359: 入り抜き — radii 완성 직후·소비 전. 원화는 자기 radii 자리 둘(아웃라인·벡터 커밋)에서 같은 커널을 곱는다
-        paintTaperRadii(ptsPx, radii, Math.max(taper.tIn, paintSpeedTaperInLen(stroke, ptsPx)), taper.tOut);   // ver2366: 속도 연동 들어가기 — 지정값과 max 결합
+        const widthState = paintStrokeRadii(ptsPx, ctx.lineWidth, stroke, paintStrokeEmaKOf(stroke), liveHost);
+        const radii = widthState.radii;
         // A stroke with a resolvable tipId stamps that texture instead of the plain round dab. Live since
         // ver1239 wired tipId through the builders and the preview (the comment here still said it was dead
         // code); shared with genga since ver1247.
@@ -69490,7 +69514,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (grainOpt) { grainOpt.originX = ox; grainOpt.originY = oy; }
         // ver1343: alphaFor는 더 이상 tip 옵션에 얹히지 않는다 — 팁 없는 원형 브러시도 筆圧→不透明度를
         // 받아야 하므로 alphaFor는 팁 존재 여부와 독립된 옵션으로 넘긴다.
-        paintFillVariableWidthBody(ctx, ptsPx, radii, stroke.color, { tip: paintTipOptionsFrom(stroke), grain: grainOpt, alphaFor: paintStrokeAlphaFor(stroke), mix: paintMixOptionsFrom(stroke), mixBase: mixBase, liveHost: liveHost, strokeKey: stroke.id, flow: paintStrokeFlowVal(stroke), waterEdge: paintWaterEdgeFrom(stroke) }); // ver1335/1337/1343/1355/1356/1625 // ver1710: mixBase // ver1784: flow // ver2393
+        paintFillVariableWidthBody(ctx, ptsPx, radii, stroke.color, { tip: paintTipOptionsFrom(stroke), grain: grainOpt, alphaFor: paintStrokeAlphaFor(stroke), mix: paintMixOptionsFrom(stroke), mixBase: mixBase, liveHost: liveHost, confirmedCount: widthState.confirmedCount, strokeKey: stroke.id, flow: paintStrokeFlowVal(stroke), waterEdge: paintWaterEdgeFrom(stroke) });
       } else if (stroke.pressure) {
         // 전체 경로를 쓰지 않는 pressure 획의 세그먼트 렌더. pressure 캡처 여부와
         // 크기·불투명도·기울기 효과의 활성 판정은 서로 다르다.
@@ -106058,19 +106082,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 떼면 그 자리에서 원래 궤적이 돌아온다(콘티의 paintStrokeLineView 와 같은 계약).
       const outPts = (sess.shiftLine === true && sess.lineEnd && sess.pts.length)
         ? [sess.pts[0], sess.lineEnd] : sess.pts;
-      const radii = paintVariableWidthRadii(outPts, sess.penBaseWidth, function(p, t) {
-        return paintPressureWidthFactor(sess, p, t);
-      }, 1); // ver2362: 필압 EMA 는 걷었다(손떨림은 좌표 전용 — CSP·Krita 표준). 스파이크 방어(head clamp·미디언·rise-limit·slew)는 radii 커널에 그대로 산다
-      const penTaper = paintStrokeTaperOf(sess);   // ver2359: 入り抜き — 콘티 whole-path 가지와 같은 자리(radii 완성 직후)
-      paintTaperRadii(outPts, radii, Math.max(penTaper.tIn, paintSpeedTaperInLen(sess, outPts)), penTaper.tOut);   // ver2366: 속도 연동 들어가기
+      const liveHostForFill = paintIncrementalInkHost(sess, null, sess.shiftLine);
+      const widthState = paintStrokeRadii(outPts, sess.penBaseWidth, sess, 1, liveHostForFill);
+      const radii = widthState.radii;
       // ver1247: shared with conte's whole-path branch — this is where 原画 gained textured tips.
       // ver1337: genga의 이 버퍼는 용지 크기 그대로라 원점이 (0,0) — 그레인이 용지에 고정된다
       // ver1343: alphaFor는 세션의 정본 필드(pressure/pressureAlpha)로 판정 — tip 유무와 독립이므로
       // 원형 dab(팁 미등록)도 筆圧→不透明度를 받는다.
       // ver1699: Shift 직선이면 증분 세션을 넘기지 않는다 — 점이 늘 두 개라 세션이 「새로 찍을 것이
       // 없다」로 읽어 첫 프레임에서 굳는다(콘티 미리보기와 같은 이유, 같은 줄에서 함께 고쳤다).
-      const liveHostForFill = paintIncrementalInkHost(sess, null, sess.shiftLine); // ver1711: 판정 커널 공용 (펜 세션이라 도형 인자는 없다 — 도형은 gengaShapeRedraw 가 따로 처리하고 두 세션은 겹치지 않는다)
-      paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess) }); // ver1335/1337/1343/1355/1356/1625 // ver1697: outPts // ver1699: liveHost // ver1710: mixBase — Shift 직선(liveHost=null)도 아래 색을 본다 // ver1784: flow // ver2393
+      paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess) });
       b.restore();
       // ver1617: 2値化+팁·종이결. 도형이 쓰는 그 함수와 그 rect 최적화를 그대로 쓴다(gengaShapeRedraw
       // 참고) — 용지 전체를 임계화하면 원화에서 1회 4.17ms 라 스캔 영역으로 좁히는 것이 그 자리의 규칙이다.
@@ -106760,14 +106781,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 획(2점 이상)의 머리는 캡 값이 맞다(시작 원값 dab 이 「동그라미」로 들키던 자리).
       if (src.length === 1 && sess.pFirstRaw != null) src = [{ x: src[0].x, y: src[0].y, p: sess.pFirstRaw, t: src[0].t, a: src[0].a }];
       const base = Math.max(0.5, Number(sess.penBaseWidth) || 1);
-      // **굵기의 정본은 화면에 그린 것과 같은 커널이어야 한다.** 아웃라인 렌더(gengaPenOutlineRedraw)가
-      // 부르는 바로 그 두 함수를 그대로 부른다 — 여기서 자체 계산을 하면 「그린 것과 저장된 것」이
-      // 갈린다(ver1345 가 pen* 방언으로 겪은 사고와 같은 종류다).
-      const radii = paintVariableWidthRadii(src, base, function(p, t) {
-        return paintPressureWidthFactor(sess, p, t);
-      }, 1); // ver2362: 아웃라인 렌더와 같은 인자(=1, 필압 EMA 없음) — 그린 것과 저장된 w 가 같아야 한다
-      const vecTaper = paintStrokeTaperOf(sess);   // ver2359: 入り抜き도 같은 사슬 — 안 곱으면 그린 것과 저장된 w 가 갈린다
-      paintTaperRadii(src, radii, Math.max(vecTaper.tIn, paintSpeedTaperInLen(sess, src)), vecTaper.tOut);   // ver2366: 속도 연동 들어가기 — 같은 사슬
+      // 라이브와 같은 굵기·들어가기/빼기 계산으로 저장할 폭을 얻는다.
+      const radii = paintStrokeRadii(src, base, sess, 1, null).radii;
       const pts = [];
       for (let i = 0; i < src.length; i++) {
         const p = src[i];
