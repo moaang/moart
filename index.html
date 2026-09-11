@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2491</title>
+  <title>MoArt ver2492</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24427,6 +24427,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2492, items: [{ ja: '実時間の動画出力で描画完了を待ってから次へ進むようにし、描画失敗時は録画を終了してエラーを表示します。再生時の描画失敗も通常のプレビューへ復帰します。', ko: '실시간 동영상 출력이 렌더 완료를 기다려 진행하고, 렌더 실패 시 녹화를 정리한 뒤 오류를 알립니다. 재생 중 렌더 실패도 기존 프리뷰로 복구합니다.', en: 'Real-time video export now waits for frame rendering and stops with an error if rendering fails. Playback rendering failures return to the regular preview.', zh: '实时视频导出现等待画面渲染完成后继续，渲染失败时结束录制并报错。播放渲染失败时也会恢复到常规预览。' }] },
       { ver: 2490, items: [{ ja: '透明色の消去と原画のフォーカス喪失時の描画取消を修正しました。画像取り込み・貼り付けは取消や対象変更後の結果を破棄し、読み込み失敗時も元の絵を保ちます。', ko: '투명색 지우기와 원화의 포커스 해제 시 그리기 취소를 수정했습니다. 이미지 가져오기·붙여넣기는 취소나 대상 변경 뒤의 결과를 폐기하고, 읽기 실패 때 기존 그림을 보존합니다.', en: 'Fixed transparent erasing and animation drawing cancellation on focus loss. Image imports and pastes now discard canceled or stale results and preserve existing drawings when reading fails.', zh: '修复透明色擦除和原画失去焦点时的绘制取消。图像导入和粘贴会丢弃取消或目标变更后的结果，并在读取失败时保留原图。' }] },
       { ver: 2489, items: [{ ja: '最近の変更を点検し、未使用の処理と古い開発資料を整理しました。描画・保存の動作は変更していません。', ko: '최근 변경을 점검하고 미사용 처리와 낡은 개발 자료를 정리했습니다. 그리기·저장 동작은 유지합니다.', en: 'Reviewed recent changes and removed unused code and outdated development notes. Drawing and saving behavior is unchanged.', zh: '检查近期修改并清理未使用的处理和过时开发资料。绘画与保存行为保持不变。' }] },
       { ver: 2488, items: [{ ja: 'アニメーション塗りの領域計算を軽くし、水彩境界の一時画像を減らしました。描画結果は維持しています。', ko: '애니메이션 채색의 영역 계산을 줄이고 수채 경계의 임시 이미지를 줄였습니다. 그려지는 결과는 유지합니다.', en: 'Reduced region calculations for animation fill and temporary images for watercolor edges, preserving the rendered result.', zh: '减少动画填色的区域计算和水彩边缘的临时图像，保持绘制结果不变。' }] },
@@ -45059,6 +45060,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }, PREVIEW_BUDGET_MS.compositorLift);
     }
 
+    function failPlaybackCompositor(error) {
+      console.error('[playbackCompositor] broken — falling back to the DOM pipeline for this session', error);
+      state.playbackCompositorBroken = true;
+      const canvas = playbackCompositorCanvasEl();
+      if (canvas) {
+        canvas._compositorPending = false;
+        canvas.classList.remove('active');
+        canvas.dataset.compositorDrawn = '';
+        canvas.dataset.compositorDrawKey = '';
+      }
+    }
+
     function renderPlaybackCompositorFrame(totalFrames) {
       try {
         const stageEl = document.getElementById('conteVideoStage');
@@ -45077,6 +45090,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           canvas.className = 'video-playback-compositor-canvas';
           screen.appendChild(canvas);
         }
+        // The pending draw owns this canvas until completion; never overlap renderers on it.
+        if (canvas._compositorPending) return true;
         // Genga rule: draw only when every bitmap of the current cut is DECODED — never a blank.
         // Missing ones start loading now; meanwhile the canvas keeps showing its previous frame.
         const entries = layerDrawingEntriesForCut(state.project, slot.cut.id);
@@ -45124,10 +45139,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // The rAF tick runs ~60fps but content is 24fps — skip the blit entirely when nothing that
         // feeds this frame changed (same frame index -> same base composite AND same overlays).
         // Rounded like the compositor's own `f` so fractional playhead values still dedupe.
-        const drawKey = Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0)) + '|' + layersSig + '|' + outWidth;
+        const frame = Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0));
+        const drawKey = frame + '|' + layersSig + '|' + outWidth;
         if (canvas.dataset.compositorDrawn === '1' && canvas.dataset.compositorDrawKey === drawKey) return true;
-        // With a complete image cache the compositor body never awaits -> this draw runs synchronously.
-        renderConteVideoFrameToCanvas(canvas, state.videoPlayheadFrames, {
+        // A complete cache avoids decode waits, but async renderer errors still reject its Promise.
+        const project = state.project;
+        canvas._compositorPending = true;
+        const rendering = renderConteVideoFrameToCanvas(canvas, state.videoPlayheadFrames, {
           outWidth: outWidth,
           cache: cache,
           subtitle: false,  // subtitles remain an export feature
@@ -45136,22 +45154,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                             // colliding with the DOM location tag and diverging from the paused look
           cutInfo: false    // ver2274: 화면 쪽 표시/비표시는 아직 배선하지 않았다 — 출력 전용
         });
-        canvas.dataset.compositorDrawn = '1';
-        canvas.dataset.compositorDrawKey = drawKey;
-        if (!canvas.classList.contains('active')) canvas.classList.add('active');
-        if (state.playbackCompositorHideRaf) {
-          window.clearTimeout(state.playbackCompositorHideRaf);
-          state.playbackCompositorHideRaf = 0;
-        }
+        Promise.resolve(rendering).then(function() {
+          canvas._compositorPending = false;
+          if (state.project !== project || !canvas.isConnected || !playbackCompositorEligible()) return;
+          if (frame !== Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0))) {
+            renderVideoPreview(totalFrames);
+            return;
+          }
+          canvas.dataset.compositorDrawn = '1';
+          canvas.dataset.compositorDrawKey = drawKey;
+          canvas.classList.add('active');
+          if (state.playbackCompositorHideRaf) {
+            window.clearTimeout(state.playbackCompositorHideRaf);
+            state.playbackCompositorHideRaf = 0;
+          }
+        }).catch(function(error) {
+          canvas._compositorPending = false;
+          if (state.project !== project || !canvas.isConnected) {
+            console.warn('[playbackCompositor] discarded render failed', error);
+            return;
+          }
+          failPlaybackCompositor(error);
+          renderVideoPreview(totalFrames);
+        });
         return true;
       } catch (error) {
-        // Any failure drops permanently back to the DOM pipeline for this session (P0+P1 still apply).
-        console.error('[playbackCompositor] broken — falling back to the DOM pipeline for this session', error); // ver750 (fix_design P3-B): the breaker itself is by design; only the SILENCE was the bug
-        state.playbackCompositorBroken = true;
-        try {
-          const el = playbackCompositorCanvasEl();
-          if (el) el.classList.remove('active');
-        } catch (cleanupError) { console.warn('[playbackCompositor] 폴백 정리 실패 — 컴포지터 캔버스가 화면에 남을 수 있다', cleanupError); }
+        failPlaybackCompositor(error);
         return false;
       }
     }
@@ -84764,49 +84792,72 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       await spec.renderFrame(canvas, startFrame);
 
       let audioCtx = null, audioDest = null, prepared = null, audioClips = 0;
-      if (spec.audio && spec.audio.prepare) {
-        try {
-          const AC = window.AudioContext || window.webkitAudioContext;
-          if (AC) {
-            audioCtx = new AC();
-            await audioCtx.resume().catch(function() {});
-            audioDest = audioCtx.createMediaStreamDestination();
-            prepared = await spec.audio.prepare(audioCtx, onStatus);
-          }
-        } catch (e) { audioCtx = null; audioDest = null; prepared = null; }
-      }
-
-      const stream = canvas.captureStream(fps);
-      if (audioDest) audioDest.stream.getAudioTracks().forEach(function(tr) { stream.addTrack(tr); });
+      let stream = null, recorder = null, stopped = null, started = false, failure = null;
       const mime = pickVideoExportMime();
-      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
       const chunks = [];
-      recorder.ondataavailable = function(event) { if (event.data && event.data.size) chunks.push(event.data); };
-      const stopped = new Promise(function(resolve) { recorder.onstop = resolve; });
-      state.videoExportCancel = false;
-      recorder.start(1000);
-      const startT = performance.now();
-      if (audioCtx && audioDest && spec.audio && spec.audio.start) {
-        try { audioClips = Number(spec.audio.start(audioCtx, audioDest, audioCtx.currentTime + 0.12, prepared)) || 0; } catch (e) {}
-      }
-      await new Promise(function(resolve) {
-        function tick() {
-          if (state.videoExportCancel) { resolve(); return; }
-          const frame = startFrame + Math.floor((performance.now() - startT) / 1000 * fps);
-          if (frame >= endFrame) {
-            spec.renderFrame(canvas, endFrame - 1);
-            resolve(); return;
+      try {
+        if (spec.audio && spec.audio.prepare) {
+          try {
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (AC) {
+              audioCtx = new AC();
+              await audioCtx.resume();
+              audioDest = audioCtx.createMediaStreamDestination();
+              prepared = await spec.audio.prepare(audioCtx, onStatus);
+            }
+          } catch (error) {
+            // Keep the context and destination owned until finally, including failed preparation.
+            console.warn('[video export] audio preparation failed; recording without audio', error);
+            if (onStatus) onStatus(t('msg.export.audioMixFailed'));
+            prepared = null;
           }
-          spec.renderFrame(canvas, frame);
-          if (onStatus) onStatus(t('msg.export.recording', Math.round((frame - startFrame) / Math.max(1, recFrames) * 100), frame - startFrame, recFrames));
-          requestAnimationFrame(tick);
         }
-        requestAnimationFrame(tick);
-      });
-      await new Promise(function(resolve) { setTimeout(resolve, 300); });
-      try { recorder.stop(); } catch (error) {}
-      await stopped;
-      if (audioCtx) { try { await audioCtx.close(); } catch (e) {} }
+        stream = canvas.captureStream(fps);
+        if (audioDest && prepared) audioDest.stream.getAudioTracks().forEach(function(tr) { stream.addTrack(tr); });
+        recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+        recorder.ondataavailable = function(event) { if (event.data && event.data.size) chunks.push(event.data); };
+        recorder.onerror = function(event) { failure = failure || event.error || new Error('MediaRecorder error'); };
+        stopped = new Promise(function(resolve) { recorder.onstop = resolve; });
+        state.videoExportCancel = false;
+        recorder.start(1000);
+        started = true;
+        const startT = performance.now();
+        if (audioCtx && audioDest && prepared && spec.audio && spec.audio.start) {
+          try { audioClips = Number(spec.audio.start(audioCtx, audioDest, audioCtx.currentTime + 0.12, prepared)) || 0; }
+          catch (error) {
+            console.warn('[video export] audio start failed; recording without audio', error);
+            if (onStatus) onStatus(t('msg.export.audioMixFailed'));
+          }
+        }
+        while (!state.videoExportCancel) {
+          await new Promise(function(resolve) { requestAnimationFrame(resolve); });
+          if (failure) throw failure;
+          if (state.videoExportCancel) break;
+          // Retain real-time timing: a slow renderer may skip elapsed frames, never overlap them.
+          const frame = startFrame + Math.floor((performance.now() - startT) / 1000 * fps);
+          await spec.renderFrame(canvas, Math.min(frame, endFrame - 1));
+          if (frame >= endFrame) break;
+          if (onStatus) onStatus(t('msg.export.recording', Math.round((frame - startFrame) / Math.max(1, recFrames) * 100), frame - startFrame, recFrames));
+        }
+        await new Promise(function(resolve) { setTimeout(resolve, 300); });
+      } catch (error) {
+        failure = failure || error;
+      } finally {
+        try {
+          if (started) {
+            if (recorder.state !== 'inactive') recorder.stop();
+            await stopped;
+          }
+        } catch (error) { failure = failure || error; }
+        const tracks = new Set(stream ? stream.getTracks() : []);
+        if (audioDest) audioDest.stream.getTracks().forEach(function(track) { tracks.add(track); });
+        tracks.forEach(function(track) { track.stop(); });
+        if (audioCtx) {
+          try { await audioCtx.close(); }
+          catch (error) { console.warn('[video export] audio cleanup failed', error); failure = failure || error; }
+        }
+      }
+      if (failure) throw failure; // Existing export-dialog error owner reports it; no incomplete download.
       const blob = new Blob(chunks, { type: mime || 'video/webm' });
       // ver1560: 확장자는 **실제로 잡힌 컨테이너**를 따른다 — mp4 로 녹화하고 .webm 으로 저장하면
       // 파일이 열리지 않는 곳이 있다.
