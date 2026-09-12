@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2508</title>
+  <title>MoArt ver2509</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24567,6 +24567,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2509, items: [
+        { ja: '固定FXのメモをタイムシートのヘッダー下に表示します。プレビューとシート画像出力に同じ内容を反映します。', ko: '고정 FX 메모를 타임시트 헤더 아래에 표시합니다. 미리보기와 시트 이미지 출력에 같은 내용을 반영합니다.', en: 'Static FX memos now appear below the timesheet header in both the preview and sheet image output.', zh: '固定效果备注现在会显示在摄影表页眉下方，预览与摄影表图像输出内容一致。' }
+      ] },
       { ver: 2508, items: [
         { ja: 'キーのない固定FXもタイムシートのメモに出力します。描画中に下のレイヤーのFXが用紙の縁で切れる問題を修正しました。', ko: '키 없는 고정 FX도 타임시트 메모로 출력합니다. 그리는 중 아래 레이어 FX가 용지 가장자리에서 잘리는 문제를 수정했습니다.', en: 'Unkeyed static effects now appear in timesheet memos. Fixed lower-layer effects being clipped at the paper edge during drawing.', zh: '无关键帧的固定效果现在也会输出到摄影表备注。修复绘制时下方图层效果在纸张边缘被裁切的问题。' },
         { ja: '保存設定にブラウザー保存の保持状態を表示し、原画の保存データが見つからない場合は通知します。', ko: '저장 설정에 브라우저 저장 유지 상태를 표시하고, 원화 그림의 저장 데이터를 찾지 못하면 알립니다.', en: 'Storage settings now show browser retention status and notify you when saved animation drawing data is missing.', zh: '存储设置现在显示浏览器存储保留状态，并在找不到原画绘图数据时通知您。' }
@@ -86543,6 +86546,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const page = Math.max(0, Math.round(Number(pageIndex) || 0));
       const svg = document.createElementNS(GENGA_TS_NS, 'svg');
       renderTimesheetKernel(svg, gt, {
+        fxMemos: gengaBuildStaticFxMemos(gt),
         nameParts: { work: parts.work, ep: parts.ep, cut: String(ownerCut.cutNo || '') },
         sheetAuthor: projectSheetAuthor(project), // ver1748: 콘티 CT 시트도 같은 값을 쓴다
         title: project.title, currentFrame: page * timesheetPageFramesFor(gt) + 1, syncPlayhead: false, applyZoom: false,
@@ -86560,6 +86564,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const page = Math.max(0, Math.round(Number(pageIndex) || 0));
       const svg = document.createElementNS(GENGA_TS_NS, 'svg');
       renderTimesheetKernel(svg, gt, {
+        fxMemos: gengaBuildStaticFxMemos(gt),
         nameParts: { work: parts.work, ep: parts.ep, cut: String(parts.cut || '') },
         sheetAuthor: projectSheetAuthor(project), // ver1748
         title: project.title, currentFrame: page * timesheetPageFramesFor(gt) + 1,
@@ -95411,7 +95416,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!svg) return;
       const gt = state.project && state.project.gengaTimeline;
       if (!(state.project && state.project.kind === 'genga') || !gt) { svg.innerHTML = ''; return; }
-      renderTimesheetKernel(svg, gengaTimesheetLiveGt(gt), {
+      const liveGt = gengaTimesheetLiveGt(gt);
+      renderTimesheetKernel(svg, liveGt, {
+        fxMemos: gengaBuildStaticFxMemos(liveGt),
         nameParts: state.project.nameParts, title: state.project.title,
         currentFrame: gengaCurrentFrame(), syncPlayhead: true, applyZoom: true
       });
@@ -95426,6 +95433,43 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // `.order.length` 라 판까지 셌고, 위 주석이 적은 「≤ 10 cels」와 코드가 갈려 있었다.
       const nCel = gengaSheetRowLabels(gt).cels.length;
       return nCel > 10 ? 72 : 144;
+    }
+    // Auto Sheet layoutAutoTextMemos: 18px, half-width wrapping, down then right, 12/8px gaps.
+    // This read-only sheet has no authored memo boxes; BG/BOOK tags are its fixed obstacles.
+    // Measure off-DOM so detached export SVGs and the visible preview use identical geometry.
+    function timesheetFxMemoLayout(texts, gap, obstacles) {
+      if (!texts.length) return [];
+      const ctx = document.createElement('canvas').getContext('2d');
+      // A crowded sheet scales the whole list instead of restarting at the top and covering earlier notes.
+      // Tags occupy narrow strips, so finite input always fits as the text and spacing shrink together.
+      for (let scale = 1; ; scale *= 0.85) {
+        const size = 18 * scale, inset = 6 * scale, rowGap = 8 * scale, colGap = 12 * scale;
+        ctx.font = '600 ' + size + 'px Arial, Helvetica, sans-serif';
+        const result = [];
+        let x = gap.x, y = gap.y, colW = 0, fits = true;
+        for (const value of texts) {
+          const w = Math.max(48 * scale, Math.min(Math.ceil(ctx.measureText(value).width) + 16 * scale, gap.w / 2));
+          const lines = [];
+          let part = '';
+          for (const ch of value) {
+            if (part && ctx.measureText(part + ch).width > w - inset * 2) { lines.push(part); part = ''; }
+            part += ch;
+          }
+          lines.push(part);
+          const h = Math.max(26 * scale, size * 1.5 * lines.length + 10 * scale);
+          for (;;) {
+            if (y + h > gap.y + gap.h) { x += Math.max(colW, w) + colGap; colW = 0; y = gap.y; }
+            if (x + w > gap.x + gap.w) { fits = false; break; }
+            const hit = obstacles.find(function(box) { return x < box.x + box.w && x + w > box.x && y < box.y + box.h && y + h > box.y; });
+            if (!hit) break;
+            y = hit.y + hit.h + rowGap;
+          }
+          if (!fits) break;
+          result.push({ x: x, y: y, w: w, h: h, size: size, lines: lines });
+          colW = Math.max(colW, w); y += h + rowGap;
+        }
+        if (fits) return result;
+      }
     }
     // Shared kernel: draws one gengaTimeline-shaped `gt` onto `svg` (the 72-row Auto-Sheet-style exposure
     // sheet — cel-token columns, Dialog header, camera lanes). Used by both genga's live panel (gt =
@@ -95686,7 +95730,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       svg.removeAttribute('width'); svg.removeAttribute('height'); // CSS scales the page to the panel
       if (meta.applyZoom !== false) gengaTimesheetApplyZoom(svg); // ver1208: Ctrl+wheel zoom, re-applied after every redraw
       rect(0, 0, PAGE_W, PAGE_H, 'none', 0, '#fff');
-      // header band: structural 7-field form filled read-only from the project (input/CSV/memo chrome intentionally dropped)
+      // Header fields and derived FX memos are read-only; editing controls stay in the project/FX UI.
       const np = meta.nameParts || {};
       const hx = 60, hy = 52, hh = 120, hEp = hx + 140, hTi = hEp + 610, hCu = hTi + 220, hDu = hCu + 220, hNa = hDu + 260, hEnd = hNa + 186;
       rect(hx, hy, hEnd - hx, hh, '#111', 1);
@@ -95699,6 +95743,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver1766/1767 で下敷きを敷いても `70%` が読めなかったのはこれが理由（ユーザー指摘「퍼센트 아직
       // 뒤에 있어보이는데」）。下敷きを厚くしても順序が後なら勝てない。
       const camLift = [];
+      const memoObstacles = [];
       // ver1798: BG·BOOK 의 네임태그. #sheet `renderLayerNameTagShape` 를 그대로 옮겼다 — 꼬리 달린 흰 말풍선에
       //   글자를 **세로로** 쌓고, 붙는 자리는 「스택에서 그 바로 아래 셀」의 **오른쪽 경계**(#sheet `snap:'right'`).
       //   자리는 셀 라벨 행 위이고, 헤더 밴드(y 52~172)와 셀 칸(y 450~) 사이가 비어 있어 그대로 들어간다.
@@ -95741,6 +95786,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 헤더 밴드(y 52~172)를 침범하지 않게 붙든다. 넷 이상 쌓이면 여기서 겹치는데, 그건 칸이 모자란
         // 것이지 배치가 틀린 게 아니다 — 겹치더라도 **가리키는 자리는 그대로**다.
         const y = Math.max(180, bottom - h), x = bx + (ci + 1) * cellW - w / 2, tipX = x + w / 2;
+        memoObstacles.push({ x: x - 6, y: y - 6, w: w + 12, h: h + 12 });
         const bodyH = tail ? (h - PLATE_TAG_TIP) : h;       // 꼬리를 뺀 몸통 높이
         const body = y + bodyH;                             // 몸통 아래 변
         node('path', {
@@ -96151,6 +96197,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const drawnByPrevBlock = (bStart > 1 && dur === bStart - 1);
         if (dur >= bStart - 1 && !drawnByPrevBlock) line(b.x, yOut, b.x + b.w, yOut, RED, SHEET_DURATION_BOUNDARY_STROKE);
       });
+      // Same first-page text as memo.textPages['0'] in the Auto Sheet JSON; never persist layout.
+      if (page === 0) {
+        const memos = meta.fxMemos || [];
+        const gap = { x: hx, y: hy + hh + 18, w: PAGE_W - hx * 2, h: TOP - 18 - (hy + hh + 18) };
+        timesheetFxMemoLayout(memos, gap, memoObstacles).forEach(function(memo, index) {
+          const group = node('g', { 'data-ts-fx-memo': index, 'pointer-events': 'none' });
+          memo.lines.forEach(function(value, i) {
+            const label = node('text', { x: memo.x + memo.size / 3, y: memo.y + memo.size * (8 / 18 + 0.65 + i * 1.25),
+              'font-size': memo.size, 'font-family': 'Arial, Helvetica, sans-serif', 'font-weight': 600,
+              fill: '#111111', 'dominant-baseline': 'middle' });
+            label.textContent = value; group.appendChild(label);
+          });
+        });
+      }
       svg.__tsGeom = { page: page, pageFrames: pageFrames, pageW: PAGE_W, TOP: TOP, NAMEH: NAMEH, ROWH: ROWH, blocks: blocks };
       if (meta.syncPlayhead !== false) gengaTimesheetUpdatePlayhead();
     }
