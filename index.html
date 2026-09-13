@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2516</title>
+  <title>MoArt ver2517</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24584,6 +24584,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2517, items: [
+        { ja: '原画・コンテの筆圧処理を統一しました。筆圧データが一時的に欠けても直前の値を保ち、線幅が急に戻る問題を修正。入力診断も改善しました。', ko: '원화·콘티의 필압 처리를 통일했습니다. 필압 표본이 잠깐 빠져도 직전 값을 유지해 굵기가 갑자기 돌아가는 문제를 수정하고 입력 진단을 보강했습니다.', en: 'Unified pressure handling in Genga and Conte. Missing pressure samples retain the previous value instead of abruptly restoring full width. Improved input diagnostics.', zh: '统一原画与分镜的笔压处理。笔压数据暂时缺失时保留前一数值，避免线宽突然恢复，并改进输入诊断。' }
+      ] },
       { ver: 2516, items: [
         { ja: 'CLIP読み込みに「見た目を優先／レイヤーを維持」を追加。対応する静的フォルダーは合成し、MoArtの一段フォルダー構造を保ちます。', ko: 'CLIP 가져오기에 모양 우선/레이어 유지를 추가했습니다. 지원되는 정적 폴더를 합성하면서 모아트의 한 단계 폴더 구조를 유지합니다.', en: 'CLIP import now offers Appearance or Keep layers. Supported static folders can be composited while keeping MoArt folders flat.', zh: 'CLIP导入新增外观优先/保留图层选项，支持合成静态文件夹，同时保持MoArt的单层文件夹结构。' }
       ] },
@@ -62284,22 +62287,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintStrokeWantsPressure(event) {
       return Boolean(event && event.pointerType === 'pen' && paintUsesPressureBy(paintBrushGet));
     }
+    // 입력 종류와 값 검증은 원화·콘티가 공유한다. 실제 0과 누락(null)을 구분한다.
+    function paintSamplePressure(event) {
+      return event && event.pointerType === 'pen' && Number.isFinite(event.pressure) && event.pressure >= 0
+        ? Math.min(1, event.pressure) : null;
+    }
+    // 획 시작의 설정 스냅샷. 이동 중 입력 종류가 바뀌어도 필압 사용 여부를 다시 정하지 않는다.
+    function paintCreatePressureSettings(event) {
+      const enabled = paintStrokeWantsPressure(event);
+      return { pressure: enabled, pressureSize: enabled && paintPressureSizeOn(),
+        pressureAlpha: enabled && paintPressureAlphaOn(), pressureMin: paintPressureMinSizeVal() / 100,
+        pressureCurvePts: paintBrushGet('pCurvePts'), pressureAlphaCurvePts: paintBrushGet('pAlphaCurvePts'),
+        pressureGain: paintPressureGainMul() };
+    }
+    // 누락 표본은 마지막 정상 출력을 유지한다. 첫 표본이 없으면 기존 중립값 0.5로 시드한다.
+    // pPrev가 필압 사슬의 정본이므로 별도 smoothP 사본이나 누락 때의 새 상승 단계를 만들지 않는다.
+    function paintReadStrokePressure(host, event) {
+      const raw = paintSamplePressure(event);
+      const value = raw == null && host.pPrev != null ? host.pPrev
+        : paintStabilizeAux(host, 'p', raw == null ? 0.5 : raw, PAINT_PRESSURE_RISE_MAX, false);
+      const diag = typeof paintDiagCur === 'undefined' ? null : paintDiagCur;
+      if (diag && event && diag.pointerId === event.pointerId) {
+        diag.pSampleN += 1;
+        if (raw == null) diag.pMissingN += 1;
+        diag.pAppliedMin = Math.min(diag.pAppliedMin, value);
+        diag.pAppliedMax = Math.max(diag.pAppliedMax, value);
+      }
+      return value;
+    }
     function paintAttachPressure(pointObj, sampleEvent, stroke) {
-      // ver625: callers already gate on pointerType==='pen' (paintStrokeWantsPressure), so pressure IS
-      // supported here — a literal 0 (Windows Ink commonly reports this on the first sample) must be
-      // trusted as 0, not silently dropped. Dropping it left points[0].p undefined, and
-      // paintPressureWidthFactor's "no data" fallback (v=0.5) drew a half-width blob at every stroke
-      // start on tablets with a low/narrow pressure range — the desktop counterpart of the genga fix.
-      // ver1356: 0.05 바닥을 걷어냈다 — 바로 위 주석이 "0은 0으로 신뢰해야 한다"고 못박는데 코드는
-      // 0.05로 올리고 있었다(ver637/ver723이 커널 paintPressureCurve에서 걷어낸 바닥값의 마지막 잔재).
-      // 그래서 같은 pressure=0 샘플이 conte에선 굵기 0.05배·농도 0.19, genga에선 보정 자체가 안 걸려
-      // **기저폭 100%·농도 1.0**으로 정반대로 그려졌다. 이제 양쪽 다 0을 그대로 싣고, 바닥은 사용자가
-      // 정한 最小サイズ(paintPressureCurve의 minS)와 렌더러의 물리적 하한(paintVariableWidthRadii의
-      // 0.15px, 2値化의 1px)이 담당한다 — 그게 원래 그 값들이 있는 이유다.
-      if (stroke && stroke.pressure && sampleEvent && typeof sampleEvent.pressure === 'number' && sampleEvent.pressure >= 0) {
-        // ver1640: 원화와 **같은 커널**을 지난다(상태는 stroke 에 산다). 콘티·용지는 그전까지
-        // 스파이크 방어도 손떨림 창도 전혀 없이 raw 를 그대로 실었다.
-        pointObj.p = paintStabilizeAux(stroke, 'p', sampleEvent.pressure, PAINT_PRESSURE_RISE_MAX, false);   // ver2362: 필압은 창 없이(rise-limit 만) — 손떨림은 좌표 전용
+      if (stroke && stroke.pressure && sampleEvent) {
+        pointObj.p = paintReadStrokePressure(stroke, sampleEvent);
       }
       // ver1328 ③ / ver1641: 기울기도 원화와 **같은 커널**을 지난다(상태는 stroke 에 산다).
       // 그전까지 콘티는 raw 를 그대로 실어, 같은 브러시가 원화와 다른 굵기를 냈다.
@@ -62405,11 +62423,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintAttachBrushDynamics(stroke, event, shapeKind, opts) {
       // 기울기를 필압보다 먼저 싣는다 — paintAttachPressure가 paintStrokeUsesTilt로 t 캡처 여부를 정한다.
       paintAttachTilt(stroke);                          // ver1328 ③ · ver2318: 최소치·최대치·곡선 한 벌
+      if (!shapeKind) {
+        const pressureSettings = paintCreatePressureSettings(event);
+        // 콘티 저장 계약: 필압을 쓰지 않는 획에는 필압 필드를 추가하지 않는다.
+        if (pressureSettings.pressure) Object.assign(stroke, pressureSettings, { pRaw: 1 });
+      }
       if (!(opts && opts.plainBrush)) {                   // ver1724: 用紙 메모는 기본 브러시만
         paintAttachTip(stroke);                          // ver1239
         paintAttachPaperTex(stroke);                     // ver1337: 종이결은 팁과 독립(팁 없는 브러시도 거친 종이에 그린다)
         paintAttachWaterEdge(stroke);                    // ver2393: 水彩境界도 팁과 독립
-        paintDiagStart();                                // ver2399
+        paintDiagStart(null, event, stroke);
         paintAttachMix(stroke);                          // ver1625: 혼색 — 팁이 있어야 걸리므로 여기 함께 둔다
         // ver1784: 絵の具量도 이 게이트 안이다. flow 는 팁이 없어도 걸리지만, 用紙 메모 획은
         // paintRenderPageStrokeInto 라는 **별도 경로**로 그려지고 그쪽은 잉크 장을 안 지난다 —
@@ -62425,16 +62448,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // (도형 슬롯이 펜을 상속하는데 도형에서 바꿀 수 없다)은 ver1705(입구)와 ver1706(슬롯 공유)로
       // 사라졌다 — 이제 도형의 붓은 펜의 붓과 같은 것이고, 어느 쪽에서든 바꿀 수 있다.
       if (shapeKind) return;
-      if (!paintStrokeWantsPressure(event)) return;
-      stroke.pressure = true;
-      stroke.pressureSize = paintPressureSizeOn();
-      stroke.pressureAlpha = paintPressureAlphaOn();
-      stroke.pressureMin = paintPressureMinSizeVal() / 100;   // ver623: brush shape captured per stroke
-      stroke.pRaw = 1;                                        // ver2362: 필압을 손떨림에서 분리한 사슬로 그린 획 — 렌더 EMA 없음(paintStrokeEmaKOf 가 1 로 읽는다). stab 은 더 안 싣는다(유일 소비처가 그 EMA 였다). 옛 획은 stab/부재 규칙 그대로 — ver2328 의 「만든 시점으로 고정」 계약 유지
-      // ver2317: `pressureGamma` 를 안 싣는다(감마 단계 삭제) — 커널이 1 로 읽고, 저장된 옛 획은 자기 값을 그대로 쓴다.
-      stroke.pressureCurvePts = paintBrushGet('pCurvePts');   // ver1622
-      stroke.pressureAlphaCurvePts = paintBrushGet('pAlphaCurvePts');
-      stroke.pressureGain = paintPressureGainMul();           // ver626: device calibration (ver2255: 정본 한 벌)
+      if (!stroke.pressure) return;
       paintAttachPressure(stroke.points[0], event, stroke);
     }
     // ver1625: 혼색을 스트로크(genga 는 세션)에 싣는다. paintAttachTip / paintAttachPaperTex 와 같은
@@ -67079,10 +67093,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintDiagOn = false;
     let paintDiagCur = null;    // 그리는 중인 획의 누적
     let paintDiagLast = null;   // 마지막으로 끝난 획
-    function paintDiagStart(start) {
+    function paintDiagStart(start, event, stroke) {
       if (!paintDiagOn) { paintDiagCur = null; return; }
       paintDiagCur = { t0: start ? start.t0 : performance.now(), frames: 0, fillMs: 0, fillMax: 0, dabs: 0, boxes: [],
                        pMin: 2, pMax: -1, tiltMax: 0, azSeen: false, ptType: '', pts: 0,
+                       pointerId: event ? event.pointerId : null, downPointerType: event ? event.pointerType : '',
+                       pressureEnabled: !!(stroke && stroke.pressure), pressureSize: !!(stroke && stroke.pressureSize),
+                       pressureAlpha: !!(stroke && stroke.pressureAlpha), pSampleN: 0, pMissingN: 0,
+                       pTypeMismatchN: 0, pAppliedMin: 2, pAppliedMax: -1,
                        // ver2418: **프레임 «간격»과 move 수.** fill 이 짧아도 프레임이 안 오면 선이 늦다 —
                        //   그 둘은 다른 명제라 fill ms 만으로는 「그리는 중 화면이 멈춘다」를 못 가른다
                        //   (합성기·GPU 몫은 JS 함수 시간에 안 잡힌다 — perf-groundtruth 의 rAF 간격 규칙).
@@ -67097,15 +67115,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                        cellsN: start ? start.cellsN : null, storeMB: start ? start.storeMB : 0,
                        // ver2429 A: 실제 펜다운의 시드 구간을 직접 잰 값. 이전 획의 비동기 보고와 무관하다.
                        seedMs: start ? start.seedMs : null };
+      if (event) paintDiagSample(event); // document 캡처보다 늦게 시작하므로 down은 여기서 기록한다.
     }
     function paintDiagSample(ev) {
       // ver2399: 골든은 함수를 «잘라서» 돌린다 — 이 함수만 실려 오고 위 `let` 이 안 오면
       //   참조 자체가 예외가 되므로 typeof 로 먼저 막는다(진단은 없어도 그리기는 돌아야 한다).
       if (typeof paintDiagCur === 'undefined') return;
-      const c = paintDiagCur; if (!c || !ev) return;
+      const c = paintDiagCur; if (!c || !ev || (c.pointerId != null && c.pointerId !== ev.pointerId)) return;
       // ver2418: 이 리스너는 pointerdown 에도 걸려 있다(paintObservePressure) — move 만 센다.
       if (ev.type === 'pointermove') c.moveN += 1;
       c.ptType = ev.pointerType || '';
+      if (c.downPointerType && c.ptType !== c.downPointerType) c.pTypeMismatchN += 1;
       const p = Number(ev.pressure);
       if (Number.isFinite(p)) { if (p < c.pMin) c.pMin = p; if (p > c.pMax) c.pMax = p; }
       const tx = Number(ev.tiltX) || 0, ty = Number(ev.tiltY) || 0;
@@ -67165,14 +67185,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintDiagReport(c, endT0) {
       const b = paintBrushGet;
-      // ver2400: **수치 옆에 «그래서 무엇을 해야 하는가»를 붙인다.** 첫 판은 「필압 0.36~0.57」까지만
-      //   찍었는데, 그것이 **기기가 범위를 다 안 준다**는 뜻이고 感度 보정으로 펴진다는 것을 아는 사람만
-      //   읽을 수 있었다(제보자는 그 줄을 보고도 무엇을 할지 알 수 없었다). 진단은 판정까지 해야 쓸모가 있다.
+      // 관측 범위는 장치의 최대 능력이 아니다. 누락·입력 종류 변경·고정값에는 감도 제안을 붙이지 않는다.
       const gainHint = (function() {
-        if (c.pMax < 0) return '';
+        if (c.ptType !== 'pen' || c.pMax <= c.pMin || c.pMissingN || c.pTypeMismatchN) return '';
         const g = paintSuggestedPressureGain();
         if (!g) return '';
-        return ' → 感度 ' + g + '% 권장(環境設定>入力) — 지금 기기가 0~1 중 ' + Math.round(c.pMax * 100) + '% 까지만 준다';
+        return ' → 感度 ' + g + '% 참고(관측 범위 기준 · 環境設定>入力)';
       })();
       // dab 이 프레임보다 훨씬 많으면 렌더가 입력을 못 따라간 것이다 — 그 사실도 말해 준다.
       const slowHint = (c.frames > 0 && c.fillAvg > 16.7)
@@ -67219,6 +67237,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         + (b('tipId') ? '·팁' : '·원') + (b('paperTexId') ? '·결' : '') + (b('pAlpha') ? '·筆圧α' : '');
       const line = '입력 ' + (c.ptType || '?') + ' · 필압 ' + (c.pMax < 0 ? '없음' : (c.pMin.toFixed(2) + '~' + c.pMax.toFixed(2)))
         + gainHint
+        + ' · 시작 ' + (c.downPointerType || '?') + ' · 필압 사용 ' + (c.pressureEnabled ? 'ON' : 'OFF')
+        + (c.pressureEnabled ? '(굵기 ' + (c.pressureSize ? 'ON' : 'OFF') + '·농도 ' + (c.pressureAlpha ? 'ON' : 'OFF') + ')' : '')
+        + ' · 판독 ' + c.pSampleN + '/누락 ' + c.pMissingN + '/입력종류변경 ' + c.pTypeMismatchN
+        + ' · 처리 압력 ' + (c.pAppliedMax < 0 ? '없음' : c.pAppliedMin.toFixed(2) + '~' + c.pAppliedMax.toFixed(2))
         + ' · 기울기 ' + c.tiltMax.toFixed(0) + '° · 방위 ' + (c.azSeen ? '있음' : '없음')
         + (c.cellsN === null ? '' : ' | 칸 ' + (c.cellsN === -1 ? '미확인' : (c.cellsN < 0 ? '?' : c.cellsN)) + ' · 상주 ' + c.storeMB.toFixed(0) + 'MB')   // ver2429: 원화 x 축
         + ' | 지연 ' + (c.lagMs < 0 ? '?' : c.lagMs.toFixed(0)) + 'ms'
@@ -107362,7 +107384,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       paintAttachTip(gengaDrawSession);
       paintAttachPaperTex(gengaDrawSession);
       paintAttachWaterEdge(gengaDrawSession);   // ver2393
-      paintDiagStart(diagStart);   // ver2429 A: 도형도 같은 시드 구간
+      paintDiagStart(diagStart, ev, gengaDrawSession);
       paintAttachMix(gengaDrawSession);
       paintAttachFlow(gengaDrawSession);   // ver1784
       paintAttachTaper(gengaDrawSession);  // ver2359: 入り抜き — 세션도 같은 정본 필드 이름을 쓴다(ver1345 규격)
@@ -107392,25 +107414,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const { layer, frame, p, pw, ph, cv, c, activeDr, seedRect, scanEligible, diagStart } = target;
       const pxStamp = paintToolBinarizeOn(state.paintTool === 'eraser' ? 'eraser' : 'pen') ? paintPixelStampRows(c.lineWidth) : null; // 2値化 on → hard-edged pixel stamping (ver617: eraser has its own key / ver2433: 透明色 펜은 펜의 설정을 읽는다)
       const penOpacity = paintBrushOpacityVal(); // ver609 brush settings (shared with conte)
-      const penPressure = paintStrokeWantsPressure(ev);
-      const penPressureSizeOnNow = penPressure && paintPressureSizeOn();
-      // ver616: pressure width factor 0.25..1.0, driven by a SMOOTHED pressure (EMA). Smoothing kills the
-      // Apple-Pencil "ink pooling": (1) the START dot used the full base width regardless of pressure — a
-      // fat blob at every stroke start; now it follows the pointerdown pressure. (2) the pen-LIFT sample
-      // spikes pressure high — a single spike barely moves the EMA, so no blob at the end either.
-      // ver623: brush shape (最小サイズ + 筆圧カーブ) — same mapping as the conte stroke fields
-      // ver626: 感度 (gain) — device pressure-range calibration, applied before min/gamma
-      const penMinS = paintPressureMinSizeVal() / 100;
-      const penGain = paintPressureGainMul(); // ver2255: 브러시 미리보기·필압 그래프와 같은 한 벌
-      // ver625: the #pen HUD (removed in ver1327) caught the real cause of the remaining desktop pooling — Windows Ink often
-      // reports a literal pressure of 0 on the very first sample (a known driver quirk, distinct from
-      // Apple Pencil's END spike that ver616 handled). The OLD `> 0 ? … : 0.5` fallback treated that 0
-      // as "device has no pressure" and substituted a hardcoded HALF-width dot — but this whole branch
-      // only runs when pointerType IS 'pen' (penPressureSizeOnNow already gates on it), so pressure
-      // genuinely IS supported; on tablets with a narrow/low pressure curve (this user's stream topped
-      // out at ~0.11) a 0.5 fallback is 5-10x fatter than the rest of the stroke — exactly a start blob.
-      // Trust the literal reported value (0 included); only a true non-number (NaN/undefined) falls back.
-      const downPressure = (ev.pointerType === 'pen' && typeof ev.pressure === 'number' && ev.pressure >= 0) ? Math.min(1, ev.pressure) : 0.5;
+      const pressureSettings = paintCreatePressureSettings(ev);
+      const downPressure = paintSamplePressure(ev) ?? 0.5;
       // ver1345: 기울기·방위의 pointerdown 값. 방위는 실제로 쓸 때만 읽는다 — 팁이 등록돼 있고
       // 追従이 '方位'일 때. (팁은 아래 paintAttachTip이 세션에 심지만 그건 이 리터럴 다음이라,
       // conte 빌더들과 마찬가지로 스토어를 직접 본다.)
@@ -107425,7 +107430,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // stamp path (already doing per-segment widths via pxStampCache) draws the FINAL pixels live,
       // killing the rejected "semi-transparent AA live → binarize at commit" behavior (pen AND eraser).
       // ver1338: 등록된 팁이 있으면 필압 설정과 무관하게 아웃라인(=whole-path) 모드로 간다. 팁이
-      // penPressureSizeOnNow에만 매여 있어서 筆圧→不透明度를 켜면 팁이 사라지던 버그의 수정 지점.
+      // 크기 필압에만 매여 있어서 筆圧→不透明度를 켜면 팁이 사라지던 버그의 수정 지점.
       // pxStamp(2値化)는 그대로 제외 — 그쪽은 픽셀 스탬프 렌더러가 따로 있다.
       // ver1343: 筆圧→不透明度(pAlpha)도 이제 아웃라인을 강제한다 — 전에는 `!(...pAlpha)`가 알파-온
       // 스트로크를 여기서 밀어내 세그먼트 폴백(gengaPreviewPointerMove)으로 보냈는데, 그 경로는 매 세그먼트를
@@ -107438,11 +107443,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       //   버퍼 진입 조건에는 넣었지만 아래 렌더러 분기는 여전히 이 변수 단독 판정이라 반쪽이었다.
       //   세션이 아직 없으므로 같은 필드를 담은 probe를 만들어 넘긴다(스토어를 읽는 attach 두 함수는
       //   세션에도 같은 값을 심으므로 판정과 실제 렌더가 어긋날 수 없다).
-      const penWholeProbe = {
-        pressure: penPressure,
-        pressureSize: penPressureSizeOnNow,
-        pressureAlpha: penPressure && paintPressureAlphaOn()
-      };
+      const penWholeProbe = { ...pressureSettings };
       // ver2254 (C19): **이 프로브는 판정식이 읽는 필드만 싣는다** — 세션이 아니라 「어느 렌더러로
       // 갈지」를 묻는 표본이다. 그래서 `paintAttachMix` 가 없는 것이 정상이다(스트로크 짝인
       // paintAttachBrushDynamics 는 넷을 다 싣는다). paintStrokeWantsWholePath 는 혼색을 안 보고,
@@ -107477,30 +107478,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
         binarizeOutline: Boolean(pxStamp && penOutlineMode), // 아웃라인을 굳혀야 하는가
         penBaseWidth: c.lineWidth,
-        // ★ver1342: 공용 커널이 읽는 **정본 이름**을 세션에 싣는다. 여기가 그 세션에서 세 번째로
-        // 같은 사고가 난 지점이었다: genga 세션은 pen* 방언을 쓰고 conte 스트로크는 pressure* 정본을
-        // 쓰는데, 공용 커널(paintPressureAlphaFactor, paintTipOptionsFrom)은 정본만 읽는다 →
-        // 原画에서는 필압 알파가 **영원히 꺼진 값**이었고, ver1340의 검증이 conte 형태 레코드를 쓴
-        // 탓에 통과했다(사용자 보고: "여전히 적용 안 됨"). 어댑터를 만들지 않고 정본을 싣는 이유:
-        // 어댑터는 **다음 커널이 그것을 쓸 것을 기억해야** 하므로 같은 함정이 계속 재발한다.
-        // ★ver1345: 방언을 **완전히 제거**했다. ver1342는 정본을 나란히 싣기만 하고 pen* 쪽을
-        // 남겨서 한 세션에 어휘가 3벌(pen* / 정본 / pressureFactor 클로저) 공존했고, 그 상태가
-        // 이번 판의 굵기 누출(ver1345 ①)을 낳았다 — 세그먼트 루프만 pen*을 읽고 아웃라인 경로는
-        // 제3의 pressureFactor를 읽는 식이었다. 지금은 세션이 정본 한 벌만 들고, 두 경로가 같은
-        // 필드를 읽는다. gengaPressureFactor가 클로저로 잡던 penMinS/penGain은
-        // pressureMin/pressureGain과 **같은 값**이라 치환은 수학적 항등이다(ver2317 에 감마가 빠졌다).
-        pressure: penPressure,
-        pressureSize: penPressureSizeOnNow,
-        pressureAlpha: penPressure && paintPressureAlphaOn(),
-        pressureMin: penMinS,
-        pressureCurvePts: paintBrushGet('pCurvePts'),       // ver1622
-        pressureAlphaCurvePts: paintBrushGet('pAlphaCurvePts'),
-        pressureGain: penGain,
+        ...pressureSettings,
         // ver750 (fix_design P4): 공용 paintStabilizePoint 의 상태(예전엔 여기 인라인 EMA 사본이 있었다).
         // ver1638: 이 `{x, y}` 는 이제 **구조가 아니라 「앵커 좌표 힌트」**다 — 커널이 자기 모양
         // (창 버퍼 + 합)을 스스로 만들면서 이 값을 시드로만 읽는다. 여기서 커널의 내부 모양을 흉내 내면
         // ver1637 처럼 커널이 바뀔 때 조용히 어긋난다(그때 TypeError 로 드러났다).
-        smoothState: { x: p.x, y: p.y }, pxStampCache: {}, smoothP: null, // ver2368: 아래에서 사슬 첫 호출로 채운다 — 어택 시드가 down 에서 심겨야 move1 부터 램프다
+        smoothState: { x: p.x, y: p.y }, pxStampCache: {},
 
         strokeKey: 'g-' + Date.now().toString(36) + '-' + (gengaStrokeSeq += 1), // ver1356: 잉크 세션의 스트로크 신원(conte의 stroke.id에 대응)
         stabScale: gengaPreviewXform ? 1 / Math.max(1e-6, gengaPreviewXform.scale) : 0, // ver1328 ②: paper px per screen px — the rope radius is a screen-space feel
@@ -107527,16 +107510,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       paintAttachTip(gengaDrawSession); // ver1338: 조건 없이 — penOutlineMode 안에 갇혀 있던 것이 버그였다
       paintAttachPaperTex(gengaDrawSession); // ver1337: 아웃라인 모드와 무관 — 종이결은 필압 설정에 안 매인다
       paintAttachWaterEdge(gengaDrawSession); // ver2393
-      paintDiagStart(diagStart);   // ver2429 A: 실제 펜다운에서 잰 이 획의 시드
+      paintDiagStart(diagStart, ev, gengaDrawSession);
       paintAttachMix(gengaDrawSession);      // ver1625: 혼색 — conte 의 paintAttachBrushDynamics 와 같은 정본 필드
       paintAttachFlow(gengaDrawSession);     // ver1784: 絵の具量 — 같은 자리(원화도 같은 dab 커널을 지난다)
       paintAttachTaper(gengaDrawSession);    // ver2359: 入り抜き — 같은 자리
       // ver2368: down 필압도 콘티(paintAttachPressure)와 같은 사슬을 지난다 — 어택 시드가 여기서 심긴다.
       // ver2370: 첫 샘플도 캡을 지나므로(원값은 pFirstRaw 로 보관) down 점·리샘플 시드에도 캡 값을
       // 싣는다 — 원값을 남기면 시작에 원값 dab 이 한 방 찍힌다(「시작 동그라미」 제보의 그 자리).
-      gengaDrawSession.smoothP = paintStabilizeAux(gengaDrawSession, 'p', downPressure, PAINT_PRESSURE_RISE_MAX, false);
-      if (gengaDrawSession.pts && gengaDrawSession.pts.length) gengaDrawSession.pts[0].p = gengaDrawSession.smoothP;
-      if (gengaDrawSession.arc) gengaDrawSession.arc.p = gengaDrawSession.smoothP;
+      const startPressure = paintReadStrokePressure(gengaDrawSession, ev);
+      if (gengaDrawSession.pts && gengaDrawSession.pts.length) gengaDrawSession.pts[0].p = startPressure;
+      if (gengaDrawSession.arc) gengaDrawSession.arc.p = startPressure;
       // ★ver2233: 획 **머리**도 몸통과 같은 한 식으로 굵어진다. 종전에는 여기만 방언이었다 —
       // 곡선을 곱해 반올림하고 그 정수에 틸트를 또 곱해 **두 번 반올림**했고(세그먼트는 ver1356 이,
       // 아웃라인은 ver1345 가 이미 커널 한 번으로 옮겼다), 클로저가 제어점 곡선(pCurvePts, ver1622)
@@ -107707,18 +107690,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           p = paintShiftLineConstrain(penSess, p, ev.shiftKey, { x: penSess.lastX, y: penSess.lastY }, 1, 1);
           if (!p) continue; // 각도가 아직 안 잠겼다
         }
-        // ver616: slew-limit the pressure so a single Apple-Pencil lift-spike can't fatten the tail.
-        // RISES capped per sample; FALLS follow freely (releasing the pen tapers naturally).
-        // ver1356: `> 0` → `>= 0`. 엄격 비교가 **필압 0인 샘플을 "데이터 없음"으로 오해**해서 아래
-        // `rawPressure != null` 게이트가 통째로 막혔고, 그 세그먼트는 굵기·농도 보정을 하나도 못 받아
-        // **기저폭 100%·농도 1.0**으로 찍혔다 — conte(0을 그대로 신뢰)와 정반대. Windows Ink가 첫
-        // 샘플에 0을 흔히 보고하므로 획 머리에 블롭이 생겼다(gengaPreviewPointerDown의 downPressure는 이미
-        // `>= 0`이라 시작점과 이후 샘플이 서로 다른 규칙을 쓰고 있었다).
-        const rawPressure = (sample.pointerType === 'pen' && typeof sample.pressure === 'number' && sample.pressure >= 0) ? Math.min(1, sample.pressure) : null;
-        // ver1640/1641: 손으로 적은 비대칭 slew-limit 을 공용 커널(paintStabilizeAux)로 옮겼다 —
-        // 필압은 상승 제한을 유지하고 이동평균 창은 건너뛴다(paintStabilizeAux의 smoothWin=false).
-        if (rawPressure != null) penSess.smoothP = paintStabilizeAux(penSess, 'p', rawPressure, PAINT_PRESSURE_RISE_MAX, false);   // ver2362: 콘티와 같은 분리
-        const usePressure = penSess.smoothP != null ? penSess.smoothP : 0.5;
+        const usePressure = paintReadStrokePressure(penSess, sample);
         // ver1328 ③: tilt, slewed like pressure so one orientation jitter can't kink the width envelope.
         // ver1641: 그 「pressure 처럼」이 이제 **말 그대로** 같은 함수다 — 손으로 적은 EMA(0.35)를
         // 공용 커널로 옮겼다. 좌표·필압과 같은 창이라 세 축의 지연이 맞는다.
@@ -107748,28 +107720,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver1328 ②: the rope holds the point STILL inside its dead zone — a zero-length segment with a
         // round cap still stamps a dot per event (and with alpha it darkens), so a standstill draws nothing.
         if (Math.hypot(p.x - penSess.lastX, p.y - penSess.lastY) < 0.05) continue;
-        // ver1345: pen* 방언과 pressureFactor 클로저를 걷어내고 세션의 **정본 필드**를 읽는다.
-        // 굵기는 공용 paintPressureWidthFactor를 쓴다. 아래 세그먼트 알파는 곡선과 기울기를 따로 곱한다.
-        // `rawPressure != null` 게이트는 유지: 이 샘플이 필압을 안 실어 왔으면 굵기/알파를 건드리지
-        // 않는다(Windows Ink가 첫 샘플에 0을 주는 사례 — ver625).
-        // ver1356: 공용 커널 paintPressureWidthFactor를 **그대로** 쓴다(곡선만 빌려 쓰고 틸트를 따로
-        // 곱하던 것을 그만둔다). 옛 코드는 곡선을 곱해 반올림하고 그 정수에 틸트를 또 곱해 반올림했는데,
-        // conte(paintPixelStampWidth)는 곡선×틸트를 하나의 float로 만들어 **한 번만** 반올림하므로 두
-        // 엔진의 2値化 굵기가 갈렸다(실측: 傾き→サイズ>0%에서 44% 불일치, 최대 2px).
-        // 커널이 pressureSize 게이트를 내부에 갖고 있어 "곡선만 공유" 이유였던 이중 적용도 없다.
-        // 필압을 안 실어 온 샘플(rawPressure==null)은 곡선 없이 틸트만 받아야 하므로 그때만 우회한다.
-        const segBase = penSess.penBaseWidth || target.lineWidth; // ver609: pen pressure → per-segment width
-        const segFactor = (rawPressure != null)
-          ? paintPressureWidthFactor(penSess, usePressure, useTilt)
-          : paintTiltWidthFactor(penSess, useTilt);
-        const segWidth = Math.max(1, Math.round(segBase * segFactor));
-        let segAlpha = 1;
-        if (penSess.pressureAlpha && rawPressure != null) {
-          segAlpha = paintPressureCurve(usePressure, 0.15, penSess.pressureGamma, penSess.pressureGain, penSess.pressureAlphaCurvePts); // ver723: shared alpha curve · ver1622: 제어점
-        }
-        segAlpha *= paintTiltAlphaMul(penSess, useTilt); // ver1328 ③ (×1 at 0%)
-        // ver1196: BOTH ends of the segment, at the width this segment is stroked with — the previous point
-        // was marked with its own (possibly narrower) width, and lineWidth is constant along a segment.
+        // 누락 여부는 입력 판독이 처리했다. 두 렌더 경로 모두 같은 압력·굵기·알파 커널을 쓴다.
+        const segBase = penSess.penBaseWidth || target.lineWidth;
+        const segWidth = Math.max(1, Math.round(segBase * paintPressureWidthFactor(penSess, usePressure, useTilt)));
+        const segAlpha = paintPressureAlphaFactor(penSess, usePressure, useTilt);
         gengaScanMark(penSess, penSess.lastX, penSess.lastY, segWidth / 2 + 1);
         gengaScanMark(penSess, p.x, p.y, segWidth / 2 + 1);
         const historyPad = segWidth / 2 + 1 + GENGA_SCAN_PAD;
