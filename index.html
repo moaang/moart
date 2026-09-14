@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2530</title>
+  <title>MoArt ver2531</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24668,6 +24668,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2531, items: [{ ja: 'コンテCTシートで複数パネルにまたがる絵の長さを保持し、素材画像を読み込めない場合は出力を中止するよう修正しました。', ko: '콘티 CT 시트에서 여러 패널에 걸친 그림의 길이를 보존하고, 소재 그림을 불러오지 못하면 출력을 중단하도록 고쳤습니다.', en: 'Conte CT sheets now preserve artwork spanning multiple panels and stop export when required artwork cannot be loaded.', zh: '分镜CT摄影表现可保留跨面板画面的持续时长，并在无法加载必要素材时中止导出。' }] },
       { ver: 2530, items: [{ ja: 'コンテの動画・タイムラプス出力で必要な画像を読み込めない場合、描画を欠いた動画を作らず、エラーを表示して中止します。', ko: '콘티 영상·타임랩스 출력에서 필요한 그림을 불러오지 못하면 그림이 빠진 영상을 만들지 않고 오류를 알리며 중단합니다.', en: 'Conte video and timelapse exports now stop with an error when required artwork cannot be loaded, instead of producing an incomplete video.', zh: '分镜视频及延时视频导出时，如无法加载所需图像，将显示错误并中止，避免生成缺少画面的文件。' }] },
       { ver: 2529, items: [{ ja: 'なげなわスタンプの説明行と取消ボタンを整理しました。プレビューを押すと保持中のスタンプを使えます。選択ボタンの文字位置も揃えました。', ko: '올가미 스탬프의 설명 줄과 취소 버튼을 정리했습니다. 미리보기 그림을 누르면 보관 중인 스탬프를 사용합니다. 선택 버튼의 글자 정렬도 맞췄습니다.', en: 'Simplified Lasso stamp: tap its preview to reuse the retained stamp. Removed inline hints and the Cancel button, and aligned choice labels with other controls.', zh: '精简套索图章：点按预览即可重用保留的图章。移除行内说明和取消按钮，并统一选项文字对齐。' }] },
       { ver: 2528, items: [{ ja: 'ツールを切り替えた後も、保持中のスタンプを元の位置に押せるようにしました。タイムラプスのX投稿ボタンを削除しました。', ko: '다른 도구를 거쳐 돌아와도 보관 중인 스탬프를 제자리에 찍을 수 있도록 고쳤습니다. 타임랩스의 X 글 초안 버튼을 제거했습니다.', en: 'Stamp in place now uses the retained stamp after switching tools. Removed the X draft button from timelapse video.', zh: '切换工具后仍可将保留的图章盖在原位。移除了延时视频的X草稿按钮。' }] },
@@ -87841,15 +87842,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       Array.from(byLane.keys()).sort(function(a, b) { return a - b; }).forEach(function(lane) {
         const komas = byLane.get(lane);
         const isBg = komas[0] && komas[0].layerRole === 'bg';
+        // Use the display's panel range, intersected with this cut's local frame domain.
+        // Zero-duration panels do not acquire a frame; later image numbers keep their place.
         const exposures = komas.map(function(l) {
-          const start = layout.panelLocalStart.has(l.startPanelCutId) ? layout.panelLocalStart.get(l.startPanelCutId) : 0;
-          const panel = project.cuts.find(function(c) { return c.id === l.startPanelCutId; });
-          const holdFrames = Math.max(1, Math.round(Number(panel && panel.pictureFrames) || 1));
-          return { id: l.id, startFrame: start + 1, holdFrames: holdFrames, instanceValue: null, dougaOffsets: [] };
-        }).sort(function(a, b) { return a.startFrame - b.startFrame; });
+          const range = layerSlotIndexRange(project, l, ownerCut);
+          let start = totalFrames, end = 0;
+          range.slots.slice(range.startIndex, range.endIndex + 1).forEach(function(slot) {
+            const panel = slot.cut;
+            if (!panel || !layout.panelLocalStart.has(panel.id)) return;
+            const localStart = layout.panelLocalStart.get(panel.id);
+            const frames = Math.max(0, Math.round(Number(panel.pictureFrames) || 0));
+            if (!frames) return;
+            start = Math.min(start, localStart);
+            end = Math.max(end, Math.min(totalFrames, localStart + frames));
+          });
+          return { id: l.id, startFrame: start + 1, holdFrames: Math.max(0, end - start), instanceValue: null, dougaOffsets: [], panelIndex: range.startIndex, order: l.order };
+        }).sort(function(a, b) { return a.panelIndex - b.panelIndex || a.order - b.order; });
+        exposures.forEach(function(e, index) { e.instanceValue = index + 1; delete e.panelIndex; delete e.order; });
         gengaLayers.push({
           id: komas[0].id, name: String(komas[0].canonicalLayerName || ''), role: isBg ? 'bgbook' : 'cel',
-          visible: true, tagOff: false, exposures: exposures, postBehavior: 'none', preBehavior: 'none',
+          visible: true, tagOff: false, exposures: exposures.filter(function(e) { return e.holdFrames > 0; }), postBehavior: 'none', preBehavior: 'none',
           serifuSections: [], repeats: [], fx: {}, fxEnabled: false
         });
       });
@@ -87954,8 +87966,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       for (const entry of entries.slice().reverse()) {           // → paint bottom-up
         const drawing = ensureLayerDrawingData(project, entry.layer.drawingRef);
         const artUrl = drawing ? layerDrawingDisplayDataUrl(entry.layer.drawingRef, drawing) : ''; // ver1432: flush-then-read(ver674)
-        if (!artUrl) continue;
-        const image = await loadImage(artUrl);
+        if (!layerDrawingHasInk(drawing)) continue;
+        const image = await loadImageForExport(artUrl, entry.layer.drawingRef);
         const box = mapRect(layerDrawingBitmapRect(drawing));
         items.push({
           layer: entry.layer,
@@ -87987,17 +87999,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const ctx = canvas.getContext('2d');
         ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
         const komaUrl = layerDrawingDisplayDataUrl(l.drawingRef, drawing); // ver1432: flush-then-read(ver674)
-        if (komaUrl) {
-          const rect = layerDrawingBitmapRect(drawing);
-          try {
-            const img = await loadImage(komaUrl);
-            ctx.drawImage(img, rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale);
-          } catch (e) {
-            // Still emit the frame-outline-only image (one koma missing must not lose the other 5),
-            // but never silently — same rule/shape as preloadVideoExportBitmaps' own warning.
-            if (typeof console !== 'undefined' && console.warn) console.warn('[CT export] koma bitmap unavailable:', l.drawingRef);
-          }
-        }
+        const img = await loadImageForExport(komaUrl, l.drawingRef);
+        const rect = layerDrawingBitmapRect(drawing);
+        ctx.drawImage(img, rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale);
         ctx.save();
         ctx.strokeStyle = 'rgba(0,0,0,0.4)';
         ctx.lineWidth = Math.max(1, scale * 0.5);
@@ -95574,7 +95578,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ver1936: 밀려난 리비전을 **공정별로** 묶는다. 리비전의 restKey 는 원본과 같은 값이라(위 items.push)
     // 라벨이 그대로 역추적된다. `_s` 와 `_sk` 는 둘 다 作監이므로 한 레이어로 모인다 — 공정이 단위이고
-    // 접미사가 단위가 아니다(#preview 의 그룹 개념). 같은 공정·같은 코마가 둘이면 점수가 높은 쪽.
+    // 접미사가 단위가 아니다. 같은 공정·같은 코마의 선택은 gengaSheetCompareImageItems 를 따른다(차수 우선).
     function gengaSheetGroupLayerRevisions(layerName, labels, dropped) {
       if (!dropped || !dropped.length) return [];
       const labelByKey = new Map();
