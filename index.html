@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2540</title>
+  <title>MoArt ver2541</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24668,6 +24668,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2541, items: [{ ja: 'SUTブラシの描画を軽くしました。筆圧と紙質の描き味は維持しています。', ko: 'SUT 브러시의 그리기 부담을 줄였습니다. 필압과 종이결의 표현은 유지합니다.', en: 'Improved SUT brush performance while preserving pressure and texture.', zh: '提升SUT笔刷绘制性能，保留笔压与纸纹效果。' }] },
       { ver: 2540, items: [{ ja: '複数パネルのカットでも、動きを保ったままOLできます。動画出力にもOLを反映し、OLの長さを0へ戻せない不具合を直しました。', ko: '여러 패널로 된 컷도 움직임을 유지하며 OL할 수 있습니다. 영상 출력에도 OL을 반영하고, OL 길이를 0으로 되돌리지 못하던 문제를 고쳤습니다.', en: 'Multi-panel cuts now keep animating during OL. Video exports include the dissolve, and existing overlaps can be reduced to zero.', zh: '多面板镜头在叠化中保持动画，视频导出也包含叠化，并修复已有叠化无法缩短到零的问题。' }] },
       { ver: 2539, items: [{ ja: '音声の速度変更・分割・トリム後の波形と再生位置、途中再生のフェードを修正しました。停止後の遅延再生と音源交換時の古いキャッシュを防ぎ、録音の長さとUndoを整えました。', ko: '오디오 속도 변경·분할·트림 뒤 파형과 재생 위치, 중간 재생의 페이드를 고쳤습니다. 정지 뒤 늦은 재생과 음원 교체 시 옛 캐시를 막고 녹음 길이와 Undo를 맞췄습니다.', en: 'Fixed waveform and playback alignment after audio speed changes, splits and trims, plus fades when starting mid-clip. Prevented late playback after stopping and stale audio caches; aligned recorded lengths and Undo.', zh: '修复音频变速、分割和修剪后的波形与播放位置，以及中途播放时的淡入淡出。防止停止后延迟播放和替换音源后的旧缓存，并校正录音时长与撤销。' }] },
       { ver: 2538, items: [{ ja: '動画のFPSをプロジェクト／23.976から選べます。長さと音声の速さを保って変換し、GIF・WebMの長さも修正しました。24fps以外のシートは未実装として無効にしました。TVPaintの案内を短くしました。', ko: '동영상 FPS를 프로젝트 / 23.976 중 선택할 수 있습니다. 길이와 음성 속도를 유지하며 변환하고 GIF·WebM의 길이도 고쳤습니다. 24fps 이외 시트는 미구현으로 비활성화했습니다. TVPaint 안내를 짧게 정리했습니다.', en: 'Choose Project or 23.976fps for video with duration and audio speed preserved. Fixed GIF and WebM timing. Non-24fps sheets are disabled as unimplemented. Shortened TVPaint export notes.', zh: '视频可选择项目FPS或23.976，保持时长和音频速度。修复GIF和WebM时长。非24fps摄影表标为未实现并禁用，简化TVPaint导出说明。' }] },
@@ -67203,9 +67204,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintInkGrainBatch = null;   // ver2387: 그 dab 들을 한 장에 모아 결을 한 번만 곱하는 캔버스(재사용)
     const PAINT_GRAIN_BATCH_MIN = 4;             // ver2387: 이보다 적으면 모을 값이 없다
     const PAINT_GRAIN_BATCH_MAX_PX = 8000000;    // ver2387: 박스가 이보다 크면 한 장 전송이 되레 비싸다
+    // 캐시와 빈 Canvas 풀은 같은 획 소유·같은 픽셀 예산을 쓴다.
+    function paintInkDabCanvasFor(cache) {
+      const canvas = cache.pool && cache.pool.pop();
+      if (canvas) cache.poolBytes -= canvas.width * canvas.height * 4;
+      return canvas || document.createElement('canvas');
+    }
+    function paintInkDabCachePrune(cache) {
+      if (!cache || !cache.keepKeys) return;
+      for (const [key, image] of cache.entries) {
+        if (cache.keepKeys.has(key)) continue;
+        const bytes = image.width * image.height * 4;
+        cache.entries.delete(key); cache.bytes -= bytes;
+        if (typeof image.getContext === 'function'
+            && cache.bytes + (cache.poolBytes || 0) + bytes <= PAINT_INK_DAB_CACHE_BYTES) {
+          if (!cache.pool) cache.pool = [];
+          cache.pool.push(image); cache.poolBytes = (cache.poolBytes || 0) + bytes;
+        }
+      }
+    }
     function paintInkDabCachePut(cache, key, image) {
       if (!key) return;
       const bytes = image.width * image.height * 4, old = cache.entries.get(key);
+      if (bytes > PAINT_INK_DAB_CACHE_BYTES) return;
+      while (cache.pool && cache.pool.length && cache.bytes + (cache.poolBytes || 0) + bytes > PAINT_INK_DAB_CACHE_BYTES) {
+        const spare = cache.pool.pop(); cache.poolBytes -= spare.width * spare.height * 4;
+      }
       if (old) { cache.bytes -= old.width * old.height * 4; cache.entries.delete(key); }
       while (cache.bytes + bytes > PAINT_INK_DAB_CACHE_BYTES) {
         const oldest = cache.entries.keys().next().value, entry = cache.entries.get(oldest);
@@ -67313,13 +67337,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const pixelDab = Boolean(blendDab);
         const key = dabCache && drawKey != null
           ? [x, y, span, gd, gOx, gOy, grainPD && grainPD.mode, pixelDab, drawKey].join('|') : null;
-        const bytes = side * side * 4, keep = key && bytes <= PAINT_INK_DAB_CACHE_BYTES;
+        const bytes = side * side * 4;
+        const keep = key && bytes <= PAINT_INK_DAB_CACHE_BYTES;
+        if (keep && resume.cacheTail !== false && dabCache.keepKeys) dabCache.keepKeys.add(key);
         let baked = key && dabCache.entries.get(key);
         if (!baked) {
           let mask = null;
           // 보관할 Canvas는 그 캔버스에 바로 굽는다. 같은 픽셀을 별도 캔버스로 다시 복사하지 않는다.
           const slot = pixelPage && pixelPage.slot(side, gx, gy, keep ? key : null);
-          const scratch = keep && !blendDab ? document.createElement('canvas') : grainScratch;
+          const scratch = keep && !blendDab ? paintInkDabCanvasFor(dabCache) : grainScratch;
           if (scratch.width < side || scratch !== grainScratch && scratch.width !== side) scratch.width = side;
           if (scratch.height < side || scratch !== grainScratch && scratch.height !== side) scratch.height = side;
           const gctx = scratch.getContext('2d');
@@ -68182,37 +68208,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ★ clip 이 필수다. destination-in / source-in 은 **그리지 않은 곳의 목적지를 지우는** 연산이라,
       //   범위만 좁혀 그리면 이미 만들어 둔 나머지가 통째로 날아간다. clip 을 걸면 그 파괴가 clip
       //   안으로 제한된다(실측으로 확인: clip 밖 픽셀이 그대로 남는다).
-      // JS 폴백(paintInkFieldToAlpha)과 평균 알파 물러섬은 증분에서 제외한다 — 그쪽은 자기 구역
-      // 계산을 따로 하고 iOS 전용이라 데스크톱에서 회귀를 증명할 수 없다.
-      // lumFilter 를 여기서 먼저 구한다 — 증분을 켜도 되는지가 그것에 달렸다(아래 조건).
-      // ver1784: 필터가 필요한지는 **장인가**로 정해진다(alphaFor 가 아니라) — flow 로 켜진 장도 같은 변환을 탄다.
+      // 필터와 CPU 변환은 같은 변경 구역을 쓴다. CPU는 직전 변환 성공일 때만 재사용한다.
       const lumFilter = (s && s.inkMode) ? paintLumToAlphaFilter() : '';
-      // 증분이 성립하는 경로는 둘뿐이다: 필터로 도는 잉크 장, 그리고 잉크가 아닌 팁 세션.
+      // 잉크 장은 필터 또는 성공한 CPU 변환을 재사용하고, 비잉크 팁 세션은 그대로 재사용한다.
       // 수채 경계는 주변의 효과 적용 전 알파를 읽는다. sc의 지난 결과를 이웃 픽셀로
       // 재사용하면 갱신 사각형 안쪽에 밝은 직선이 남는다. dab 누적은 유지하고 후처리만
       // 획 범위 전체에서 다시 계산한다. s.clean일 때의 완성 결과 재사용은 아래에서 유지한다.
-      const incOk = Boolean(!opts.waterEdge && sc.reused && s && s.newBox && (s.inkMode ? Boolean(lumFilter) : true));
+      const reusableAlpha = s && (!s.inkMode || Boolean(lumFilter) || s.alphaConverted === true);
+      const incOk = Boolean(!opts.waterEdge && sc.reused && s && s.newBox && reusableAlpha);
       const incBox = incOk ? s.newBox : null;
-      const wx = incBox ? incBox.x : bx, wy = incBox ? incBox.y : by;
-      const ww = incBox ? incBox.w : bw, wh = incBox ? incBox.h : bh;
+      let wx = incBox ? incBox.x : bx, wy = incBox ? incBox.y : by;
+      let ww = incBox ? incBox.w : bw, wh = incBox ? incBox.h : bh;
       // 이번 fill의 작업 구역: [종이 x, y, 폭, 높이, 증분 여부]. 화면 픽셀과 대조할 때는
       // 줌·팬 좌표를 맞춘다. 경계와 증상의 일치는 조사 단서이며 원인 확정은 아니다.
       // 하네스의 __boxes(newBox/box 객체)와는 다른 진단 출력이다.
       if (diagOn) diagOn.boxes.push([wx, wy, ww, wh, incBox ? 1 : 0]);
-      // ── ver2301: 변화 없는 프레임은 지난 결과를 그대로 얹는다 ──────────────────────────────
-      // s.clean = 이번 paintInkSessionStep 호출이 s.cv 를 안 바꿨다(ver2302 — 세션이 직접 남기는
-      // 정본 판정). 그러면 s.cv·s.av·pts(개수 불변)·radii(pts 의 순수 함수)·마스크(깊이는 획 시작
-      // 필압 고정, ver2070)·gbox 전부 지난 프레임 그대로라 sc(reused)가 이미 최종 결과를 들고 있다.
-      // 그런데 아래 사슬은 그때 incOk 가 서지 않아 **작업 구역을 gbox 전체로 넓혀** 클리어→변환→
-      // 곱→되얹기를 통째로 다시 했다. 실기 실측(연필R size100, 교대 3라운드)에서 이런 프레임이 곧
-      // 획 중 스파이크였다: 스킵으로 >17ms 프레임 2~5→0~1, 획 총 -19~25%(changelog ver2301).
-      // ver2302: 판정을 `!s.newBox` 에서 `s.clean` 으로 바꿨다 — newBox 는 「찍었는데 null」이
-      // 두 갈래로 가능해(paintStrokeScratchBox 가 상자=캔버스 전체면 null · 비잉크 분기는 스탬프
-      // 성공과 무관하게 점에서 계산) 작은 레이어+큰 브러시에서 낡은 그림을 얹을 수 있었다.
-      // 스킵이 서는 경로는 sc 내용이 프레임 불변인 두 가지뿐이다 — 잉크 장(필터 경로)과 팁 세션.
-      // 필터가 없는 브라우저(iOS JS 폴백·평균 알파 물러섬)는 종전대로 지나간다(flatAlpha 가 매
-      // 프레임 ctx.globalAlpha 에 곱혀야 하므로 여기서 끊으면 안 된다).
-      if (s && s.clean && sc.reused && (!s.inkMode || lumFilter)) {
+      // 변화 없는 프레임은 같은 소유자의 완성 결과를 얹는다. 평균 알파 fallback은 제외한다.
+      if (s && s.clean && sc.reused && reusableAlpha) {
         ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // 최종 blit 은 매 프레임 필요(ctx 는 프레임마다 씻긴다)
         return;
       }
@@ -68261,30 +68273,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         else { inkCtx.fillStyle = color || '#111111'; inkCtx.fillRect(0, 0, ww, wh); }
         inkCtx.globalCompositeOperation = 'source-over';
         sc.ctx.drawImage(inkTmp, 0, 0, ww, wh, wx, wy, ww, wh);
-      } else if (s && s.inkMode && paintInkFieldToAlpha(sc, s, w, h, color)) {
-        // ver1370: 필터가 없는 브라우저(iOS/WebKit)도 **같은 잉크 장**을 쓴다 — 휘도→알파만 JS로 옮긴다.
-        // ver1369 의 물러섬은 안전하지만 획 전체가 한 농도가 됐다. 여기서는 농담이 그대로 살아 있고,
-        // 훑는 구역이 캔버스 전체가 아니라 세션이 쌓아 둔 s.box(획이 지나간 곳)라 비용이 획 크기에 붙는다.
-        // 성공하면 true 를 돌려주므로 이 분기가 성립하고, 실패하면(구역이 비었거나 픽셀을 못 읽으면)
-        // 아래 평균 알파 물러섬으로 그대로 흘러간다.
-      } else if (alphaFor) {
-        // ver1346: 휘도→알파 필터가 없는 브라우저 — 모양을 그리고 획 **전체 평균 알파**로 물러선다.
-        // 경로에 따른 변화는 잃지만 아티팩트는 없다(조용히 필압을 무시하는 것보다 정직하다).
-        paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
-        let sum = 0;
-        for (let i = 0; i < pts.length; i += 1) {
-          const raw = Number(alphaFor(pts[i].p, pts[i].t));
-          sum += Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
-        }
-        if (pts.length) flatAlpha = sum / pts.length;
-      } else if (s && !s.inkMode) {
-        sc.ctx.drawImage(s.cv, wx, wy, ww, wh, wx, wy, ww, wh); // ver1619/1629
+      } else if (s && s.inkMode && (s.alphaConverted = paintInkFieldToAlpha(sc, s, w, h, color, incBox))) {
+        // CPU 변환도 동일한 잉크 장의 R을 alpha로 옮긴다. 성공 여부는 다음 재사용의 조건이다.
       } else {
-        // ver1784: `!s.inkMode` 를 붙인 이유 — 장은 **회색조**라 여기로 흘러들면 회색 덩어리가 그려진다.
-        // flow 만 켠 획이 필터도 JS 폴백도 실패하면(둘 다 없는 브라우저) 위 두 가지를 다 놓치고
-        // 여기로 온다. 그때는 flow 를 포기하고 모양만 정직하게 그린다(위 alphaFor 의 평균 알파 물러섬과
-        // 같은 태도). alphaFor 쪽은 그 앞 `else if (alphaFor)` 가 이미 잡으므로 여기 오지 않는다.
-        paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
+        // 부분 변환 실패는 지난 정상 결과와 섞지 않는다. 전체 fallback을 새로 만든다.
+        if (s && s.inkMode && incBox) {
+          sc.ctx.restore(); sc.ctx.save();
+          sc.ctx.clearRect(0, 0, w, h);
+          wx = bx; wy = by; ww = bw; wh = bh;
+        }
+        if (alphaFor) {
+          // ver1346: 휘도→알파 필터가 없는 브라우저 — 모양을 그리고 획 **전체 평균 알파**로 물러선다.
+          // 경로에 따른 변화는 잃지만 아티팩트는 없다(조용히 필압을 무시하는 것보다 정직하다).
+          paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
+          let sum = 0;
+          for (let i = 0; i < pts.length; i += 1) {
+            const raw = Number(alphaFor(pts[i].p, pts[i].t));
+            sum += Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
+          }
+          if (pts.length) flatAlpha = sum / pts.length;
+        } else if (s && !s.inkMode) {
+          sc.ctx.drawImage(s.cv, wx, wy, ww, wh, wx, wy, ww, wh); // ver1619/1629
+        } else {
+          // ver1784: `!s.inkMode` 를 붙인 이유 — 장은 **회색조**라 여기로 흘러들면 회색 덩어리가 그려진다.
+          // flow 만 켠 획이 필터도 JS 폴백도 실패하면(둘 다 없는 브라우저) 위 두 가지를 다 놓치고
+          // 여기로 온다. 그때는 flow 를 포기하고 모양만 정직하게 그린다(위 alphaFor 의 평균 알파 물러섬과
+          // 같은 태도). alphaFor 쪽은 그 앞 `else if (alphaFor)` 가 이미 잡으므로 여기 오지 않는다.
+          paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
+        }
       }
       if (mask && grain.mode !== 'multiply') {
         paintApplyGrainPixels(sc.ctx, wx, wy, ww, wh, grain, grainDepth / 100,
@@ -68465,8 +68481,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 비용이 캔버스 크기가 아니라 그은 크기에 붙고, 라이브 미리보기에서도 감당할 만해진다.
     // 실패하면 false 를 돌려주고 호출부가 ver1346 의 평균 알파 물러섬으로 간다.
     let paintInkAlphaScratch = null, paintInkAlphaScratchCtx = null;
-    function paintInkFieldToAlpha(sc, s, w, h, color) {
-      const box = s && s.box;
+    function paintInkFieldToAlpha(sc, s, w, h, color, workBox) {
+      const box = workBox ? { x0: workBox.x, y0: workBox.y, x1: workBox.x + workBox.w, y1: workBox.y + workBox.h } : s && s.box;
       if (!box) return false;
       const x0 = Math.max(0, Math.floor(box.x0)), y0 = Math.max(0, Math.floor(box.y0));
       const x1 = Math.min(w, Math.ceil(box.x1)), y1 = Math.min(h, Math.ceil(box.y1));
@@ -68516,7 +68532,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // 휘도 → 알파. 잉크 장(paintStampInkField)은 값을 **불투명 회색**으로 들고 있다가(그래야 lighten이
     // 정확한 max다) 마지막에 이 필터로 알파 채널에 옮긴다. SVG feColorMatrix 1패스.
-    // 지원하지 않는 브라우저는 ''를 받고 호출부가 획 전체 평균 알파로 물러선다.
+    // 지원하지 않으면 빈 문자열을 반환한다. 호출부는 같은 잉크 장을 CPU로 변환한다.
     let paintLumFilterCss = null;        // '' = 이 브라우저는 지원하지 않음
     function paintLumToAlphaFilter() {
       if (paintLumFilterCss != null) return paintLumFilterCss;
@@ -68719,10 +68735,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.grainKey = grainKey;   // ver2303
         // ver2090: live — 리본 워커가 마지막 세그먼트를 보류할지 정한다(코너는 다음 점이 있어야
         // 정해진다). 커밋은 host 가 없어 false 이고, 그때 처음부터 한 번 그리므로 완결된다.
-        s.walk = { seg: 0, carry: 0, dabIndex: 0, firstEmitted: false, live: Boolean(host),
+        s.walk = { seg: 0, carry: 0, dabIndex: 0, firstEmitted: false, live: Boolean(host), cacheTail: false,
           dabCache: host ? { entries: new Map(), bytes: 0 } : null };
         s.av = [];
         s.done = 0;
+        s.alphaConverted = false;
         s.tailBox = null;   // ver2341: 굳히지 않은 꼬리가 지금 어디 있나(백업 캔버스는 재사용한다)
         s.tailMix = null;
         s.box = null; // ver1370: 이 스트로크가 장에서 실제로 건드린 범위(휘도→알파를 JS로 옮길 때의 작업 구역)
@@ -68811,14 +68828,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // ver2341: 지난 프레임 꼬리를 되돌리고 → 확정 구간만 이어 찍고 → 꼬리를 새로 찍는다.
           const prevTail = paintInkTailRestore(s, cx);
           // 계산에 필요한 뒤 이웃은 보존하고, 실제로 찍을 끝만 제한한다.
+          if (s.walk.dabCache) {
+            if (!s.walk.dabCache.keepKeys) s.walk.dabCache.keepKeys = new Set();
+            else s.walk.dabCache.keepKeys.clear();
+          }
           s.walk.pointLimit = confirmN;
           const b = paintStampInkField(cx, confirmedPts, confirmedRadii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);
           let tb = null;
           if (tailHold) {
             paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
             // 진행량은 복사한다. 점에서 유도한 접선 캐시는 공유해 확정 구간도 뒤 이웃의 방향을 본다.
-            tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk, { pointLimit: n }), s.mixTipFor, s.colorCtx, flow, grainPD);
+            tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }), s.mixTipFor, s.colorCtx, flow, grainPD);
           }
+          // 확정한 마스크는 다시 쓰지 않는다. 이번 임시 꼬리에 필요한 것만 남긴다.
+          paintInkDabCachePrune(s.walk.dabCache);
           const b2 = (b && tb)
             ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) }
             : (b || tb);
