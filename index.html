@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2555</title>
+  <title>MoArt ver2557</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23880,76 +23880,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
 
 
-    function buildCutsFromScenario() {
-      const blocks = getAllBlocks();
-      if (!blocks.length) return;
-      const cuts = buildCutCandidatesFromBlocks(blocks, { allowUnreliable: true });
-      runCommand('Build cut candidates', function(project) {
-        if (cuts.length) applyScenarioCutsToExistingSlots(project, cuts);
-        while (project.cuts.length < EMPTY_SLOT_COUNT) project.cuts.push(createBlankCut(project.cuts.length + 1));
-        setCurrentPicturePanelId(project.cuts[0] ? project.cuts[0].id : '');
-        project.currentPage = 1;
-      });
-    }
-
-    function applyScenarioCutsToExistingSlots(project, scenarioCuts) {
-      const cuts = Array.isArray(project.cuts) ? project.cuts : [];
-      while (cuts.length < scenarioCuts.length) cuts.push(createBlankCut(cuts.length + 1));
-      cuts.forEach(clearScenarioPlacementFields);
-      scenarioCuts.forEach(function(candidate, index) {
-        const target = cuts[index] || createBlankCut(index + 1);
-        if (!cuts[index]) cuts[index] = target;
-        copyScenarioPlacementFields(candidate, target);
-        reassignScenarioCandidateBlocks(project, candidate, target);
-      });
-      project.cuts = cuts;
-    }
-
-    function clearScenarioPlacementFields(cut) {
-      if (!cut) return;
-      cut.cutNo = '';
-      cut.inheritedCutNoHidden = false;
-      cut.sourceBlockIds = [];
-      cut.pictureTextBlockIds = [];
-      cut.dialogBlockIds = [];
-      cut.memoBlockIds = [];
-      cut.actionText = '';
-      cut.dialogText = '';
-      cut.meta = cut.meta || {};
-      cut.meta.autoScenarioPlacement = false;
-    }
-
-    function copyScenarioPlacementFields(source, target) {
-      target.cutNo = String(source && source.cutNo || '');
-      target.inheritedCutNoHidden = Boolean(source && source.inheritedCutNoHidden);
-      target.sourceBlockIds = (source && source.sourceBlockIds || []).slice();
-      target.pictureTextBlockIds = (source && source.pictureTextBlockIds || []).slice();
-      target.dialogBlockIds = (source && source.dialogBlockIds || []).slice();
-      target.memoBlockIds = (source && source.memoBlockIds || []).slice();
-      target.actionText = String(source && source.actionText || '');
-      target.dialogText = String(source && source.dialogText || '');
-      target.meta = Object.assign({}, target.meta || {}, source && source.meta || {}, { autoScenarioPlacement: true });
-    }
-
-    function reassignScenarioCandidateBlocks(project, candidate, target) {
-      if (!project || !candidate || !target) return;
-      const ids = [];
-      ['sourceBlockIds', 'pictureTextBlockIds', 'dialogBlockIds', 'memoBlockIds'].forEach(function(key) {
-        (candidate[key] || []).forEach(function(id) {
-          if (id && ids.indexOf(id) < 0) ids.push(id);
-        });
-      });
-      ids.forEach(function(id) {
-        const block = findBlockById(project, id);
-        if (!block) return;
-        block.assignedCutId = target.id;
-        if ((candidate.dialogBlockIds || []).indexOf(id) >= 0) block.assignedPanelId = 'dialogText';
-        else if ((candidate.pictureTextBlockIds || []).indexOf(id) >= 0) block.assignedPanelId = 'actionText';
-        else if ((candidate.memoBlockIds || []).indexOf(id) >= 0) block.assignedPanelId = candidate.cutNo && /^(OP|ED|CM|END)$/i.test(candidate.cutNo) ? 'cutNo' : 'actionText';
-        else block.assignedPanelId = target.cutNo && /^(OP|ED|CM|END)$/i.test(target.cutNo) ? 'cutNo' : 'actionText';
-      });
-    }
-
     function clearScenarioBoard() {
       clearImportedScenarioFileOnly();
     }
@@ -23973,8 +23903,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cut.pictureTextBlockIds = [];
         cut.dialogBlockIds = [];
         cut.memoBlockIds = [];
-        cut.meta = cut.meta || {};
-        cut.meta.autoScenarioPlacement = false;
       });
       state.selectedBlockId = '';
       state.sourceText = '';
@@ -29378,206 +29306,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       invalidateVideoTimelineCache();
     }
 
-    function buildCutCandidatesFromBlocks(blocks, options) {
-      options = options || {};
-      const quality = options.quality || blocks.extractionQuality || {};
-      if (quality.autoCutDisabled && !options.allowUnreliable) {
-        blocks.forEach(function(block) {
-          block.assignedCutId = '';
-          block.assignedPanelId = '';
-        });
-        return [];
-      }
-      const candidateBlocks = blocks.filter(function(block) {
-        block.assignedCutId = '';
-        block.assignedPanelId = '';
-        return isAutoCutEligibleBodyBlock(block, options);
-      });
-      return buildCutsByDialogUnit(candidateBlocks, options);
-    }
-
-    function isAutoCutEligibleBodyBlock(block, options) {
-      options = options || {};
-      if (!block || !block.assignableToCut) return false;
-      if (BODY_BLOCK_TYPES.indexOf(block.type) < 0) return false;
-      if (block.zone !== 'body') return false;
-      const confidence = Number(block.meta && block.meta.confidence) || 0;
-      const quality = options.quality || {};
-      const threshold = quality.verticalExtractionUnreliable && !options.allowUnreliable ? 0.75 : 0.60;
-      return confidence >= threshold;
-    }
-
-    function buildCutsByDialogUnit(blocks, options) {
-      options = options || {};
-      const cuts = [];
-      let pendingLead = [];
-      let activeCut = null;
-      let activeBlocks = [];
-      let sequenceOrder = 1;
-      let nextNumericCutNo = 1;
-
-      function createCutFromGroup(group, reason) {
-        const cleanGroup = group.filter(Boolean);
-        if (!cleanGroup.length) return null;
-        const cut = createCutFromBlock(cleanGroup[0], sequenceOrder);
-        cut.cutNo = String(nextNumericCutNo);
-        sequenceOrder += 1;
-        nextNumericCutNo += 1;
-        for (let index = 1; index < cleanGroup.length; index += 1) {
-          attachBlockToCut(cut, cleanGroup[index]);
-        }
-        cut.meta.evidence = mergeUnique(cut.meta.evidence || [], [reason || 'dialog-centered grouping']);
-        cut.meta.warnings = mergeUnique(cut.meta.warnings || [], ['auto cut candidate', 'user review required']);
-        updateCutConfidence(cut, cleanGroup);
-        cuts.push(cut);
-        activeCut = cut;
-        activeBlocks = cleanGroup.slice();
-        return cut;
-      }
-
-      function createMarkerCut(block, markerLabel) {
-        const cut = createCutMarkerFromBlock(block, markerLabel, sequenceOrder);
-        sequenceOrder += 1;
-        cuts.push(cut);
-        activeCut = null;
-        activeBlocks = [];
-        return cut;
-      }
-
-      function attachToActive(block) {
-        if (!activeCut) return false;
-        attachBlockToCut(activeCut, block);
-        activeBlocks.push(block);
-        updateCutConfidence(activeCut, activeBlocks);
-        return true;
-      }
-
-      blocks.forEach(function(block) {
-        const isDialog = DIALOG_AREA_TYPES.indexOf(block.type) >= 0;
-        const isHardLead = block.type === 'section_marker' || block.type === 'scene_heading' || block.type === 'transition';
-        const markerLabel = scenarioCutMarkerLabel(block);
-        if (markerLabel) {
-          if (pendingLead.length) {
-            createCutFromGroup(pendingLead, 'action before cut marker');
-            pendingLead = [];
-          }
-          createMarkerCut(block, markerLabel);
-          return;
-        }
-        if (isDialog) {
-          createCutFromGroup(pendingLead.concat([block]), 'one dialog unit per cut');
-          pendingLead = [];
-          return;
-        }
-        if (isHardLead) {
-          pendingLead.push(block);
-          if (block.type === 'section_marker' || block.type === 'scene_heading') {
-            activeCut = null;
-            activeBlocks = [];
-          }
-          return;
-        }
-        if (activeCut) {
-          attachToActive(block);
-          return;
-        }
-        pendingLead.push(block);
-      });
-
-      if (pendingLead.length) {
-        if (activeCut && !pendingLead.some(function(block) { return block.type === 'section_marker' || block.type === 'scene_heading'; })) {
-          pendingLead.forEach(attachToActive);
-        } else {
-          createCutFromGroup(pendingLead, 'action-only residual group');
-        }
-      }
-      return cuts;
-    }
-
-
-    function updateCutConfidence(cut, blocks) {
-      const confidences = blocks.map(function(block) { return Number(block.meta && block.meta.confidence) || 0.5; });
-      const average = confidences.reduce(function(sum, value) { return sum + value; }, 0) / Math.max(1, confidences.length);
-      const penalty = cut.meta && cut.meta.warnings && cut.meta.warnings.length > 2 ? 0.05 : 0;
-      cut.meta.confidence = Math.max(0.1, Math.min(0.95, average - penalty));
-    }
-
     function mergeUnique(left, right) {
       return (left || []).concat(right || []).filter(function(value, index, array) {
         return value && array.indexOf(value) === index;
       });
-    }
-
-    function createCutFromBlock(block, order) {
-      const cut = {
-        id: 'cut-' + Date.now().toString(36) + '-' + order,
-        cutNo: String(order),
-        order: order,
-        inheritedCutNoHidden: false,
-        sourceBlockIds: [],
-        pictureTextBlockIds: [],
-        dialogBlockIds: [],
-        memoBlockIds: [],
-        rowSpan: 1,
-        pictureFrames: 0,
-        pictureFramesManual: false,
-        pictureFramesInferred: 0,
-        durationFrames: 0,
-        durationFramesLocked: false,
-        actionText: '',
-        dialogText: '',
-        meta: {
-          confidence: block.meta.confidence,
-          evidence: ['generated from imported block #' + block.order],
-          warnings: ['auto cut candidate'],
-          alternatives: []
-        }
-      };
-      attachBlockToCut(cut, block);
-      return cut;
-    }
-
-    function createCutMarkerFromBlock(block, markerLabel, order) {
-      const cut = createBlankCut(order);
-      cut.id = 'cut-marker-' + Date.now().toString(36) + '-' + order + '-' + markerLabel.toLowerCase();
-      cut.cutNo = markerLabel;
-      cut.sourceBlockIds = [block.id];
-      cut.meta = {
-        confidence: Number(block.meta && block.meta.confidence) || 0.9,
-        evidence: ['generated from section marker #' + (block.order || block.globalOrder || '')],
-        warnings: ['auto cut marker'],
-        alternatives: []
-      };
-      block.assignedCutId = cut.id;
-      block.assignedPanelId = 'cutNo';
-      return cut;
-    }
-
-    function scenarioCutMarkerLabel(block) {
-      if (!block) return '';
-      let text = String(block.text || block.rawText || '').normalize('NFKC').trim();
-      text = text.replace(/^[■□◆◇●○◯◎▽▼▲△・\s]+/, '').replace(/[()（）［］\[\]「」『』]/g, '').trim();
-      const exact = text.toUpperCase().replace(/\s+/g, '');
-      const exactMarker = exact.match(/^(?:中|前|後)?(OP|ED|CM|END)(?:中|入り|明け)?$/);
-      if (exactMarker) return exactMarker[1];
-      if (block.type !== 'section_marker') return '';
-      const match = exact.match(/^(OP|ED|CM|END)\b/);
-      return match && exact.length <= 12 ? match[1] : '';
-    }
-
-    function attachBlockToCut(cut, block) {
-      addCutBlockLink(cut, block, block && DIALOG_AREA_TYPES.indexOf(block.type) >= 0 ? 'dialogText' : 'actionText');
-      block.assignedCutId = cut.id;
-      if (DIALOG_AREA_TYPES.indexOf(block.type) >= 0) {
-        block.assignedPanelId = 'dialogText';
-        cut.dialogText = appendLine(cut.dialogText, dialogDisplayTextForBlock(block));
-      } else {
-        // ver2056: 여기 `transition|section_marker|sound_cue|music_cue` 를 따로 받는 갈래가 있었는데
-        // **본문이 이 else 와 글자 그대로 같았다.** 갈래를 남겨 두면 「이 넷은 다르게 다룬다」는
-        // 거짓 신호가 된다 — 실제로 다르게 다뤄야 할 날이 오면 그때 다시 가른다.
-        block.assignedPanelId = 'actionText';
-        cut.actionText = appendLine(cut.actionText, block.text);
-      }
     }
 
     function dialogDisplayTextForBlock(block) {
@@ -121269,8 +121001,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         setElementActiveClass(event.currentTarget, 'drop-ready', false);
         handleDocumentFile(firstDroppedFile(event));
       });
-      const buildCutsButton = document.getElementById('buildCutsBtn');
-      if (buildCutsButton) buildCutsButton.addEventListener('click', buildCutsFromScenario);
       document.getElementById('addConteLayerBtn').addEventListener('click', function() { addConteLayerToSelection('cut'); });
       document.getElementById('addConteLayerKomaBtn').addEventListener('click', function() { addConteLayerToSelection('panel'); });
       document.getElementById('addPicturePanelBtn').addEventListener('click', addPicturePanelAfterSelection);
