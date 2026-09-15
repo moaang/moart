@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2557</title>
+  <title>MoArt ver2558</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24616,6 +24616,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2558, items: [{ ja: 'SUTの紙質の明るさ・コントラストと、円形・楕円形穂先のアンチエイリアスを改善しました。再読み込みで反映されます。', ko: 'SUT 종이결 밝기·대비와 원형·타원 팁의 안티에일리어싱을 개선했습니다. 다시 가져오면 반영됩니다.', en: 'Improved SUT paper brightness/contrast and geometric-tip anti-aliasing. Reimport to apply.', zh: '改进SUT纸纹亮度、对比度与圆形、椭圆形笔尖的抗锯齿。重新导入即可应用。' }] },
       { ver: 2555, items: [{ ja: 'シナリオ読み込みで人物・場所の名簿、複数話者、文書別ページ、台詞の内容を保持します。',
         ko: '시나리오 가져오기에서 인물·장소 명부, 복수 화자, 문서별 페이지, 대사 내용을 보존합니다.',
         en: 'Scenario imports now retain character and location rosters, multiple speakers, document pages and dialogue content.',
@@ -59944,10 +59945,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paperTexMode: { def: 'multiply', legacy: null, parse: function(r) { return paintGrainMode(r); }, ser: function(v) { return paintGrainMode(v); } },
       mixBlend: { def: false, legacy: null, parse: function(r) { return r === '1'; }, ser: function(v) { return v ? '1' : '0'; } },
       paperTexReverse: { def: false, legacy: null, parse: function(r) { return r === '1'; }, ser: function(v) { return v ? '1' : '0'; } },
+      paperTexBrightness: { def: 0, legacy: null, parse: function(r) { return Math.max(-100, Math.min(100, Number(r) || 0)); }, ser: function(v) { return String(Number(v) || 0); } },
+      paperTexContrast: { def: 0, legacy: null, parse: function(r) { return Math.max(-100, Math.min(100, Number(r) || 0)); }, ser: function(v) { return String(Number(v) || 0); } },
       paperTexRotation: { def: 0, legacy: null, parse: function(r) { return Number.isFinite(Number(r)) ? Number(r) % 360 : 0; }, ser: function(v) { return String(Number(v) || 0); } },
       tipThickCurvePts: { def: null, legacy: null, parse: function(r) { try { return paintNormCurvePts(JSON.parse(r)); } catch (e) { return null; } }, ser: function(v) { return v ? JSON.stringify(v) : ''; } },
       tipShape: { def: '', legacy: null, parse: function(r) { return r === 'circle' ? r : ''; }, ser: function(v) { return v === 'circle' ? v : ''; } },
-      tipAntialias: { def: -1, legacy: null, parse: function(r) { return r === '0' ? 0 : -1; }, ser: function(v) { return v === 0 ? '0' : '-1'; } },
+      tipAntialias: { def: -1, legacy: null, parse: function(r) { return /^[0-3]$/.test(r) ? Number(r) : -1; }, ser: function(v) { return Number.isInteger(v) && v >= 0 && v <= 3 ? String(v) : '-1'; } },
       tipJitThick: { def: 0, legacy: null, parse: function(r) { return Math.max(0, Math.min(100, Number(r) || 0)); }, ser: function(v) { return String(Number(v) || 0); } },
       // ver1181: the six 入り抜き (taper) fields are GONE — the feature was ruled unnecessary, not
       // deferred, so leaving stored-but-inert fields behind would be the same lie the pending marks
@@ -60395,23 +60398,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function setPaintPaperTexScale(v) { paintBrushSet('paperTexScale', Math.max(10, Math.min(400, Math.round(Number(v) || 100)))); }
     // 텍스처 비트맵 → 알파 마스크. 그레인 이미지는 보통 불투명한 회색조라 destination-in이 쓰는 알파가
     // 전부 1이다(=마스크 효과 없음). 그래서 휘도를 알파로 옮긴다. 원본이 이미 알파를 갖는 경우도 있어
-    // 둘을 곱한다(둘 중 하나만 가정하면 한쪽 포맷에서 조용히 아무 일도 안 일어난다).
-    // depth는 마스크를 만들 때 적용한다: alpha = 1 - depth*(1-g). 나중에 부분 투명 마스크를 겹쳐
-    // 알파 합성으로 흉내내려 하면 (1-d)+d²g 같은 틀린 식이 나온다 — 여기서 정확히 계산하는 게 맞다.
-    // 캐시 키는 (id, depth) — depth 슬라이더는 5단위라 항목이 몇 개 안 생긴다.
-    const PAINT_GRAIN_MASKS = {};
+    // Masks are scoped to the decoded source object, then transform/depth/form.
+    // A replaced or released material cannot leave a mask under its reused string ID.
+    const PAINT_GRAIN_MASKS = new WeakMap();
     // ver2303: form 인자 — 기본(마스크: RGB 0 + 알파 = 1−d·(1−g), destination-in 용)과
     // 'lum'(회색조 불투명: 휘도 = g, multiply 용 — perDab 이 dab 마다 씀). depth 를 굽지 않는 것이
     // 'lum' 의 요점이다: multiply 를 globalAlpha=d 로 걸면 결과 휘도가 L·(1−d·(1−g)) 로 마스크와
     // 같은 식이 되므로, 타일은 depth 무관 1장 캐시로 충분하고 dab 마다 d 만 바꾸면 필압 곡선이
     // dab 단위로 걸린다. 채널 판정(hasAlphaVariation)과 g 계산은 두 폼이 **한 벌**이다.
-    function paintGrainMask(id, depthPct, form, reverse, coverage) {
+    function paintGrainMask(id, depthPct, form, reverse, coverage, tone) {
       const src = paintGetTip(id); // 비트맵 레지스트리를 공유한다(팁도 종이결도 "id로 부르는 비트맵")
       if (!src || !src.width || !src.height) return null;
       const lumForm = form === 'lum';
       const d = lumForm ? 1 : Math.max(0, Math.min(1, (Number(depthPct) == null ? 100 : Number(depthPct)) / 100));
-      const key = (lumForm ? (id + '|lum') : (id + '|' + Math.round(d * 100))) + (reverse ? '|reverse' : '') + (coverage ? '|coverage' : '');
-      if (PAINT_GRAIN_MASKS[key]) return PAINT_GRAIN_MASKS[key];
+      const brightness = Math.max(-100, Math.min(100, Number(tone && tone.brightness) || 0));
+      const contrast = Math.max(-100, Math.min(100, Number(tone && tone.contrast) || 0));
+      const transformed = brightness !== 0 || contrast !== 0;
+      const slope = contrast <= 0 ? 1 + contrast / 100 : 1 / (1 - contrast / 100);
+      const key = [lumForm ? 'lum' : d, !!reverse, !!coverage, brightness, contrast].join('|');
+      let masks = PAINT_GRAIN_MASKS.get(src);
+      if (!masks) { masks = new Map(); PAINT_GRAIN_MASKS.set(src, masks); }
+      if (masks.has(key)) return masks.get(key);
       const cv = document.createElement('canvas');
       cv.width = src.width; cv.height = src.height;
       const c = cv.getContext('2d', { willReadFrequently: true });
@@ -60433,31 +60440,29 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let g = hasAlphaVariation
           ? (p[i + 3] / 255)
           : ((p[i] * 0.299 + p[i + 1] * 0.587 + p[i + 2] * 0.114) / 255);
+        // Native ramp controls: negative contrast compresses before brightness; positive contrast expands after it.
+        // At +100 contrast the reciprocal slope becomes a threshold (avoid 0 * Infinity).
+        if (transformed) {
+          const centered = g - 0.5 - brightness / 200;
+          g = contrast === 100 ? (centered > 0 ? 1 : centered < 0 ? 0 : 0.5)
+            : Math.max(0, Math.min(1, contrast <= 0 ? (g - 0.5) * slope + 0.5 - brightness / 200 : centered * slope + 0.5));
+        }
         if (reverse) g = 1 - g;
         if (lumForm) {   // ver2303: 휘도 = g, 불투명 — multiply 의 소스
-          const gv = Math.round(Math.max(0, Math.min(1, g)) * 255);
+          const gv = transformed ? Math.min(255, Math.floor(g * 256)) : Math.round(Math.max(0, Math.min(1, g)) * 255);
           p[i] = gv; p[i + 1] = coverage ? 255 : gv; p[i + 2] = gv;
           p[i + 3] = 255;
           continue;
         }
         p[i] = 0; p[i + 1] = 0; p[i + 2] = 0;
-        p[i + 3] = Math.round(Math.max(0, Math.min(1, 1 - d * (1 - g))) * 255);
+        p[i + 3] = transformed ? Math.min(255, Math.floor((1 - d * (1 - g)) * 256))
+          : Math.round(Math.max(0, Math.min(1, 1 - d * (1 - g))) * 255);
       }
-      // ver1341 degenerate 가드(ver950의 zero-area 가드와 같은 사상): 결과 마스크가 사실상 전부
-      // 투명하면 그건 종이결이 아니라 획을 지우는 장치다. 캐시에 넣지 말고 null을 반환해 그레인 없이
-      // 그리게 한다 — 브러시가 안 보이는 것보다 결이 없는 것이 낫고, 원인을 콘솔에 남긴다.
-      // ver2303: lum 폼은 알파가 전부 255 라 같은 사상의 가드를 **휘도**로 잰다 — 평균 g 가 거의
-      // 0 이면 multiply 가 dab 을 통째로 검게 지우는 장치가 된다(마스크 폼의 「전부 투명」과 등가).
-      let sum = 0, cnt = 0;
-      const gch = lumForm ? 0 : 3;
-      for (let i = gch; i < p.length; i += 4) { sum += p[i]; cnt += 1; }
-      const meanAlpha = cnt ? sum / cnt : 0;
-      if (meanAlpha < 8 && !reverse) {
-        console.warn('[paintGrainMask] ' + (lumForm ? '결 통과율이 거의 0 — 종이결을 건너뜁니다.' : '마스크가 거의 전부 투명 — 종이결을 건너뜁니다.') + ' id=' + id + ' depth=' + depthPct + ' mean=' + meanAlpha.toFixed(1));
-        return null;
-      }
+      // Zero transmission is a valid texture result, including brightness/contrast extremes.
+      // Do not silently replace a transparent mask with an untextured opaque stroke.
       c.putImageData(im, 0, 0);
-      PAINT_GRAIN_MASKS[key] = cv;
+      if (masks.size >= 24) masks.clear();
+      masks.set(key, cv);
       return cv;
     }
     // ★ver2339: 종이결 배율을 **타일에 미리 굽는다.** 패턴 변환(`setTransform`)에 배율이 들어
@@ -60540,7 +60545,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return image;
     }
     function paintApplyGrainImage(image, grain, depth, originX, originY, luminosity) {
-      const lum = paintGrainMask(grain.id, 100, 'lum', grain.reverse);
+      const lum = paintGrainMask(grain.id, 100, 'lum', grain.reverse, false, grain);
       if (!lum) return;
       const tile = paintGrainScaledTile(lum, grain.id, Math.max(0.05, (Number(grain.scale) || 100) / 100));
       let pixels = paintGrainPixelCache.get(tile);
@@ -60582,7 +60587,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 알 수 있고, 이 함수는 스토어만 보고 도는 자리다(게이트 판정에도 쓰인다).
       const dc = paintCurveIfOn(src.paperTexDepthCurveOn, src.paperTexDepthCurvePts);   // ver2304: 판정 한 벌 — 스트로크에는 On 이 없어 종전과 동일
       // ver2303: perDab(描点ごとに適用) — 소비는 paintInkSessionStep(잉크 장 강제 + dab 곱).
-      return { id: id, depth: depth, depthCurve: dc, scale: Math.max(10, Math.min(400, Number(src.paperTexScale) || 100)), perDab: Boolean(src.paperTexPerDab), mode: paintGrainMode(src.paperTexMode), reverse: Boolean(src.paperTexReverse), rotation: Number(src.paperTexRotation) || 0 };
+      return { id: id, depth: depth, depthCurve: dc, scale: Math.max(10, Math.min(400, Number(src.paperTexScale) || 100)), perDab: Boolean(src.paperTexPerDab), mode: paintGrainMode(src.paperTexMode), reverse: Boolean(src.paperTexReverse), rotation: Number(src.paperTexRotation) || 0, brightness: Number(src.paperTexBrightness) || 0, contrast: Number(src.paperTexContrast) || 0 };
     }
     // ver2393: 水彩境界 한 벌. 세기의 환산은 **실측 한 점**이다 — `AlphaPower` 10 에서 띠의 알파가
     //   본체의 1.33 배, 곧 남은 여백(1−a)의 35.6 % 를 채운다.
@@ -61143,7 +61148,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       'tipId', 'tipSpacing', 'tipAngle', 'tipRotate', 'tipThick', 'tipRibbon', 'tipRibbonPitch', 'tipRibbonAlt', 'tipThickVert', 'tipScaling', 'tipDarken', 'tipAdjustFlow', 'tipJitSize', 'tipJitAngle', 'tipScatter', 'tipJitFlow',
       'waterEdge', 'waterEdgeRadius', 'waterEdgePower',   // ver2393: 水彩境界
       'mixOn', 'mixAmount', 'mixAmtPressure', 'mixAmtCurvePts', 'mixDensity', 'mixDensCurvePts', 'mixExtend', 'mixBlend',
-      'paperTexId', 'paperTexDepth', 'paperTexScale', 'paperTexDepthCurvePts', 'paperTexDepthCurveOn', 'paperTexPerDab', 'paperTexMode', 'paperTexReverse', 'paperTexRotation', 'tipThickCurvePts', 'tipJitThick', 'tipShape', 'tipAntialias',
+      'paperTexId', 'paperTexDepth', 'paperTexScale', 'paperTexDepthCurvePts', 'paperTexDepthCurveOn', 'paperTexPerDab', 'paperTexMode', 'paperTexReverse', 'paperTexRotation', 'paperTexBrightness', 'paperTexContrast', 'tipThickCurvePts', 'tipJitThick', 'tipShape', 'tipAntialias',
       'flow', 'flowCurvePts', 'flowCurveOn'   // 絵の具量은 에어브러쉬의 정체 그 자체다(ver1784) — 팁만 바꾸고 이것을 두면 반쪽이 된다
     ];
     // ver2312 (사용자 판정): **`.sut` 가 주는 축은 전부 그 브러시의 것이다** — 다른 브러시나
@@ -62069,10 +62074,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   넷이 여기 없어서, `.sut` 엔트리에는 값이 들어갔는데 **적용하면 전부 기본값으로 떨어졌다**
     //   (제보: 「내셔멍청펜 아무것도 안 변했는데」). 게이트는 이런 목록 누락을 안 보므로
     //   docs/i18n_tools/validate_brush_fields.py 를 새로 두어 이제 막는다.
-    const PAINT_PRESET_PEN_FIELDS = ['size', 'opacity', 'flow', 'stabilizer', 'pMin', 'pSize', 'pAlpha', 'blendMode', 'binarize', 'tipId', 'tipSpacing', 'tipAngle', 'tipRotate', 'tipThick', 'tipRibbon', 'tipRibbonPitch', 'tipRibbonAlt', 'tipThickVert', 'tipScaling', 'tipDarken', 'tipAdjustFlow', 'tipJitSize', 'tipJitAngle', 'tipScatter', 'tipJitFlow', 'mixOn', 'mixAmount', 'mixAmtPressure', 'mixAmtCurvePts', 'mixDensity', 'mixDensCurvePts', 'mixExtend', 'mixBlend', 'paperTexId', 'paperTexDepth', 'paperTexScale', 'paperTexDepthCurvePts', 'paperTexDepthCurveOn', 'paperTexPerDab', 'paperTexMode', 'paperTexReverse', 'paperTexRotation', 'tipThickCurvePts', 'tipJitThick', 'tipShape', 'tipAntialias', 'flowCurvePts', 'flowCurveOn', 'pCurvePts', 'pAlphaCurvePts', 'tiltSizeMin', 'tiltSizeMax', 'tiltSizeCurvePts', 'tiltAlphaMin', 'tiltAlphaMax', 'tiltAlphaCurvePts', 'taperIn', 'taperOut', 'taperBySpeed', 'waterEdge', 'waterEdgeRadius', 'waterEdgePower'];
+    const PAINT_PRESET_PEN_FIELDS = ['size', 'opacity', 'flow', 'stabilizer', 'pMin', 'pSize', 'pAlpha', 'blendMode', 'binarize', 'tipId', 'tipSpacing', 'tipAngle', 'tipRotate', 'tipThick', 'tipRibbon', 'tipRibbonPitch', 'tipRibbonAlt', 'tipThickVert', 'tipScaling', 'tipDarken', 'tipAdjustFlow', 'tipJitSize', 'tipJitAngle', 'tipScatter', 'tipJitFlow', 'mixOn', 'mixAmount', 'mixAmtPressure', 'mixAmtCurvePts', 'mixDensity', 'mixDensCurvePts', 'mixExtend', 'mixBlend', 'paperTexId', 'paperTexDepth', 'paperTexScale', 'paperTexDepthCurvePts', 'paperTexDepthCurveOn', 'paperTexPerDab', 'paperTexMode', 'paperTexReverse', 'paperTexRotation', 'paperTexBrightness', 'paperTexContrast', 'tipThickCurvePts', 'tipJitThick', 'tipShape', 'tipAntialias', 'flowCurvePts', 'flowCurveOn', 'pCurvePts', 'pAlphaCurvePts', 'tiltSizeMin', 'tiltSizeMax', 'tiltSizeCurvePts', 'tiltAlphaMin', 'tiltAlphaMax', 'tiltAlphaCurvePts', 'taperIn', 'taperOut', 'taperBySpeed', 'waterEdge', 'waterEdgeRadius', 'waterEdgePower'];
     const PAINT_PRESET_FIELDS = {
       pen:          PAINT_PRESET_PEN_FIELDS,
-      eraser:       ['size', 'opacity', 'flow', 'stabilizer', 'pMin', 'pSize', 'pAlpha', 'binarize', 'tipId', 'tipSpacing', 'tipAngle', 'tipRotate', 'tipThick', 'tipRibbon', 'tipRibbonPitch', 'tipRibbonAlt', 'tipThickVert', 'tipScaling', 'tipDarken', 'tipAdjustFlow', 'tipJitSize', 'tipJitAngle', 'tipScatter', 'tipJitFlow', 'paperTexId', 'paperTexDepth', 'paperTexScale', 'paperTexDepthCurvePts', 'paperTexDepthCurveOn', 'paperTexPerDab', 'paperTexMode', 'paperTexReverse', 'paperTexRotation', 'tipThickCurvePts', 'tipJitThick', 'tipShape', 'tipAntialias', 'flowCurvePts', 'flowCurveOn', 'pCurvePts', 'pAlphaCurvePts', 'tiltSizeMin', 'tiltSizeMax', 'tiltSizeCurvePts', 'tiltAlphaMin', 'tiltAlphaMax', 'tiltAlphaCurvePts', 'taperIn', 'taperOut', 'taperBySpeed', 'waterEdge', 'waterEdgeRadius', 'waterEdgePower'], // blendMode: the eraser is forced normal // ver1719: 지우개도 필압 곡선·기울기를 그대로 쓴다(paintAttachBrushDynamics 는 도구를 안 가린다) // ver1784: flow — 지우개도 같은 dab 커널이라 겹치면 더 지워진다
+      eraser:       ['size', 'opacity', 'flow', 'stabilizer', 'pMin', 'pSize', 'pAlpha', 'binarize', 'tipId', 'tipSpacing', 'tipAngle', 'tipRotate', 'tipThick', 'tipRibbon', 'tipRibbonPitch', 'tipRibbonAlt', 'tipThickVert', 'tipScaling', 'tipDarken', 'tipAdjustFlow', 'tipJitSize', 'tipJitAngle', 'tipScatter', 'tipJitFlow', 'paperTexId', 'paperTexDepth', 'paperTexScale', 'paperTexDepthCurvePts', 'paperTexDepthCurveOn', 'paperTexPerDab', 'paperTexMode', 'paperTexReverse', 'paperTexRotation', 'paperTexBrightness', 'paperTexContrast', 'tipThickCurvePts', 'tipJitThick', 'tipShape', 'tipAntialias', 'flowCurvePts', 'flowCurveOn', 'pCurvePts', 'pAlphaCurvePts', 'tiltSizeMin', 'tiltSizeMax', 'tiltSizeCurvePts', 'tiltAlphaMin', 'tiltAlphaMax', 'tiltAlphaCurvePts', 'taperIn', 'taperOut', 'taperBySpeed', 'waterEdge', 'waterEdgeRadius', 'waterEdgePower'], // blendMode: the eraser is forced normal // ver1719: 지우개도 필압 곡선·기울기를 그대로 쓴다(paintAttachBrushDynamics 는 도구를 안 가린다) // ver1784: flow — 지우개도 같은 dab 커널이라 겹치면 더 지워진다
       line:         PAINT_PRESET_PEN_FIELDS,
       curve:        PAINT_PRESET_PEN_FIELDS,
       rect:         PAINT_PRESET_PEN_FIELDS.concat(['shapeFill']),
@@ -62568,7 +62573,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return {
         id: id,
         shape: src && src.tipShape === 'circle' ? 'circle' : '',
-        antialias: src && src.tipAntialias === 0 ? 0 : -1,
+        antialias: src && Number.isInteger(src.tipAntialias) && src.tipAntialias >= 0 && src.tipAntialias <= 3 ? src.tipAntialias : -1,
         replaceAlpha: paintStrokeReplacesAlpha(src),
         spacing: Number(src && src.tipSpacing) || 0,
         angle: Number(src && src.tipAngle) || 0,
@@ -62814,7 +62819,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!tipId && shape !== 'circle') return;
       if (tipId) stroke.tipId = tipId;
       if (shape === 'circle') stroke.tipShape = shape;
-      if (g('tipAntialias') === 0) stroke.tipAntialias = 0;
+      const aa = g('tipAntialias');
+      if (Number.isInteger(aa) && aa >= 0 && aa <= 3) stroke.tipAntialias = aa;
       const sp = Number(g('tipSpacing')) || 0;
       if (sp > 0) stroke.tipSpacing = sp;
       // ver1335: 회전도 여기서 실린다 — conte의 세 빌더와 genga 세션이 전부 이 함수 하나를 지나므로
@@ -62970,6 +62976,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (mode !== 'multiply') stroke.paperTexMode = mode;
       if (g('paperTexReverse')) stroke.paperTexReverse = true;
       if (Number(g('paperTexRotation'))) stroke.paperTexRotation = Number(g('paperTexRotation'));
+      if (Number(g('paperTexBrightness'))) stroke.paperTexBrightness = Number(g('paperTexBrightness'));
+      if (Number(g('paperTexContrast'))) stroke.paperTexContrast = Number(g('paperTexContrast'));
     }
     // ver2393: 水彩境界 — 팁·종이결과 같은 attach 규격(팁이 없는 붓도 쓴다 — 수채 둥근 붓이 그렇다).
     function paintAttachWaterEdge(stroke, get) {
@@ -64724,6 +64732,28 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return targets;
       } catch (error) { return null; }
     }
+    // CSP uses the nonempty alpha bounds as the paper tile, not the padded thumbnail rectangle.
+    // Normalize newly imported SUT paper to white RGB + source alpha. Opaque paper then has
+    // transmission 1 even when its preview RGB is black; generic PNG grain keeps its own encoding.
+    function brushLibrarySutPaperDataUrl(image) {
+      const cv = document.createElement('canvas'); cv.width = image.width; cv.height = image.height;
+      const ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(image, 0, 0);
+      const pixels = ctx.getImageData(0, 0, cv.width, cv.height);
+      let left = cv.width, top = cv.height, right = 0, bottom = 0;
+      for (let y = 0; y < cv.height; y += 1) for (let x = 0; x < cv.width; x += 1) {
+        const i = (y * cv.width + x) * 4;
+        if (pixels.data[i + 3]) {
+          left = Math.min(left, x); top = Math.min(top, y);
+          right = Math.max(right, x + 1); bottom = Math.max(bottom, y + 1);
+        }
+        pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = 255;
+      }
+      ctx.putImageData(pixels, 0, 0);
+      const tile = document.createElement('canvas');
+      tile.width = Math.max(1, right - left); tile.height = Math.max(1, bottom - top);
+      if (right > left && bottom > top) tile.getContext('2d').drawImage(cv, left, top, tile.width, tile.height, 0, 0, tile.width, tile.height);
+      return tile.toDataURL('image/png');
+    }
     // One selected material, decoded once per import/role. Unused embedded materials are not registered.
     async function brushLibraryPrepareSutMaterial(material, paper) {
       const label = paper ? '종이결' : '붓끝';
@@ -64762,7 +64792,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const ref = brushLibraryNewRef();
         const ready = await new Promise(function(resolve) { brushLibraryRegisterTipFromDataUrl(ref, dataUrl, resolve); });
         if (!ready) { result.note = label + ' PNG를 읽지 못해 미적용'; return result; }
-        const image = paintGetTip(ref);
+        let image = paintGetTip(ref);
+        if (paper) {
+          dataUrl = brushLibrarySutPaperDataUrl(image);
+          const normalized = await new Promise(function(resolve) { brushLibraryRegisterTipFromDataUrl(ref, dataUrl, resolve); });
+          if (!normalized) { paintUnregisterTip(ref); result.note = label + ' 알파 소재 준비 실패'; return result; }
+          image = paintGetTip(ref);
+        }
         result.ref = ref; result.width = image.width; result.height = image.height;
         trackPersistFailure('brush ' + (paper ? 'paper' : 'tip'), putWorkspaceDbValue('bt:' + ref, dataUrl));
         return result;
@@ -65457,9 +65493,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       // AA 등급은 가장자리 처리이며 최종 알파 전체를 이진화하는 binarize와 동의어가 아니다.
       const aa = num(v.AntiAlias);
-      brush.tipAntialias = aa === 0 && brush.tipShape === 'circle' ? 0 : -1;
+      brush.tipAntialias = Number.isInteger(aa) && aa >= 0 && aa <= 3 && brush.tipShape === 'circle' ? aa : -1;
       if (brush.tipAntialias === 0) notes.push('AntiAlias=0 — 원형 팁의 기하 경계만 정수 픽셀로 적용; 농도·종이결 유지');
-      else if (aa != null) notes.push('AntiAlias=' + aa + ' (외곽 AA 단계 커널 미지원; Canvas 기본 coverage 사용)');
+      else if (brush.tipAntialias > 0) notes.push('AntiAlias=' + aa + ' — 기하 팁 경계 적용; AA 폭보다 얇은 타원은 Canvas coverage 사용');
+      else if (aa != null) notes.push('AntiAlias=' + aa + ' (소재 팁 외곽 AA 커널 미지원; Canvas 기본 coverage 사용)');
       // ver1784: BrushFlow 를 이 목록에서 뺐다 — 위에서 실제로 받는다(絵の具量 축이 생겼다).
       // ver2060: BrushBlendPatternByDarken 을 이 목록에서 뺐다 — 위에서 실제로 받는다.
       // ★ver2079: **끄는 값도 명시한다.** brushLibraryApplyEntry 는 엔트리에 있는 키만 적용하므로
@@ -65503,14 +65540,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       brush.flowCurveOn = true;
       brush.paperTexDepthCurveOn = true;
       if (brush.paperTexPerDab !== true) brush.paperTexPerDab = false;   // ver2303
-      // Reverse/rotation are wired. Brightness, contrast and stress still lack a matching kernel.
+      // Native paper ramp measurements: docs/tests/sut_native_2554/README.md.
       // Only active material settings warrant paper warnings.
       brush.paperTexReverse = !!brush.paperTexId && num(v.TextureReverseDensity) === 1;
       brush.paperTexRotation = brush.paperTexId ? (num(v.TextureRotate) || 0) % 360 : 0;
+      brush.paperTexBrightness = brush.paperTexId ? Math.max(-100, Math.min(100, num(v.TextureBrightness) || 0)) : 0;
+      brush.paperTexContrast = brush.paperTexId ? Math.max(-100, Math.min(100, num(v.TextureContrast) || 0)) : 0;
       if (brush.paperTexId) {
+        if (brush.paperTexBrightness || brush.paperTexContrast) notes.push('TextureBrightness/TextureContrast → 종이결 밝기·대비 적용');
         if (brush.paperTexReverse || brush.paperTexRotation) notes.push('종이결 반전·회전 적용 (TextureReverseDensity/TextureRotate)');
-        for (const [key, label] of [['TextureBrightness', '종이결 밝기'], ['TextureContrast', '종이결 대비'],
-          ['TextureStressDensity', '종이결 농도 강조']]) {
+        for (const [key, label] of [['TextureStressDensity', '종이결 농도 강조']]) {
           const n = num(v[key]);
           if (n != null && n !== 0) notes.push(key + '=' + n + ' — ' + label + ' (종이결 처리 미지원)');
         }
@@ -66111,9 +66150,80 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   CSP 는 33px). 세 계통이 같은 답을 냈다 — 실측 폭 · 필드 이름(`BrushVerticalThicknes=0`)
     //   · CSP 도구 속성 화면의 「적용 방향 = 수평」. 경위는 docs/csp_thickness_axis_2026-09-01.md.
     //   thickVert 를 주면 종전과 **같은 픽셀**이다(누르는 축이 종전의 세로 그대로다).
-    function paintDabEllipse(ctx, x, y, diameter, thick, vertical, angle, antialias) {
+    // Native geometry AA: circle distance ramp; ellipse scanline spans and cap ramps.
+    // Raw PSD/independent size+angle controls: docs/tests/sut_native_2554/aa-scanline-measurements.json.
+    // One reusable upload buffer; no destination readback or per-dab Canvas allocation.
+    let paintDabAaScratch = null;
+    function paintDabAaStamp(ctx, x, y, rx, ry, angle, grade, gray, coverage) {
+      const width = grade + 0.5, circle = rx === ry;
+      if (!circle && Math.min(rx, ry) <= width) return false;
+      const c = Math.cos(angle), sn = Math.sin(angle);
+      const hx = Math.hypot(rx * c, ry * sn), hy = Math.hypot(rx * sn, ry * c);
+      const x0 = Math.max(0, Math.ceil(x - hx - 0.5)), y0 = Math.max(0, Math.ceil(y - hy - 0.5));
+      const x1 = Math.min(ctx.canvas.width - 1, Math.floor(x + hx - 0.5)), y1 = Math.min(ctx.canvas.height - 1, Math.floor(y + hy - 0.5));
+      if (x1 < x0 || y1 < y0) return true;
+      const w = x1 - x0 + 1, h = y1 - y0 + 1;
+      let slot = paintDabAaScratch;
+      if (!slot) {
+        slot = paintDabAaScratch = { canvas: document.createElement('canvas'), palette: new Uint8ClampedArray(1024), key: '' };
+        slot.colors = new Uint32Array(slot.palette.buffer);
+      }
+      if (!slot.data || slot.data.width < w || slot.data.height < h) {
+        const bw = Math.max(32, Math.pow(2, Math.ceil(Math.log2(w))), slot.data ? slot.data.width : 0), bh = Math.max(32, Math.pow(2, Math.ceil(Math.log2(h))), slot.data ? slot.data.height : 0);
+        slot.canvas.width = bw; slot.canvas.height = bh;
+        slot.ctx = slot.canvas.getContext('2d');
+        slot.data = slot.ctx.createImageData(bw, bh);
+        slot.words = new Uint32Array(slot.data.data.buffer);
+      }
+      const v = Number.isFinite(gray) ? gray : 255, key = v + '|' + Boolean(coverage);
+      if (slot.key !== key) {
+        for (let a = 0; a < 256; a++) { const i = a * 4; slot.palette[i] = v; slot.palette[i+1] = coverage ? 255 : v; slot.palette[i+2] = v; slot.palette[i+3] = a; }
+        slot.key = key;
+      }
+      const stride = slot.data.width, words = slot.words, colors = slot.colors;
+      const ix = 1 / (rx * rx), iy = 1 / (ry * ry);
+      const aa = c*c*ix + sn*sn*iy, bb = 2*c*sn*(ix-iy), cc = sn*sn*ix + c*c*iy;
+      const irx = rx-width, iry = ry-width;
+      const iix = !circle ? 1/(irx*irx) : 0, iiy = !circle ? 1/(iry*iry) : 0;
+      const ia = c*c*iix + sn*sn*iiy, ib = 2*c*sn*(iix-iiy), ic = sn*sn*iix + c*c*iiy;
+      const ih = circle ? Math.max(0, rx-width) : Math.hypot(irx*sn, iry*c);
+      for (let py = y0; py <= y1; py++) {
+        const row = (py-y0)*stride, dy = py+0.5-y;
+        words.fill(0, row, row+w);
+        const half = Math.sqrt(Math.max(0, (bb*dy)*(bb*dy)-4*aa*(cc*dy*dy-1)))/(2*aa);
+        const mid = x-bb*dy/(2*aa), left = mid-half, right = mid+half;
+        const start = Math.max(x0, Math.ceil(left-0.5)), end = Math.min(x1, Math.floor(right-0.5));
+        let innerLeft = x, innerRight = x, innerMid = x, amp = 256;
+        const cap = Math.abs(dy) >= ih;
+        if (circle) {
+          const r = Math.max(0, rx-width), span = Math.sqrt(Math.max(0, r*r-dy*dy));
+          innerLeft = x-span; innerRight = x+span;
+        } else {
+          innerMid = x-ib*dy/(2*ia);
+          const span = Math.sqrt(Math.max(0, (ib*dy)*(ib*dy)-4*ia*(ic*dy*dy-1)))/(2*ia);
+          innerLeft = cap ? Math.floor(innerMid - 0.5) + 0.5 : innerMid-span;
+          innerRight = cap ? innerLeft : innerMid+span;
+          if (cap) amp = Math.min(256, 256*(hy-Math.abs(dy)+(dy<0 ? 0.5 : -0.5))/width);
+        }
+        const fullStart = cap ? end+1 : Math.max(start, Math.ceil(innerLeft-0.5));
+        const fullEnd = cap ? end : Math.min(end, Math.floor(innerRight-0.5));
+        if (fullEnd >= fullStart) words.fill(colors[255], row+fullStart-x0, row+fullEnd-x0+1);
+        for (let px = start; px <= end; px++) {
+          if (px === fullStart && fullEnd >= fullStart) { px = fullEnd; continue; }
+          const xx = px+0.5;
+          const value = circle ? 256*(rx-Math.hypot(xx-x,dy))/width
+            : xx < innerMid ? amp*(xx-left)/(innerLeft-left+1) : amp*(right-xx)/(right-innerRight+1);
+          words[row+px-x0] = colors[Math.max(0,Math.min(255,Math.floor(value)))];
+        }
+      }
+      slot.ctx.putImageData(slot.data, 0, 0, 0, 0, w, h);
+      ctx.drawImage(slot.canvas, 0, 0, w, h, x0, y0, w, h);
+      return true;
+    }
+    function paintDabEllipse(ctx, x, y, diameter, thick, vertical, angle, antialias, gray, coverage) {
       const rx = diameter * (vertical ? 1 : thick) / 2, ry = diameter * (vertical ? thick : 1) / 2;
       if (!(rx > 0 && ry > 0)) return;
+      if (antialias >= 1 && antialias <= 3 && paintDabAaStamp(ctx, x, y, rx, ry, angle, antialias, gray, coverage)) return;
       if (antialias !== 0) {
         ctx.beginPath();
         if (rx === ry) ctx.arc(x, y, rx, 0, Math.PI * 2);
@@ -66194,13 +66304,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   **5.74 → 0.71 ms/프레임**이고 **픽셀 해시가 8 회 전부 같다**(자기시험 통과).
     //   굽기는 획 8 회에 **1 회** — 깊이가 획 안에서 불변(ver2070)이라 캐시가 산다.
     //   한 장만 쥔다(용지 3508×2480 이면 약 35MB). 키가 갈리면 그 자리에서 새로 굽는다.
-    let paintGrainBakedCanvas = null, paintGrainBakedKey = '';
+    let paintGrainBakedCanvas = null, paintGrainBakedKey = '', paintGrainBakedTile = null;
     function paintGrainPatternTransform(rotation, ox, oy) {
       const r = (Number(rotation) || 0) * Math.PI / 180, c = Math.cos(r), s = Math.sin(r);
       return { a: c, b: s, c: -s, d: c, e: -ox, f: -oy };
     }
     function paintGrainBakedFull(tile, key, w, h, ox, oy, rotation) {
-      if (paintGrainBakedKey === key && paintGrainBakedCanvas
+      if (paintGrainBakedTile === tile && paintGrainBakedKey === key && paintGrainBakedCanvas
           && paintGrainBakedCanvas.width === w && paintGrainBakedCanvas.height === h) return paintGrainBakedCanvas;
       const c = document.createElement('canvas');
       c.width = w; c.height = h;
@@ -66210,7 +66320,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (typeof DOMMatrix === 'function' && p.setTransform) p.setTransform(paintGrainPatternTransform(rotation, ox, oy));
       x.fillStyle = p;
       x.fillRect(0, 0, w, h);
-      paintGrainBakedCanvas = c; paintGrainBakedKey = key;
+      paintGrainBakedCanvas = c; paintGrainBakedKey = key; paintGrainBakedTile = tile;
       return c;
     }
     function paintWalkTipDabs(pts, radii, tip, cb, resume) {
@@ -67181,7 +67291,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 불변(0×g=0)이고 lighten/screen 에 항등이라 임시 배경으로 안전하다. 깊이(=globalAlpha)를
       // dab 필압 곡선으로 접으면 결과 휘도가 L·(1−d·(1−g)) — 획 단위 마스크와 같은 식이 dab
       // 단위로 걸린다(筆圧→紙質濃度의 정확한 자리).
-      const gLum = grainPD ? paintGrainMask(grainPD.id, 100, 'lum', grainPD.reverse, coverage) : null;
+      const gLum = grainPD ? paintGrainMask(grainPD.id, 100, 'lum', grainPD.reverse, coverage, grainPD) : null;
       let pixelPage = null;
       let gPat = null, gctx = null, gK = 1, gDepth = 0, gCurve = null, gOx = 0, gOy = 0;
       let gTile = null, gTiled = null;   // ver2348: 배율 구운 타일과 그것을 2×2 로 이은 것
@@ -67563,11 +67673,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (grainStamp) {   // ver2303: 원판도 같은 곱 — perDab 이 잉크 장을 강제하므로 팁 없는 브러시도 온다
             grainStamp(x, y, d, i, t, function(g2, cxp, cyp) {
               g2.fillStyle = coverage ? 'rgb(' + v + ',255,' + v + ')' : paintGrayCss(v);
-              paintDabEllipse(g2, cxp, cyp, d, thk, tip && tip.thickVert, rad, tip && tip.antialias);
+              paintDabEllipse(g2, cxp, cyp, d, thk, tip && tip.thickVert, rad, tip && tip.antialias, v, coverage);
             });
           } else {
             fctx.fillStyle = coverage ? 'rgb(' + v + ',255,' + v + ')' : paintGrayCss(v);
-            paintDabEllipse(fctx, x, y, d, thk, tip && tip.thickVert, rad, tip && tip.antialias);
+            paintDabEllipse(fctx, x, y, d, thk, tip && tip.thickVert, rad, tip && tip.antialias, v, coverage);
           }
         }
         // ver1627: 색 장. 팁 모양·회전은 잉크 장과 **같은 값**을 쓴다(같은 dab 이니까). 알파는 팁
@@ -68082,7 +68192,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const f = paintCurveEvalPts(grain.depthCurve, p0);
         if (f != null) grainDepth = Math.max(0, Math.min(100, grain.depth * f));
       }
-      const mask = (grain && !grainPerDab) ? paintGrainMask(grain.id, grainDepth, null, grain.reverse) : null;
+      const mask = (grain && !grainPerDab) ? paintGrainMask(grain.id, grainDepth, null, grain.reverse, false, grain) : null;
       // 그레인도 알파도 없음 → ver1337의 손대지 않은 빠른 경로.
       // ver1784: **잉크 장이면 여기로 오면 안 된다.** 장은 회색조라 그대로 그리면 회색 덩어리가 된다 —
       // 아래 블록의 휘도→알파를 반드시 지나야 한다. 종전에는 「alphaFor 없음 = 장 아님」이 성립했지만
