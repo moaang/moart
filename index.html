@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2549</title>
+  <title>MoArt ver2551</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -60869,21 +60869,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintTipOrGrainActive(src) {
       return Boolean(paintGrainActive(src) || paintStrokeTipActive(src) || paintStrokeReplacesAlpha(src) || (src && src.tipShape === 'circle'));
     }
-    // 그레인이 켜졌으면 스트로크는 **한 덩어리로** 그려져야 한다: 마스크는 완성된 모양의 알파에 곱하는
-    // 것이므로 세그먼트를 레이어에 하나씩 얹는 증분 경로에서는 격리가 불가능하다. 그래서 whole-path
-    // 렌더러를 강제한다(선택 영역이 ver767에서, 필압 아웃라인이 ver621에서 쓰는 그 장치와 같다).
-    // 기본 스트로크(pSize=true)는 이미 whole-path라 실제 영향 범위는 필압알파·2値化·무필압 획뿐이고,
-    // 그쪽도 ver622의 rAF 배칭을 그대로 탄다.
+    // 획 후처리 결과 한 장. 잉크 세션과 달리 전역 재사용이므로 소유권을 확인한 뒤에만 증분 갱신한다.
     let paintGrainScratch = null;
-    // ver1619: box 를 주면 그 범위만 비운다. 캔버스 크기가 바뀌면 브라우저가 알아서 전부 비우므로
-    // 그때는 box 를 무시해도 된다(오히려 비우면 안 되는 상태가 없다).
-    // ver1629: `ownerKey` 는 **이 스크래치에 남아 있는 그림이 누구 것인가**다. 그레인 합성을 증분으로
-    // 돌리려면 「지난 프레임 내 결과가 아직 여기 있다」가 보장돼야 하는데, 이 캔버스는 전역 한 장이라
-    // 다른 스트로크·다른 레이어·브러시 미리보기가 언제든 덮어쓴다 — 그게 증분화의 유일한 실패 경로였고,
-    // 소유권을 적어 두면 구조적으로 막힌다(남이 썼으면 키가 달라져 그 프레임만 전체를 다시 만든다).
-    // 재사용일 때는 **클리어하지 않는다** — 호출부가 clip 안에서 새 범위만 지운다.
+    // 빌려주는 함수는 크기·컨텍스트 상태·소유권만 관리한다. clear/clip은 paintFillVariableWidthBody가 맡는다.
+    // 다른 획·레이어·썸네일이 사용했거나 크기가 바뀌면 이전 결과를 재사용할 수 없다.
     let paintGrainScratchKey = null;
-    function paintGrainScratchFor(w, h, box, ownerKey) {
+    function paintGrainScratchFor(w, h, ownerKey) {
       if (!paintGrainScratch) paintGrainScratch = document.createElement('canvas');
       let resized = false;
       if (paintGrainScratch.width !== w) { paintGrainScratch.width = w; resized = true; }
@@ -60895,13 +60886,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       c.filter = 'none';
       const reused = ownerKey != null && paintGrainScratchKey === ownerKey && !resized;
       paintGrainScratchKey = (ownerKey == null) ? null : ownerKey;
-      // ★ver1631: **여기서는 비우지 않는다.** ver1629 는 `reused` 일 때만 클리어를 건너뛰고 호출부가
-      //   증분 범위를 비우게 했는데, 호출부는 「증분을 실제로 쓸 때(incBox)」만 비웠다 — 그래서
-      //   **재사용인데 증분을 안 쓰는 프레임**에서는 아무도 비우지 않았고, 지난 프레임 그림 위에
-      //   그대로 덧그려졌다. 그 조합은 드물지 않다: 점이 안 늘어난 프레임(포인터가 멈춘 사이의 rAF),
-      //   세션이 없는 획(팁도 잉크 장도 아닌 그레인 전용), 휘도→알파 필터가 없는 브라우저.
-      //   사용자에게는 **큰 사각형 덩어리가 깜빡이고 획을 떼도 남는** 증상으로 나왔다(실사용 제보).
-      //   비우는 조건이 두 함수에 나뉘어 있던 것이 원인이므로, 한 곳(호출부)이 전부 책임진다.
+      // 여기서 비우면 증분 결과가 사라진다. reused여도 전체 재처리가 필요한지는 호출부가 결정한다.
       return { cv: paintGrainScratch, ctx: c, reused: reused };
     }
 
@@ -67266,32 +67251,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (ma !== 1) ctx.globalAlpha = baseAlpha;
       }, resume);
     }
-    // ── ver1356: 잉크 장(場) — dab이 곧 브러시 팁이고, 그 팁이 곧 농도다 ────────────────────────
-    // ver1345~1355는 스트로크를 **두 겹의 곱**으로 만들었다: ①모양(진짜 팁 스탬프) × ②농도 마스크.
-    // ②를 팁으로 만들면 팁알파가 두 번 곱해져 텍스처가 제곱된다(코드맵 ver1350의 "제곱 문제") —
-    // 그래서 ②를 원(ver1346~52)으로, 다시 격자(ver1353~55)로 만들었고, 사용자는 그때마다 정확히
-    // 그것을 봤다("농도가 원 모양", "격자 모자이크"). 특히 격자는 셀 크기가 반지름에 비례해서
-    // 사이즈 489 브러시면 셀이 24px(상한)까지 커진다 — 그 크기의 계단이 곧 모자이크였고, ver1355의
-    // falloff 확대는 셀 **내부** 양자화를 건드리지 못하므로 아무것도 고치지 못했다.
-    //
-    // 제곱 문제는 팁을 포기할 이유가 아니라 **두 겹을 포기할 이유**였다. 여기서는 한 겹만 만든다:
-    //   장(x,y) = max_dab( 팁알파_dab(x,y) × 필압알파_dab )
-    // 이 한 장이 곧 모양이자 농도다. 곱셈이 없으니 제곱도 없고, 원·격자·셀이 아예 없으니 원형
-    // 얼룩도 모자이크도 **원리적으로** 생길 수 없다. 남는 모양은 팁의 모양뿐이다 — 사용자가 요구한 것.
-    //
-    // 구현: Canvas2D에 max-alpha 합성이 없으므로(W3C #11397 기각) **불투명 그레이스케일**로 우회한다.
-    //   - 팁을 흰색으로 틴트해 검은 배경에 구워둔다(lum 캔버스, 팁당 1장 캐시) → 휘도 = 팁알파.
-    //   - dab마다 **작업 캔버스 1장**(팁 크기, 재사용)에 검정을 깔고 그 lum을 `globalAlpha=필압알파`로
-    //     얹는다 → 휘도 = 팁알파 × 필압알파, **불투명**. 그걸 `lighten`으로 장에 찍는다.
-    //     **불투명 원본 + 불투명 대상**에서 lighten은 정확한 채널 max다(실측: 20회 반복 스탬프에도
-    //     값 무증가 = 누적 없음. 이 두 조건이 깨지면 트릭이 무효라는 점은 ver1348 주석 참고).
-    //     ⚠ dab마다 `filter='brightness()'`로 스케일하는 편이 짧지만 **실측 1005ms/216dab**이었다
-    //       (필터 변경이 매 dab 파이프라인을 플러시한다). 작업 캔버스 왕복이 훨씬 싸다.
-    //   - drawImage의 가장자리는 작업 캔버스 테두리(검정)를 샘플링하므로 max에 무해하다.
-    //   - 마지막에 휘도→알파(기존 SVG 필터)로 옮기고 색을 source-in으로 채운다.
-    // 원형 브러시는 팁 이미지가 없으므로 **불투명 회색 원판을 직접** 찍는다(작업 캔버스 왕복이 필요
-    // 없어 더 싸다). AA 테두리 1px만 부분 알파인데, 부분 알파의 lighten은 Cb와 max(Cb,Cs) 사이의
-    // 값이라 **참 max를 넘지 않는다** — 누적으로 새지 않는다(위 실측의 따름정리).
+    // 잉크 누적: 팁 알파와 농도를 불투명 RGB에 저장해 Canvas2D의 lighten(max)/screen을 사용한다.
+    // 겹침 모드는 paintStampInkField에서 선택한다. transparent source-over로 바꾸면 같은 값이 아니다.
+    // perDab 종이결은 회전된 팁 마스크에 용지 위상으로 적용한다. 그 외 소재 팁은 원본 크기 scratch를 쓴다.
+    // 마지막에 paintFillVariableWidthBody가 R을 알파로 옮긴다. 알파 대체 모드의 G는 별도 coverage다.
+    // SVG 필터가 실제 픽셀 검사를 통과하면 필터 경로, 아니면 같은 필드의 CPU 변환 경로를 쓴다.
+    // 도입 이력과 현재 제약: docs/tests/pencil_pipeline_2550/structure_audit.md.
     let paintTipLumCache = new Map();  // tipId → 불투명 그레이스케일 캔버스(휘도=팁알파)
     function paintTipLumFor(tipImage, key) {
       const hit = paintTipLumCache.get(key);
@@ -67388,12 +67353,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 농도」만 담고(회색조), 색은 이 장이 담는다 — 마지막 합성에서 알파는 잉크 장, RGB 는 색 장에서
     // 온다. 걷기를 두 번 하지 않는 것이 중요하다: mixTipFor 는 부를 때마다 carried 를 갱신하는
     // **상태 있는** 함수라, 두 번 걸으면 색이 두 배로 감쇠한다.
-    // ver1784: `flow`(0.01..1) 가 오면 **합성이 max 에서 screen 으로 바뀐다.**
-    //   max    = 같은 자리를 몇 번 지나도 그대로 (지금까지의 동작, flow 100%)
-    //   screen = 1-(1-a)^N 로 쌓인다 (絵の具量, flow < 100%)
-    // 불투명 회색조 장에서 screen 은 정확히 그 식이다(실측: a=0.12 를 1·2·5·20 회 → 31·58·121·236,
-    // 산술 예측과 네 지점 일치). 둘 다 결합·교환이 성립해 증분 세션의 「이어 찍기 = 처음부터 찍기」가
-    // 유지된다 — 단 screen 은 멱등이 아니므로 **dab 중복이 없어야** 한다(paintInkSessionStep 주석 참조).
+    // max/screen 선택은 팁 유무·darken·flow의 조합으로 정한다. screen은 같은 dab을 다시 찍으면 누적된다.
+    // 라이브는 임시 꼬리를 복원한 뒤 다시 찍고, 혼색은 원래 dab 순서를 유지한다.
     function paintStampInkField(fctx, pts, radii, tip, tipImage, av, resume, mixTipFor, cctx, flow, grainPD) {
       const coverage = Boolean(tip && tip.replaceAlpha);
       const lum = tipImage ? paintTipLumFor(tipImage, (tip && tip.id) || '') : null;
@@ -67573,8 +67534,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         const bw = bx1 - bx0, bh = by1 - by0;
         if (!paintInkGrainBatch) paintInkGrainBatch = document.createElement('canvas');
-        if (paintInkGrainBatch.width < bw) paintInkGrainBatch.width = bw;
-        if (paintInkGrainBatch.height < bh) paintInkGrainBatch.height = bh;
+        // 가로·세로 획의 최대 폭/높이를 합쳐 큰 backing store를 남기지 않는다.
+        const growW = Math.max(paintInkGrainBatch.width, bw), growH = Math.max(paintInkGrainBatch.height, bh);
+        const keepSize = growW * growH <= PAINT_GRAIN_BATCH_MAX_PX;
+        const allocW = keepSize ? growW : bw, allocH = keepSize ? growH : bh;
+        if (paintInkGrainBatch.width !== allocW) paintInkGrainBatch.width = allocW;
+        if (paintInkGrainBatch.height !== allocH) paintInkGrainBatch.height = allocH;
         const bctx = paintInkGrainBatch.getContext('2d');
         bctx.setTransform(1, 0, 0, 1, 0, 0);
         bctx.globalCompositeOperation = 'source-over';
@@ -67610,7 +67575,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         q.length = 0;
       } : null;
       let dctx = null, dw = 0, dh = 0;
-      if (lum) {
+      // perDab는 grainBake에 직접 굽는다. 사용하지 않는 원본 크기 팁 scratch는 준비하지 않는다.
+      // 리본은 아래 Canvas 폴백에서 이 scratch를 사용한다.
+      if (lum && (!grainStamp || (tip && tip.ribbon))) {
         if (!paintInkDabScratch) paintInkDabScratch = document.createElement('canvas');
         dw = lum.width; dh = lum.height;
         if (paintInkDabScratch.width !== dw) paintInkDabScratch.width = dw;
@@ -67780,7 +67747,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
           }
         } else {
-          // 원판: 회전 대칭이라 rad를 볼 필요가 없다(회전해도 같은 그림).
+          // 소재 없는 팁도 두께로 타원이 될 수 있어 paintDabEllipse에 회전과 AA를 전달한다.
           const v = Math.max(0, Math.min(255, tip && tip.shape === 'circle' ? Math.floor(a * 255) : Math.round(a * 255)));
           if (grainStamp) {   // ver2303: 원판도 같은 곱 — perDab 이 잉크 장을 강제하므로 팁 없는 브러시도 온다
             grainStamp(x, y, d, i, t, function(g2, cxp, cyp) {
@@ -68283,10 +68250,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const diagOn = (typeof paintDiagCur !== 'undefined') && paintDiagCur;   // ver2399: typeof 가드(골든 자립성)
       const diagT0 = diagOn ? performance.now() : 0;
       if (diagOn) {
-        // ver2418: 프레임 «간격» — 화면이 얼마나 자주 갱신됐는가. fill ms 와 다른 축이라
-        //   fill 이 짧은데 간격이 벌어지면 이 함수 밖(합성·GPU·rAF)이 범인이다.
+        // fill 호출 간격이다. 실제 화면 표시 간격이나 입력→표시 지연은 별도 계측해야 한다.
+        // fill 바깥의 합성·GPU·이벤트/rAF 대기는 이 수치만으로 원인을 확정할 수 없다.
         if (diagOn.lastFrameT) diagOn.gaps.push(diagT0 - diagOn.lastFrameT);
-        else diagOn.firstFrameT = diagT0;   // ver2419: 이 획의 첫 프레임 = 첫 픽셀이 나온 시각
+        else diagOn.firstFrameT = diagT0;   // 이 획의 첫 fill 진입 시각(실제 표시 완료 시각 아님)
         diagOn.lastFrameT = diagT0;
         diagOn.frames += 1; diagOn.pts = pts ? pts.length : 0;
       }
@@ -68295,18 +68262,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 라이브(liveHost)든 커밋이든 같은 함수 — 라이브만 이어 그리고, 커밋은 처음부터 한 번 만든다.
       const s = paintInkSessionStep(opts.liveHost || null, ctx, pts, radii, color, opts);
       paintRecordStrokeCoverage(ctx.canvas, s);
-      // ver2070: 筆圧→紙質濃度. **획 단위 근사**이고, 그 이유는 구조다 —
-      //  · 그레인은 **용지 고정**(createPattern + setTransform)이라 dab 로컬 좌표에서 곱하면
-      //    dab 회전이 결까지 돌려 버린다.
-      //  · 완성 획에 곱하는 지금 자리에서 dab 마다 다른 깊이를 주려면 픽셀마다 깊이가 달라야 하는데
-      //    Canvas2D 의 destination-in 은 한 번에 한 마스크뿐이다.
-      //  · dab 마다 따로 곱하면 겹친 자리에 결이 두 번 걸린다(multiply 는 누적된다).
-      // 그래서 **획이 시작될 때의 필압** 하나로 그 획의 깊이를 정한다. 획 사이에는 달라지고 획
-      // 안에서는 안 변한다 — 마스크 캐시와 ver1629 증분이 그대로 성립하는 것도 이 성질 덕이다
-      // (획 중에 깊이가 흔들리면 결이 프레임마다 다시 만들어져 눈에 띄게 떨린다).
-      // ver2303: 描点ごとに適用 — 결이 dab 픽셀에 이미 구워져 있다(paintStampInkField). 여기서
-      // 또 곱으면 이중 적용이다. 획 단위 근사(위 ver2070)도 그 자리(dab 필압)로 올라갔다.
-      // 판정은 세션이 정한 것(s.grainPD) 하나만 본다 — 리본 무효·미지원 폴백이 거기 접혀 있다.
+      // 세션이 perDab 종이결을 이미 구웠다면 여기서는 다시 곱하지 않는다.
+      // 획 단위 종이결은 시작 필압으로 깊이를 정한다. 리본·지원되지 않는 perDab 조합도 이 경로다.
       const grainPerDab = Boolean(s && s.grainPD);
       let grainDepth = grain ? grain.depth : 0;
       if (grain && !grainPerDab && grain.depthCurve && pts.length) {
@@ -68339,7 +68296,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gbox = paintStrokeScratchBox(s && s.box, pts, radii, w, h);
       const bx = gbox ? gbox.x : 0, by = gbox ? gbox.y : 0;
       const bw = gbox ? gbox.w : w, bh = gbox ? gbox.h : h;
-      const sc = paintGrainScratchFor(w, h, gbox, opts.strokeKey == null ? null : opts.strokeKey);
+      const sc = paintGrainScratchFor(w, h, opts.strokeKey == null ? null : opts.strokeKey);
       // ── ver1629: 그레인 증분 ────────────────────────────────────────────────────────────────
       // 지금까지 그레인은 **매 프레임 획 전체(gbox)** 를 다시 만들었다: 스크래치 클리어 → 장 복사 →
       // 마스크 곱. 획이 길어질수록 그 면적이 커져 비용이 「그은 길이」에 비례했다(실측: 원화에서
@@ -68427,7 +68384,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           wx = bx; wy = by; ww = bw; wh = bh;
         }
         if (alphaFor) {
-          // ver1346: 휘도→알파 필터가 없는 브라우저 — 모양을 그리고 획 **전체 평균 알파**로 물러선다.
+          // 필터와 CPU 변환을 모두 사용할 수 없을 때의 최종 폴백: 전체 평균 알파.
           // 경로에 따른 변화는 잃지만 아티팩트는 없다(조용히 필압을 무시하는 것보다 정직하다).
           paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
           let sum = 0;
@@ -68619,11 +68576,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.fillStyle = color || '#111111';
       ctx.fill();
     }
-    // ver1370: 휘도→알파를 **JS로** 옮긴다 — SVG 필터를 실제로는 걸지 않는 브라우저(iOS/WebKit)를 위한
-    // 같은 결과의 다른 길. 필터판과 픽셀 단위로 같은 일을 한다: alpha := R (장은 R=G=B=휘도인 불투명 회색).
-    // 캔버스 전체가 아니라 s.box — 세션이 dab 을 찍으며 쌓아 둔 **획이 지나간 범위**만 훑는다. 그래서
-    // 비용이 캔버스 크기가 아니라 그은 크기에 붙고, 라이브 미리보기에서도 감당할 만해진다.
-    // 실패하면 false 를 돌려주고 호출부가 ver1346 의 평균 알파 물러섬으로 간다.
+    // 필터 프로브가 실패한 환경의 같은 잉크 변환: R→A, 단색 RGB 또는 별도 색 장 적용.
+    // workBox는 이번 갱신 구역, 없으면 s.box의 전체 획 범위다. 실패 시 false로 재사용을 무효화한다.
     let paintInkAlphaScratch = null, paintInkAlphaScratchCtx = null;
     function paintInkFieldToAlpha(sc, s, w, h, color, workBox) {
       const box = workBox ? { x0: workBox.x, y0: workBox.y, x1: workBox.x + workBox.w, y1: workBox.y + workBox.h } : s && s.box;
@@ -68633,12 +68587,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const bw = x1 - x0, bh = y1 - y0;
       if (bw <= 0 || bh <= 0) return false;
       try {
-        // ★ 전용 캔버스를 쓰는 이유는 `willReadFrequently` 하나다. GPU 뒤에 있는 캔버스에서 getImageData 는
-        //   파이프라인을 세우는 읽기라, 구역이 아무리 작아도 고정 비용이 붙는다 — 실측(1500×844, 260×104
-        //   구역): 기본 컨텍스트 **16.15ms/프레임**, 이 힌트를 주면 **1.61ms**. 10배다. 힌트를 공용
-        //   스크래치(paintGrainScratchFor)에 걸 수는 없다. 그쪽은 읽지 않고 합성만 하므로 CPU 쪽에 붙들면
-        //   오히려 손해다. 그래서 읽는 캔버스만 따로 둔다.
-        //   구역 제한도 힌트와 함께여야 값이 산다: 같은 조건에서 캔버스 전체는 7.92ms, 획 범위만은 1.61ms.
+        // 읽기용 scratch를 합성용 surface와 분리한다. willReadFrequently는 힌트이며 실제 backing을 보장하지 않는다.
+        // 직접 읽기/쓰기와 GPU 중간 변환도 비교했지만 일관된 이득이 없었다. 측정: tests/pencil_pipeline_2550/README.md.
         if (!paintInkAlphaScratch) {
           paintInkAlphaScratch = document.createElement('canvas');
           paintInkAlphaScratchCtx = paintInkAlphaScratch.getContext('2d', { willReadFrequently: true });
@@ -68654,13 +68604,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         rc.drawImage(s.cv, x0, y0, bw, bh, 0, 0, bw, bh);
         const img = rc.getImageData(0, 0, bw, bh);
         const d = img.data;
-        for (let i = 0; i < d.length; i += 4) d[i + 3] = d[i]; // alpha := R (필터의 feColorMatrix와 같은 식)
+        // 단색은 알파 변환과 같은 픽셀 루프에서 색도 쓴다. 별도 source-in 색칠을 하지 않는다.
+        // 혼색·다른 CSS 색 표현은 기존 Canvas 색 적용을 사용한다.
+        const flat = !s.colorField && /^#[0-9a-f]{6}$/i.test(color) ? hexToRgb(color) : null;
+        if (flat) {
+          for (let i = 0; i < d.length; i += 4) {
+            d[i + 3] = d[i]; d[i] = flat.r; d[i + 1] = flat.g; d[i + 2] = flat.b;
+          }
+        } else {
+          for (let i = 0; i < d.length; i += 4) d[i + 3] = d[i];
+        }
         rc.putImageData(img, 0, 0);
         rc.globalCompositeOperation = 'source-in';
         // ver1627: 필터판과 **같은 규칙** — 혼색이면 색 장에서 그 구역을 가져온다(여기서 갈리면
         // iOS 에서만 색이 다른 그림이 나온다).
         if (s.colorField) rc.drawImage(s.colorField, x0, y0, bw, bh, 0, 0, bw, bh);
-        else { rc.fillStyle = color || '#111111'; rc.fillRect(0, 0, bw, bh); }
+        else if (!flat) { rc.fillStyle = color || '#111111'; rc.fillRect(0, 0, bw, bh); }
         rc.globalCompositeOperation = 'source-over';
         sc.ctx.setTransform(1, 0, 0, 1, 0, 0);
         sc.ctx.globalAlpha = 1;
@@ -68835,9 +68794,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!n) return null;
       const tipId = (opts.tip && opts.tip.id) || '';
       const tipImage = tipId ? paintGetTip(tipId) : null;
-      // ver1784: 絵の具量. **팁이 없을 때만** 잉크 장을 새로 켠다 — 팁이 있으면 텍스처 세션이
-      // source-over 로 **이미 누적**하고 있어서(그쪽은 dab 마다 globalAlpha 를 곱할 훅이 있다),
-      // 잉크 장으로 보내면 회색조 한 장이 되어 오히려 색이 단순해진다. 설계 §1-B/1-C 의 갈래가 이것.
+      // 잉크 필드 선택은 아래 inkMode 조건이 정본이다. 팁/농도/종이결/혼색/coverage를 함께 본다.
       const flow = paintOptsFlowVal(opts);
       // ver2060: 比較暗 은 팁이 있을 때도 장을 켜야 한다 — 쌓지 않는 겹침(max)은 장에만 있다.
       // 筆圧→絵の具量 곡선도 마찬가지다(팁이 없으면 장 외에 dab 알파를 건드릴 자리가 없다).
@@ -68957,9 +68914,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 리셋(canResume 실패)은 clear/fill 로 이미 s.cv 를 바꿨으므로 그 자체가 변화다.
       let cvChanged = !canResume;
       if (inkMode) {
-        // ver1784: 장은 이제 **두 이유로** 켜진다 — 筆圧→濃度(alphaFor 있음)와 絵の具量(flow<1).
-        // 후자만일 때는 필압 알파가 없으므로 av 를 1 로 채운다. 그러면 dab 의 농도는 flow 하나가 정하고
-        // (paintStampInkField 가 a*flow 를 쓴다) 나머지 경로는 필압 때와 완전히 같다.
+        // alphaFor 없이도 팁·종이결·혼색·coverage가 필드를 켠다. 그때는 필압 알파를 1로 둔다.
         // ★이 분기를 안 두면 alphaFor 가 null 인 채로 불려 그 자리에서 터진다(실측으로 잡았다 —
         //  게이트는 문법만 보므로 이런 도달 조합은 앱을 띄워야만 드러난다).
         const alphaOf = opts.alphaFor;
