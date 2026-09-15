@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2552</title>
+  <title>MoArt ver2553</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24682,6 +24682,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2553, items: [{ ja: 'ブラシのプレビューが素材の読み込み後も丸い線のまま残る問題を修正しました。設定の変更・読み込み失敗による表示の混線も防ぎます。',
+        ko: '브러시 소재를 불러온 뒤에도 미리보기가 원형 획으로 남는 문제를 수정했습니다. 설정 변경·로딩 실패로 다른 그림이 표시되는 문제도 방지합니다.',
+        en: 'Fixed brush previews staying round after their materials loaded, and stale previews caused by changing settings or failed loads.',
+        zh: '修复了笔刷素材加载后预览仍显示圆形笔画的问题，以及设置变化或加载失败导致的预览错乱。' }] },
       { ver: 2552, items: [{ ja: 'SUTの素材参照・開始終了の適用対象を修正し、固定間隔の濃度補正と素材穂先の自動間隔を改善しました。再読み込みで反映されます。',
         ko: 'SUT 소재 참조·시작과 끝 적용 대상을 수정하고, 고정 간격 농도 보정과 소재 팁 자동 간격을 개선했습니다. 다시 가져오면 반영됩니다.',
         en: 'Fixed SUT material references and taper targets; improved fixed-spacing density correction and material-tip automatic spacing. Reimport to apply.',
@@ -60464,6 +60468,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.paintPressureGain = Math.max(PAINT_PRESSURE_GAIN_MIN, Math.min(PAINT_PRESSURE_GAIN_MAX, Math.round(Number(v) || 100)));
       try { localStorage.setItem(PAINT_PRESSURE_GAIN_KEY, String(state.paintPressureGain)); } catch (e) {}
       renderPressureGainRow();
+      paintBrushPreviewRefresh();
     }
     // ver2318: 기울기의 두 축을 **한 표**로 적는다 — 최소치·최대치의 상한, 곡선 필드, 그리고 곡선이
     //   없을 때의 기본 모양. 두 축이 같은 커널(paintTiltMul)을 지나고 여기서만 갈린다.
@@ -60979,11 +60984,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // opts  = { w, h, dpr, sizeMul, color, seed, chip }.
     function paintBrushPreviewDraw(targetCanvas, brush, opts) {
       if (!targetCanvas) return;
-      opts = opts || {};
-      brush = brush || {};
-      const cssW = Math.max(24, Math.round(Number(opts.w) || targetCanvas.clientWidth || BRUSH_PREVIEW_BOX_W));
-      const cssH = Math.max(16, Math.round(Number(opts.h) || targetCanvas.clientHeight || BRUSH_PREVIEW_BOX_H));
-      const dpr = Math.max(1, Math.min(3, Number(opts.dpr) || window.devicePixelRatio || 1));
+      opts = paintBrushPreviewOptions(targetCanvas, opts);
+      brush = paintBrushPreviewSettings(brush);
+      const cssW = opts.w, cssH = opts.h, dpr = opts.dpr;
       const W = Math.round(cssW * dpr), H = Math.round(cssH * dpr);
       if (targetCanvas.width !== W) targetCanvas.width = W;
       if (targetCanvas.height !== H) targetCanvas.height = H;
@@ -61004,25 +61007,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const mul = Math.max(0.25, Math.min(2, Number(opts.sizeMul) || 1));
       const ceilCss = cssH * (1 - 2 * BRUSH_PREVIEW_AMP_FRAC);
       const drawnCss = Math.max(0.5, Math.min(ceilCss, actualSize * mul));
-      // The chip marks the user's preview multiplier; its number remains the real brush size.
-      const scaled = Math.abs(mul - 1) > 0.001;
+      const scaled = Math.abs(drawnCss - actualSize) > 0.001;
 
       const pts = paintBrushPreviewPathPoints(cssW / BRUSH_PREVIEW_BOX_W * dpr, cssH / BRUSH_PREVIEW_BOX_H * dpr);
-      // ver1334: 저작된 S-웨이브를 그대로 쓴다(tremor 제거 — 위 주석). 이제 실제 스윙이 정확히
-      // BRUSH_PREVIEW_AMP_FRAC와 같아져서, 아래 ceilCss의 "웨이브가 박스를 못 밀어내는 최대 half-width"
-      // 계산이 처음으로 정직해졌다 — tremor는 그 진폭을 넘어 흔들었으므로 옛 천장은 낙관적이었다.
       const sampled = pts.map(function(pt, i) { return { x: pt.x, y: pt.y, t: i / (pts.length - 1) }; });
-      // ver1236: 手ブレ補正 (stabilizer) is NOT applied here any more (user). Running the preview path through
-      // the real smoother was defensible in principle — it is what the brush would do — but the sample path is
-      // a fixed synthetic wobble, so all smoothing did was flatten that wobble and pull the stroke's end short,
-      // making the thumbnail read WORSE without telling you anything about the mark the brush leaves. The
-      // stabilizer changes how faithfully your hand is followed, not the mark itself, so it has nothing to
-      // show in a thumbnail. (paintStabilizeStep is still the live drawing path's smoother, untouched.)
+      // 손 움직임을 보정하는 입력 필터는 고정 표본 경로에 적용하지 않는다.
       const path = sampled.map(function(pt) {
         return { x: pt.x / W, y: pt.y / H, p: paintBrushPreviewPressure(pt.t) };
       });
 
-      // Same object shape beginPaintRasterDraw builds, so drawPaintStroke cannot tell this from a real stroke.
+      // 고정 표본을 공용 렌더에 전달할 획 레코드로 만든다.
       const stroke = {
         tool: isEraser ? 'eraser' : 'pen',
         color: isEraser ? '#111111' : (opts.color || '#111111'),
@@ -61046,21 +61040,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver2317: `pressureGamma` 를 안 싣는다 — 감마 단계가 사라졌고 곡선이 정본이다(없으면 커널이 1).
         pressureCurvePts: paintNormCurvePts(brush.pCurvePts), // ver1622
         pressureAlphaCurvePts: paintNormCurvePts(brush.pAlphaCurvePts),
-        pressureGain: paintPressureGainMul()   // ver1799: 그래프와 같은 한 벌 · ver2316: 앱 전역이라 레코드에서 안 읽는다
+        pressureGain: opts.pressureGain
       };
-      // ver1239: carry the TIP. Without this the preview built a stroke with no tipId, so drawPaintStroke took
-      // its plain-round-dab branch and a textured brush previewed as a smooth one — the thumbnail actively lied
-      // about the mark, which is the one thing a brush library thumbnail exists to tell you. Same field names
-      // the real builders attach (paintAttachTip), so preview and commit stay one rasterizer with one input
-      // shape ([[preview-commit-raster-consistency]]). Guarded: an unregistered tipId falls back to the round
-      // dab exactly as a real stroke would.
-      // ★ver2391: 팁 필드는 **실제 빌더와 같은 함수**로 싣는다(paintAttachTip — mix/flow/taper 가
-      //   이미 그렇다). 여기 손으로 베껴 두었던 목록은 ver2338 適用方向(tipThickVert) · ver2073 리본
-      //   (tipRibbon·Alt·Pitch·Scaling) · 比較暗(tipDarken) 을 빠뜨리고 있었다 — 얇은 붓·리본 붓이
-      //   타일에서 딴 붓으로 보였다(제보: 「스트로크 프리뷰가 애초에 거짓말」). 다시는 안 빠진다.
-      //   썸네일의 getter와 덮어쓰기:
-      //   ① 'azimuth' 는 그대로 넘긴다. 방위 표본이 없으므로 커널이 고정 각도로 찍는다.
-      //   ② 지터 시드는 ★고정 상수 — 썸네일은 리드로우마다 달라지면 안 된다(ver1336).
+      // 실제 획과 같은 부착 함수를 쓰며, 표본에는 펜 방위 입력이 없다.
       const previewGet = function(k) {
         const v = brush[k];
         // 'azimuth' 는 그대로 — 프리뷰에는 펜 방위가 없으니 커널이 고정 각도로 찍는다. CSP 의
@@ -61069,7 +61051,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return v;
       };
       paintAttachTip(stroke, previewGet);
-      if (stroke.tipSeed != null) stroke.tipSeed = 0x5eed1;
+      if (stroke.tipSeed != null) stroke.tipSeed = opts.seed;
       // ver1718: 혼색(下地混色)도 스와치에 나타난다. 필드 매핑은 **실제 빌더와 같은 함수**를 부른다 —
       // 읽는 곳만 레코드로 바꾼다(그러지 않으면 필드가 늘 때마다 두 곳이 갈린다).
       // 아래 색은 이 아래에서 종이 칸을 넘긴다 — 잉크가 투명한 자기 레이어에 그려지므로 그냥 싣기만
@@ -61089,26 +61071,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ink.width = W; ink.height = H;
       const ictx = ink.getContext('2d');
       if (isEraser) { ictx.fillStyle = BRUSH_PREVIEW_ERASER_BAND; ictx.fillRect(0, 0, W, H); }
-      // ver1718: 혼색의 아래 색 = **지금까지 그린 종이 칸**(ctx.canvas). 앱이 실제로 쌓는 순서와 같다.
-      paintBrushPreviewStrokeInto(ictx, stroke, W, H, ctx.canvas);
-      ctx.drawImage(ink, 0, 0);
+      paintBrushPreviewStrokeInto(ctx, stroke, W, H, isEraser ? ink : ctx.canvas, ink);
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-over';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
 
-      if (opts.chip !== false) paintBrushPreviewSizeChip(ctx, W, H, dpr, actualSize, mul < 1, scaled);
+      if (opts.chip !== false) paintBrushPreviewSizeChip(ctx, W, H, dpr, actualSize, drawnCss < actualSize, scaled);
     }
-    // THE one dispatch between the two rasterizers, shared by the thumbnail and by the pad's live redraw —
-    // so a pad stroke and its preview can never diverge in edge treatment.
-    function paintBrushPreviewStrokeInto(ctx, stroke, W, H, mixBase) {
+    // 표본 경로만 프리뷰 전용이다. 획 버퍼와 최종 합성은 실제 그리기의 공용 경로를 쓴다.
+    function paintBrushPreviewStrokeInto(ctx, stroke, W, H, mixBase, base) {
+      const ink = document.createElement('canvas');
+      ink.width = W; ink.height = H;
+      const ic = ink.getContext('2d');
+      const drawStroke = paintStrokeBufferView(stroke);
       if (stroke.aa === false && !paintTipOrGrainActive(stroke)) {
-        ctx.imageSmoothingEnabled = false;             // 2値化: the jaggies ARE the parameter being shown
-        paintPixelStampStrokeInto(ctx, stroke, W, H, 0, 0);
+        ic.imageSmoothingEnabled = false;
+        paintPixelStampStrokeInto(ic, drawStroke, W, H, 0, 0);
       } else {
-        // ver1718: mixBase(ver1710) — 이 잉크 캔버스는 투명이라 아래 색이 여기 없다. 안 넘기면
-        // 커널이 ctx.canvas 로 떨어져 붓이 투명을 물고 간다.
-        drawPaintStroke(ctx, stroke, W, H, 0, 0, null, mixBase || null);
-        // ver1617: 팁·종이결이 있는 2値化 획은 실물이 임계화로 그려지므로 미리보기도 같아야 한다.
-        // 이 분기가 없어서 **미리보기에서도 팁이 원으로 보였다** — 실물과 같은 이유였다.
-        if (stroke.aa === false) paintBinarizeCanvasAlpha(ctx.canvas);
+        drawPaintStroke(ic, drawStroke, W, H, 0, 0, null, mixBase || base);
+        if (stroke.aa === false) paintBinarizeCanvasAlpha(ink);
       }
+      paintCompositeBufferOnto(ctx, base, ink, {
+        width: W, height: H, alpha: stroke.opacity,
+        gco: paintStrokeErases(stroke) ? 'destination-out' : paintBrushModeCompositeOp(stroke.mode),
+        replaceAlpha: !paintStrokeErases(stroke) && paintStrokeReplacesAlpha(stroke)
+      });
     }
     // Never silently rescale: the chip states the REAL px size and marks the direction whenever the drawn
     // line is not that size (↓ capped by the box, ↑ magnified by the preview multiplier), so a 100px brush
@@ -61134,11 +61123,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ── thumbnail cache + one rAF coalescer ───────────────────────────────────────────────────────
-    // A list of preset thumbnails redrawn on every slider tick is unaffordable HERE specifically: this
-    // machine's Chrome rasterizes canvas in SOFTWARE (chrome://gpu confirmed), so N stroke rasters per
-    // input event are felt immediately. Requests are keyed by the fields that change the pixels, coalesced
-    // into ONE frame, and kept as an ImageBitmap — an unchanged preset then costs a drawImage, not a raster.
-    // Measured in the prototype: 40 thumbnails = 29.5ms to raster, 0.6ms to blit from cache.
+    // 동일한 설정·소재·표시 크기는 다시 그리지 않는다. 완료된 그림만 제한 캐시에 넣는다.
     const BRUSH_PREVIEW_CACHE_MAX = 96;
     function paintBrushPreviewCache() {
       if (!(state.brushPreviewCache instanceof Map)) state.brushPreviewCache = new Map();
@@ -61148,37 +61133,50 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!(state.brushPreviewPending instanceof Map)) state.brushPreviewPending = new Map();
       return state.brushPreviewPending;
     }
-    // Every field the raster depends on, plus the device geometry — a bitmap made at dpr 1 must never be
-    // blitted into a dpr 2 canvas.
-    // ver1718: **필드 목록을 손으로 적지 않는다.** 종전 목록에는 각도·회전·지터·팁 두께·종이결·혼색·
-    // 필압 곡선이 빠져 있었고, 그 값들만 다른 두 브러시는 **같은 키**를 내므로 캐시가 **남의 썸네일을
-    // 그대로 돌려줬다**(「브러시를 바꿔도 미리보기가 안 바뀐다」). 프리뷰 빌더가 브러시에서 읽는
-    // 필드가 늘 때마다 여기를 같이 고쳐야 하는 구조였고, ver1335·1336·1337·1628 이 전부 안 고쳤다.
-    // 정본은 PAINT_PRESET_PEN_FIELDS(펜이 갖는 전부) **하나뿐이다.** ver1718 은 필압 곡선 두 개를
-    // 여기서 손으로 더했는데(그때는 그 표에 없었다) ver1719 가 표에 넣었으므로 뺀다 — 남겨 두면
-    // 그것이 곧 이 판이 없앤 사본이다.
-    // 지연 계산이다 — PAINT_PRESET_PEN_FIELDS 는 이 아래에 선언돼 있어 로드 시점에는 TDZ 다.
+    // 필드 목록은 프리셋 정본에서 지연 계산한다(선언 순서의 TDZ 회피).
     let brushPreviewKeyFields = null;
     function brushPreviewKeyFieldList() {
       if (!brushPreviewKeyFields) brushPreviewKeyFields = PAINT_PRESET_PEN_FIELDS.slice();
       return brushPreviewKeyFields;
     }
+    function paintBrushPreviewSettings(brush) {
+      const b = fastClone(brush || {});
+      BRUSH_IDENTITY_FIELDS.forEach(function(name) {
+        const spec = PAINT_BRUSH_SETTING_SPEC[name];
+        if (b[name] === undefined && spec && Object.prototype.hasOwnProperty.call(spec, 'def')) b[name] = fastClone(spec.def);
+      });
+      return b;
+    }
+    function paintBrushPreviewOptions(canvasEl, opts) {
+      const o = opts || {};
+      return {
+        w: Math.max(24, Math.round(Number(o.w) || canvasEl.clientWidth || BRUSH_PREVIEW_BOX_W)),
+        h: Math.max(16, Math.round(Number(o.h) || canvasEl.clientHeight || BRUSH_PREVIEW_BOX_H)),
+        dpr: Math.max(1, Math.min(3, Number(o.dpr) || window.devicePixelRatio || 1)),
+        sizeMul: Math.max(0.25, Math.min(2, Number(o.sizeMul) || 1)),
+        color: o.color || '#111111', chip: o.chip !== false,
+        seed: Number.isFinite(o.seed) ? o.seed >>> 0 : 0x5eed1,
+        pressureGain: Number(o.pressureGain) > 0 ? Number(o.pressureGain) : paintPressureGainMul()
+      };
+    }
+    const brushPreviewAssetIds = new WeakMap();
+    let brushPreviewAssetSequence = 0;
+    function paintBrushPreviewAssets(brush) {
+      return [brush.tipId, brush.paperTexId].map(function(id) {
+        if (!id) return 0;
+        const image = paintGetTip(id);
+        if (!image) return null;
+        if (!brushPreviewAssetIds.has(image)) brushPreviewAssetIds.set(image, ++brushPreviewAssetSequence);
+        return brushPreviewAssetIds.get(image);
+      });
+    }
     function paintBrushPreviewKey(canvasEl, brush, opts) {
-      const b = brush || {}, o = opts || {};
-      const dpr = Math.max(1, Math.min(3, Number(o.dpr) || window.devicePixelRatio || 1));
-      const head = [
-        Math.round(Number(o.w) || canvasEl.clientWidth || BRUSH_PREVIEW_BOX_W),
-        Math.round(Number(o.h) || canvasEl.clientHeight || BRUSH_PREVIEW_BOX_H),
-        dpr.toFixed(2), Number(o.sizeMul) || 1, o.color || '', Number(o.seed) || 0, o.chip === false ? 0 : 1,
-        b.tool || 'pen'
-      ];
-      // 배열 필드(곡선점)가 있으므로 값은 JSON 으로 접는다 — undefined 는 빈 칸이 되어 옛 키와 같은 뜻이다.
+      const b = brush || {}, o = paintBrushPreviewOptions(canvasEl, opts);
+      const head = [o.w, o.h, o.dpr, o.sizeMul, o.color, o.seed, o.chip, o.pressureGain,
+        b.tool || 'pen', paintBrushPreviewAssets(b)];
       const fields = brushPreviewKeyFieldList();
-      for (let i = 0; i < fields.length; i += 1) {
-        const v = b[fields[i]];
-        head.push(v === undefined ? '' : JSON.stringify(v));
-      }
-      return head.join('|');
+      for (let i = 0; i < fields.length; i += 1) head.push(b[fields[i]]);
+      return JSON.stringify(head);
     }
     function paintBrushPreviewBlit(canvasEl, bmp) {
       if (canvasEl.width !== bmp.width) canvasEl.width = bmp.width;
@@ -61193,6 +61191,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintBrushPreviewStore(key, canvasEl) {
       const cache = paintBrushPreviewCache();
       const keep = function(bmp) {
+        const previous = cache.get(key);
+        if (previous && previous !== bmp && previous.close) previous.close();
         cache.set(key, bmp);
         while (cache.size > BRUSH_PREVIEW_CACHE_MAX) {  // insertion order = oldest first
           const oldest = cache.keys().next().value;
@@ -61210,38 +61210,78 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         keep(copy);
       }
     }
+    const brushPreviewRequests = new WeakMap();
     function paintBrushPreviewRequest(canvasEl, brush, opts) {
       if (!canvasEl) return;
-      if (brush && brush.imageBrushPreview) {
-        const key = brush.imageBrushPreview;
-        if (canvasEl.dataset.brushPreviewKey === key) return;
-        canvasEl.dataset.brushPreviewKey = key;
-        loadImageAsync(key).then(function(image) {
-          if (!canvasEl.isConnected || canvasEl.dataset.brushPreviewKey !== key) return;
-          canvasEl.width = image.naturalWidth; canvasEl.height = image.naturalHeight;
-          canvasEl.getContext('2d').drawImage(image, 0, 0);
-        }).catch(imageBrushReportFailure);
+      const b = paintBrushPreviewSettings(brush), o = paintBrushPreviewOptions(canvasEl, opts);
+      const key = b.imageBrushPreview ? 'image:' + b.imageBrushPreview : paintBrushPreviewKey(canvasEl, b, o);
+      const previous = brushPreviewRequests.get(canvasEl);
+      if (previous && previous.pending && previous.key === key) return;
+      // 새 요청은 완료된 그림으로 돌아오는 경우에도 이전 비동기 작업을 무효화한다.
+      const job = { brush: b, opts: o, key: key, pending: false };
+      brushPreviewRequests.set(canvasEl, job);
+      paintBrushPreviewPending().delete(canvasEl);
+      if (canvasEl.dataset.brushPreviewKey === key) return;
+      if (!b.imageBrushPreview && paintBrushPreviewAssets(b).includes(null)) {
+        canvasEl.getContext('2d').clearRect(0, 0, canvasEl.width, canvasEl.height);
+        delete canvasEl.dataset.brushPreviewKey;
+        return; // 기존 소재 준비 완료 콜백이 다시 요청한다. 원형 대체를 캐시하지 않는다.
+      }
+      if (b.imageBrushPreview) {
+        job.pending = true;
+        loadImageAsync(b.imageBrushPreview).then(function(image) {
+          if (!canvasEl.isConnected || brushPreviewRequests.get(canvasEl) !== job) return;
+          paintBrushPreviewBlit(canvasEl, image);
+          canvasEl.dataset.brushPreviewKey = key;
+        }).catch(imageBrushReportFailure).finally(function() {
+          job.pending = false;
+        });
         return;
       }
-      const key = paintBrushPreviewKey(canvasEl, brush, opts);
-      if (canvasEl.dataset.brushPreviewKey === key) return;      // already showing exactly this
-      canvasEl.dataset.brushPreviewKey = key;
       const cached = paintBrushPreviewCache().get(key);
-      if (cached) { paintBrushPreviewBlit(canvasEl, cached); return; }
-      paintBrushPreviewPending().set(canvasEl, { brush: brush, opts: opts, key: key });
-      if (state.brushPreviewRaf) return;
-      state.brushPreviewRaf = requestAnimationFrame(paintBrushPreviewFlush);
+      if (cached) {
+        paintBrushPreviewBlit(canvasEl, cached);
+        canvasEl.dataset.brushPreviewKey = key;
+        return;
+      }
+      job.pending = true;
+      paintBrushPreviewPending().set(canvasEl, job);
+      if (!state.brushPreviewRaf) state.brushPreviewRaf = requestAnimationFrame(paintBrushPreviewFlush);
     }
     function paintBrushPreviewFlush() {
       state.brushPreviewRaf = 0;
       const pending = paintBrushPreviewPending();
-      pending.forEach(function(job, canvasEl) {
-        if (!canvasEl.isConnected) return;                       // a list rebuilt under us — nothing to paint into
-        if (canvasEl.dataset.brushPreviewKey !== job.key) return; // superseded while queued
-        paintBrushPreviewDraw(canvasEl, job.brush, job.opts);
-        paintBrushPreviewStore(job.key, canvasEl);
-      });
+      const jobs = Array.from(pending);
       pending.clear();
+      jobs.forEach(function(entry) {
+        const canvasEl = entry[0], job = entry[1];
+        if (brushPreviewRequests.get(canvasEl) !== job) return;
+        try {
+          if (!canvasEl.isConnected) return;
+          // 요청과 실행 사이 소재가 교체/해제됐다면 현재 소재로 새 요청한다.
+          if (paintBrushPreviewKey(canvasEl, job.brush, job.opts) !== job.key) {
+            job.pending = false;
+            paintBrushPreviewRequest(canvasEl, job.brush, job.opts);
+            return;
+          }
+          paintBrushPreviewDraw(canvasEl, job.brush, job.opts);
+          paintBrushPreviewStore(job.key, canvasEl);
+          canvasEl.dataset.brushPreviewKey = job.key;
+        } catch (error) {
+          delete canvasEl.dataset.brushPreviewKey;
+          console.warn('[brush preview]', error);
+        } finally {
+          job.pending = false;
+        }
+      });
+    }
+    // 표시 중인 요청만 다시 평가한다. 소재 로드와 전역 감도 변경이 같은 경로를 쓴다.
+    function paintBrushPreviewRefresh(assetId) {
+      document.querySelectorAll('canvas[data-brush-preview], canvas.pb-preview-canvas').forEach(function(canvasEl) {
+        const job = brushPreviewRequests.get(canvasEl);
+        if (!job || (assetId && job.brush.tipId !== assetId && job.brush.paperTexId !== assetId)) return;
+        paintBrushPreviewRequest(canvasEl, job.brush, Object.assign({}, job.opts, { pressureGain: paintPressureGainMul() }));
+      });
     }
     // The one markup for a preview card, so the thumbnail looks identical wherever it is mounted. The label
     // is resolved here rather than left to applyI18n: the callers build their bodies with innerHTML + t()
@@ -64580,7 +64620,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver2271: 등록은 **나중에** 끝난다(부팅 하이드레이트·임포트·복원 셋 다 이 자리를 지난다).
       // 그때 브러시 패널의 행 활성(`pbRowEnabled`)이 팁 유무로 갈리므로 여기서 다시 칠한다 —
       // 안 그러면 「먹는데 회색」이 사용자가 패널을 만질 때까지 남는다(부팅 직후 11 행 실측).
-      img.onload = function() { paintRegisterTip(ref, img); paintBrushPanelUpdateValues(); if (onReady) onReady(true); };
+      img.onload = function() { paintRegisterTip(ref, img); paintBrushPreviewRefresh(ref); paintBrushPanelUpdateValues(); if (onReady) onReady(true); };
       img.onerror = function() { if (onReady) onReady(false); };
       img.src = dataUrl;
     }
@@ -65008,12 +65048,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   [섹션]  ? · nPoints · ?   그 뒤 (x,y) double 쌍 × nPoints      ← 섹션은 최대 두 벌
     //   usedFlag 비트: 0x10 필압 · 0x20 기울기 · 0x40 속도 · 0x80 랜덤
     //
-    // 손에 있는 .sut 9 개(27 개 Effector)를 이 구조로 읽으면 **헤더 길이가 nHeader 와 정확히 맞고
-    // 남는 바이트가 0** 이다 — 구조가 맞다는 첫 검산이다.
-    //
-    // 첫 섹션의 점들이 **필압→출력 곡선**(x=입력 0~1, y=출력 배율 0~1)이고, 그 **첫 점의 y 가 곧
-    // 최소 크기**다. 사용자가 같은 브러시의 최소 크기만 바꿔 저장한 세 파일이 그것을 못박았다:
-    // 오일 파스텔 (0,0.000) / 02 (0,0.252) / 03 (0,0.491) — 첫 점 y 말고는 한 바이트도 안 움직인다.
+    // 길이/플래그는 unsigned, 최소·최대는 signed다. 색 변화의 rMin=-100도 보존한다.
+    // 필압/기울기 곡선은 섹션별로 읽으며 헤더의 최소·최대와 혼동하지 않는다.
     // CSP 자동 간격: 0은 고정(BrushInterval), 1/2/3은 넓음/보통/좁음이다.
     // approx는 연필 원본 형상에서 역산한 공용 근사(pencilr_texture_gap_2026-09-02.md §4-B).
     // blend의 좁음은 해당 혼색 조합의 PNG 반복 주기로 확인했다(sut_fidelity_2026-09-10.md §5).
@@ -65031,24 +65067,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
         let p = 0;
         const u32 = function() { const v = dv.getUint32(p, false); p += 4; return v; };
+        const i32 = function() { const v = dv.getInt32(p, false); p += 4; return v; };
         const f64 = function() { const v = dv.getFloat64(p, false); p += 8; return v; };
         const nHeader = u32();
         if (nHeader !== 40 && nHeader !== 44) return null; // 아는 형식만 — 모르면 포기한다
         if (u8.length < nHeader) return null;
         u32();                       // undetermined2
         const flag = u32();
-        const pmin = u32();
+        const pmin = i32();
         // ver2392: 기울기의 최소치도 이 자리다 — 사용자 CSP 화면(수채 평붓 「기울기 최소치 100 · 최대치
         //   300」)과 `.sut` 의 +16=100 · +40=300 이 그대로 맞는다. 표본 4,584 개에서 켠 축은 100 이
         //   많고 끈 축은 0 이 많던 「뜻 모를 +16」(pressure_curve_csp_parity 7 절)의 정체.
-        const tmin = u32();          // tMin
-        u32();                       // vMax
+        const tmin = i32();          // tMin
+        const vmax = i32();         // vMax: 값은 보존하되 속도 정규화식은 미확정
         // ver2343: **랜덤의 최소치는 이 자리다.** 주석은 처음부터 `rMin` 이라 부르면서 값을 안
         // 뽑고 있었고, 조사문서가 「4 번째 u32(=pmin)가 랜덤 [최소치]」라고 잘못 짚어 두었다.
         // 실측 셋이 같은 답을 냈다(鉛筆R): 이 자리 = **50** · 사용자 CSP 화면의 랜덤 [최소치] = 50 ·
         // CSP 출력에서 잰 dab 별 최대농도 비 min/max = **0.52**(두 표본 33~63 · 66~127).
         // pmin(4 번째)은 **필압**의 최소치라 0 이다 — 그것을 쓰면 랜덤 폭이 100 % 가 되어 틀린다.
-        const rmin = u32();          // rMin — 랜덤값이 최소일 때의 배율(%)
+        const rmin = i32();          // rMin: 색 변화 Effector의 최소값은 음수도 가능
         u32();                       // undetermined
         // ver2406: **곡선 섹션의 바이트 크기가 헤더에 적혀 있다** — 그것으로 자른다.
         //   ver1621~2405 는 이 둘을 버리고 헤더 뒤부터 순차로 읽어 첫 섹션을 `curve`(필압) 자리에
@@ -65061,7 +65098,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         //   파서는 안 고쳐, 그 뒤 줄곧 `undefined` 였다 — 임포트 비고가 61 개 브러시(수채 평붓·
         //   수채 둥근 붓·G펜…)에 「최대치 ?%」를 찍고 있었다. 쓰는 쪽이 `usesTilt` 일 때만 읽는
         //   규칙은 그대로다(끈 blob 의 38 % 가 기본값 500 을 들고 있다 — 아래 주석).
-        const tmax = (nHeader > 40) ? u32() : null;   // +40
+        const tmax = (nHeader > 40) ? i32() : null;   // +40
         if (p !== nHeader || nHeader + sec1 + sec2 !== u8.length) return null;
         // 선언된 크기만큼만 읽는다 — 크기가 0 이면 그 섹션은 없는 것이고 자리도 비운다.
         const readSection = function(bytes) {
@@ -65087,7 +65124,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           usesRandom: (flag & 0x80) !== 0,
           pmin: pmin,   // 필압 최소치(%) — ver2392 부터 실제로 싣는다
           tmin: tmin,   // ver2392: 기울기 최소치(%)
-          rmin: rmin,   // ver2343
+          rmin: rmin,
+          vmax: vmax,
           max: tmax,    // ver2406: 최대치(%) — 옛 헤더(40 바이트)면 null
           curve: curve,
           curve2: curve2,   // ver1622: 두 번째 섹션 = 기울기 곡선
@@ -65682,6 +65720,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (n != null && n !== 0) notes.push(key + '=' + n + ' — ' + label + ' (종이결 처리 미지원)');
         }
       }
+      // 색 변화의 ON/OFF와 저장 수치는 별개다. 꺼진 값은 효과로 보고하지 않는다.
+      [
+        ['BrushChangePatternColor', ['BrushHueChange', 'BrushSaturationChange', 'BrushValueChange', 'BrushSubColor']],
+        ['BrushChangeStrokeColor', ['BrushStrokeHueChange', 'BrushStrokeSaturationChange', 'BrushStrokeValueChange', 'BrushStrokeSubColor']]
+      ].forEach(function(group) {
+        const enabled = num(v[group[0]]);
+        if (enabled === 0) return;
+        const values = group[1].filter(function(key) { return num(v[key]) != null && num(v[key]) !== 0; });
+        if (enabled !== 1 && !values.length) return;
+        notes.push(group[0] + '=' + enabled + ' — ' + values.map(function(key) { return key + '=' + v[key]; }).join(', ')
+          + ' (색 변화 실행 미지원' + (enabled == null ? ' · 활성 여부 미확인' : '') + ')');
+      });
       // ver2071: 실물 14개를 전수로 대조해 **켜져 있는데 아무 말도 안 나가던 축 아홉**을 넣었다.
       //   D5 의 요점은 매핑을 포기하는 것이 아니라 **포기한 것을 남기는 것**인데, 이것들은
       //   로그조차 없어서 사용자가 「왜 다른지」를 알 방법이 전혀 없었다.
@@ -65701,9 +65751,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
        ['BrushPatternReverseHorizontal', 0, '붓끝 좌우 반전'],
        ['BrushPatternReverseVertical', 0, '붓끝 상하 반전'],
        ['BrushWaterColor', 0, '下地混色 의 방식(色混ぜ/色重ね/にじみ)'],
-       ['BrushHueChange', 0, '찍을 때마다 색상 흔들기'],
-       ['BrushSaturationChange', 0, '찍을 때마다 채도 흔들기'],
-       ['BrushValueChange', 0, '찍을 때마다 명도 흔들기'],
        ['BrushSizeSyncViewScale', 0, '화면 배율에 브러시 크기 연동'],
        ['BrushBlurLinkSize', 0, '붓끝 흐림을 크기에 연동']].forEach(function(e) {
         // ver2406: **리본 붓은 이 두 컬럼을 위에서 실제로 읽는다** — 繰り返し方法·上下反転 으로
@@ -65955,12 +66002,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const byId = new Map();
       brushLibraryBuiltinEntries().forEach(function(e) { byId.set(e.id, e); });
       lib.entries.forEach(function(e) { if (e && e.t !== 'sep' && e.t !== 'br') byId.set(e.id, e); });
+      applyBrushLibraryWindowState(); // 크기를 적용한 뒤 요청의 표시 좌표를 고정한다.
       grid.querySelectorAll('[data-bl-entry]').forEach(function(tile) {
         const e = byId.get(tile.getAttribute('data-bl-entry'));
         const cv = tile.querySelector('canvas');
         if (e && cv) paintBrushPreviewRequest(cv, Object.assign({ tool: 'pen', size: 12, opacity: 1 }, e.brush), { color: activePaintColor() });
       });
-      applyBrushLibraryWindowState(); // ver1988: cell/W/H CSS 변수 — customPanel 의 같은 자리
     }
     function openBrushLibraryWindow() {
       const win = brushLibraryWindowEl();
@@ -65978,10 +66025,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 가변폭 채움(paintFillVariableWidthBody/Shape), 라이브 증분 세션(paintInkSessionStep),
     // 휘도→알파 필터, 경로 스무딩(라쏘)과 손떨림 보정(pulled string).
     // ===========================================================================================
-    // Tips are shape-only alpha masks (like every real brush-tip format) — this tints one to the
-    // stroke's color ONCE per stroke render (not per dab: source-in on a tip-sized offscreen canvas is
-    // cheap, and the whole stroke already re-renders whole per move under ver621/641's model, so a
-    // per-dab retint would be pure waste for identical output).
+    // 팁 원본과 합성 캐시는 아래 공용 스탬퍼에서 관리한다.
     // ── ver1625: 혼색(下地混色) — 팁 dab 이 아래 색을 물고 간다 ────────────────────────────────
     // CSP 의 「下地混色」과 같은 축이다: 絵の具量(BrushMixColor) · 色延び(BrushMixColorExtension).
     // 유화·파스텔·색연필이 종이 위의 색을 끌고 가며 섞이는 것이 이 축이고, 앱에는 그 개념 자체가
@@ -83838,10 +83882,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       adv.hidden = !open;
       if (advBtn) advBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
 
-      // preview mount — owned by the parallel stroke-preview workstream. Its published signature is
-      // paintBrushPreviewDraw(targetCanvas, brushRecord, opts) where brushRecord is the
-      // PAINT_PRESET_FIELDS shape captureCurrentBrushSettings() returns, so this supplies a canvas and
-      // the live record and nothing else. Guarded on BOTH functions: this panel must boot with neither.
+      // 현재 브러시 레코드를 공용 프리뷰 요청에 전달한다.
       const mount = document.getElementById('paintBrushPreviewMount');
       if (mount) {
         if (mount.dataset.blBound !== '1') { // ver1332: 예약석 입주 — 프리뷰 클릭 = 브러시 라이브러리 토글 (ver1249 "reserved", settings_tab_redesign ⑤)
@@ -83856,9 +83897,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           let cv = mount.querySelector('canvas');
           if (!cv) { cv = document.createElement('canvas'); cv.className = 'pb-preview-canvas'; mount.appendChild(cv); }
           const rec = (typeof captureCurrentBrushSettings === 'function') ? captureCurrentBrushSettings() : null;
-          // request(), not draw(): this runs on every panel sync, and the coalescer both dedupes an
-          // unchanged key and caps rasterisation at one per frame — the target machine rasterises canvas
-          // in software, so an uncoalesced redraw per slider tick is felt.
+          // 같은 키는 재사용하고 변경 요청은 rAF에서 합친다.
           try { paintBrushPreviewRequest(cv, rec, { color: activePaintColor() }); } catch (e) { console.warn('[brush] 패널 미리보기 갱신 실패', e); }
         }
       }
