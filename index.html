@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2553</title>
+  <title>MoArt ver2555</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -23029,8 +23029,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const text = String(raw.text != null ? raw.text : (raw.normalizedText || raw.rawText || ''));
       const order = Number(raw.order || raw.orderOnPage || index + 1) || index + 1;
       const block = {
+        ...raw,
+        sourceFormat: 'scenario_to_conte_package',
         id: String(raw.id || ('scenario-b' + (index + 1))),
-        sourceDocumentId: 'src-scenario',
+        sourceDocumentId: String(raw.sourceDocumentId || 'src-scenario'),
         sourceFileName: String(raw.sourceFileName || raw.sourceDocumentTitle || ''),
         pageNo: Math.max(1, Math.round(Number(raw.pageNo) || 1)),
         order: order,
@@ -23063,21 +23065,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function scenarioPackageToPages(pkg) {
-      const blocks = Array.isArray(pkg && pkg.blocks) ? pkg.blocks : [];
       const byPage = new Map();
-      blocks.forEach(function(raw, index) {
+      const ids = new Set();
+      pkg.blocks.forEach(function(raw, index) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid scenario block.');
         const block = scenarioPackageBlockToConteBlock(raw, index);
-        if (!byPage.has(block.pageNo)) byPage.set(block.pageNo, []);
-        byPage.get(block.pageNo).push(block);
+        if (ids.has(block.id)) throw new Error('Duplicate scenario block ID: ' + block.id);
+        ids.add(block.id);
+        const key = JSON.stringify([block.sourceDocumentId, block.pageNo]);
+        if (!byPage.has(key)) byPage.set(key, { id: 'scenario-page-' + byPage.size,
+          sourceDocumentId: block.sourceDocumentId, pageNo: block.pageNo, blocks: [] });
+        byPage.get(key).blocks.push(block);
       });
-      return Array.from(byPage.keys()).sort(function(a, b) { return a - b; }).map(function(pageNo) {
-        const pageBlocks = byPage.get(pageNo).sort(function(a, b) { return (a.globalOrder || 0) - (b.globalOrder || 0); });
-        return {
-          id: 'src-scenario-page-' + pageNo,
-          pageNo: pageNo,
-          text: pageBlocks.map(function(b) { return b.rawText || b.text || ''; }).join('\n'),
-          blocks: pageBlocks
-        };
+      // Export array order is authoritative; page numbers restart for each source document.
+      return Array.from(byPage.values()).map(function(page) {
+        page.text = page.blocks.map(function(b) { return b.rawText || b.text || ''; }).join('\n');
+        return page;
       });
     }
 
@@ -23088,12 +23091,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try {
         const pkg = JSON.parse(await file.text());
         if (!pkg || !Array.isArray(pkg.blocks)) throw new Error('Not a scenario package (missing blocks[]).');
+        if (pkg.format && pkg.format !== 'scenario_to_conte_package') throw new Error('Unsupported scenario package format.');
+        if (pkg.schemaVersion != null && pkg.schemaVersion !== 1) throw new Error('Unsupported scenario package version.');
         const pages = scenarioPackageToPages(pkg);
         const blockCount = pages.reduce(function(sum, page) { return sum + page.blocks.length; }, 0);
         state.sourceText = '';
         state.sourceFileName = file.name;
         runCommand('Import scenario package', function(project) {
-          project.sourceDocuments = [{ id: 'src-scenario', fileName: file.name, type: 'scenario-package', pages: pages }];
+          const { blocks, ...metadata } = pkg;
+          project.sourceDocuments = [{ id: 'src-scenario', fileName: file.name, type: 'scenario-package', scenarioPackage: metadata, pages: pages }];
           project.cuts = Array.from({ length: EMPTY_SLOT_COUNT }, function(_, index) { return createBlankCut(index + 1); });
           project.audio = { clips: [] };
           project.timeline = { tracks: [] };
@@ -24682,6 +24688,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2555, items: [{ ja: 'シナリオ読み込みで人物・場所の名簿、複数話者、文書別ページ、台詞の内容を保持します。',
+        ko: '시나리오 가져오기에서 인물·장소 명부, 복수 화자, 문서별 페이지, 대사 내용을 보존합니다.',
+        en: 'Scenario imports now retain character and location rosters, multiple speakers, document pages and dialogue content.',
+        zh: '剧本导入现可保留人物及地点名录、多位说话人、各文档页码和台词内容。' }] },
       { ver: 2553, items: [{ ja: 'ブラシのプレビューが素材の読み込み後も丸い線のまま残る問題を修正しました。設定の変更・読み込み失敗による表示の混線も防ぎます。',
         ko: '브러시 소재를 불러온 뒤에도 미리보기가 원형 획으로 남는 문제를 수정했습니다. 설정 변경·로딩 실패로 다른 그림이 표시되는 문제도 방지합니다.',
         en: 'Fixed brush previews staying round after their materials loaded, and stale previews caused by changing settings or failed loads.',
@@ -29804,10 +29814,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
+    function dialogBlockFromScenarioSource(block, id) {
+      return normalizeDialogBlock({ id: id, kind: DIALOG_AREA_TYPES.indexOf(block.type) >= 0 ? 'dialog' : 'free',
+        speaker: block.speaker || block.characterName || '', body: block.text,
+        suffix: block.modifier || block.dialogMode || '', sourceBlockId: block.id });
+    }
+
     function parseDialogBlocksFromText(project, cut) {
       const blocks = [];
       const lines = String((cut && cut.dialogText) || '').split(/\n+/);
       const blockIds = Array.isArray(cut && cut.dialogBlockIds) ? cut.dialogBlockIds.slice() : [];
+      const sources = blockIds.map(function(id) { return findBlockById(project, id); });
+      if (sources.length && sources.every(function(b) { return b && b.sourceFormat === 'scenario_to_conte_package'; })
+          && [sources.map(function(b) { return b.text; }).join('\n'), sources.map(dialogDisplayTextForBlock).join('\n')].includes(String(cut.dialogText || ''))) {
+        return sources.map(function(b, index) { return dialogBlockFromScenarioSource(b, 'dlgblk-' + cut.id + '-' + (index + 1)); });
+      }
       let idx = 0;
       lines.forEach(function(line) {
         const rawLine = String(line || '').trim();
@@ -30123,6 +30144,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (i < 0) return;
         const moved = srcBlocks.splice(i, 1)[0];
         dstBlocks.push(moved);
+        const source = moved.sourceBlockId && findBlockById(p, moved.sourceBlockId);
+        if (source) {
+          removeCutBlockLink(src, source.id);
+          addCutBlockLink(dst, source, 'dialogText');
+          source.assignedCutId = dst.id;
+          source.assignedPanelId = 'dialogText';
+        }
         ((p.audio && p.audio.clips) || []).forEach(function(c) {
           if (c.dialogBlockId === blockId) c.sourceCutId = toCutId;
         });
@@ -35210,7 +35238,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function collectProjectSpeakers(project) {
       const list = [], seen = Object.create(null);
       ((project && project.cuts) || []).forEach(function(cut) {
-        ((cut && cut.dialogBlocks) || []).forEach(function(b) {
+        dialogBlocksForDisplay(project, cut).forEach(function(b) {
           // Plates key off characterName; speaker is the raw field. Prefer characterName so the picker
           // lists exactly the names that get plates, but fall back to speaker for un-resolved blocks.
           const s = String((b && (b.characterName || b.speaker)) || '').trim();
@@ -50684,7 +50712,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function renderCharacterView(listEl, blocks) {
-      const characters = collectCharacterStats(blocks);
+      const characters = collectCharacterStats(blocks, state.project);
       if (!characters.length) {
         listEl.innerHTML = '<div class="empty-state">' + escapeHtml(t('project.conte.noCharacterMeta')) + '</div>';
         return;
@@ -50714,7 +50742,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function renderLocationView(listEl, blocks) {
-      const locations = collectLocationStats(blocks);
+      const locations = collectLocationStats(blocks, state.project);
       if (!locations.length) {
         listEl.innerHTML = '<div class="empty-state">' + escapeHtml(t('project.conte.noLocationMeta')) + '</div>';
         return;
@@ -50730,50 +50758,67 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }).join('') + '</div>';
     }
 
-    function collectCharacterStats(blocks) {
-      const map = new Map();
-      blocks.forEach(function(block) {
-        if (DIALOG_AREA_TYPES.indexOf(block.type) < 0) return;
-        const name = block.characterName || scenarioNormalizeSpeakerName(block.speaker || '').name;
-        if (!name) return;
-        if (!map.has(name)) {
-          map.set(name, { name: name, gender: '', age: '', dialogs: 0, pages: new Set() });
-        }
-        const item = map.get(name);
-        if (!item.gender) item.gender = block.characterGender || scenarioInferGenderFromText(name);
-        if (!item.age) item.age = scenarioInferAgeFromText((block.rawText || block.text || '') + ' ' + name);
-        item.dialogs += 1;
-        const pageNo = Number(block.pageNo);
-        item.pages.add(Number.isFinite(pageNo) ? pageNo : 1);
+    function scenarioPackageCatalog(project, key) {
+      return ((project && project.sourceDocuments) || []).flatMap(function(doc) {
+        const rows = doc.scenarioPackage && doc.scenarioPackage[key];
+        return Array.isArray(rows) ? rows : [];
       });
-      blocks.forEach(function(block) {
-        const name = block.characterName || '';
-        if (!name || !map.has(name)) return;
-        const item = map.get(name);
-        if (!item.gender) item.gender = block.characterGender || scenarioInferGenderFromText((block.rawText || block.text || '') + ' ' + name);
-        if (!item.age) item.age = scenarioInferAgeFromText((block.rawText || block.text || '') + ' ' + name);
-      });
-      return Array.from(map.values())
-        .filter(function(item) { return item.dialogs > 0; })
-        .sort(function(left, right) {
-          return (right.dialogs - left.dialogs) || left.name.localeCompare(right.name);
-        });
     }
 
-    function collectLocationStats(blocks) {
+    function scenarioBlockSpeakerNames(block) {
+      if (Array.isArray(block.speakerNames) && block.speakerNames.length) return Array.from(new Set(block.speakerNames.filter(Boolean)));
+      const name = block.characterName || (block.sourceFormat === 'scenario_to_conte_package'
+        ? block.speaker : scenarioNormalizeSpeakerName(block.speaker || '').name);
+      return name ? [name] : [];
+    }
+
+    function collectCharacterStats(blocks, project) {
       const map = new Map();
+      scenarioPackageCatalog(project, 'characters').forEach(function(character) {
+        if (!character.name || map.has(character.name)) return;
+        map.set(character.name, { ...character, gender: character.gender || '', age: character.age || '', dialogs: 0, pages: new Set() });
+      });
+      blocks.forEach(function(block) {
+        if (DIALOG_AREA_TYPES.indexOf(block.type) < 0) return;
+        const names = scenarioBlockSpeakerNames(block);
+        names.forEach(function(name) {
+          if (!map.has(name)) map.set(name, { name: name, gender: '', age: '', dialogs: 0, pages: new Set() });
+          const item = map.get(name);
+          if (names.length === 1) {
+            if (!item.gender) item.gender = block.characterGender || '';
+            if (!item.age) item.age = block.characterAge || '';
+          }
+          if (block.sourceFormat !== 'scenario_to_conte_package') {
+            if (!item.gender) item.gender = scenarioInferGenderFromText(name);
+            if (!item.age) item.age = scenarioInferAgeFromText((block.rawText || block.text || '') + ' ' + name);
+          }
+          item.dialogs += 1;
+          const pageNo = Number(block.pageNo);
+          item.pages.add(Number.isFinite(pageNo) ? pageNo : 1);
+        });
+      });
+      return Array.from(map.values()).sort(function(left, right) {
+        return (right.dialogs - left.dialogs) || left.name.localeCompare(right.name);
+      });
+    }
+
+    function collectLocationStats(blocks, project) {
+      const map = new Map();
+      scenarioPackageCatalog(project, 'places').forEach(function(place) {
+        if (!place.name || map.has(place.name)) return;
+        map.set(place.name, { ...place, timeOfDay: '', scenes: 0, blocks: 0, dialogs: 0, pages: new Set() });
+      });
       blocks.forEach(function(block) {
         let name = block.locationName || '';
         let timeOfDay = block.timeOfDay || '';
-        if (!name && block.type === 'scene_heading') {
+        const canonical = block.sourceFormat === 'scenario_to_conte_package';
+        if (!canonical && !name && block.type === 'scene_heading') {
           const parsed = scenarioParseSceneMeta(block.text || block.rawText || '', {});
           name = parsed.locationName || '';
           timeOfDay = timeOfDay || parsed.timeOfDay || '';
         }
-        if (!name || scenarioIsNonLocationMarkerLine(name)) return;
-        if (!map.has(name)) {
-          map.set(name, { name: name, timeOfDay: '', scenes: 0, blocks: 0, dialogs: 0, pages: new Set() });
-        }
+        if (!name || (!canonical && scenarioIsNonLocationMarkerLine(name))) return;
+        if (!map.has(name)) map.set(name, { name: name, timeOfDay: '', scenes: 0, blocks: 0, dialogs: 0, pages: new Set() });
         const item = map.get(name);
         if (!item.timeOfDay) item.timeOfDay = timeOfDay;
         item.blocks += 1;
@@ -50847,10 +50892,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ['adult', 'Adult'],
         ['senior', 'Senior']
       ];
-      const selected = current || 'adult';
+      const selected = String(current || 'adult');
+      if (!options.some(function(option) { return option[0] === selected; })) options.unshift([selected, selected]);
       return options.map(function(option) {
         const value = option[0];
-        return '<option value="' + value + '"' + (selected === value ? ' selected' : '') + '>' + option[1] + '</option>';
+        return '<option value="' + escapeAttr(value) + '"' + (selected === value ? ' selected' : '') + '>' + escapeHtml(option[1]) + '</option>';
       }).join('');
     }
 
@@ -51284,8 +51330,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const normalized = scenarioMetaKey(name);
       const block = getProjectBlocks(project).find(function(item) {
         if (DIALOG_AREA_TYPES.indexOf(item.type) < 0) return false;
-        const blockName = item.characterName || scenarioNormalizeSpeakerName(item.speaker || '').name;
-        return scenarioMetaKey(blockName) === normalized;
+        return scenarioBlockSpeakerNames(item).some(function(speaker) { return scenarioMetaKey(speaker) === normalized; });
       });
       if (block && block.text) return block.text;
       return name + 'です。';
@@ -51301,7 +51346,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.voicevoxSpeakers = await response.json();
         state.voicevoxStatus = voicevoxSpeakersStatusLabel() + (result.endpoint !== endpoint ? ' via local proxy' : '');
         state.voicevoxErrorAlerted = false;
-        ensureVoiceProfilesForCharacters(state.project, collectCharacterStats(getProjectBlocks(state.project)));
+        ensureVoiceProfilesForCharacters(state.project, collectCharacterStats(getProjectBlocks(state.project), state.project));
         if (state.sourceView === 'characters') refresh();
         return state.voicevoxSpeakers;
       } catch (error) {
@@ -53200,9 +53245,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ['rain', 'Rain'],
         ['snow', 'Snow']
       ];
+      const selected = String(current || 'unknown');
+      if (!options.some(function(option) { return option[0] === selected; })) options.unshift([selected, selected]);
       return options.map(function(option) {
         const value = option[0];
-        return '<option value="' + value + '"' + ((current || 'unknown') === value ? ' selected' : '') + '>' + timeIcon(value) + ' ' + option[1] + '</option>';
+        return '<option value="' + escapeAttr(value) + '"' + (selected === value ? ' selected' : '') + '>' + timeIcon(value) + ' ' + escapeHtml(option[1]) + '</option>';
       }).join('');
     }
 
@@ -53267,6 +53314,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const normalized = scenarioMetaKey(name);
       const nextGender = normalizeGenderValue(gender);
       getProjectBlocks(project).forEach(function(block) {
+        if (block.sourceFormat === 'scenario_to_conte_package') return;
         const blockName = block.characterName || (DIALOG_AREA_TYPES.indexOf(block.type) >= 0 ? scenarioNormalizeSpeakerName(block.speaker || '').name : '');
         if (scenarioMetaKey(blockName) !== normalized) return;
         block.characterName = blockName || name;
@@ -53374,16 +53422,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function placeBlockIntoCut(blockId, cutId, fieldName) {
+      const source = findBlockById(state.project, blockId);
+      if (fieldName === 'dialogText' && source && source.sourceFormat === 'scenario_to_conte_package' && source.assignedPanelId === 'dialogText') {
+        const oldCut = state.project.cuts.find(function(c) { return c.id === source.assignedCutId; });
+        const placed = oldCut && dialogBlocksForDisplay(state.project, oldCut).find(function(b) { return b.sourceBlockId === blockId; });
+        if (placed) {
+          if (oldCut.id !== cutId) moveDialogBlockToCut(placed.id, cutId);
+          return;
+        }
+      }
       runCommand('Place source block', function(project) {
         const block = findBlockById(project, blockId);
         const cut = project.cuts.find(function(item) { return item.id === cutId; });
         if (!block || !cut) return;
         const oldCut = project.cuts.find(function(item) { return item.id === block.assignedCutId; });
         if (oldCut && block.assignedPanelId) {
-          oldCut[block.assignedPanelId] = removeTextChunk(oldCut[block.assignedPanelId], block.text);
+          if (block.assignedPanelId === 'dialogText') {
+            oldCut.dialogBlocks = materializeDialogBlocks(project, oldCut).filter(function(b) { return b.sourceBlockId !== block.id; });
+            deriveDialogTextFromBlocks(oldCut);
+          } else oldCut[block.assignedPanelId] = removeTextChunk(oldCut[block.assignedPanelId], block.text);
           removeCutBlockLink(oldCut, block.id);
         }
-        cut[fieldName] = appendText(cut[fieldName], block.text);
+        if (fieldName === 'dialogText' && block.sourceFormat === 'scenario_to_conte_package') {
+          materializeDialogBlocks(project, cut).push(dialogBlockFromScenarioSource(block, newDialogBlockId(project)));
+          deriveDialogTextFromBlocks(cut);
+        } else cut[fieldName] = appendText(cut[fieldName], block.text);
         block.assignedCutId = cut.id;
         block.assignedPanelId = fieldName;
         addCutBlockLink(cut, block, fieldName);
