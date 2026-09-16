@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2561</title>
+  <title>MoArt ver2562</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24616,6 +24616,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2562, items: [{ ja: 'SUT素材穂先の固定の左右・上下反転を読み込み時に反映します。再読み込みで適用されます。', ko: 'SUT 소재 팁의 고정 좌우·상하 반전을 가져올 때 반영합니다. 다시 가져오면 적용됩니다.', en: 'SUT material tips now retain fixed horizontal and vertical flips on import. Reimport to apply.', zh: '导入SUT素材笔尖时保留固定的水平和垂直翻转。重新导入即可应用。' }] },
       { ver: 2561, items: [{ ja: '素材・紙質ブラシの線先を滑らかに表示し、狭い範囲の折り返しや細かな曲線を描きやすくしました。', ko: '소재·종이결 브러시의 선 끝 표시를 부드럽게 하고, 좁은 영역의 왕복과 작은 곡선을 더 정확하게 그리도록 개선했습니다.', en: 'Improved the live endpoint of material and textured brushes, preserving small turns and curves for detailed drawing.', zh: '改进素材和纸纹笔刷的实时笔迹末端显示，保留细小转折和曲线，方便精细绘制。' }] },
       { ver: 2560, items: [{ ja: 'SUTの未対応設定の案内と、紙質設定の編集反映を修正しました。楕円形穂先の余分なメモリ使用も削減しました。', ko: 'SUT 미지원 안내와 종이결 설정의 편집 반영을 수정했습니다. 타원 팁의 불필요한 메모리 사용도 줄였습니다.', en: 'Fixed SUT support notes and edited texture settings. Reduced excess memory retained by elliptical tips.', zh: '修正SUT不支持设置的提示及纸纹设置的编辑应用，减少椭圆笔尖多余的内存占用。' }] },
       { ver: 2559, items: [{ ja: 'SUTの紙質の濃度強調を、確認済みの円形穂先・固定濃度の組み合わせで再現します。再読み込みで反映されます。', ko: '검증된 원형 팁·고정 농도 조합에서 SUT 종이결 농도 강조를 재현합니다. 다시 가져오면 반영됩니다.', en: 'SUT texture density emphasis now works for verified circular-tip and fixed-density combinations. Reimport to apply.', zh: '支持已验证的圆形笔尖与固定浓度组合中的SUT纸纹浓度强调。重新导入即可应用。' }] },
@@ -64838,10 +64839,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (right > left && bottom > top) tile.getContext('2d').drawImage(cv, left, top, tile.width, tile.height, 0, 0, tile.width, tile.height);
       return tile.toDataURL('image/png');
     }
-    // One selected material, decoded once per import/role. Unused embedded materials are not registered.
-    async function brushLibraryPrepareSutMaterial(material, paper) {
+    // Fixed CSP flips are local material transforms, before angle/thickness/ribbon rendering.
+    // Bake only on import; saved tip refs use the existing renderer without per-dab conversion.
+    function brushLibrarySutFlippedTipDataUrl(image, horizontal, vertical) {
+      const cv = document.createElement('canvas'); cv.width = image.width; cv.height = image.height;
+      const ctx = cv.getContext('2d'); ctx.imageSmoothingEnabled = false;
+      ctx.translate(horizontal ? cv.width : 0, vertical ? cv.height : 0);
+      ctx.scale(horizontal ? -1 : 1, vertical ? -1 : 1); ctx.drawImage(image, 0, 0);
+      return cv.toDataURL('image/png');
+    }
+    // One selected material per import/role/fixed transform. Unused materials are not registered.
+    async function brushLibraryPrepareSutMaterial(material, paper, flipHorizontal, flipVertical) {
       const label = paper ? '종이결' : '붓끝';
-      const result = { ref: '', note: '', scaling: 0, scaleMul: 1, width: 0, height: 0 };
+      const result = { ref: '', note: '', scaling: 0, scaleMul: 1, width: 0, height: 0, flipHorizontal: false, flipVertical: false };
+      flipHorizontal = !paper && !!flipHorizontal; flipVertical = !paper && !!flipVertical;
+      let ref = '';
       try {
         const members = tarReadEntries(material.FileData);
         const thumb = members.find(function(en) { return /(^|\/)thumbnail\.png$/i.test(en.name); });
@@ -64873,20 +64885,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             console.warn('[brushLibrary]', result.note, error);
           }
         }
-        const ref = brushLibraryNewRef();
+        ref = brushLibraryNewRef();
         const ready = await new Promise(function(resolve) { brushLibraryRegisterTipFromDataUrl(ref, dataUrl, resolve); });
         if (!ready) { result.note = label + ' PNG를 읽지 못해 미적용'; return result; }
         let image = paintGetTip(ref);
-        if (paper) {
-          dataUrl = brushLibrarySutPaperDataUrl(image);
+        if (paper || flipHorizontal || flipVertical) {
+          dataUrl = paper ? brushLibrarySutPaperDataUrl(image) : brushLibrarySutFlippedTipDataUrl(image, flipHorizontal, flipVertical);
           const normalized = await new Promise(function(resolve) { brushLibraryRegisterTipFromDataUrl(ref, dataUrl, resolve); });
-          if (!normalized) { paintUnregisterTip(ref); result.note = label + ' 알파 소재 준비 실패'; return result; }
+          if (!normalized) { paintUnregisterTip(ref); result.note = label + ' 소재 변환 실패 — 미적용'; return result; }
           image = paintGetTip(ref);
         }
         result.ref = ref; result.width = image.width; result.height = image.height;
+        result.flipHorizontal = flipHorizontal; result.flipVertical = flipVertical;
         trackPersistFailure('brush ' + (paper ? 'paper' : 'tip'), putWorkspaceDbValue('bt:' + ref, dataUrl));
         return result;
       } catch (error) {
+        if (ref) paintUnregisterTip(ref);
+        result.ref = ''; result.flipHorizontal = result.flipVertical = false;
         result.note = label + ' 소재를 읽지 못해 미적용';
         console.warn('[brushLibrary]', result.note, error);
         return result;
@@ -64918,8 +64933,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (paths.length > 1) notes.push(key + ' 소재 ' + paths.length + '개 — 첫 참조만 적용, 복수 소재 실행 미지원');
         const matches = materials.filter(function(m) { return m && m.OriginalPath === paths[0]; });
         if (matches.length !== 1) { notes.push(key + ' 참조 소재 ' + (matches.length ? '중복' : '누락') + ' — 미적용'); return null; }
-        const cacheKey = (paper ? 'paper:' : 'tip:') + paths[0];
-        if (!prepared.has(cacheKey)) prepared.set(cacheKey, brushLibraryPrepareSutMaterial(matches[0], paper));
+        const flipHorizontal = !paper && Number(v.BrushPatternReverseHorizontal) === 1;
+        const flipVertical = !paper && Number(v.BrushPatternReverseVertical) === 1;
+        const cacheKey = JSON.stringify([paper, paths[0], flipHorizontal, flipVertical]);
+        if (!prepared.has(cacheKey)) prepared.set(cacheKey, brushLibraryPrepareSutMaterial(matches[0], paper, flipHorizontal, flipVertical));
         const result = await prepared.get(cacheKey);
         if (result.note) notes.push(result.note);
         return result;
@@ -64932,7 +64949,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const paper = await select(v, 'TextureImage', true, notes);
         const brush = { tool: 'pen', tipId: tip ? tip.ref : '', tipSpacing: 0 };
         if (paper && paper.ref) { brush.paperTexId = paper.ref; brush.paperTexDepth = 100; brush.paperTexScale = 100; }
-        brushLibraryApplySutVariant(brush, v, notes);
+        brushLibraryApplySutVariant(brush, v, notes, tip);
         if (paper && paper.scaleMul !== 1 && brush.paperTexId && Number(brush.paperTexScale) > 0) {
           const raw = Number(brush.paperTexScale), scaled = Math.round(raw * paper.scaleMul);
           brush.paperTexScale = Math.max(10, Math.min(400, scaled));
@@ -65118,7 +65135,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // BrushSize 의 「단위 미확인」은 샘플이 풀었다: 「鉛筆R A4 400dpi(8px)」의 BrushSize 가 8.0,
     // 「カスタムGペン 3」이 20.0 이고 **둘 다 BrushSizeUnit = 0** — 파일 이름이 단위를 말해 준다(px).
     // 0 이 아닌 Unit 은 본 적이 없으므로 그때는 적용하지 않고 기록만 한다(추측 금지).
-    function brushLibraryApplySutVariant(brush, v, notes) {
+    function brushLibraryApplySutVariant(brush, v, notes, preparedTip) {
       if (!v) return;
       const num = function(x) {
         if (typeof x !== 'number' && !(typeof x === 'string' && x.trim() !== '')) return null;
@@ -65676,7 +65693,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (num(v.BrushUsePatternImage) === 0 || (paths && paths.length <= 1 && order >= 0 && order <= 3)) return;
           // One-time modes still stop after the only tip; they are not equivalent to repetition.
         }
-        if (ribbonOn && e[0] === 'BrushPatternReverseVertical' && num(v.BrushPatternReverseVertical) === 3) return; // handled above; other reverse modes remain unsupported
+        if (e[0] === 'BrushPatternReverseHorizontal' || e[0] === 'BrushPatternReverseVertical') {
+          if (num(v.BrushUsePatternImage) === 0) return; // CSP disables material flips for circle tips.
+          const applied = preparedTip && preparedTip.ref === brush.tipId &&
+            preparedTip[e[0] === 'BrushPatternReverseHorizontal' ? 'flipHorizontal' : 'flipVertical'];
+          if (num(v[e[0]]) === 1 && applied) return; // Only an actually converted asset proves support.
+        }
+        if (ribbonOn && e[0] === 'BrushPatternReverseVertical' && num(v.BrushPatternReverseVertical) === 3) return; // Foldback is handled above.
         const n = num(v[e[0]]);
         if (n != null && n !== e[1]) notes.push(e[0] + '=' + n + ' — ' + e[2] + ' (앱에 대응 항목 없음)');
       });
