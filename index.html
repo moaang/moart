@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2589</title>
+  <title>MoArt ver2590</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -65810,33 +65810,49 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // CSP uses the nonempty alpha bounds as the paper tile, not the padded thumbnail rectangle.
     // Normalize newly imported SUT paper to white RGB + source alpha. Opaque paper then has
     // transmission 1 even when its preview RGB is black; generic PNG grain keeps its own encoding.
+    // Nonempty alpha bounds of RGBA pixel data (right/bottom exclusive); null when every pixel is transparent.
+    function brushLibraryAlphaBounds(data, w, h) {
+      let left = w, top = h, right = 0, bottom = 0;
+      for (let y = 0; y < h; y += 1) for (let x = 0; x < w; x += 1) {
+        if (data[(y * w + x) * 4 + 3]) {
+          left = Math.min(left, x); top = Math.min(top, y);
+          right = Math.max(right, x + 1); bottom = Math.max(bottom, y + 1);
+        }
+      }
+      return right > left && bottom > top ? { left: left, top: top, right: right, bottom: bottom } : null;
+    }
     function brushLibrarySutPaperDataUrl(image) {
       const cv = document.createElement('canvas'); cv.width = image.width; cv.height = image.height;
       const ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(image, 0, 0);
       const pixels = ctx.getImageData(0, 0, cv.width, cv.height);
-      let left = cv.width, top = cv.height, right = 0, bottom = 0;
-      for (let y = 0; y < cv.height; y += 1) for (let x = 0; x < cv.width; x += 1) {
-        const i = (y * cv.width + x) * 4;
-        if (pixels.data[i + 3]) {
-          left = Math.min(left, x); top = Math.min(top, y);
-          right = Math.max(right, x + 1); bottom = Math.max(bottom, y + 1);
-        }
-        pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = 255;
-      }
+      const b = brushLibraryAlphaBounds(pixels.data, cv.width, cv.height);
+      for (let i = 0; i < pixels.data.length; i += 4) pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = 255;
       ctx.putImageData(pixels, 0, 0);
       const tile = document.createElement('canvas');
-      tile.width = Math.max(1, right - left); tile.height = Math.max(1, bottom - top);
-      if (right > left && bottom > top) tile.getContext('2d').drawImage(cv, left, top, tile.width, tile.height, 0, 0, tile.width, tile.height);
+      tile.width = b ? b.right - b.left : 1; tile.height = b ? b.bottom - b.top : 1;
+      if (b) tile.getContext('2d').drawImage(cv, b.left, b.top, tile.width, tile.height, 0, 0, tile.width, tile.height);
       return tile.toDataURL('image/png');
     }
     // Fixed CSP flips are local material transforms, before angle/thickness/ribbon rendering.
     // Bake only on import; saved tip refs use the existing renderer without per-dab conversion.
-    function brushLibrarySutFlippedTipDataUrl(image, horizontal, vertical) {
-      const cv = document.createElement('canvas'); cv.width = image.width; cv.height = image.height;
+    // ver2590: a tip material is its nonempty alpha bounds, exactly like paper (ver2554). CSP pads an image it registers
+    // as a material by one transparent column and row (LAB Multi0917: 12×16 became 13×17, 268×222 became 269×223) and
+    // still repeats the ribbon every size × 16/12: the native period transitions 42.5 · 68.5 · 111.5 · 137.5 · 180.5 fit
+    // 42.67 · 69.17 · 111.84 · 138.35 · 181.01 and not the padded 41.85 · 68.37 · 110.22 · 136.75 · 178.59
+    // (docs/tests/sut_multitip_native_2590). The 11 sample SUTs have no margin, so only user-registered tips change.
+    // Returns null when neither the crop nor a flip changes anything (no re-registration).
+    function brushLibrarySutTipDataUrl(image, horizontal, vertical) {
+      const w = image.width, h = image.height;
+      const src = document.createElement('canvas'); src.width = w; src.height = h;
+      const sctx = src.getContext('2d', { willReadFrequently: true }); sctx.drawImage(image, 0, 0);
+      const b = brushLibraryAlphaBounds(sctx.getImageData(0, 0, w, h).data, w, h) || { left: 0, top: 0, right: w, bottom: h };
+      const cw = b.right - b.left, ch = b.bottom - b.top;
+      if (cw === w && ch === h && !horizontal && !vertical) return null;
+      const cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
       const ctx = cv.getContext('2d'); ctx.imageSmoothingEnabled = false;
-      ctx.translate(horizontal ? cv.width : 0, vertical ? cv.height : 0);
-      ctx.scale(horizontal ? -1 : 1, vertical ? -1 : 1); ctx.drawImage(image, 0, 0);
-      return cv.toDataURL('image/png');
+      ctx.translate(horizontal ? cw : 0, vertical ? ch : 0);
+      ctx.scale(horizontal ? -1 : 1, vertical ? -1 : 1); ctx.drawImage(src, b.left, b.top, cw, ch, 0, 0, cw, ch);
+      return { dataUrl: cv.toDataURL('image/png'), cropped: cw !== w || ch !== h, width: cw, height: ch };
     }
     // One selected material per import/role/fixed transform. Unused materials are not registered.
     async function brushLibraryPrepareSutMaterial(material, paper, flipHorizontal, flipVertical) {
@@ -65886,11 +65902,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const ready = await new Promise(function(resolve) { brushLibraryRegisterTipFromDataUrl(ref, dataUrl, resolve); });
         if (!ready) { result.note = label + ' PNG를 읽지 못해 미적용'; return result; }
         let image = paintGetTip(ref);
-        if (paper || flipHorizontal || flipVertical) {
-          dataUrl = paper ? brushLibrarySutPaperDataUrl(image) : brushLibrarySutFlippedTipDataUrl(image, flipHorizontal, flipVertical);
+        const converted = paper ? { dataUrl: brushLibrarySutPaperDataUrl(image) } : brushLibrarySutTipDataUrl(image, flipHorizontal, flipVertical);
+        if (converted) {
+          dataUrl = converted.dataUrl;
           const normalized = await new Promise(function(resolve) { brushLibraryRegisterTipFromDataUrl(ref, dataUrl, resolve); });
           if (!normalized) { paintUnregisterTip(ref); result.note = label + ' 소재 변환 실패 — 미적용'; return result; }
           image = paintGetTip(ref);
+          if (converted.cropped) result.note = (result.note || label) + ' — 투명 여백을 잘라 ' + converted.width + '×' + converted.height + ' (CSP 는 알파 경계를 소재로 쓴다, ver2590)';
         }
         result.ref = ref; result.width = image.width; result.height = image.height;
         result.flipHorizontal = flipHorizontal; result.flipVertical = flipVertical;
@@ -65946,7 +65964,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (r.note) notes.push(r.note);
           results.push(r);
         }
-        const good = results.filter(function(r) { return r && r.ref; });
+        // ver2590: BrushPatternImageArray is stored in the reverse of CSP's tip list, and the list order is the usage order:
+        // LAB Multi0917 stores [268×222, 12×16] while its list and the native first ribbon period (42.67 px at size 32) are 12×16.
+        const good = results.filter(function(r) { return r && r.ref; }).reverse();
         if (!many) return results[0] || null;
         if (!good.length) return results[0] || null;
         const first = Object.assign({}, good[0], { refs: good.map(function(r) { return r.ref; }) });
@@ -66421,8 +66441,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (flowEff && (flowEff.usesPressure || flowEff.usesTilt || flowEff.usesVelocity || flowEff.usesRandom)) notes.push('2-ブラシ 濃度 Effector 활성 — 미측정, 보조 농도는 상수로 둔다');
     }
     // ver2587: 繰り返し方法 (BrushPatternOrderType) with several tip materials → tipIds (every registered ref) + tipOrder.
-    // 0 繰り返し · 1 折り返し · 3 ランダム are seen in files / native 9절; 2 繰り返さない · 4 一回のみ · 5 ランダム(一巡) follow the
-    // popup order (unverified). One material has nothing to cycle — the value is a leftover (sutStepUnsupported stays quiet).
+    // All six values are pinned by exports of one LAB brush saved once per popup entry (docs/tests/sut_multitip_native_2590):
+    // 0 繰り返し · 1 折り返し · 2 繰り返さない · 3 ランダム · 4 一回のみ · 5 ランダム(一巡). One material has nothing to cycle — the
+    // value is a leftover (sutStepUnsupported stays quiet).
     const SUT_TIP_ORDERS = { 0: 'repeat', 1: 'fold', 2: 'hold', 3: 'random', 4: 'once', 5: 'randomOnce' };
     const SUT_TIP_ORDER_NAMES = { 0: '繰り返し', 1: '折り返し', 2: '繰り返さない', 3: 'ランダム', 4: '一回のみ', 5: 'ランダム(一巡)' };
     function sutStepTipOrder(ctx) {
@@ -66432,8 +66453,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       brush.tipIds = tip.refs.join(',');
       const order = num(v.BrushPatternOrderType);
       brush.tipOrder = SUT_TIP_ORDERS[order] || 'repeat';
-      notes.push('繰り返し方法 = ' + (SUT_TIP_ORDER_NAMES[order] || order) + ' → 팁 ' + tip.refs.length + '장을 ' + brush.tipOrder + ' 순서로 — 리본은 주기마다 한 장, 주기 = 그 팁의 크기×H/W (native 9절); 일반 자국은 자국마다 한 장 (미측정)'
-        + ((order === 2 || order === 4 || order === 5) ? ' · 값 ' + order + ' 의 뜻은 팝업 순서 추정' : ''));
+      notes.push('繰り返し方法 = ' + (SUT_TIP_ORDER_NAMES[order] || order) + ' → 팁 ' + tip.refs.length + '장을 ' + brush.tipOrder + ' 순서로(목록 순서 = 저장 배열의 역순, ver2590) — 리본은 주기마다 한 장, 주기 = 그 팁의 크기×H/W (native 9절); 일반 자국은 자국마다 한 장 (미측정)');
       if (brush.tipRibbon && brush.tipRibbonAlt) notes.push('여러 장의 折り返し時に反転 은 미측정 — 반전은 팁 한 장 규칙 그대로');
     }
     // Paper scale and density from the file (they used to be pinned at 100/100).
@@ -68105,8 +68125,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 조각 평균 폭이 아니라 양 끝 입력점의 폭을 보간한다. 인접 조각은 같은 중심·각도뿐 아니라
         // 같은 두 끝점까지 공유하므로 필압 변화 때 생기던 1px 쐐기 틈이 구조적으로 사라진다.
         const a = ang0 + d * f, h = (sw0 + (sw1 - sw0) * f) / 2;
-        const collapsed = Boolean(firstPiece && k === 0);
-        const nx = collapsed ? 0 : Math.sin(a) * h, ny = collapsed ? 0 : -Math.cos(a) * h;
+        // ver2590: the first cross-section is no longer collapsed to P0 (ribbon_gap_hunt 2026-08-31 made the stroke start a
+        // triangle). CSP starts the band at full width — LAB Multi0917's five native strokes begin flat, and with a long
+        // first piece the triangle was a 43 px wedge (docs/tests/sut_multitip_native_2590). A soft start still comes from w0.
+        const nx = Math.sin(a) * h, ny = -Math.cos(a) * h;
         const uu = u0 + (u1 - u0) * f;
         const su = ((rs.pad || 0) + (flipU ? 1 - uu : uu) * rs.len) / texW;
         return { tx: x + nx, ty: y + ny, bx: x - nx, by: y - ny, u: su };
@@ -68114,8 +68136,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let a = section(0);
       for (let k = 0; k < steps; k += 1) {
         const b = section(k + 1);
-        // A(top0), B(bottom0), C(bottom1) / A, C, D(top1). 첫 셀은 A=B=P0 이므로
-        // 자연스럽게 P0-C-D 삼각형 하나로 축퇴한다.
+        // A(top0), B(bottom0), C(bottom1) / A, C, D(top1).
         paintRibbonMeshVertex(batch, a.tx, a.ty, a.u, vTop, pa);
         paintRibbonMeshVertex(batch, a.bx, a.by, a.u, vBot, pa);
         paintRibbonMeshVertex(batch, b.bx, b.by, b.u, vBot, pa);
