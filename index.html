@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2592</title>
+  <title>MoArt ver2593</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -60093,8 +60093,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Boolean(stroke) && (stroke.tool === 'eraser' || stroke.transparent === true);
     }
     // 버퍼에는 붓 모양만 만든다. 지우기·합성 모드·획 불투명도는 대상에 합칠 때 한 번 적용한다.
+    // The view a stroke is drawn with INTO A BUFFER: opaque, normal, its replace-alpha nature carried as a flag for the
+    // caller's composite. ver2593: `bufferView` marks it so drawPaintStroke never re-enters its own replace/CSP-mix branch
+    // — the view keeps mixModel 'csp' (the mixer needs it), and from ver2586 that re-selected the branch: every CSP-mix
+    // stroke drawn through drawPaintStroke recursed to the stack limit (1,857 levels, 3,713 scratch canvases), threw
+    // RangeError and left no ink — the conte page path, and every library tile preview of such a brush on every grid
+    // render (the iPad 'library gets heavy' report; docs/tests/brush_lib_perf_2593).
     function paintStrokeBufferView(stroke) {
-      return Object.assign({}, stroke, { tool: 'pen', transparent: false, mode: 'normal', opacity: 1, replaceAlpha: paintStrokeReplacesAlpha(stroke) });
+      return Object.assign({}, stroke, { tool: 'pen', transparent: false, mode: 'normal', opacity: 1, replaceAlpha: paintStrokeReplacesAlpha(stroke), bufferView: true });
     }
     function setPaintBrushColor(color, options) {
       options = options || {};
@@ -68920,6 +68926,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     const PAINT_TIP_SAMPLE_MAX = 256;
     let paintTipSampleScratch = null;
+    // ver2593: the QUEUED grain path (grainFlush) needs its own copy of every sample until the flush; a fresh canvas per
+    // dab (ver2586) was 144 canvases per stroke and 122 per library tile. The copies now come from a pool whose index
+    // the ink field resets when it starts a new queue; past the cap a copy is a throwaway again.
+    const paintTipSampleOwnPool = [];
+    let paintTipSampleOwnNext = 0;
+    const PAINT_TIP_SAMPLE_OWN_POOL_MAX = 1024;
+    function paintTipSampleOwnReset() { paintTipSampleOwnNext = 0; }
     // One dab through the sampler → { canvas, x0, y0, w, h } (the scratch is reused; consume it before the next call —
     // or pass `own` to get a per-dab copy, which the ink field's QUEUED path needs: it defers the draw, and every queued
     // dab drew the last sample until ver2586 found it on a 45° mixing stroke) or null when the sampler does not apply
@@ -68956,9 +68969,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       slot.ctx.putImageData(slot.data, 0, 0, 0, 0, w, h);
       if (own) {
-        const c = document.createElement('canvas');
-        c.width = w; c.height = h;
-        c.getContext('2d').drawImage(slot.canvas, 0, 0, w, h, 0, 0, w, h);
+        const pooled = paintTipSampleOwnNext < PAINT_TIP_SAMPLE_OWN_POOL_MAX;
+        let c = pooled ? paintTipSampleOwnPool[paintTipSampleOwnNext] : null;
+        if (!c) { c = document.createElement('canvas'); if (pooled) paintTipSampleOwnPool[paintTipSampleOwnNext] = c; }
+        paintTipSampleOwnNext += 1;
+        if (c.width < w || c.height < h) { c.width = Math.max(c.width, w); c.height = Math.max(c.height, h); }
+        const oc = c.getContext('2d');
+        oc.setTransform(1, 0, 0, 1, 0, 0); oc.globalCompositeOperation = 'source-over'; oc.globalAlpha = 1;
+        oc.clearRect(0, 0, w, h);   // the consumer reads (0,0,w,h) only
+        oc.drawImage(slot.canvas, 0, 0, w, h, 0, 0, w, h);
         return { canvas: c, x0: x0, y0: y0, w: w, h: h };
       }
       return { canvas: slot.canvas, x0: x0, y0: y0, w: w, h: h };
@@ -69201,6 +69220,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       //   ③ draw가 불투명 값을 놓을 것. globalAlpha<1인 팁은 lighten도 배경과 보간하므로 max가 아니다.
       //   서지 않으면 `grainBake` 를 dab 마다 부른다(종전과 같은 호출 순서·같은 픽셀).
       const grainQueue = grainBake ? [] : null;
+      if (grainBake) paintTipSampleOwnReset();   // ver2593: the previous queue's pooled sample copies are free again
       const grainStamp = grainBake ? function(x, y, span, i, t, draw, drawKey, opaque) {
         let gd = gDepth;
         if (gCurve) {
@@ -73212,7 +73232,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       stroke = paintStrokeLineView(stroke);
       const points = Array.isArray(stroke.points) ? stroke.points : [];
       if (!points.length) return;
-      if ((stroke.mode === 'replace-alpha' || stroke.mixModel === 'csp') && paintStrokeReplacesAlpha(stroke) && !paintStrokeErases(stroke)) {   // ver2586: CSP 혼색도
+      if (!stroke.bufferView && (stroke.mode === 'replace-alpha' || stroke.mixModel === 'csp') && paintStrokeReplacesAlpha(stroke) && !paintStrokeErases(stroke)) {   // ver2586: CSP 혼색도 · ver2593: a buffer view never re-enters
         const owner = liveHost || {}, w = ctx.canvas.width, h = ctx.canvas.height;
         const base = paintScratchCanvas(owner, 'replaceBase', w, h), buf = paintScratchCanvas(owner, 'replaceStroke', w, h);
         base.getContext('2d').drawImage(ctx.canvas, 0, 0);
