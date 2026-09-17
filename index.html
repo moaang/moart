@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2593</title>
+  <title>MoArt ver2594</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -68075,10 +68075,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           'attribute vec2 aPos;attribute vec2 aUv;attribute float aA;uniform vec2 uSize;' +
           'varying vec2 vUv;varying float vA;' +
           'void main(){vec2 q=aPos/uSize;gl_Position=vec4(q.x*2.0-1.0,1.0-q.y*2.0,0.0,1.0);vUv=aUv;vA=aA;}');
-        const fs = compile(gl.FRAGMENT_SHADER,
-          'precision mediump float;uniform sampler2D uTex;uniform float uOpaque;' +
+        // ver2594: uMode 0 = bilinear (legacy PNG tips), 1 = one nearest texel at the pixel centre (AA0), 2 = the dab
+        // sampler's four nearest texels at the pixel's screen offsets (0,0)·(.5,0)·(0,.5)·(.5,.5) averaged (AA1~3) —
+        // paintTipSampledDab's rule carried through the piece's local map by dFdx/dFdy (OES_standard_derivatives;
+        // without it mode 2 falls back to bilinear on the same mip level).
+        const fsSrc = function(deriv) { return (deriv ? '#extension GL_OES_standard_derivatives : enable\n' : '') +
+          'precision mediump float;uniform sampler2D uTex;uniform float uOpaque;uniform vec2 uTexSize;uniform float uMode;' +
           'varying vec2 vUv;varying float vA;' +
-          'void main(){vec4 c=texture2D(uTex,vUv);gl_FragColor=mix(c*vA,vec4(c.rgb*vA,1.0),uOpaque);}');
+          'vec4 fetch(vec2 tp){return texture2D(uTex,(floor(tp)+0.5)/uTexSize);}' +
+          'void main(){vec4 c;if(uMode<0.5){c=texture2D(uTex,vUv);}else{vec2 tp=vUv*uTexSize;' +
+          (deriv ? 'if(uMode<1.5){c=fetch(tp);}else{vec2 dx=dFdx(tp);vec2 dy=dFdy(tp);c=(fetch(tp-0.5*dx-0.5*dy)+fetch(tp-0.5*dy)+fetch(tp-0.5*dx)+fetch(tp))*0.25;}' : 'c=fetch(tp);') +
+          '}gl_FragColor=mix(c*vA,vec4(c.rgb*vA,1.0),uOpaque);}'; };
+        let deriv = Boolean(gl.getExtension('OES_standard_derivatives')), fs;
+        try { fs = compile(gl.FRAGMENT_SHADER, fsSrc(deriv)); }
+        catch (e) { if (!deriv) throw e; deriv = false; fs = compile(gl.FRAGMENT_SHADER, fsSrc(false)); }
         const program = gl.createProgram();
         gl.attachShader(program, vs); gl.attachShader(program, fs); gl.linkProgram(program);
         gl.deleteShader(vs); gl.deleteShader(fs);
@@ -68102,6 +68112,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           aA: gl.getAttribLocation(program, 'aA'),
           uSize: gl.getUniformLocation(program, 'uSize'), uTex: gl.getUniformLocation(program, 'uTex'),
           uOpaque: gl.getUniformLocation(program, 'uOpaque'),
+          uTexSize: gl.getUniformLocation(program, 'uTexSize'), uMode: gl.getUniformLocation(program, 'uMode'), deriv: deriv,   // ver2594
           texImg: null   // ver2321: 마지막으로 올린 텍스처 소스(참조 캐시 — rs.src 는 팁당 불변)
         };
         return paintRibbonMeshGlState;
@@ -68111,8 +68122,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return null;
       }
     }
-    function paintRibbonMeshBatch() {
-      return { data: [], pieces: [], x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    // ver2594: grade = the brush's AA grade (tip.antialias; −1 for PNG tips → bilinear as before); sampling is set by
+    // paintRibbonMeshLevel (0 bilinear · 1 one nearest sample · 2 four samples, see the shader).
+    function paintRibbonMeshBatch(grade) {
+      return { data: [], pieces: [], grade: Number.isInteger(grade) ? grade : -1, sampling: 0, x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
     }
     function paintRibbonMeshVertex(batch, x, y, u, v, a) {
       batch.data.push(x, y, u, v, a);   // ver2325: 정점당 5 — 알파가 함께 실린다
@@ -68220,6 +68233,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
           st.texImg = img;
         }
+        // ver2594: the batch's sampling mode — nearest texels for the dab rule, bilinear for legacy PNG tips (or when
+        // derivatives are unavailable and four samples cannot be placed)
+        const smode = batch.sampling === 2 ? (st.deriv ? 2 : 0) : (batch.sampling === 1 ? 1 : 0);
+        const filt = smode ? gl.NEAREST : gl.LINEAR;
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+        gl.uniform2f(st.uTexSize, img.width || 1, img.height || 1); gl.uniform1f(st.uMode, smode);
         gl.enable(gl.BLEND);
         if (mode === 'max') {
           gl.blendEquation(st.minmax.MAX_EXT); gl.blendFunc(gl.ONE, gl.ONE);
@@ -68246,8 +68265,36 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // shift, Canvas2D's drawImage gave 26.5 cleanly). Pre-minify the source by exact 2× halvings per axis until each
     // axis is ≤ 2 texels per px, the same box-then-bilinear chain the dab sampler uses (paintTipMipChain); u/v are
     // normalized so the mesh needs no other change. Levels are cached on rs (one per (hx, hy) pair).
+    // ver2594: a graded (SUT) tip is sampled like a dab (native 9절: 「표본은 자국과 같은 규칙」 — 268×222 AA3 fits level 2 with two
+    // samples per axis at 2.93, one sample 13.1, other levels 7~29): the mip level comes from paintTipSampling with size =
+    // the band width (thickness 100) and longSide = the tip's long side, built by exact 2×2 boxes (even part only, as
+    // paintTipMipChain), and the shader averages the dab sampler's 1 or 4 nearest texels per pixel. PNG tips (no grade) keep
+    // the ver2583 per-axis halving + bilinear (paintRibbonMeshLevelLegacy).
     function paintRibbonMeshLevel(rs, batch) {
       if (!rs || !rs.src || !batch || !batch.pieces.length) return rs ? rs.src : null;
+      const grade = batch.grade;
+      if (!(grade >= 0 && grade <= 3)) { batch.sampling = 0; return paintRibbonMeshLevelLegacy(rs, batch); }
+      let wmax = 0;
+      for (let i = 0; i < batch.pieces.length; i += 1) if (batch.pieces[i].w > wmax) wmax = batch.pieces[i].w;
+      const plan = paintTipSampling(Math.max(0.3, wmax), grade, Math.max(rs.len, rs.wide));
+      batch.sampling = plan.offsets.length;
+      if (!plan.level) return rs.src;
+      if (!rs.levelsU) rs.levelsU = {};
+      let c = rs.levelsU[plan.level];
+      if (!c) {
+        let cur = rs.src, cw = rs.src.width, ch = rs.src.height;
+        for (let l = 0; l < plan.level; l += 1) {
+          const ew = (cw >> 1) << 1, eh = (ch >> 1) << 1;
+          if (!ew || !eh) break;
+          const n = document.createElement('canvas'); n.width = ew / 2; n.height = eh / 2;
+          n.getContext('2d').drawImage(cur, 0, 0, ew, eh, 0, 0, ew / 2, eh / 2);
+          cur = n; cw = ew / 2; ch = eh / 2;
+        }
+        c = rs.levelsU[plan.level] = cur;
+      }
+      return c;
+    }
+    function paintRibbonMeshLevelLegacy(rs, batch) {
       let wmax = 0, perU = 0;   // widest piece · px per whole period along the path (len / Δu)
       for (let i = 0; i < batch.pieces.length; i += 1) {
         const p = batch.pieces[i];
@@ -68732,14 +68779,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // 먼저 flush 한다(배치는 globalAlpha 한 값으로 그려진다). Canvas2D 렌더의 실체는 종전
           // 그대로 paintDrawRibbonJoin(몸통 한 방 + 조인 삼각형, changelog ver2308~2310)이다.
           // ver2587: 팁마다 배치 하나(텍스처가 다르다) — flush 는 전부, 순서는 팁 순.
-          let meshes = rsList.map(function() { return paintRibbonMeshBatch(); }), meshAlpha = null;
+          let meshes = rsList.map(function() { return paintRibbonMeshBatch(tip && tip.sampling === 'csp' ? tip.antialias : -1); }), meshAlpha = null;   // ver2594: grade
           const flushMesh = function() {
             const ma = meshAlpha == null ? 1 : meshAlpha;
             ctx.globalAlpha = baseAlpha * ma;
             for (let k = 0; k < meshes.length; k += 1) {
               if (!meshes[k].pieces.length) continue;
               paintRibbonMeshDrawOrFallback(ctx, rsList[k].src, rsList[k], meshes[k]);
-              meshes[k] = paintRibbonMeshBatch();
+              meshes[k] = paintRibbonMeshBatch(meshes[k].grade);
             }
             ctx.globalAlpha = baseAlpha;
           };
@@ -69396,12 +69443,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             return paintInkDabScratch;
           }; };
           const inkFallbackSrc = inkFallbackFor(rs);
-          let inkMeshes = rsList.map(function() { return paintRibbonMeshBatch(); }), colorMeshes = rsList.map(function() { return paintRibbonMeshBatch(); });
+          let inkMeshes = rsList.map(function() { return paintRibbonMeshBatch(tip && tip.sampling === 'csp' ? tip.antialias : -1); }), colorMeshes = rsList.map(function() { return paintRibbonMeshBatch(tip && tip.sampling === 'csp' ? tip.antialias : -1); });   // ver2594: grade
           const flushInkMesh = function() {
             for (let k = 0; k < inkMeshes.length; k += 1) {
               if (!inkMeshes[k].pieces.length) continue;
               paintRibbonMeshDrawOrFallback(fctx, rsList[k].src, rsList[k], inkMeshes[k], false, true, k ? inkFallbackFor(rsList[k]) : inkFallbackSrc);
-              inkMeshes[k] = paintRibbonMeshBatch();
+              inkMeshes[k] = paintRibbonMeshBatch(inkMeshes[k].grade);
             }
           };
           const okR = paintWalkRibbonPieces(pts, radii, tip, rsList.map(function(r) { return r.len; }), rsList.map(function(r) { return r.wide; }), rs.swapped, function(u0, u1, px, py, ang0, w, len, i, t, seam, tipIdx, ex, ey, ang1, firstPiece, w0, w1, sel) {
