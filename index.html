@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2594</title>
+  <title>MoArt ver2595</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -60682,6 +60682,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (state.paintEditTool) return 'pen';
       return paintBrushToolSlotKeyOf(state.paintTool);
     }
+    // ver2595: 2-ブラシ 適用方法 열세 가지 — 메인 α m 과 보조 획 α d(0..1) 의 함수. native 2595(LAB Anim0917, 모드마다 한 층):
+    //   標準·加算·比較(明)·スクリーン·オーバーレイ·覆い焼き 는 평균 오차 ≤1.3, 乗算·減算·比較(暗)·焼き込み(リニア) ≤4(보조 마스크 모델의 몫),
+    //   高さ(リニア) = clamp(2m − d) 1.5, ハードミックス 는 オーバーレイ 와 픽셀 98.5% 동일(0.31), 焼き込み 는 d = 0 & m = 1 의 41 이상치를
+    //   빼면 색상 번 식. 색은 메인 획의 것 — 보조 획의 색 효과(RGB値に適用)는 같은 색으로 재어 보이지 않았다.
+    const PAINT_DUAL_MODE_FNS = {
+      normal: function(m, d) { return m + d - m * d; },
+      multiply: function(m, d) { return m * d; },
+      add: function(m, d) { return Math.min(1, m + d); },
+      subtract: function(m, d) { return Math.max(0, m - d); },
+      darken: function(m, d) { return Math.min(m, d); },
+      lighten: function(m, d) { return Math.max(m, d); },
+      screen: function(m, d) { return m + d - m * d; },
+      overlay: function(m, d) { return m < 0.5 ? 2 * m * d : 1 - 2 * (1 - m) * (1 - d); },
+      dodge: function(m, d) { return d >= 1 ? (m > 0 ? 1 : 0) : Math.min(1, m / (1 - d)); },
+      burn: function(m, d) { return d <= 0 ? 0 : 1 - Math.min(1, (1 - m) / d); },
+      linearburn: function(m, d) { return Math.max(0, m + d - 1); },
+      hardmix: function(m, d) { return m < 0.5 ? 2 * m * d : 1 - 2 * (1 - m) * (1 - d); },
+      height: function(m, d) { return Math.max(0, Math.min(1, 2 * m - d)); }
+    };
+    const PAINT_DUAL_MODE_FORMULA = { normal: 'm+d−md', multiply: 'm·d', add: 'min(1,m+d)', subtract: 'max(0,m−d)', darken: 'min(m,d)', lighten: 'max(m,d)', screen: 'm+d−md',
+      overlay: 'm<.5 ? 2md : 1−2(1−m)(1−d)', dodge: 'min(1,m/(1−d))', burn: '1−min(1,(1−m)/d)', linearburn: 'max(0,m+d−1)', hardmix: 'オーバーレイ 와 같음', height: 'clamp(2m−d)' };
+    function paintDualModeFn(name) { return (typeof name === 'string' && Object.prototype.hasOwnProperty.call(PAINT_DUAL_MODE_FNS, name)) ? PAINT_DUAL_MODE_FNS[name] : null; }
+    // 보조 획만 있는 픽셀(m = 0 인 합집합 계열)의 색 — 획 색 #rrggbb(aa) 또는 rgb(a)() 의 RGB 와 알파.
+    function paintDualColorRgb(color) {
+      const str = String(color || '#000000').trim();
+      const m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)$/i.exec(str);
+      if (m) return [Math.round(+m[1]), Math.round(+m[2]), Math.round(+m[3]), m[4] == null ? 1 : Math.max(0, Math.min(1, +m[4]))];
+      const h = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(str);
+      if (h) return [parseInt(h[1].slice(0, 2), 16), parseInt(h[1].slice(2, 4), 16), parseInt(h[1].slice(4, 6), 16), h[2] ? parseInt(h[2], 16) / 255 : 1];
+      return [0, 0, 0, 1];
+    }
     const PAINT_BRUSH_SETTING_SPEC = {
       opacity:    { def: 1,     legacy: 'paintBrushOpacity',    parse: function(r) { const n = Number(r); return Number.isFinite(n) && n >= 10 && n <= 100 ? n / 100 : 1; }, ser: function(v) { return String(Math.round(v * 100)); } },
       stabilizer: { def: 2,     legacy: 'paintStabilizer',      parse: function(r) { const n = Number(r); return Number.isFinite(n) && n >= 0 ? Math.min(10, Math.round(n)) : 2; }, ser: function(v) { return String(v); } },
@@ -60791,7 +60822,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       waterEdgeCsp:    { def: false, legacy: null, parse: function(r) { return r === '1'; }, ser: function(v) { return v ? '1' : '0'; } },
       // ver2584: 2-ブラシ(Dual) 곱하기 — native 5절: 보조 원형 획(자기 크기·자동 간격·AA, 크기 연동 없음)의 알파를 메인 획
       // 알파에 곱하는 마스크. 가져오기만 세운다(측정된 조합: 곱하기·RGB 적용 OFF·크기 연동 OFF·원형·경도 100). '' = 없음.
-      dualMask:    { def: '', legacy: null, parse: function(r) { return r === 'multiply' ? 'multiply' : ''; }, ser: function(v) { return v === 'multiply' ? 'multiply' : ''; } },
+      dualMask:    { def: '', legacy: null, parse: function(r) { return paintDualModeFn(r) ? r : ''; }, ser: function(v) { return paintDualModeFn(v) ? v : ''; } },   // ver2595: 適用方法 이름(열세 가지)
       dualSize:    { def: 30, legacy: null, parse: function(r) { const n = Number(r); return Number.isFinite(n) && n > 0 ? Math.min(2000, n) : 30; }, ser: function(v) { return String(v == null ? 30 : v); } },
       dualAa:      { def: 2, legacy: null, parse: function(r) { const n = Math.round(Number(r)); return n >= 0 && n <= 3 ? n : 2; }, ser: function(v) { return String(v == null ? 2 : v); } },
       dualSpacing: { def: 0.08, legacy: null, parse: function(r) { const n = Number(r); return Number.isFinite(n) && n > 0 ? Math.min(5, n) : 0.08; }, ser: function(v) { return String(v == null ? 0.08 : v); } },
@@ -61586,13 +61617,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { radius: r, fill: Math.max(0, Math.min(1, p * PAINT_WATER_EDGE_K)), csp: Boolean(src.waterEdgeCsp), power: p };
     }
     // ver2584: 2-ブラシ 곱하기(native 5절) — 보조 원형 획을 메인 획 알파의 마스크로. 가져오기가 세운 dualMask 만 켠다.
+    // ver2595: dualMask 는 適用方法 이름(paintDualModeFn) — 곱하기 외의 열두 가지는 픽셀 함수로 합친다.
     function paintDualFrom(src) {
-      if (!src || src.dualMask !== 'multiply') return null;
+      if (!src || !paintDualModeFn(src.dualMask)) return null;
       const size = Number(src.dualSize) > 0 ? Math.min(2000, Number(src.dualSize)) : 30;
       const aaRaw = Math.round(Number(src.dualAa)), aa = aaRaw >= 0 && aaRaw <= 3 ? aaRaw : 2;
       const spacing = Number(src.dualSpacing) > 0 ? Math.min(5, Number(src.dualSpacing)) : 0.08;
       const flow = Math.max(1, Math.min(100, Number(src.dualFlow) || 100));
-      return { size: size, aa: aa, spacing: spacing, flow: flow };
+      return { mode: src.dualMask, size: size, aa: aa, spacing: spacing, flow: flow };
     }
     function paintGrainActive(src) { return !!(paintGrainOptionsFrom(src) && paintGetTip(src.paperTexId)); }
     // ver1338: 등록된 팁을 실제로 갖고 있는가. ver1332~1337 동안 팁은 **penOutlineMode 하나에만** 묶여
@@ -61643,7 +61675,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Boolean((src && src.pressure && (src.pressureSize || src.pressureAlpha)) || paintGrainActive(src) || paintStrokeTipActive(src) || paintStrokeReplacesAlpha(src) || (src && src.tipShape === 'circle') || paintStrokeFlowVal(src) < 1
         || (src && paintCurveIfOn(src.flowCurveOn, src.flowCurvePts)) || (src && src.tipDarken)
         || (src && src.waterEdge)   // ver2393: 띠는 획 **윤곽 전체**의 함수라 조각으로 못 만든다
-        || (src && src.dualMask === 'multiply')   // ver2584: 2-ブラシ 마스크도 획 전체의 함수(보조 반경이 메인보다 크다)
+        || (src && paintDualModeFn(src.dualMask))   // ver2584: 2-ブラシ 마스크도 획 전체의 함수(보조 반경이 메인보다 크다) · ver2595 열세 가지
         || (src && (Number(src.taperIn) > 0 || Number(src.taperOut) > 0)));
     }
     // ver1617: 2値化 획이 **원반 스탬프가 아니라 임계화**로 가야 하는가. 팁과 종이결은 이미지라
@@ -64008,8 +64040,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver2584: 2-ブラシ 곱하기 — 같은 attach 규격(가져오기가 세운 브러시만 갖는다).
     function paintAttachDual(stroke, get) {
       const g = get || paintBrushGet;
-      if (g('dualMask') !== 'multiply') return;
-      stroke.dualMask = 'multiply';
+      if (!paintDualModeFn(g('dualMask'))) return;   // ver2595: 適用方法 이름
+      stroke.dualMask = g('dualMask');
       stroke.dualSize = Number(g('dualSize')) || 30;
       const aa = Math.round(Number(g('dualAa')));
       stroke.dualAa = aa >= 0 && aa <= 3 ? aa : 2;
@@ -66035,10 +66067,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 적용 가능한 조합은 brushLibraryApplySutVariant가 고르며, 미검증 조합은 비고를 남긴다.
     // material: native 32/128px and 25/100% thickness controls, tests/sut_native_2552.
     // Its pitch is diameter * thickness * coefficient, independent of stroke direction.
-    const PAINT_SUT_AUTO_INTERVAL = { 1: { approx: 0.07, material: 0.12 }, 2: { approx: 0.05, material: 0.08 }, 3: { approx: 0.03, material: 0.04, blend: 0.04 } };
+    // ver2595: 원형 팁의 자동 간격 계수도 소재와 같은 .12/.08/.04 — native 2595(LAB Circ0918: 원형·AA3·크기 32/64 의 가장자리 스펙트럼
+    //   2.56/3.84/5.12 = 크기 × .08/.12/.08, 농도 20 의 겹침 수 → 狭い .040). 종전 approx .07/.05/.03 은 형상 역산 추정이었다.
+    const PAINT_SUT_AUTO_INTERVAL = { 1: { approx: 0.12, material: 0.12 }, 2: { approx: 0.08, material: 0.08 }, 3: { approx: 0.04, material: 0.04, blend: 0.04 } };
     const PAINT_SUT_AUTO_INTERVAL_NAME = { 0: '固定', 1: '広い', 2: '普通', 3: '狭い' };
-    // ver2584: 2-ブラシ 원형의 자동 간격 계수 — 普通 = .08 이 native 5절(30px → 2.4px, 2,050픽셀 ≤1)로 확정. 広い/狭い 는
-    // 소재 팁의 계수를 그대로 둔 추정(미측정).
+    // ver2584: 2-ブラシ 원형의 자동 간격 계수 — 普通 = .08 이 native 5절(30px → 2.4px, 2,050픽셀 ≤1)로 확정.
+    // ver2595: 広い .12 · 狭い .04 도 실측(濃度 20 의 over 누적, 오차 2.6/3.2 로 다른 계수보다 뚜렷).
     const PAINT_SUT_DUAL_AUTO_INTERVAL = { 1: 0.12, 2: 0.08, 3: 0.04 };
     function paintSutParseEffector(blob) {
       try {
@@ -66313,7 +66347,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (autoIv != null && autoIv !== 0 && autoSf != null) {
         brush.tipSpacing = autoSf;
         if (!ribbonOn) notes.push('間隔 = ' + PAINT_SUT_AUTO_INTERVAL_NAME[autoIv] + '(BrushAutoIntervalType='
-          + autoIv + ') → 팁 간격 ' + autoSf + (materialSpacing != null ? ' (CSP 소재·고정 두께 대조)' : measuredSpacing != null ? ' (CSP 고정 간격 대조·PNG 반복 주기)' : ' (형상 역산 근사)')
+          + autoIv + ') → 팁 간격 ' + autoSf + (materialSpacing != null ? ' (CSP 소재·고정 두께 대조)' : measuredSpacing != null ? ' (CSP 고정 간격 대조·PNG 반복 주기)' : ' (원형·소재 공통 계수, native 2595)')
           + ' — 파일의 ' + iv + '% 는 「고정」용 참고값');
       } else if (iv != null && iv > 0) {
         brush.tipSpacing = Math.min(4, iv / 100);
@@ -66400,28 +66434,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         brush.waterEdgeCsp = true;   // ver2585: CSP 의 픽셀 식(native 6절)
         notes.push('水彩境界 ON — 範囲 ' + brush.waterEdgeRadius + 'px · 透明度の影響 ' + brush.waterEdgePower
           + ' → 투명 픽셀까지의 거리 d < 範囲+1 인 획 픽셀에 M×(透明度の影響/10)×(範囲+1−d)/(範囲+1) 을 더한다(d=1 은 .3, M = 획 최대 α, 255 에서 자름; 100 은 이진화 — native 6절)');
-        if (weV != null && weV > 0) notes.push('明るさの影響=' + weV + ' — 앱은 띠의 명도를 따로 낮추지 않는다(알파만) — 미적용');
-        if (num(v.BrushWaterEdgeAfterDrag) === 1) notes.push('ドラッグ後に処理=ON — 앱은 획을 그리는 동안 바로 건다(같은 결과, 다른 시점)');
+        if (weV != null && weV > 0) notes.push('明るさの影響=' + weV + ' — 띠의 명도를 낮춘다(native 2595: 100 에서 빨강 R 255 → 202~206, 10 에서 250; 알파는 불변, 픽셀의 α·d 에 따라 다름) — 식 미확정, 미적용');
+        if (num(v.BrushWaterEdgeAfterDrag) === 1) notes.push('ドラッグ後に処理=ON — 앱은 획을 그리는 동안 바로 건다(native 2595: 같은 알파, 다른 시점)');
         const weB = num(v.BrushWaterEdgeBlur);
-        if (weB != null && weB > 0) notes.push('ぼかし幅=' + weB + ' — 띠를 흐리는 축은 앱에 없다 — 미적용');
+        if (weB != null && weB > 0) notes.push('ぼかし幅=' + weB + ' — 띠를 흐린다(native 2595: 3 → 경계 α −9/+4, 10 → −21/+4, ドラッグ後に処理 ON 에서만 켜짐) — 커널 미확정, 미적용');
       } else {
         brush.waterEdge = false;
         brush.waterEdgeCsp = false;
         if (num(v.BrushUseWaterEdge) === 1) notes.push('水彩境界 ON 이지만 範囲 단위가 px 가 아니다(BrushWaterEdgeRadiusUnit=' + weU + ') — 미적용');
       }
     }
-    // ver2584: 2-ブラシ(Dual). native 5절이 확정한 조합만 세운다 — 適用方法 = 곱하기(DualBrushCompositeMode 1), RGB 적용 OFF,
-    // 크기 연동 OFF, 원형 보조 팁(DualUsePatternImage 0)·경도 100·두께 100, 리본/살포/종이결 없음, 크기 단위 px. 그 밖의
-    // 조합은 값을 지어내지 않고 비고로만 남긴다. 보조 획의 필압 Effector 는 미측정이라 상수 크기·농도로 두고 비고에 적는다.
+    // ver2584: 2-ブラシ(Dual). native 5절이 확정한 조합만 세운다 — 원형 보조 팁(DualUsePatternImage 0)·경도 100·두께 100,
+    // 리본/살포/종이결 없음, 크기 단위 px. 그 밖의 조합은 값을 지어내지 않고 비고로만 남긴다. 보조 획의 필압 Effector 는
+    // 미측정이라 상수 크기·농도로 두고 비고에 적는다.
+    // ver2595: 適用方法 열세 가지(DualBrushCompositeMode 0~12, LAB Anim0917 내보내기로 값 확정)를 이름으로 싣고, RGB値に適用 ON 은
+    // 알파가 標準(합집합)이었으므로 'normal' 로(색 효과는 미측정), サイズ連動 ON 은 보조 크기 그대로(연동 규칙 미측정), 濃度 < 100 은
+    // over 누적으로 실측됐다(20). 소재 보조 팁은 실측(rampx64)은 있으나 보조 자국의 소재 표본기가 없어 미적용.
+    const SUT_DUAL_MODES = { 0: 'normal', 1: 'multiply', 2: 'add', 3: 'subtract', 4: 'darken', 5: 'lighten', 6: 'screen', 7: 'overlay', 8: 'dodge', 9: 'burn', 10: 'linearburn', 11: 'hardmix', 12: 'height' };
+    const SUT_DUAL_MODE_NAMES = { 0: '標準', 1: '乗算', 2: '加算(発光)', 3: '減算', 4: '比較(暗)', 5: '比較(明)', 6: 'スクリーン', 7: 'オーバーレイ', 8: '覆い焼き', 9: '焼き込み', 10: '焼き込み(リニア)', 11: 'ハードミックス', 12: '高さ(リニア)' };
     function sutStepDual(ctx) {
       const brush = ctx.brush, v = ctx.v, num = ctx.num, notes = ctx.notes;
       brush.dualMask = '';
       if (num(v.UseDualBrush) !== 1) return;
       const why = [];
-      if (num(v.DualBrushCompositeMode) !== 1) why.push('適用方法=' + num(v.DualBrushCompositeMode) + '(곱하기 1 만 실측)');
-      if (num(v.ChangeRGBByDual) === 1) why.push('RGB 適用 ON(미측정)');
-      if (num(v.SyncDualBrushSize) === 1) why.push('サイズ連動 ON(미측정)');
-      if (num(v.DualUsePatternImage) === 1) why.push('소재 보조 팁(미측정)');
+      const modeRaw = num(v.DualBrushCompositeMode), mode = SUT_DUAL_MODES[modeRaw];
+      if (!mode) why.push('適用方法=' + modeRaw + '(0~12 밖)');
+      if (num(v.DualUsePatternImage) === 1) why.push('소재 보조 팁(native 2595 에 rampx64 실측은 있으나 보조 자국의 소재 표본기가 없다 — 미구현)');
       if (num(v.DualSizeUnit) != null && num(v.DualSizeUnit) !== 0) why.push('크기 단위 ' + num(v.DualSizeUnit) + '(px 만)');
       if (num(v.DualHardness) != null && num(v.DualHardness) !== 100) why.push('硬さ=' + num(v.DualHardness) + '(100 만 실측)');
       if (num(v.DualThickness) != null && num(v.DualThickness) !== 100) why.push('厚さ=' + num(v.DualThickness) + '(원형만 실측)');
@@ -66431,24 +66469,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const size = num(v.DualSize);
       if (!(size > 0)) why.push('DualSize 없음');
       if (why.length) {
-        notes.push('2-ブラシ ON — ' + why.join(' · ') + ' → 미적용 (native 5절은 곱하기·RGB OFF·크기 연동 OFF·원형·경도 100 만 확정)');
+        notes.push('2-ブラシ ON — ' + why.join(' · ') + ' → 미적용 (native 5절·2595 는 원형 보조 팁·경도 100·두께 100 만 확정)');
         return;
       }
       const autoIv = num(v.DualAutoIntervalType), iv = num(v.DualInterval);
       let spacing = PAINT_SUT_DUAL_AUTO_INTERVAL[autoIv];
       let how;
-      if (spacing != null) how = '間隔 = ' + PAINT_SUT_AUTO_INTERVAL_NAME[autoIv] + ' → ' + spacing + (autoIv === 2 ? ' (native 5절 실측)' : ' (普通 만 실측 — 소재 계수 추정)');
+      if (spacing != null) how = '間隔 = ' + PAINT_SUT_AUTO_INTERVAL_NAME[autoIv] + ' → ' + spacing + (autoIv === 2 ? ' (native 5절 실측)' : ' (native 2595 실측)');
       else if (iv != null && iv > 0) { spacing = Math.min(5, iv / 100); how = 'DualInterval=' + iv + '% → ' + spacing + ' (고정 간격 — 미측정, 비율 그대로)'; }
       else { spacing = 0.08; how = '間隔 값 없음 → 普通 .08'; }
       const aaRaw = num(v.DualAntiAlias), aa = aaRaw >= 0 && aaRaw <= 3 ? Math.round(aaRaw) : 2;
       const flowRaw = num(v.DualFlow), flow = flowRaw != null ? Math.max(1, Math.min(100, Math.round(flowRaw))) : 100;
-      brush.dualMask = 'multiply';
+      const rgb = num(v.ChangeRGBByDual) === 1;
+      brush.dualMask = rgb ? 'normal' : mode;
       brush.dualSize = Math.min(2000, size);
       brush.dualAa = aa;
       brush.dualSpacing = spacing;
       brush.dualFlow = flow;
-      notes.push('2-ブラシ 곱하기 → 보조 원형 획(크기 ' + brush.dualSize + 'px · AA' + aa + ' · ' + how + ' · 濃度 ' + flow + (flow !== 100 ? '(100 만 실측)' : '')
-        + ') 의 알파를 메인 획 알파에 곱한다 — 크기 연동 OFF 라 메인 크기와 무관, 메인이 보조보다 크면 보조 띠로 잘린다 (native 5절)');
+      notes.push('2-ブラシ ' + SUT_DUAL_MODE_NAMES[modeRaw] + ' → 보조 원형 획(크기 ' + brush.dualSize + 'px · AA' + aa + ' · ' + how + ' · 濃度 ' + flow + (flow !== 100 ? '(over 누적 — native 2595)' : '')
+        + ') 의 알파 d 와 메인 획 알파 m 을 ' + PAINT_DUAL_MODE_FORMULA[brush.dualMask] + ' 로 합친다 — 크기 연동 OFF 라 메인 크기와 무관 (native 5절 乗算 · 2595 열세 가지)');
+      if (rgb) notes.push('RGB値に適用 ON → 알파는 標準(합집합)으로 합쳐졌다(native 2595) — 보조 획의 색 효과는 같은 색으로 재어 보이지 않았으므로 미적용');
+      if (num(v.SyncDualBrushSize) === 1) notes.push('サイズ連動 ON — 메인 크기를 바꾸지 않은 실측(native 2595)에서는 보조 크기 그대로였다; 연동 규칙 미측정, 보조 크기를 상수로 둔다');
       if (num(v.DualAdjustFlowByInterval) === 1) notes.push('2-ブラシ 間隔による濃度補正 ON — 미측정, 보정 없이 둔다');
       const sizeEff = ctx.readEffector('DualSizeEffector'), flowEff = ctx.readEffector('DualFlowEffector');
       if (sizeEff && (sizeEff.usesPressure || sizeEff.usesTilt || sizeEff.usesVelocity || sizeEff.usesRandom)) notes.push('2-ブラシ サイズ Effector 활성 — 미측정, 보조 크기는 상수로 둔다');
@@ -66468,7 +66509,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const order = num(v.BrushPatternOrderType);
       brush.tipOrder = SUT_TIP_ORDERS[order] || 'repeat';
       notes.push('繰り返し方法 = ' + (SUT_TIP_ORDER_NAMES[order] || order) + ' → 팁 ' + tip.refs.length + '장을 ' + brush.tipOrder + ' 순서로(저장 배열 순서 그대로 — 리본·자국 같음, native 2591) — 리본은 주기마다 한 장, 주기 = 그 팁의 크기×H/W (native 9절); 일반 자국은 자국마다 한 장' + (order === 5 ? ' · ランダム(一巡)은 한 바퀴 뒤 끝' : ''));
-      if (brush.tipRibbon && brush.tipRibbonFlip === 'fold') notes.push(brush.tipOrder === 'fold' ? '上下反転=3(折り返し時に反転) + 折り返し → 마지막 팁과 되돌아오는 주기를 경로 방향으로 뒤집는다 (native 2592: 두 장·세 장)' : '上下反転=3(折り返し時に反転) — 折り返し 가 아닌 순서에서는 미측정, 반전 없이 둔다');
+      if (brush.tipRibbon && brush.tipRibbonFlip === 'fold') notes.push(brush.tipOrder === 'fold' ? '上下反転=3(折り返し時に反転) + 折り返し → 마지막 팁과 되돌아오는 주기를 경로 방향으로 뒤집는다 (native 2592: 두 장·세 장)' : '上下反転=3(折り返し時に反転) — 折り返し 가 아닌 다섯 순서에서는 반전이 없다(native 2595: 네 장으로 繰り返し·繰り返さない·ランダム·一回のみ·ランダム(一巡) 전부 N)');
     }
     // Paper scale and density from the file (they used to be pinned at 100/100).
     function sutStepPaperScale(ctx) {
@@ -66600,10 +66641,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 上下反転 (native V31): 反転 = every period, baked into the material at import; ランダム = each period at random;
         // 折り返し時に反転 = no flip at all with one tip, whatever 繰り返し方法; with several tips on 折り返し it mirrors the
         // last tip and the way back (ver2592, paintRibbonFlipFor) — sutStepTipOrder says so once the tip count is known.
+        // ver2595: with several tips on the other five orders there is no flip either (native 2595, four tips).
         const rv = num(v.BrushPatternReverseVertical);
         brush.tipRibbonFlip = rv === 2 ? 'random' : (rv === 3 ? 'fold' : '');
         if (rv === 2) notes.push('上下反転=2(ランダム) → 리본 주기마다 무작위로 뒤집는다 (native V31)');
-        else if (rv === 3) notes.push('上下反転=3(折り返し時に反転) — 팁 한 장이면 繰り返し方法 과 무관하게 반전이 일어나지 않는다 (native V31; 여러 장의 折り返し 는 미측정)');
+        else if (rv === 3) notes.push('上下反転=3(折り返し時に反転) — 팁 한 장이면 繰り返し方法 과 무관하게 반전이 일어나지 않는다 (native V31; 여러 장도 折り返し 가 아니면 반전 없음 — native 2595)');
         brush.tipSpacing = PAINT_RIBBON_SPACING;
         notes.push('リボン ON → 팁을 경로를 따라 늘여 붙인다(ver2064) · 向きの影響元 = 線の方向 · 팁 간격을 ' + PAINT_RIBBON_SPACING
           + ' 로 (CSP 는 리본에서 間隔을 잠그므로 파일의 ' + (iv == null ? '?' : iv) + '% 는 잔재다)');
@@ -66783,7 +66825,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const brush = ctx.brush, v = ctx.v, num = ctx.num, notes = ctx.notes, preparedTip = ctx.preparedTip, ribbonOn = ctx.ribbonOn;
       SUT_UNSUPPORTED_SETTINGS.forEach(function(e) {
         if (e[0] === 'BrushHardness' && num(v.BrushUsePatternImage) === 1) return;   // circle-only setting
-        if (e[0] === 'UseDualBrush' && brush.dualMask === 'multiply') return;   // ver2584: applied by sutStepDual (its note says how)
+        if (e[0] === 'UseDualBrush' && brush.dualMask) return;   // ver2584: applied by sutStepDual (its note says how)
         if (e[0] === 'BrushPatternOrderType') {
           if (brush.tipIds) return;   // ver2587: applied by sutStepTipOrder (its note says how)
           // Ordering warnings share one material-count check for ribbon and ordinary tips; a one-time mode
@@ -68568,7 +68610,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (tip && tip.ribbonFlip === 'random') return paintJitterUnit((Number(tip.seed) || 0) >>> 0, tipIdx, 5) < 0.5;
       // ver2592: 折り返し時に反転 with several tips on 折り返し — the periods of the last tip and of the way back are
       // mirrored along the path (native: two tips B R B R → every R flipped; three tips B R X R → X and the returning R
-      // flipped, the outgoing R not; docs/tests/sut_ribbon_end_flip_2592). Other orders: no flip (only 折り返し measured).
+      // flipped, the outgoing R not; docs/tests/sut_ribbon_end_flip_2592). Other orders: no flip (native 2595 measured the
+      // other five with four tips: every period N).
       if (tip && tip.ribbonFlip === 'fold' && tip.ids && tip.ids.length >= 2 && tip.order === 'fold') {
         const n = tip.ids.length, p = tipIdx % (2 * n - 2);
         return p >= n - 1;
@@ -70073,7 +70116,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // ver2585: CSP 水彩境界 (native 6절, 35,632픽셀 중 96.0% ≤1알파) — pure, DOM 없음(node 커널 검사가 잘라 돌린다).
     // 획 픽셀(α > 0) 가운데 가장 가까운 투명 픽셀(α = 0, 픽셀 중심끼리)까지의 유클리드 거리 d 가 範囲+1 미만인 것에
-    // α += floor(M × 透明度の影響/10 × w + .5), w = (範囲+1−d)/(範囲+1) 단 d = 1 은 .3; M = 획의 최대 α; 255 에서 자른다.
+    // α += floor(M × 透明度の影響/10 × w + .5), w = (範囲+1−d)/(範囲+1) 단 d = 1 은 .3; 255 에서 자른다. M 은 픽셀마다 (2·範囲+1)²
+    // 정사각 창의 최대 α(ver2595 — native 2595: 자국이 겹쳐 76/130 인 획에서 획 전체 최대는 평균 오차 13.95, 반폭 5 의 정사각 창은
+    // 1.06·최대 5, 원 창·다른 반폭은 더 나쁘다; 균일한 획에서는 전체 최대와 같다).
     // 안쪽·투명 픽셀은 불변. 배열 밖은 투명으로 치지 않는다 — 호출부가 작업 구역을 ceil(範囲)+1 만큼 넓혀 읽으므로
     // 잃는 경계가 없다. 거리는 「획 픽셀과 4-이웃인 투명 픽셀」에서만 뿌린다(가장 가까운 투명 픽셀은 반드시 그런 픽셀이다 —
     // 아니면 그 이웃이 더 가깝다). data 는 stride/off 로 알파를 가리킨다(RGBA 4/3, 알파만 1/0).
@@ -70082,6 +70127,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let M = 0;
       for (let i = 0; i < n; i += 1) { const a = data[i * stride + off]; if (a > M) M = a; }
       if (!M) return 0;
+      // ver2595: 창 최대 — 가로 창의 최대를 먼저, 그 위에 세로 창(분리 가능).
+      const K0 = Math.max(0, Math.round(range)), rowMax = new Uint8Array(n), Mloc = new Uint8Array(n);
+      for (let y = 0; y < h; y += 1) {
+        const row = y * w;
+        for (let x = 0; x < w; x += 1) {
+          let best = 0;
+          const xa = x - K0 > 0 ? x - K0 : 0, xb = x + K0 < w - 1 ? x + K0 : w - 1;
+          for (let xx = xa; xx <= xb; xx += 1) { const a = data[(row + xx) * stride + off]; if (a > best) best = a; }
+          rowMax[row + x] = best;
+        }
+      }
+      for (let x = 0; x < w; x += 1) for (let y = 0; y < h; y += 1) {
+        let best = 0;
+        const ya = y - K0 > 0 ? y - K0 : 0, yb = y + K0 < h - 1 ? y + K0 : h - 1;
+        for (let yy = ya; yy <= yb; yy += 1) { const a = rowMax[yy * w + x]; if (a > best) best = a; }
+        Mloc[y * w + x] = best;
+      }
       const offs = [];
       for (let dy = -K; dy <= K; dy += 1) for (let dx = -K; dx <= K; dx += 1) { const q = dx * dx + dy * dy; if (q > 0 && q < lim2) offs.push(dx, dy, q); }
       const d2 = new Float32Array(n).fill(Infinity);
@@ -70098,13 +70160,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (q < d2[j]) d2[j] = q;
         }
       }
-      const gain = M * power / 10;
+      const gainK = power / 10;
       let changed = 0;
       for (let i = 0; i < n; i += 1) {
         const a = data[i * stride + off];
         if (a === 0 || !(d2[i] < lim2)) continue;
         const d = Math.sqrt(d2[i]);
-        const v = a + Math.floor(gain * (d === 1 ? 0.3 : (lim - d) / lim) + 0.5);
+        const v = a + Math.floor(Mloc[i] * gainK * (d === 1 ? 0.3 : (lim - d) / lim) + 0.5);
         data[i * stride + off] = v > 255 ? 255 : v;
         changed += 1;
       }
@@ -70364,11 +70426,39 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         dmCtx.fillStyle = '#000000';
         paintDualMaskDabs(dmCtx, pts, dual, wx, wy);
         dmCtx.globalAlpha = 1;
-        dmCtx.globalCompositeOperation = 'source-in';   // 색은 메인 획, α = 메인 × 마스크
-        dmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
-        dmCtx.globalCompositeOperation = 'source-over';
-        sc.ctx.clearRect(wx, wy, ww, wh);
-        sc.ctx.drawImage(dmTmp, 0, 0, ww, wh, wx, wy, ww, wh);
+        if (dual.mode === 'multiply') {
+          dmCtx.globalCompositeOperation = 'source-in';   // 색은 메인 획, α = 메인 × 마스크
+          dmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
+          dmCtx.globalCompositeOperation = 'source-over';
+          sc.ctx.clearRect(wx, wy, ww, wh);
+          sc.ctx.drawImage(dmTmp, 0, 0, ww, wh, wx, wy, ww, wh);
+        } else {
+          // ver2595: 다른 適用方法 — 픽셀마다 α' = f(m, d)(PAINT_DUAL_MODE_FNS, native 2595). 색은 메인 획의 것이고 보조 획만 있는
+          // 픽셀(m = 0, 합집합 계열)은 획 색으로 태어난다; 획 색의 알파는 보조 α 에 곱한다. 읽기는 수채 경계와 같은 읽기용 스크래치로.
+          const rc = paintWaterEdgeReader(ww, wh), fn = paintDualModeFn(dual.mode);
+          if (rc && fn) {
+            rc.globalCompositeOperation = 'copy';
+            rc.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
+            rc.globalCompositeOperation = 'source-over';
+            let mi = null, di = null;
+            try { mi = rc.getImageData(0, 0, ww, wh); di = dmCtx.getImageData(0, 0, ww, wh); } catch (e) { mi = di = null; }
+            if (mi && di) {
+              const md = mi.data, dd = di.data, col = paintDualColorRgb(color), ca = col[3];
+              for (let i = 0; i < md.length; i += 4) {
+                const m0 = md[i + 3], d0 = dd[i + 3];
+                if (!m0 && !d0) continue;
+                const a = fn(m0 / 255, d0 * ca / 255);
+                const val = a <= 0 ? 0 : (a >= 1 ? 255 : Math.round(a * 255));
+                if (val === m0) continue;
+                if (!m0 && val) { md[i] = col[0]; md[i + 1] = col[1]; md[i + 2] = col[2]; }
+                md[i + 3] = val;
+              }
+              rc.putImageData(mi, 0, 0);
+              sc.ctx.clearRect(wx, wy, ww, wh);
+              sc.ctx.drawImage(rc.canvas, 0, 0, ww, wh, wx, wy, ww, wh);
+            }
+          }
+        }
       }
       // ── ver2393: 水彩境界 ─────────────────────────────────────────────────────────
       // 완성된 획 모양의 **가장자리 안쪽 R px 띠**를 한 번 더 겹쳐 진하게 한다.
