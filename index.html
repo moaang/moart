@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2580</title>
+  <title>MoArt ver2581</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -66475,7 +66475,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const brush = ctx.brush, aa = ctx.num(ctx.v.AntiAlias), notes = ctx.notes;
       brush.tipAntialias = Number.isInteger(aa) && aa >= 0 && aa <= 3 && brush.tipShape === 'circle' ? aa : -1;
       if (brush.tipAntialias === 0) notes.push('AntiAlias=0 — 원형 팁의 기하 경계만 정수 픽셀로 적용; 농도·종이결 유지');
-      else if (brush.tipAntialias > 0) notes.push('AntiAlias=' + aa + ' — 기하 팁 경계 적용; AA 폭보다 얇은 타원은 Canvas coverage 사용');
+      else if (brush.tipAntialias > 0) notes.push('AntiAlias=' + aa + ' — 원형·타원 팁 경계에 CSP 커널 적용 (원형 AA 폭 min(g+.5,R) · 얇은 경로 · 스캔라인, native 484자국 대조)');
       else if (aa != null) notes.push('AntiAlias=' + aa + ' (소재 팁 외곽 AA 커널 미지원; Canvas 기본 coverage 사용)');
     }
     // 入り抜き: the target BLOB (id · enabled · minimum) decides; stored lengths with no enabled target do
@@ -67149,17 +67149,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       tctx.fillRect(0, 0, w, h);
       return c;
     }
-    // Native geometry AA: circle distance ramp; ellipse scanline spans and cap ramps.
-    // Raw PSD/independent size+angle controls: docs/tests/sut_native_2554/aa-scanline-measurements.json.
-    // One reusable upload buffer; no destination readback or per-dab Canvas allocation.
+    // ═══ circle / ellipse dab AA — CSP's kernels (ver2581) ═══════════════════════════════════════════════════
+    // Measured on CSP's own output (docs/tests/sut_native_20260917/README.md §2, 484 dabs; fixture + contract in
+    // docs/tests/sut_aa_2581). Local axes: u across the thickness (half-width rx), v along the major axis (ry);
+    // the tip is normalised so rx ≤ ry. Grades 1..3 (w = g + 0.5):
+    //   circle (rx === ry)         alpha = floor(256·clamp((R − d) / min(w, R)))   — the AA width is capped by the radius
+    //   thin   (rx < (g + 4.5)/2)   one sample per row centre: exact horizontal overlap of the rotated band |u| ≤ a,
+    //                               |v| ≤ E with the pixel, times clamp((E − |v|) / W) taken at the pixel's LEFT edge;
+    //                               a = max(rx, 1) − .5, E = ry − min(.2·ry, .8), W = min(min(w, rx) + 1.5, E − .75)
+    //   scanline (the rest)         outer/inner ellipse spans per row; a pixel centre exactly on the inner span edge is
+    //                               NOT full (strict), cap rows use the inner chord midpoint clamped into
+    //                               [left + .5, right − .5] of the outer span
+    // Grade 0 ellipses sample the pixel's right edge (x + 1, y + .5); grade 0 circles have no measured rule and keep
+    // the integer scanline (paintDabEllipse). Open items (45°/60° AA3 cap rows, rx = 1 AA0) stay as measured.
     let paintDabAaScratch = null;
+    function paintDabAaSlab(k, b, h) {
+      // x-range where |k·x + b| ≤ h (k ≈ 0: the whole line or nothing)
+      if (Math.abs(k) < 1e-12) return Math.abs(b) <= h + 1e-9 ? [-Infinity, Infinity] : [1, -1];
+      const lo = (-h - b) / k, hi = (h - b) / k;
+      return [Math.min(lo, hi) - 1e-9, Math.max(lo, hi) + 1e-9];
+    }
     function paintDabAaStamp(ctx, x, y, rx, ry, angle, grade, gray, coverage) {
+      if (ry < rx) { const t = rx; rx = ry; ry = t; angle += Math.PI / 2; }   // thickness axis = u (rx ≤ ry)
       const width = grade + 0.5, circle = rx === ry;
-      if (!circle && Math.min(rx, ry) <= width) return false;
       const c = Math.cos(angle), sn = Math.sin(angle);
       const hx = Math.hypot(rx * c, ry * sn), hy = Math.hypot(rx * sn, ry * c);
-      const x0 = Math.max(0, Math.ceil(x - hx - 0.5)), y0 = Math.max(0, Math.ceil(y - hy - 0.5));
-      const x1 = Math.min(ctx.canvas.width - 1, Math.floor(x + hx - 0.5)), y1 = Math.min(ctx.canvas.height - 1, Math.floor(y + hy - 0.5));
+      const x0 = Math.max(0, Math.ceil(x - hx - 1.5)), y0 = Math.max(0, Math.ceil(y - hy - 1.5));
+      const x1 = Math.min(ctx.canvas.width - 1, Math.floor(x + hx + 0.5)), y1 = Math.min(ctx.canvas.height - 1, Math.floor(y + hy + 0.5));
       if (x1 < x0 || y1 < y0) return true;
       const w = x1 - x0 + 1, h = y1 - y0 + 1;
       let slot = paintDabAaScratch;
@@ -67181,39 +67197,64 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         slot.key = key;
       }
       const stride = slot.data.width, words = slot.words, colors = slot.colors;
-      const ix = 1 / (rx * rx), iy = 1 / (ry * ry);
-      const aa = c*c*ix + sn*sn*iy, bb = 2*c*sn*(ix-iy), cc = sn*sn*ix + c*c*iy;
-      const irx = rx-width, iry = ry-width;
-      const iix = !circle ? 1/(irx*irx) : 0, iiy = !circle ? 1/(iry*iry) : 0;
-      const ia = c*c*iix + sn*sn*iiy, ib = 2*c*sn*(iix-iiy), ic = sn*sn*iix + c*c*iiy;
-      const ih = circle ? Math.max(0, rx-width) : Math.hypot(irx*sn, iry*c);
-      for (let py = y0; py <= y1; py++) {
-        const row = (py-y0)*stride, dy = py+0.5-y;
-        words.fill(0, row, row+w);
-        const half = Math.sqrt(Math.max(0, (bb*dy)*(bb*dy)-4*aa*(cc*dy*dy-1)))/(2*aa);
-        const mid = x-bb*dy/(2*aa), left = mid-half, right = mid+half;
-        const start = Math.max(x0, Math.ceil(left-0.5)), end = Math.min(x1, Math.floor(right-0.5));
-        let innerLeft = x, innerRight = x, innerMid = x, amp = 256;
-        const cap = Math.abs(dy) >= ih;
-        if (circle) {
-          const r = Math.max(0, rx-width), span = Math.sqrt(Math.max(0, r*r-dy*dy));
-          innerLeft = x-span; innerRight = x+span;
-        } else {
-          innerMid = x-ib*dy/(2*ia);
-          const span = Math.sqrt(Math.max(0, (ib*dy)*(ib*dy)-4*ia*(ic*dy*dy-1)))/(2*ia);
-          innerLeft = cap ? Math.floor(innerMid - 0.5) + 0.5 : innerMid-span;
-          innerRight = cap ? innerLeft : innerMid+span;
-          if (cap) amp = Math.min(256, 256*(hy-Math.abs(dy)+(dy<0 ? 0.5 : -0.5))/width);
+      const put = function(row, px, value) { words[row + px - x0] = colors[Math.max(0, Math.min(255, Math.floor(value)))]; };
+      if (circle) {
+        const r = rx, aw = Math.min(width, r);
+        for (let py = y0; py <= y1; py++) {
+          const row = (py - y0) * stride, dy = py + 0.5 - y;
+          words.fill(0, row, row + w);
+          for (let px = x0; px <= x1; px++) {
+            const d = Math.hypot(px + 0.5 - x, dy);
+            if (d >= r) continue;
+            put(row, px, 256 * Math.min(1, (r - d) / aw));
+          }
         }
-        const fullStart = cap ? end+1 : Math.max(start, Math.ceil(innerLeft-0.5));
-        const fullEnd = cap ? end : Math.min(end, Math.floor(innerRight-0.5));
-        if (fullEnd >= fullStart) words.fill(colors[255], row+fullStart-x0, row+fullEnd-x0+1);
-        for (let px = start; px <= end; px++) {
-          if (px === fullStart && fullEnd >= fullStart) { px = fullEnd; continue; }
-          const xx = px+0.5;
-          const value = circle ? 256*(rx-Math.hypot(xx-x,dy))/width
-            : xx < innerMid ? amp*(xx-left)/(innerLeft-left+1) : amp*(right-xx)/(right-innerRight+1);
-          words[row+px-x0] = colors[Math.max(0,Math.min(255,Math.floor(value)))];
+      } else if (rx < (grade + 4.5) / 2) {
+        // thin path
+        const a = Math.max(rx, 1) - 0.5, E = ry - Math.min(0.2 * ry, 0.8), W = Math.min(Math.min(width, rx) + 1.5, E - 0.75);
+        for (let py = y0; py <= y1; py++) {
+          const row = (py - y0) * stride, dy = py + 0.5 - y;
+          words.fill(0, row, row + w);
+          const su = paintDabAaSlab(c, sn * dy, a), sv = paintDabAaSlab(-sn, c * dy, E);
+          const lo0 = Math.max(su[0], sv[0]), hi0 = Math.min(su[1], sv[1]);
+          if (!(hi0 > lo0)) continue;
+          for (let px = x0; px <= x1; px++) {
+            const xl = px - x;   // pixel left edge − centre
+            const lo = Math.max(lo0, xl), hi = Math.min(hi0, xl + 1);
+            if (hi <= lo) continue;
+            const vv = -sn * xl + c * dy;
+            const val = Math.floor(255 * (hi - lo) * Math.max(0, Math.min(1, (E - Math.abs(vv)) / W)) + 1e-9);
+            if (val > 0) put(row, px, val);
+          }
+        }
+      } else {
+        // scanline path (outer / inner ellipse spans)
+        const section = function(ea, eb, dy) {
+          const aa = c * c / (ea * ea) + sn * sn / (eb * eb), bb = 2 * c * sn * (1 / (ea * ea) - 1 / (eb * eb)), cc = sn * sn / (ea * ea) + c * c / (eb * eb);
+          const halfH = Math.hypot(ea * sn, eb * c), mid = -bb * dy / (2 * aa);
+          const halfW = Math.sqrt(Math.max(0, (bb * dy) * (bb * dy) - 4 * aa * (cc * dy * dy - 1))) / (2 * aa);
+          return { left: mid - halfW, right: mid + halfW, halfH: halfH, mid: mid };
+        };
+        const irx = rx - width, iry = ry - width;
+        for (let py = y0; py <= y1; py++) {
+          const row = (py - y0) * stride, dy = py + 0.5 - y;
+          words.fill(0, row, row + w);
+          const outer = section(rx, ry, dy);
+          if (!(Math.abs(dy) < outer.halfH)) continue;
+          const inner = section(irx, iry, dy);
+          const mid = Math.max(outer.left + 0.5, Math.min(outer.right - 0.5, inner.mid));
+          const cap = Math.abs(dy) >= inner.halfH;
+          let il = inner.left, ir = inner.right, amp = 256;
+          if (cap) { il = Math.floor(x + mid - 0.5) + 0.5 - x; ir = il; amp = Math.min(256, 256 * (outer.halfH - Math.abs(dy) + (dy < 0 ? 0.5 : -0.5)) / width); }
+          const start = Math.max(x0, Math.ceil(x + outer.left - 0.5)), end = Math.min(x1, Math.floor(x + outer.right - 0.5));
+          for (let px = start; px <= end; px++) {
+            const dx = px + 0.5 - x;
+            if (dx < outer.left || dx > outer.right) continue;
+            let value;
+            if (!cap && dx > il && dx < ir) value = 256;
+            else value = dx < mid ? amp * (dx - outer.left) / (il - outer.left + 1) : amp * (outer.right - dx) / (outer.right - ir + 1);
+            if (value > 0) put(row, px, value);
+          }
         }
       }
       slot.ctx.putImageData(slot.data, 0, 0, 0, 0, w, h);
@@ -67231,12 +67272,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ctx.fill();
         return;
       }
+      if (rx !== ry) {
+        // AA0 ellipse (ver2581): a pixel is on when its RIGHT edge (x + 1, y + .5) lies inside the rotated ellipse
+        const c = Math.cos(angle), s = Math.sin(angle);
+        const hx = Math.hypot(rx * c, ry * s), hy = Math.hypot(rx * s, ry * c);
+        const px0 = Math.max(0, Math.floor(x - hx - 1)), py0 = Math.max(0, Math.floor(y - hy - 1));
+        const px1 = Math.min(ctx.canvas.width - 1, Math.ceil(x + hx)), py1 = Math.min(ctx.canvas.height - 1, Math.ceil(y + hy));
+        for (let py = py0; py <= py1; py += 1) {
+          const dy = py + 0.5 - y;
+          let runStart = -1;
+          for (let px = px0; px <= px1 + 1; px += 1) {
+            let inside = false;
+            if (px <= px1) {
+              const dx = px + 1 - x;
+              const u = c * dx + s * dy, v = -s * dx + c * dy;
+              inside = (u / rx) * (u / rx) + (v / ry) * (v / ry) <= 1;
+            }
+            if (inside && runStart < 0) runStart = px;
+            else if (!inside && runStart >= 0) { ctx.fillRect(runStart, py, px - runStart, 1); runStart = -1; }
+          }
+        }
+        return;
+      }
       const cx = Math.floor(x) + 0.5, cy = Math.floor(y) + 0.5;
-      const c = Math.cos(angle), s = Math.sin(angle), ix = 1 / (rx * rx), iy = 1 / (ry * ry);
-      const a = c * c * ix + s * s * iy, b = 2 * c * s * (ix - iy), cc = s * s * ix + c * c * iy;
-      const h = Math.hypot(rx * s, ry * c);
+      const cc = Math.cos(angle), s = Math.sin(angle), ix = 1 / (rx * rx), iy = 1 / (ry * ry);
+      const a = cc * cc * ix + s * s * iy, b = 2 * cc * s * (ix - iy), c2 = s * s * ix + cc * cc * iy;
+      const h = Math.hypot(rx * s, ry * cc);
       for (let py = Math.ceil(cy - h - 0.5); py <= Math.floor(cy + h - 0.5); py += 1) {
-        const dy = py + 0.5 - cy, bb = b * dy, det = bb * bb - 4 * a * (cc * dy * dy - 1);
+        const dy = py + 0.5 - cy, bb = b * dy, det = bb * bb - 4 * a * (c2 * dy * dy - 1);
         if (det < 0) continue;
         const root = Math.sqrt(det), left = Math.ceil(cx + (-bb - root) / (2 * a) - 0.5), right = Math.floor(cx + (-bb + root) / (2 * a) - 0.5);
         if (right >= left) ctx.fillRect(left, py, right - left + 1, 1);
