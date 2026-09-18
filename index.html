@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2605</title>
+  <title>MoArt ver2606</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24753,6 +24753,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2606, items: [{ ja: '素材ブラシの重複計算と描画バッファの初期化を減らし、描画処理を軽くしました。', ko: '소재 브러시의 중복 계산과 그리기 버퍼 초기화를 줄였습니다.', en: 'Reduced duplicate material-brush calculations and drawing-buffer clearing.', zh: '减少了素材笔刷的重复计算和绘图缓冲区清理。' }] },
       { ver: 2605, items: [{ ja: '絵のデータが欠けていても用紙表示・拡大縮小・コマ移動が止まらないようにしました。読み込み失敗を待機中と区別し、画像を欠いたままのファイル保存を防ぎます。', ko: '그림 데이터가 누락돼도 용지 표시·확대 축소·코마 이동이 멈추지 않도록 했습니다. 불러오기 실패와 준비 중을 구분하고 이미지가 빠진 파일 저장을 막습니다.', en: 'Missing drawing data no longer blocks the paper, zoom or frame navigation. Loading failures are distinguished from pending work, and file saves reject missing drawing assets.', zh: '图像数据缺失时仍可显示画纸、缩放和切换画格。区分载入失败与等待状态，并防止保存缺少图像数据的文件。' }] },
       { ver: 2604, items: [{ ja: '原画を開くときの画像準備を順番に行い、再生では現在位置に近い絵から準備します。紙質マスクの保管量を制限し、ぼかし非対応のブラウザーでも選択範囲のぼかしが働くようにしました。', ko: '원화를 열 때 그림을 순서대로 준비하고, 재생은 현재 위치와 가까운 그림부터 준비합니다. 종이결 마스크의 보관량을 제한하고 블러 필터 미지원 브라우저에서도 선택 영역 페더가 작동하도록 했습니다.', en: 'Drawing restore now prepares images in sequence, and playback prepares a bounded window near the playhead. Grain mask retention is bounded, and selection feathering now works when native canvas blur is unavailable.', zh: '打开原画时按顺序准备图像，播放时优先准备播放头附近的画面。限制了纸纹蒙版缓存，并为不支持画布模糊的浏览器补充选区羽化。' }] },
       { ver: 2603, items: [{ ja: '自動保存から開くときの画像準備の重複を修正し、素材ブラシの余分なメモリ使用とコピーを削減しました。', ko: '자동저장 복원 중 그림 준비가 중복되는 문제를 고치고, 소재 브러시의 불필요한 메모리 사용과 복사를 줄였습니다.', en: 'Fixed duplicate image preparation when reopening autosaved projects, and reduced excess memory use and copying in material brushes.', zh: '修复从自动保存恢复时重复准备图像的问题，减少素材笔刷多余的内存占用和复制。' }] },
@@ -69122,18 +69123,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     const PAINT_TIP_SAMPLE_MAX = 256;
     let paintTipSampleScratch = null;
-    // ver2593: the QUEUED grain path (grainFlush) needs its own copy of every sample until the flush; a fresh canvas per
-    // dab (ver2586) was 144 canvases per stroke and 122 per library tile. The copies now come from a pool whose index
-    // the ink field resets when it starts a new queue; past the cap a copy is a throwaway again.
+    // Ordinary grain work samples on consumption and immediately uses the shared scratch.
+    // Coverage carries an independent G channel; preserve its queued sample ownership/Canvas rounding.
+    // gray emits opaque RGB = mask alpha; otherwise white with mask alpha.
     const paintTipSampleOwnPool = [];
     let paintTipSampleOwnNext = 0;
     const PAINT_TIP_SAMPLE_OWN_POOL_MAX = 1024;
     function paintTipSampleOwnReset() { paintTipSampleOwnNext = 0; }
-    // One dab through the sampler → { canvas, x0, y0, w, h } (the scratch is reused; consume it before the next call —
-    // or pass `own` to get a per-dab copy, which the ink field's QUEUED path needs: it defers the draw, and every queued
-    // dab drew the last sample until ver2586 found it on a 45° mixing stroke) or null when the sampler does not apply
-    // (no chain, no grade, dab too large). gray: opaque RGB = alpha (the ink field wants an opaque source for its max
-    // composite); otherwise white with the alpha (a mask to colour).
     function paintTipSampledStamp(chain, x, y, d, thickPct, angleDeg, grade, thickVert, gray, own) {
       if (!chain || !(grade >= 0 && grade <= 3) || !(d > 0)) return null;
       const w0 = chain[0].w, h0 = chain[0].h, longSide = Math.max(w0, h0);
@@ -69294,8 +69290,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const coverage = Boolean(tip && tip.replaceAlpha);
       const lum = tipImage ? paintTipLumFor(tipImage, (tip && tip.id) || '') : null;
       if (tipImage && !lum) return null;
-      // ver2582: SUT material tips resample the way CSP does (tip.sampling === 'csp'); the sampled window replaces
-      // the scaled/rotated lum draw and the live dab cache is bypassed for it (the sample depends on the sub-pixel centre).
+      // CSP sampling preserves the exact sub-pixel centre. The grain cache includes that centre and all sampler inputs.
       const cspChain = (lum && tip && tip.sampling === 'csp' && tip.antialias >= 0) ? paintTipChainFor(tipImage, (tip && tip.id) || '') : null;
       const blendDab = mixTipFor && mixTipFor.blendDab;
       const fl = (Number.isFinite(flow) && flow > 0 && flow < 1) ? flow : 1;
@@ -69417,7 +69412,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       //   ③ draw가 불투명 값을 놓을 것. globalAlpha<1인 팁은 lighten도 배경과 보간하므로 max가 아니다.
       //   서지 않으면 `grainBake` 를 dab 마다 부른다(종전과 같은 호출 순서·같은 픽셀).
       const grainQueue = grainBake ? [] : null;
-      if (grainBake) paintTipSampleOwnReset();   // ver2593: the previous queue's pooled sample copies are free again
+      if (grainBake && coverage) paintTipSampleOwnReset();
       const grainStamp = grainBake ? function(x, y, span, i, t, draw, drawKey, opaque) {
         let gd = gDepth;
         if (gCurve) {
@@ -69657,19 +69652,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // ver2353: 크기는 **lum 으로 잰다** — 작업 캔버스는 lum 과 같은 크기라 값이 같고(아래
           //   dw·dh 가 그것이다), 종이결 가지에서는 그 캔버스를 아예 안 굽는다.
           if (grainStamp) {
-            // ver2353: **팁 작업 캔버스를 굽지 않는다.** 굽는 목적은 「검정 위에 흰 팁을 필압
-            //   알파로 = 불투명 회색조」를 만드는 것인데, 결 스크래치가 이미 검정으로 채워진
-            //   불투명 캔버스라 거기 바로 그리면 같은 그림이 나온다. dab 마다 **팁 원본 크기**
-            //   (연필R 은 268×222) fillRect + drawImage 두 번이 사라진다 — 브러시를 작게 해도
-            //   팁 원본이 크면 안 줄던 비용이 그것이다. dab 단가 25~30 % (마이크로벤치 29.3 % ·
-            //   실기 앱 A/B 23~34 %, 두 계통 일치. drawing_brush_perf_2026-08-30 3-D · q3=A).
-            //   축소와 알파 곱은 교환 가능해 그림은 같고, 8bit 양자화 지점이 한 번 앞당겨지는
-            //   몫만 남는다(획 픽셀 실측 최대 차 1 — changelog ver2353).
-            // ★종이결이 꺼진 아래 가지는 **그대로 둔다** — 그쪽은 장이 lighten/screen 이라
-            //   소스가 불투명해야 합성이 순수 max 가 된다. 작업 캔버스가 그 몫을 한다.
-            // ver2586: the draw below is QUEUED (grainFlush) — take an own copy of the sample or every dab draws the last one
-            const sampled = cspChain ? paintTipSampledStamp(cspChain, x, y, d, thk * 100, rad * 180 / Math.PI, tip.antialias, tip.thickVert, true, true) : null;
+            // Grain baking already supplies an opaque black background. Draw the sampled/scaled tip there directly.
+            // The non-grain branch below still needs its opaque tip scratch for max/screen compositing.
+            // RGB coverage keeps the old owned-sample route. Pure masks queue recipes and sample only on a cache miss.
+            const ownedSample = coverage && cspChain ? paintTipSampledStamp(cspChain, x, y, d, thk * 100, rad * 180 / Math.PI, tip.antialias, tip.thickVert, true, true) : null;
             grainStamp(x, y, Math.sqrt(ds.w * ds.w + ds.h * ds.h), i, t, function(g2, cxp, cyp) {
+              const sampled = ownedSample || (!coverage && cspChain ? paintTipSampledStamp(cspChain, x, y, d, thk * 100, rad * 180 / Math.PI, tip.antialias, tip.thickVert, true) : null);
               g2.translate(cxp, cyp);
               if (rad && !sampled) g2.rotate(rad);
               g2.globalAlpha = coverage ? 1 : a;
@@ -69684,7 +69672,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 g2.globalCompositeOperation = 'source-over';
               }
               g2.setTransform(1, 0, 0, 1, 0, 0);
-            }, dabCache && !sampled ? [selK, rad, ds.w, ds.h, a].join('|') : null, a === 1);   // ver2587: the tip is part of the key
+            }, dabCache && !(coverage && cspChain) ? [selK, rad, ds.w, ds.h, a, cspChain ? d : '', cspChain ? thk : '', cspChain ? tip.antialias : '', Boolean(tip.thickVert)].join('|') : null, a === 1);
           } else {
             // 작업 캔버스: 검정 위에 흰 팁을 필압 알파로 → 휘도 = 팁알파×필압알파, 불투명.
             // ver2582: with the CSP sampler the window (already rotated) is baked at its own size and blitted at its origin.
@@ -69843,8 +69831,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       c.totalMs = endT0 - c.t0;
       // 기존 JSON 키를 유지하되 관측 지점을 명시한다. rAF는 표시 완료 신호가 아니다.
       c.timingScope = { lagMs: 'pointerdown-to-first-fill-entry', paintMs: 'task-to-raf-or-timeout', gaps: 'fill-entry-intervals', commitMs: 'penup-entry-to-microtask' };
+      // Only coverage still owns queued samples. Ordinary material tips use the shared scratch below.
       const poolPixels = paintTipSampleOwnPool.reduce(function(n, cv) { return n + cv.width * cv.height; }, 0);
       c.samplePool = { count: paintTipSampleOwnPool.length, pixels: poolPixels, rgbaBytes: poolPixels * 4 };
+      const sample = paintTipSampleScratch && paintTipSampleScratch.canvas;
+      c.sampleScratch = { count: sample ? 1 : 0, pixels: sample ? sample.width * sample.height : 0 };
       c.lagMs = c.firstFrameT ? c.firstFrameT - c.t0 : -1;
       c.fillAvg = c.frames ? c.fillMs / c.frames : 0;
       // ver2418: 프레임 간격의 분포. 평균은 멈춤을 감춘다 — 60fps 로 돌다 한 번 800ms 멈춰도
@@ -70451,8 +70442,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (diagOn) diagOn.boxes.push([wx, wy, ww, wh, incBox ? 1 : 0]);
       // 변화 없는 프레임은 같은 소유자의 완성 결과를 얹는다. 평균 알파 fallback은 제외한다.
       if (s && s.clean && sc.reused && reusableAlpha) {
-        ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // 최종 blit 은 매 프레임 필요(ctx 는 프레임마다 씻긴다)
-        return;
+        ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh);
+        return { x: bx, y: by, w: bw, h: bh }; // Actual output extent for callers that clear a retained buffer.
       }
       sc.ctx.save();
       if (incBox) {
@@ -70727,6 +70718,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 최종 blit 은 **획 전체**다 — 목적지(ctx)는 프레임마다 비워지므로 증분이 성립하지 않는다.
       ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // ver1619
       ctx.globalAlpha = prevAlpha;
+      return { x: bx, y: by, w: bw, h: bh };
       } finally {   // ver2399: 진단
         if (diagOn && diagT0) { const d = performance.now() - diagT0;
           diagOn.fillMs += d; if (d > diagOn.fillMax) diagOn.fillMax = d; }
@@ -70790,8 +70782,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           paintInkAlphaScratchCtx = paintInkAlphaScratch.getContext('2d', { willReadFrequently: true });
         }
         if (!paintInkAlphaScratchCtx) return false;
-        if (paintInkAlphaScratch.width !== bw) paintInkAlphaScratch.width = bw;
-        if (paintInkAlphaScratch.height !== bh) paintInkAlphaScratch.height = bh;
+        // Dirty bounds change each frame. Reuse small capacity; large conversions remain exact-sized.
+        const small = bw <= 256 && bh <= 256;
+        const cw = small ? Math.max(Math.min(paintInkAlphaScratch.width, 256), Math.pow(2, Math.ceil(Math.log2(bw)))) : bw;
+        const ch = small ? Math.max(Math.min(paintInkAlphaScratch.height, 256), Math.pow(2, Math.ceil(Math.log2(bh)))) : bh;
+        if (paintInkAlphaScratch.width !== cw) paintInkAlphaScratch.width = cw;
+        if (paintInkAlphaScratch.height !== ch) paintInkAlphaScratch.height = ch;
         const rc = paintInkAlphaScratchCtx;
         rc.setTransform(1, 0, 0, 1, 0, 0);
         rc.globalAlpha = 1;
@@ -70821,7 +70817,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         sc.ctx.globalAlpha = 1;
         sc.ctx.globalCompositeOperation = 'source-over';
         sc.ctx.filter = 'none';
-        sc.ctx.drawImage(paintInkAlphaScratch, x0, y0); // 제자리에 얹는다
+        sc.ctx.drawImage(paintInkAlphaScratch, 0, 0, bw, bh, x0, y0, bw, bh); // Capacity outside the current rectangle is not output.
         return true;
       } catch (e) {
         // getImageData 가 막히는 경우(오염된 캔버스 등) — 스크래치를 비우고 평균 알파 물러섬에 맡긴다
@@ -111746,7 +111742,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const b = sess.shapeBuf.getContext('2d');
       b.save();
       b.setTransform(1, 0, 0, 1, 0, 0);
-      b.clearRect(0, 0, sess.shapeBuf.width, sess.shapeBuf.height);
+      // Clear exactly the previous fill's output, including effects outside timeline/history scan bounds.
+      // Unknown bounds (first frame or the direct shape path) retain the full clear.
+      const clearBox = sess.outlineBounds;
+      if (clearBox) b.clearRect(clearBox.x, clearBox.y, clearBox.w, clearBox.h);
+      else b.clearRect(0, 0, sess.shapeBuf.width, sess.shapeBuf.height);
       // ver1345 (REGRESSION FIX): was `sess.pressureFactor(p) * paintTiltWidthFactor(sess, t)`.
       // `sess.pressureFactor` was a closure applying the 筆圧→굵기 curve **unconditionally** (gone as of ver2233) —
       // it never looks at pressureSize. That was survivable only because penOutlineMode used to REQUIRE
@@ -111768,7 +111768,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 원형 dab(팁 미등록)도 筆圧→不透明度를 받는다.
       // ver1699: Shift 직선이면 증분 세션을 넘기지 않는다 — 점이 늘 두 개라 세션이 「새로 찍을 것이
       // 없다」로 읽어 첫 프레임에서 굳는다(콘티 미리보기와 같은 이유, 같은 줄에서 함께 고쳤다).
-      paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, pointRevision: sess.arc ? sess.arc.revision : 0, final: gengaDrawSession !== sess, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess), dual: paintDualFrom(sess) });
+      sess.outlineBounds = paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, pointRevision: sess.arc ? sess.arc.revision : 0, final: gengaDrawSession !== sess, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess), dual: paintDualFrom(sess) });
       b.restore();
       // ver1617: 2値化+팁·종이결. 도형이 쓰는 그 함수와 그 rect 최적화를 그대로 쓴다(gengaShapeRedraw
       // 참고) — 용지 전체를 임계화하면 원화에서 1회 4.17ms 라 스캔 영역으로 좁히는 것이 그 자리의 규칙이다.
