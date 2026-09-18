@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2611</title>
+  <title>MoArt ver2612</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -17905,9 +17905,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const INDEXED_DB_PROJECT_MAX_VERSIONS = 3;  // ver2002: 5 -> 3(사용자 지시)
     const INDEXED_DB_VERSION_MIN_INTERVAL_MS = 45000; // don't snapshot more often than this (time-spread the ring)
     const INDEXED_DB_AUTOSAVE_DELAY_MS = 1600;
-    // Pen strokes save on a long idle debounce so rapid drawing does not autosave per-stroke.
+    const INDEXED_DB_AUTOSAVE_MAX_WAIT_MS = 10000;
+    // Drawing uses the full wait budget; ordinary edits keep the shorter idle delay.
     // Hide/pagehide only offers a last attempt; mobile shutdown may skip or interrupt it.
-    const INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS = 12000;
+    const INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS = INDEXED_DB_AUTOSAVE_MAX_WAIT_MS;
     const INDEXED_DB_AUDIO_KEY_PREFIX = 'indexedDbAudio:';
     const INDEXED_DB_VIDEO_KEY_PREFIX = 'indexedDbVideo:';   // ver2577 (q1=A): V1 media blobs without a working folder — same record shape and sweep rule as conte audio
     const INDEXED_DB_LAYER_DRAWING_KEY_PREFIX = 'indexedDbLayerDrawing:';
@@ -57194,8 +57195,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // (레이어 붙여넣기·undo 로 다시 쓰이는 그림이 실제로 이 경로를 탄다).
         const next = {};
         unused.forEach(function(k) { next[k] = (Number(prev[k]) || 0) + 1; });
-        // ver1460: 익은 것만 모아 **한 트랜잭션에** 지운다(실사용에서 한 번에 수천 건이 나온다).
-        // 삭제 가능성의 최종 판정은 자동/수동이 공유하는 deleteWorkspaceDbValues가 맡는다.
+        // 유예를 채운 후보만 공통 삭제기로 넘긴다. 최신 root를 재확인하고 나누어 삭제하는
+        // 책임은 자동/수동이 공유하는 deleteWorkspaceDbValues가 맡는다.
         const ripe = Object.keys(next).filter(function(k) { return next[k] >= STORAGE_SWEEP_STREAK_LIMIT; });
         let deletedCount = 0;
         if (ripe.length) {
@@ -57839,7 +57840,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         container.appendChild(row);
       });
     }
-    const INDEXED_DB_AUTOSAVE_MAX_WAIT_MS = 10000;
     let indexedDbAutosavePendingSince = 0;
     function scheduleIndexedDbAutosave(delay) {
       if (!indexedDbAutosaveEnabled(state.project)) return;
@@ -93853,9 +93853,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         } catch (e) { fail(e); }
       };
     }
-    let gengaPersistWorker = null;              // false = 생성 실패·크래시 — 이후 메인 경로로 산다(재시도 루프 금지)
+    let gengaPersistWorker = null;              // false = 생성 실패·크래시·무응답 종료 — 이후 메인 경로(재시도 루프 금지)
     let gengaPersistWorkerSeq = 0;
-    const gengaPersistWorkerJobs = new Map();   // seq → { settle, done } — done 은 게시 배리어가 기다린다
+    const gengaPersistWorkerJobs = new Map();   // seq → { settle, timer }; 완료 Promise의 소유자는 gengaPersistJobs
     function gengaPersistWorkerStop(worker, reason) {
       if (gengaPersistWorker !== worker) return;
       gengaPersistWorker = false;
@@ -93927,8 +93927,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             magic: GENGA_TILE_MAGIC,
             hdr: { v: 1, tile: ts.tile, gw: ts.gw, gh: ts.gh, pw: ts.pw, ph: ts.ph, x: ts.x, y: ts.y, w: ts.w, h: ts.h },
             cells: ts.cells });
-          const job = { ref: ref, settle: null, done: null, timer: 0 };   // ver2443: 이 맵은 «전송 식별자 → 응답 연결»만 소유한다 — 최종 성공 판정은 gengaPersistJobs 다
-          job.done = new Promise(function(resolve) {
+          const job = { settle: null, timer: 0 };
+          const done = new Promise(function(resolve) {
             job.settle = function(ok, message) {
               if (ok) {
                 if (canDel) gengaDeltaDiskDone.delete(ref); else gengaDeltaDiskForget(ref);
@@ -93942,8 +93942,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // WebKit may stall without error/abort. Terminate the executor before
           // retrying, so a late worker cannot overwrite the main-thread result.
           job.timer = setTimeout(function() { gengaPersistWorkerStop(w, 'drawing storage timed out'); }, WORKSPACE_DB_OP_TIMEOUT_MS);
-          gengaMarkPersisted(ref, job.done);
-          return gengaPersistJobRegister(ref, job.done);
+          gengaMarkPersisted(ref, done);
+          return gengaPersistJobRegister(ref, done);
         } catch (e) {
           console.error('[gengaPersist] worker postMessage threw for gd:' + ref + ' - main-thread fallback', e);
         }
