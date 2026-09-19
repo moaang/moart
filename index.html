@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2620</title>
+  <title>MoArt ver2621</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24785,6 +24785,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2621, items: [{ ja: '素材ブラシのGPU転送をまとめ、同じ素材の再アップロードを減らしました。', ko: '소재 브러시의 GPU 전송을 묶고 같은 소재의 재업로드를 줄였습니다.', en: 'Batched material-brush GPU transfers and reduced repeated uploads of the same material.', zh: '合并了素材笔刷的 GPU 传输，并减少相同素材的重复上传。' }] },
       { ver: 2620, items: [{ ja: '音声・動画クリップを上下だけにドラッグしても、レーン間を移動できるよう修正しました。', ko: '오디오·영상 클립을 위아래로만 끌어도 레인 사이로 이동하도록 고쳤습니다.', en: 'Fixed audio and video clips failing to move between lanes when dragged only vertically.', zh: '修复了仅上下拖动音频和视频片段时无法在轨道间移动的问题。' }] },
       { ver: 2619, items: [{ ja: '素材ブラシの描画中に繰り返す一時データの生成とバッファの再確保を減らしました。', ko: '소재 브러시를 그릴 때 반복 생성하던 임시 데이터와 버퍼 재할당을 줄였습니다.', en: 'Reduced repeated temporary data creation and buffer reallocation while drawing material brushes.', zh: '减少了绘制素材笔刷时重复生成的临时数据和缓冲区重新分配。' }] },
       { ver: 2618, items: [{ ja: '音声メニューの「オーディオ設定」を「オーディオデバイス設定」に変更し、削除の直前に移しました。', ko: '오디오 메뉴의 ‘오디오 설정’을 ‘오디오 장치 설정’으로 바꾸고 삭제 바로 위로 옮겼습니다.', en: 'Renamed Audio settings to Audio device settings and moved it immediately above Delete in audio menus.', zh: '将音频菜单中的“音频设置”改名为“音频设备设置”，并移至删除项正上方。' }] },
@@ -68661,7 +68662,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 래스터화한다. 현행 Canvas2D 렌더(몸통 한 방 + 조인 삼각형)는 조각·조인이 각각의 채움이라
     // Skia AA 가 공유 변마다 이음을 남길 수 있는데(커브·큰 붓의 자잘한 틈 — 시험판 대조에서 사용자
     // 관측), 메쉬는 이웃 단면이 좌표를 정확히 공유하고 내부 변에 AA 가 없어(antialias:false) 그 틈이
-    // 구조적으로 없다. 첫 단면은 L0=R0=P0 축퇴(획 시작이 정확히 삼각형), 폭은 양 끝 입력점에서 정점
+    // 구조적으로 없다. 폭은 양 끝 입력점에서 정점
     // 보간(조각 평균 폭이 아니라 — 필압 변화 때의 1px 쐐기 틈이 사라진다). 렌더러 선택은 環境設定
     // (ribbonRendererMode) — WebGL/EXT_blend_minmax 미지원·컨텍스트 로스트·거대 배치는 **그 배치만**
     // 현행 렌더로 물러선다. 경위·판정은 docs/ribbon_webgl_renderer_2026-08-31.md.
@@ -68738,7 +68739,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           uSize: gl.getUniformLocation(program, 'uSize'), uTex: gl.getUniformLocation(program, 'uTex'),
           uOpaque: gl.getUniformLocation(program, 'uOpaque'),
           uTexSize: gl.getUniformLocation(program, 'uTexSize'), uMode: gl.getUniformLocation(program, 'uMode'), deriv: deriv,   // ver2594
-          texImg: null   // One bound source; changing mip levels replaces this entry.
+          texImg: null, texW: 0, texH: 0, textures: new Map(), texturePixels: 0   // Last binding + bounded immutable mip cache.
         };
         return paintMeshGlState;
       } catch (e) {
@@ -68806,8 +68807,57 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (op === 'source-over') return 'source-over';
       return '';
     }
+    // Immutable mip textures are bounded by both count and RGBA area (8 entries / 4 MiB).
+    // texDirty remains the contract for mutable ink; oversized sources retain the single-texture path.
+    function paintMeshReleaseTexture(img) {
+      const st = paintMeshGlState, entry = st && st.textures.get(img);
+      if (st && st.texImg === img) st.texImg = null;
+      if (!entry) return;
+      st.gl.deleteTexture(entry.texture); st.textures.delete(img); st.texturePixels -= entry.pixels;
+    }
+    function paintMeshBindTexture(st, img, texDirty) {
+      const gl = st.gl, w = img.width, h = img.height, pixels = w * h;
+      // The private mesh context keeps this binding until the next call or explicit release.
+      if (!texDirty && st.texImg === img && st.texW === w && st.texH === h) return;
+      st.texImg = null;   // A failed upload must not leave a stale last-bound shortcut.
+      let entry = st.textures.get(img);
+      if (entry && (texDirty || entry.w !== w || entry.h !== h)) { paintMeshReleaseTexture(img); entry = null; }
+      gl.activeTexture(gl.TEXTURE0);
+      if (texDirty || pixels > 1048576) {
+        gl.bindTexture(gl.TEXTURE_2D, st.texture);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        st.texImg = img; st.texW = w; st.texH = h;
+        return;
+      }
+      if (!entry) {
+        while (st.textures.size && (st.textures.size >= 8 || st.texturePixels + pixels > 1048576)) paintMeshReleaseTexture(st.textures.keys().next().value);
+        const texture = gl.createTexture();
+        if (!texture) throw new Error('Mesh texture allocation failed');
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        try {
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        } catch (e) { gl.deleteTexture(texture); throw e; }
+        entry = { texture: texture, w: w, h: h, pixels: pixels }; st.texturePixels += pixels;
+      } else {
+        st.textures.delete(img); gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+      }
+      st.textures.set(img, entry); st.texImg = img; st.texW = w; st.texH = h;
+    }
     function paintMeshDraw(ctx, img, batch, mode, texDirty, opaque) {
-      if (!ctx || !img || !batch || !batch.data.length || !mode) return false;
+      return paintMeshDrawBatches(ctx, [{ img: img, batch: batch, texDirty: texDirty }], mode, opaque);
+    }
+    function paintMeshDrawBatches(ctx, items, mode, opaque) {
+      if (!ctx || !mode) return false;
+      if (!items.length) return true;
+      if (items.length > 1 && (mode !== 'max' || !opaque || ctx.globalAlpha !== 1 || (ctx.filter && ctx.filter !== 'none'))) return false;
+      for (const item of items) if (!item.img || !item.batch || !item.batch.data.length) return false;
+      const batch = items.length === 1 ? items[0].batch : {
+        x0: Math.min(...items.map(item => item.batch.x0)), y0: Math.min(...items.map(item => item.batch.y0)),
+        x1: Math.max(...items.map(item => item.batch.x1)), y1: Math.max(...items.map(item => item.batch.y1))
+      };
       const st = paintMeshGl();
       if (!st || (mode === 'max' && !st.minmax)) return false;
       const gl = st.gl;
@@ -68829,12 +68879,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         st.cv.width = Math.max(st.cv.width, bw);
         st.cv.height = Math.max(st.cv.height, bh);
       }
-      const src = new Float32Array(batch.data.length);
-      for (let i = 0; i < batch.data.length; i += 5) {   // ver2325: 정점당 5(x,y,u,v,a)
-        src[i] = batch.data[i] - x0; src[i + 1] = batch.data[i + 1] - y0;
-        src[i + 2] = batch.data[i + 2]; src[i + 3] = batch.data[i + 3];
-        src[i + 4] = batch.data[i + 4];
-      }
       try {
         // ver2324: 캔버스가 배치보다 클 수 있다(위 grow-only) — 이번 몫을 **좌상단**에 둔다.
         // GL 의 y 는 아래에서 위로라 원점이 (0, height − bh) 이고, 그러면 캔버스 이미지에서는
@@ -68844,36 +68888,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gl.enable(gl.SCISSOR_TEST); gl.scissor(0, st.cv.height - bh, bw, bh);
         gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
         gl.useProgram(st.program);
-        gl.bindBuffer(gl.ARRAY_BUFFER, st.buffer); gl.bufferData(gl.ARRAY_BUFFER, src, gl.STREAM_DRAW);
-        gl.enableVertexAttribArray(st.aPos); gl.vertexAttribPointer(st.aPos, 2, gl.FLOAT, false, 20, 0);
-        gl.enableVertexAttribArray(st.aUv); gl.vertexAttribPointer(st.aUv, 2, gl.FLOAT, false, 20, 8);
-        gl.enableVertexAttribArray(st.aA); gl.vertexAttribPointer(st.aA, 1, gl.FLOAT, false, 20, 16);
-        gl.uniform2f(st.uSize, bw, bh); gl.uniform1i(st.uTex, 0);
-        gl.uniform1f(st.uOpaque, opaque ? 1 : 0);
-        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.texture);
-        // Reuse only the last uploaded image. Alternating material mip levels still require uploads.
-        // A mutable ink scratch forces an upload through texDirty even when its identity is unchanged.
-        if (texDirty || st.texImg !== img) {
-          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-          st.texImg = img;
+        for (const item of items) {
+          const img = item.img, batch = item.batch;
+          const src = new Float32Array(batch.data.length);
+          for (let i = 0; i < batch.data.length; i += 5) {   // ver2325: 정점당 5(x,y,u,v,a)
+            src[i] = batch.data[i] - x0; src[i + 1] = batch.data[i + 1] - y0;
+            src[i + 2] = batch.data[i + 2]; src[i + 3] = batch.data[i + 3];
+            src[i + 4] = batch.data[i + 4];
+          }
+          gl.bindBuffer(gl.ARRAY_BUFFER, st.buffer); gl.bufferData(gl.ARRAY_BUFFER, src, gl.STREAM_DRAW);
+          gl.enableVertexAttribArray(st.aPos); gl.vertexAttribPointer(st.aPos, 2, gl.FLOAT, false, 20, 0);
+          gl.enableVertexAttribArray(st.aUv); gl.vertexAttribPointer(st.aUv, 2, gl.FLOAT, false, 20, 8);
+          gl.enableVertexAttribArray(st.aA); gl.vertexAttribPointer(st.aA, 1, gl.FLOAT, false, 20, 16);
+          gl.uniform2f(st.uSize, bw, bh); gl.uniform1i(st.uTex, 0);
+          gl.uniform1f(st.uOpaque, opaque ? 1 : 0);
+          paintMeshBindTexture(st, img, item.texDirty);
+          // ver2594: the batch's sampling mode — nearest texels for the dab rule, bilinear for legacy PNG tips (or when
+          // derivatives are unavailable and four samples cannot be placed)
+          const smode = batch.sampling === 2 ? (st.deriv ? 2 : 0) : (batch.sampling === 1 ? 1 : 0);
+          const filt = smode ? gl.NEAREST : gl.LINEAR;
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+          gl.uniform2f(st.uTexSize, img.width || 1, img.height || 1); gl.uniform1f(st.uMode, smode);
+          gl.enable(gl.BLEND);
+          if (mode === 'max') {
+            gl.blendEquation(st.minmax.MAX_EXT); gl.blendFunc(gl.ONE, gl.ONE);
+          } else if (mode === 'screen') {
+            gl.blendEquation(gl.FUNC_ADD);
+            gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+          } else {
+            gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+          }
+          gl.drawArrays(gl.TRIANGLES, 0, src.length / 5);
         }
-        // ver2594: the batch's sampling mode — nearest texels for the dab rule, bilinear for legacy PNG tips (or when
-        // derivatives are unavailable and four samples cannot be placed)
-        const smode = batch.sampling === 2 ? (st.deriv ? 2 : 0) : (batch.sampling === 1 ? 1 : 0);
-        const filt = smode ? gl.NEAREST : gl.LINEAR;
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
-        gl.uniform2f(st.uTexSize, img.width || 1, img.height || 1); gl.uniform1f(st.uMode, smode);
-        gl.enable(gl.BLEND);
-        if (mode === 'max') {
-          gl.blendEquation(st.minmax.MAX_EXT); gl.blendFunc(gl.ONE, gl.ONE);
-        } else if (mode === 'screen') {
-          gl.blendEquation(gl.FUNC_ADD);
-          gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        } else {
-          gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        }
-        gl.drawArrays(gl.TRIANGLES, 0, src.length / 5);
         // ver2321: gl.finish() 는 걷었다 — 뒤따르는 drawImage(st.cv) 가 암묵 동기화한다.
         ctx.drawImage(st.cv, 0, 0, bw, bh, x0, y0, bw, bh);   // ver2324: 캔버스의 이번 몫만
         return true;
@@ -69345,7 +69391,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // 뻗은 선 끝」을 직선으로 이어 안을 채운다(paintDrawRibbonJoin 의 조인 삼각형 — CSP 실물 대조의 정의:
           // 중심에서 길이가 같은 두 선의 끝점을 이어 채운 삼각형, 둔각이면 길쭉한 낫).
           // 방출은 입력 세그먼트마다 즉시 — 게이트·임계류는 실기가 전부 기각했다(위 pcAng 배너).
-          const firstPiece = pcAng == null;   // ver2321: 획 첫 조각 — 메쉬의 첫 단면이 P0 로 축퇴한다
+          const firstPiece = pcAng == null;   // First piece uses the current segment angle; its input width is preserved.
           const startAng = firstPiece ? segAng : pcAng;
           // ver2076: 이 조각이 **몇 번째 팁**에 속하는가. 소비자가 홀짝으로 상하 반전한다.
           const tipIdx = Math.floor(u);
@@ -69825,11 +69871,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return paintMeshTipLevel(source, batch);
     }
     function paintMaterialMeshFlush(ctx, lum, groups) {
-      for (const batch of groups.values()) {
-        const img = paintMaterialMeshSource(lum, batch);
-        if (!paintMeshDraw(ctx, img, batch, paintMeshMode(ctx), false, true)) {
-          for (const d of batch.recipes) paintNativeMaterialDab(ctx, lum, d.x, d.y, d.ds, d.rad, d.alpha);
-        }
+      const items = Array.from(groups.values(), batch => ({ img: paintMaterialMeshSource(lum, batch), batch: batch }));
+      if (!paintMeshDrawBatches(ctx, items, paintMeshMode(ctx), true)) {
+        for (const batch of groups.values()) for (const d of batch.recipes) paintNativeMaterialDab(ctx, lum, d.x, d.y, d.ds, d.rad, d.alpha);
       }
     }
     const paintMaterialMeshPreference = new WeakMap();
@@ -69848,7 +69892,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (choices.has(size)) return choices.get(size).mesh;
       // Brush preview preparation may measure. Pen-down only consumes a known choice; no benchmark on input.
       if (!probe || gengaDrawSession || state.paintRasterOp) return false;
-      const lum = paintTipLumFor(image, id), groups = new Map();
+      const lum = paintTipLumFor(image, id), groups = new Map(), smallGroups = new Map();
       if (!lum) return false;
       for (let i = 0; i < 96; i++) {
         const ds = paintNativeDabSize(lum, size * [0.2, 0.35, 0.6, 1][i % 4], 0.58, {});
@@ -69856,7 +69900,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       const make = function() { const c = document.createElement('canvas'); c.width = 128; c.height = 128; return c.getContext('2d', { willReadFrequently: true }); };
       const native = make(), mesh = make();
-      const run = function(ctx, gpu) {
+      // Ordinary input often stays in one mip. A dense multi-mip probe alone overvalues grouping.
+      const smallDab = paintNativeDabSize(lum, size * 0.6, 0.58, {});
+      for (let i = 0; i < 8; i++) paintMaterialMeshAdd(smallGroups, lum, 32 + i * 3, 32, smallDab, 0.2, 0.6);
+      const run = function(ctx, gpu, groups) {
         ctx.globalCompositeOperation = 'source-over'; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 128, 128);
         ctx.globalCompositeOperation = 'lighten';
         const start = performance.now();
@@ -69866,10 +69913,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ctx.getImageData(0, 0, 128, 128);
         return performance.now() - start;
       };
-      let canvasMs = 0, meshMs = 0;
-      run(native, false); run(mesh, true);
-      for (let i = 0; i < 3; i++) { canvasMs += run(native, false); meshMs += run(mesh, true); }
-      const result = { mesh: meshMs < canvasMs * 0.8, canvasMs: canvasMs, meshMs: meshMs };
+      let canvasMs = 0, meshMs = 0, smallCanvasMs = 0, smallMeshMs = 0;
+      run(native, false, groups); run(mesh, true, groups);
+      run(native, false, smallGroups); run(mesh, true, smallGroups);
+      for (let i = 0; i < 3; i++) {
+        canvasMs += run(native, false, groups); meshMs += run(mesh, true, groups);
+        smallCanvasMs += run(native, false, smallGroups); smallMeshMs += run(mesh, true, smallGroups);
+      }
+      const result = { mesh: meshMs < canvasMs * 0.8 && smallMeshMs < smallCanvasMs * 0.8,
+        canvasMs: canvasMs, meshMs: meshMs, smallCanvasMs: smallCanvasMs, smallMeshMs: smallMeshMs };
       choices.set(size, result); native.canvas.width = mesh.canvas.width = 1;
       return result.mesh;
     }
@@ -69879,7 +69931,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintMaterialWorkerState = null, paintMaterialWorkerFailed = false, paintMaterialWorkerId = 0;
     function paintMaterialWorkerBoot() {
       const fields = new Map();
-      function closeField(f) { if (f) for (const img of f.assets.values()) img.close(); }
+      function closeField(f) { if (f) for (const img of f.assets.values()) { paintMeshReleaseTexture(img); img.close(); } }
       onmessage = function(event) {
         const m = event.data;
         if (m.release) { closeField(fields.get(m.id)); fields.delete(m.id); return; }
@@ -69899,7 +69951,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (f.tailBox && f.tailBak) paintInkTailCanvasRestore(ctx, f.tailBak, f.tailBox);
           function draw(list) {
             ctx.globalCompositeOperation = 'lighten';
-            for (const item of list) if (!paintMeshDraw(ctx, f.assets.get(item.asset), item.batch, 'max', false, true)) throw new Error('Material mesh unavailable');
+            if (!paintMeshDrawBatches(ctx, list.map(item => ({ img: f.assets.get(item.asset), batch: item.batch })), 'max', true)) throw new Error('Material mesh unavailable');
             ctx.globalCompositeOperation = 'source-over';
           }
           draw(m.confirmed);
@@ -69934,7 +69986,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let url;
       try {
         const body = 'const document={createElement:()=>new OffscreenCanvas(1,1)};let paintMeshGlState=null,paintMeshGlFailed=false;\n' +
-          [paintMeshGl, paintMeshDraw, paintInkTailCanvasBackup, paintInkTailCanvasRestore].map(fn => fn.toString()).join('\n') +
+          [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore].map(fn => fn.toString()).join('\n') +
           '\n(' + paintMaterialWorkerBoot.toString() + ')();';
         url = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
         const st = { worker: new Worker(url), ready: false, jobs: new Map() };
