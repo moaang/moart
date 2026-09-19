@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2631</title>
+  <title>MoArt ver2632</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24808,6 +24808,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2632, items: [{ ja: '素材ブラシの描画処理と、描画によるコマ作成・取り消しの表示更新を軽くしました。', ko: '소재 브러시의 그리기 처리와 그리기로 만든 코마의 화면 갱신·실행 취소를 가볍게 했습니다.', en: 'Reduced material-brush rendering work and UI refresh costs when drawing creates a cel or is undone.', zh: '降低了素材笔刷绘制以及绘画新建单元和撤销时的界面更新开销。' }] },
       { ver: 2631, items: [{ ja: '長いベクター線の確定と、空きフレームへの描画時の処理を軽くしました。', ko: '긴 벡터 획 확정과 빈 프레임에 그릴 때의 코마 생성 처리를 가볍게 했습니다.', en: 'Reduced the cost of committing long vector strokes and creating cels by drawing in empty frames.', zh: '减少了长矢量笔画确认及在空白帧绘画时新建单元的处理开销。' }] },
       { ver: 2630, items: [{ ja: 'ベクター線を描き足すたびに増えていた、ペンを離した後の処理を軽くしました。', ko: '벡터 획을 추가할수록 늘어나던 펜업 처리 비용을 줄였습니다.', en: 'Reduced pen-release work that grew as vector strokes accumulated.', zh: '减少了随矢量笔画累积而增加的松笔处理开销。' }] },
       { ver: 2629, items: [{ ja: '複数の先端を持つブラシの再読み込みと、共有素材の削除判定を修正しました。', ko: '복수 팁 브러시의 재로드와 공유 소재 삭제 판정을 수정했습니다.', en: 'Fixed reloading multi-tip brushes and preserving shared materials when deleting a brush.', zh: '修复多笔尖画笔重新加载及删除画笔时的共享素材保留。' }] },
@@ -69958,7 +69959,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintMaterialWorkerState = null, paintMaterialWorkerFailed = false, paintMaterialWorkerId = 0;
     function paintMaterialWorkerBoot() {
       const fields = new Map();
-      function closeField(f) { if (f) for (const img of f.assets.values()) { paintMeshReleaseTexture(img); img.close(); } }
+      function closeField(f) {
+        if (f) for (const img of f.assets.values()) {
+          const source = paintMaterialMeshSources.get(img);
+          if (source && source.levels) for (const level of Object.values(source.levels)) paintMeshReleaseTexture(level);
+          paintMeshReleaseTexture(img); img.close();
+        }
+      }
       onmessage = function(event) {
         const m = event.data;
         if (m.release) { closeField(fields.get(m.id)); fields.delete(m.id); return; }
@@ -69978,7 +69985,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (f.tailBox && f.tailBak) paintInkTailCanvasRestore(ctx, f.tailBak, f.tailBox);
           function draw(list) {
             ctx.globalCompositeOperation = 'lighten';
-            if (!paintMeshDrawBatches(ctx, list.map(item => ({ img: f.assets.get(item.asset), batch: item.batch })), 'max', true)) throw new Error('Material mesh unavailable');
+            const batches = [];
+            for (const item of list) {
+              const lum = f.assets.get(item.asset), groups = new Map(), d = item.dabs;
+              for (let i = 0; i < d.length; i += 6) paintMaterialMeshAdd(groups, lum, d[i], d[i + 1], { w: d[i + 2], h: d[i + 3] }, d[i + 4], d[i + 5], false);
+              for (const batch of groups.values()) batches.push({ img: paintMaterialMeshSource(lum, batch), batch: batch });
+            }
+            if (!paintMeshDrawBatches(ctx, batches, 'max', true)) throw new Error('Material mesh unavailable');
             ctx.globalCompositeOperation = 'source-over';
           }
           draw(m.confirmed);
@@ -70012,8 +70025,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function' || typeof createImageBitmap !== 'function') return null;
       let url;
       try {
-        const body = 'const document={createElement:()=>new OffscreenCanvas(1,1)};let paintMeshGlState=null,paintMeshGlFailed=false;\n' +
-          [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore].map(fn => fn.toString()).join('\n') +
+        const body = 'const document={createElement:()=>new OffscreenCanvas(1,1)},paintMaterialMeshSources=new WeakMap();let paintMeshGlState=null,paintMeshGlFailed=false;\n' +
+          [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore,
+            paintRibbonMeshBatch, paintMaterialMeshAdd, paintMeshTipLevel, paintMaterialMeshSource].map(fn => fn.toString()).join('\n') +
           '\n(' + paintMaterialWorkerBoot.toString() + ')();';
         url = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
         const st = { worker: new Worker(url), ready: false, jobs: new Map() };
@@ -70063,7 +70077,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const tip = opts.tip;
       if (!grew || !s.done || !tipImage || !tip || tip.sampling !== 'mesh' || !tip.darken || tip.ribbon
           || tip.ids || s.grainPD || s.coverageMode || s.mixTipFor || s.colorCtx) return false;
-      if (!m && paintMaterialWorkerPolicy !== 'on' && !(s.walk.meshMs >= 4)) return false;
+      if (!m && paintMaterialWorkerPolicy !== 'on' && !(s.walk.materialMs >= 4)) return false;
       const st = paintMaterialWorkerGet();
       if (!st || !st.ready) return false;
       if (!m) m = s.materialWorker = { id: ++paintMaterialWorkerId, assets: new Map(), seeded: false, closed: false };
@@ -70077,7 +70091,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         box: box && s.box ? { x0: Math.min(box.x0, s.box.x0), y0: Math.min(box.y0, s.box.y0), x1: Math.max(box.x1, s.box.x1), y1: Math.max(box.y1, s.box.y1) } : box || s.box };
       m.inflight = true; m.started = performance.now(); s.clean = true; s.newBox = null;
       m.timeout = setTimeout(function() { if (!m.closed && m.inflight) opts.onMaterialReady(); }, 210);
-      const stats = host.materialWorkerStats || (host.materialWorkerStats = { posted: 0, published: 0, failed: 0, rasterMs: 0, roundTripMaxMs: 0 });
+      const stats = host.materialWorkerStats || (host.materialWorkerStats = { posted: 0, published: 0, failed: 0, rasterMs: 0, geometryBytes: 0, roundTripMaxMs: 0 });
       const publish = function(result) {
         clearTimeout(m.timeout); m.inflight = false;
         if (m.closed || host.livePaint !== s) { if (result.patch) result.patch.close(); if (result.tail) result.tail.close(); return; }
@@ -70109,18 +70123,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           async function serialize(groups) {
             const out = [];
-            for (const capture of groups) for (const batch of capture.groups.values()) {
-              const img = paintMaterialMeshSource(capture.lum, batch);
+            for (const capture of groups) {
+              const img = capture.lum;
               let id = m.assets.get(img);
               if (!id) { id = m.assets.size + 1; m.assets.set(img, id); const bitmap = await createImageBitmap(img); assets.push({ id: id, image: bitmap }); transfers.push(bitmap); }
-              out.push({ asset: id, batch: { data: new Float32Array(batch.data), sampling: 0, x0: batch.x0, y0: batch.y0, x1: batch.x1, y1: batch.y1 } });
-              transfers.push(out[out.length - 1].batch.data.buffer);
+              // Keep the original double values until the shared vertex builder rounds them for GL.
+              const dabs = new Float64Array(capture.dabs);
+              out.push({ asset: id, dabs: dabs }); transfers.push(dabs.buffer);
             }
             return out;
           }
           msg.confirmed = await serialize(confirmed); msg.tail = await serialize(tail);
           if (m.closed) { for (const item of transfers) if (item.close) item.close(); return; }
-          st.jobs.set(m.id, publish); st.worker.postMessage(msg, transfers); m.seeded = true; stats.posted++;
+          const geometryBytes = msg.confirmed.concat(msg.tail).reduce((n, item) => n + item.dabs.byteLength, 0);
+          st.jobs.set(m.id, publish); st.worker.postMessage(msg, transfers); m.seeded = true; stats.posted++; stats.geometryBytes += geometryBytes;
         } catch (e) { for (const item of transfers) if (item.close) item.close(); publish({ error: String(e) }); }
       })();
       return true;
@@ -70357,7 +70373,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Fast snapshots rasterize at the destination dab size, not the original material resolution.
       // Historical blank sampling and CSP/coverage/mixing keep their previous opaque-mask path.
       const nativeDab = tip && (tip.sampling === 'canvas' || tip.sampling === 'mesh') && !coverage && !mixTipFor && !tip.ribbon;
-      const materialMesh = nativeDab && tip.sampling === 'mesh' && tip.darken && !grainPD && !tipSet && !cctx ? new Map() : null;
+      const materialMesh = nativeDab && tip.sampling === 'mesh' && tip.darken && !grainPD && !tipSet && !cctx ? (captureMesh ? [] : new Map()) : null;
+      const materialStart = materialMesh && !captureMesh ? performance.now() : 0;
       let dctx = null, dw = 0, dh = 0;
       // perDab는 grainBake에 직접 굽는다. 사용하지 않는 원본 크기 팁 scratch는 준비하지 않는다.
       // 리본은 아래 Canvas 폴백에서 이 scratch를 사용한다.
@@ -70525,7 +70542,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               g2.setTransform(1, 0, 0, 1, 0, 0);
             }, dabCache && !(coverage && cspChain) ? [selK, rad, ds.w, ds.h, a, cspChain ? d : '', cspChain ? thk : '', cspChain ? tip.antialias : '', Boolean(tip.thickVert)].join('|') : null, a === 1);
           } else if (nativeDab) {
-            if (materialMesh) paintMaterialMeshAdd(materialMesh, lum, x, y, ds, rad, a, !captureMesh);
+            if (materialMesh && captureMesh) materialMesh.push(x, y, ds.w, ds.h, rad, a);
+            else if (materialMesh) paintMaterialMeshAdd(materialMesh, lum, x, y, ds, rad, a);
             else paintNativeMaterialDab(fctx, lum, x, y, ds, rad, a);
           } else {
             // 작업 캔버스: 검정 위에 흰 팁을 필압 알파로 → 휘도 = 팁알파×필압알파, 불투명.
@@ -70600,11 +70618,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (y + half > y1) y1 = y + half;
       }, resume);
       if (materialMesh) {
-        if (captureMesh) captureMesh.push({ lum: lum0, groups: materialMesh });
+        if (captureMesh) captureMesh.push({ lum: lum0, dabs: materialMesh });
         else {
-          const meshStart = performance.now();
           paintMaterialMeshFlush(fctx, lum0, materialMesh);
-          if (resume) resume.meshMs = Math.max(resume.meshMs || 0, performance.now() - meshStart);
+          // Worker eligibility includes the main-thread dab/vertex preparation it can now reduce.
+          if (resume) resume.materialMs = Math.max(resume.materialMs || 0, performance.now() - materialStart);
         }
       }
       if (grainFlush) grainFlush();   // ver2387: 모은 dab 을 한 번에 굽는다 — 조건이 안 서면 하나씩
@@ -81519,7 +81537,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return out;
     }
     function paintInputQueuePost(q) {
-      if (q.posted || paintInputQueueState !== q) return;
+      if (q.posted || q.workerWaitRaf || paintInputQueueState !== q) return;
       if (!paintInputChannel) {
         paintInputChannel = new MessageChannel();
         paintInputChannel.port1.onmessage = function(event) {
@@ -81533,6 +81551,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintInputQueueDone(q, error) {
       if (paintInputQueueState !== q) return;
       paintInputQueueState = null; q.entries.length = 0;
+      if (q.workerWaitRaf) cancelAnimationFrame(q.workerWaitRaf);
       q.stats.elapsedMs = performance.now() - q.started; q.stats.complete = true;
       paintInputLastStats = q.stats; q.resolve(error || null);
     }
@@ -81549,6 +81568,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (state.project !== q.project) { q.stats.cancelled = true; paintInputQueueAbort(q); return; }
       const entry = q.entries[q.head];
       if (!entry) { paintInputQueueDone(q); return; }
+      // Keep pointer-up in the same FIFO while an already submitted material job finishes.
+      // Other synchronous UI actions still flush from the published checkpoint; never replay them.
+      if (!q.sync && entry.event && entry.event.type === 'pointerup' && q.owner && q.owner.livePaint && q.owner.livePaint.materialWorker && q.owner.livePaint.materialWorker.inflight) {
+        const waitAt = performance.now();
+        q.workerWaitRaf = requestAnimationFrame(function() {
+          q.workerWaitRaf = 0; q.stats.workerWaitMs += performance.now() - waitAt;
+          if (paintInputQueueState === q) paintInputQueuePost(q);
+        });
+        return;
+      }
       const started = performance.now(); q.running = true;
       try {
         if (entry.action) { entry.action(); q.entries[q.head++] = null; }
@@ -81574,13 +81603,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (q.head >= q.entries.length) paintInputQueueDone(q);
       else if (!q.sync) paintInputQueuePost(q);
     }
-    function paintInputQueueEvent(owner, event, handler, samples, present) {
+    function paintInputQueueEvent(owner, event, handler, samples, present, force) {
       let q = paintInputQueueState;
       if (q && q.running) { q.owner = owner; return false; }
-      if (!q && (!samples || samples.length <= 32)) return false;
+      if (!q && !force && (!samples || samples.length <= 32)) return false;
       if (!q) {
         q = { ticket: ++paintInputTicket, owner: owner, present: present, surface: event.currentTarget || event.target, project: state.project, entries: [], head: 0, chunk: 32, started: performance.now(),
-          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, discarded: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0 } };
+          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, discarded: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0, workerWaitMs: 0 } };
         q.done = new Promise(function(resolve) { q.resolve = resolve; }); paintInputQueueState = q;
         if (paintDiagCur) (paintDiagCur.inputQueues || (paintDiagCur.inputQueues = [])).push(q.stats);
       }
@@ -81591,8 +81620,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (event.cancelable) event.preventDefault();
       event.stopPropagation(); paintInputQueuePost(q); return true;
     }
-    function paintInputDeferEvent(event, handler, present) {
+    function paintInputDeferEvent(event, handler, present, endingOwner) {
       const q = paintInputQueueState;
+      if (!q && event.type === 'pointerup' && endingOwner && endingOwner.livePaint && endingOwner.livePaint.materialWorker && endingOwner.livePaint.materialWorker.inflight) {
+        return paintInputQueueEvent(endingOwner, event, handler, null, present, true);
+      }
       if (!q || q.running || q.present !== present) return false;
       // An uncommitted cancelled stroke has no pixels to preserve. Drop only the trailing
       // moves of that pointer; never cross a release, down, action or another pointer.
@@ -82989,7 +83021,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function endPaintStroke(event) {
-      if (paintInputDeferEvent(event, endPaintStroke, paintPresentQueuedInput)) return;
+      if (paintInputDeferEvent(event, endPaintStroke, paintPresentQueuedInput, state.paintPointerId === event.pointerId ? state.paintRasterOp : null)) return;
       const endingStroke = state.paintRasterOp;
       try {
         paintDiagEnd();   // ver2411: 콘티·用紙 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
@@ -83436,7 +83468,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function endVideoPaintStroke(event) {
-      if (paintInputDeferEvent(event, endVideoPaintStroke, paintPresentQueuedInput)) return;
+      if (paintInputDeferEvent(event, endVideoPaintStroke, paintPresentQueuedInput, state.paintPointerId === event.pointerId ? state.paintRasterOp : null)) return;
       const endingStroke = state.paintRasterOp;
       try {
         paintDiagEnd();   // ver2411: 映像 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
@@ -113177,7 +113209,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps); // ver1104 / ver1667
     }
     function gengaPreviewPointerEnd(ev) {
-      if (paintInputDeferEvent(ev, gengaPreviewPointerEnd, gengaPresentQueuedInput)) return;
+      if (paintInputDeferEvent(ev, gengaPreviewPointerEnd, gengaPresentQueuedInput, gengaDrawSession && gengaDrawSession.pointerId === ev.pointerId ? gengaDrawSession : null)) return;
       const endingStroke = gengaDrawSession;
       try {
         paintDiagEnd();   // ver2399: 이 획의 진단을 확정한다(커밋 경로 어디로 가든 여기를 지난다)
@@ -116605,6 +116637,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       shell.exposures = layer.exposures.map(function(e) { return Object.assign({}, e, { drawing: null }); });
       return fastClone(shell);
     }
+    function gengaRefreshKomaStructure(layerIds, previousLabels) {
+      const gt = state.project.gengaTimeline;
+      const ids = previousLabels === gengaLayerGlobalRenderSignature(gt) ? layerIds : gt.layers.map(function(l) { return l.id; });
+      // Creation changes rows, not camera/audio controls. The renderer owns mount/geometry promotion.
+      refresh({ skipChrome: true, gengaRenderPlan: { scope: 'partial', layerIds: ids, audio: false } });
+      updatePaintUndoRedoButtonsOnly();
+    }
     function runGengaKomaCreationCommand(name, layer, frame, mutator, options) {
       const gt = state.project.gengaTimeline;
       if (!layer || gengaExposureAt(layer, frame) || !Number.isInteger(frame) || frame < 1) return false;
@@ -116615,6 +116654,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (new Set(ids).size !== ids.length || members.some(function(l) {
         return l.exposures.length !== ids.length || l.exposures.some(function(e, i) { return String(e.id) !== ids[i]; });
       })) return false;
+      const previousLabels = gengaLayerGlobalRenderSignature(gt);
       const before = { layers: members.map(function(l) { return { id: l.id, layer: gengaLayerStructure(l) }; }), totalFrames: gt.totalFrames };
       invalidateVideoTimelineCache();
       mutator(state.project);
@@ -116642,11 +116682,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaDrawingContext: options.gengaDrawingContext, recordingKind: 'drawing' }, options.selectionRider));
       if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] koma creation command detection failed', e); } }
       state.redoStack = [];
-      refresh({ skipChrome: true }); updatePaintUndoRedoButtonsOnly();
+      gengaRefreshKomaStructure(members.map(function(l) { return l.id; }), previousLabels);
       return true;
     }
     function applyGengaKomaCreationHistory(command, undoing) {
       const target = undoing ? command.before : command.after, edit = command.gengaKomaCreation;
+      const previousLabels = gengaLayerGlobalRenderSignature(state.project.gengaTimeline);
       // Validate every destination before mutating any of them.
       const resolved = target.layers.map(function(entry) {
         const layer = gengaLayerById(entry.id);
@@ -116667,7 +116708,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       state.project.gengaTimeline.totalFrames = target.totalFrames;
       invalidateVideoTimelineCache(); gengaFrameStackInvalidate(); gengaInvalidateSelectionPixelsAfterHistory();
-      refresh({ skipChrome: true }); updatePaintUndoRedoButtonsOnly();
+      gengaRefreshKomaStructure(target.layers.map(function(entry) { return entry.id; }), previousLabels);
     }
     function captureGengaLayerPatchState(project, layerIds) {
       const gt = (project || state.project || {}).gengaTimeline;
