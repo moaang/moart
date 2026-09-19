@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2626</title>
+  <title>MoArt ver2627</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -21021,6 +21021,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { scope: 'partial', layerIds: layerIds, audio: audio };
     }
     function runCommand(name, mutator, refreshOptions) {
+      paintInputFlushSync(); // Synchronous command callers retain their return/ownership contract.
       const before = snapshotProject();
       invalidateVideoTimelineCache();
       mutator(state.project);
@@ -22381,12 +22382,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
     function undo() {
+      if (paintInputDeferAction(undo)) return;
       if (cancelPendingPaintTransform()) return; // ver1283
       if (cancelPendingGengaTransform()) return; // ver1320: 원화도 같은 계약
       applyHistoryCommand('undo');
       gengaKickTileEncodePump();   // ver2430: 되돌아온 그림이 대기 중(굽지 않은 prev)이면 펌프가 이제 그것을 참조 ref 로 굽는다
     }
-    function redo() { applyHistoryCommand('redo'); gengaKickTileEncodePump(); }   // ver2430: undo 와 같은 이유
+    function redo() { if (paintInputDeferAction(redo)) return; applyHistoryCommand('redo'); gengaKickTileEncodePump(); }   // ver2430: undo 와 같은 이유
 
     // ver1725 (판정 q3=A): 두 히스토리(명령 스택 · 用紙 메모 스택)를 **한 줄로 세우는 눈금**.
     // 벽시계를 바닥으로 쓰되 단조 증가시킨다 — 같은 ms 안의 두 동작도 안 겹치고, 세션을 넘겨도
@@ -24785,6 +24787,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2627, items: [{ ja: 'ペン入力が集中した時の処理を分割し、操作を受け付ける機会を増やしました。', ko: '펜 입력이 한꺼번에 몰릴 때 작업을 나눠, 다른 입력을 받을 기회를 늘렸습니다.', en: 'Split concentrated pen input into smaller tasks so the app can receive input more often.', zh: '将集中到达的画笔输入分批处理，让应用更频繁地响应操作。' }] },
       { ver: 2626, items: [{ ja: '長いベクター線の描画とペンを離した後の処理を軽くしました。Shift直線も表示どおり保存します。', ko: '긴 벡터 선을 그릴 때와 펜을 놓을 때의 반복 처리를 줄였습니다. Shift 직선도 보이는 그대로 저장합니다.', en: 'Reduced repeated work during long vector strokes and at pen release. Shift-constrained lines now save as displayed.', zh: '减少长矢量笔画绘制和松笔时的重复处理，Shift 直线也会按显示结果保存。' }] },
       { ver: 2625, items: [{ ja: 'インスペクターの尺入力欄で、秒を2桁に揃えるのをやめました（1+07 のように表示・入力します）。', ko: '인스펙터의 컷·패널 길이 입력칸에서 초를 2자리로 채우지 않습니다(1+07 처럼 보이고 입력됩니다).', en: 'The inspector duration fields no longer pad seconds to two digits (they show and accept 1+07).', zh: '检查器的尺输入框不再把秒补足两位（按 1+07 显示和输入）。' }] },
       { ver: 2624, items: [{ ja: 'ベクター線の確定した輪郭を再利用し、素材ブラシのGPUバッファとコンテの座標変換の重複を減らしました。', ko: '벡터 선의 확정된 윤곽을 재사용하고, 소재 브러시의 GPU 버퍼와 콘티 좌표 변환의 중복을 줄였습니다.', en: 'Reused confirmed vector-stroke paths and reduced material-brush GPU allocations and repeated storyboard coordinate conversion.', zh: '复用矢量笔画已确定的路径，减少素材笔刷 GPU 缓冲区分配和分镜坐标的重复转换。' }] },
@@ -56804,6 +56807,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //    덮었다. 반환도 boolean 이 아니라 결과 객체다 — 부르는 쪽이 실패를 볼 수 있어야 한다(F1·F7).
     async function writeProjectToIndexedDbSlot(opts) {
       const recordingProject = state.project;
+      // Recording failure may save the drawing without its recording. Failed input must
+      // not be mistaken for that optional-feature failure or reported as a successful save.
+      try { await paintInputDrain(); }
+      catch (error) { return { ok: false, code: 'drawing-input', error: error }; }
       try { await drawingRecordingDrain({ capture: false }); }
       catch (error) { if (drawingRecordingRuntime) drawingRecordingFail(drawingRecordingRuntime, error); }
       if (state.project !== recordingProject) return { ok: false, code: 'owner-changed' };
@@ -56894,7 +56901,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 그림이 다음 프로젝트의 prune 에 회수돼 사라진다 — 그 자리가 이 함수의 유일한 존재 이유였다.
     async function snapshotCurrentProjectForTabSwitch() {
       if (!state.projectActive || !indexedDbAvailable()) return { ok: true, skipped: 'no-project' };
-      try { await drawingRecordingDrain(); return await writeProjectToIndexedDbSlot(); }
+      try { await drawingFlushPending(); return await writeProjectToIndexedDbSlot(); }
       catch (error) {
         console.error('[persist] 탭 전환 전 저장이 실패했다 — 현재 프로젝트를 유지한다', error);
         return { ok: false, code: 'publish', error: error };
@@ -59274,7 +59281,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // (audio + layer bitmaps; video not bundled). Names match what importConteFolderZip re-inlines by basename.
     async function buildConteFolderBundle(owner, recordingLeaseKeys) {
       owner = owner || projectIoOwner(); assertProjectIoOwner(owner);
-      await drawingRecordingDrain(); assertProjectIoOwner(owner);
+      await drawingFlushPending(); assertProjectIoOwner(owner);
       await hydrateWorkspaceMediaRefs(owner);
       assertProjectIoOwner(owner);
       const baseline = projectUnsavedSnapshot(), copy = fastClone(owner.project);
@@ -59584,7 +59591,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     async function persistWorkspaceProject(owner, compressed) {
       assertProjectIoOwner(owner);
-      await drawingRecordingDrain(); assertProjectIoOwner(owner);
+      await drawingFlushPending(); assertProjectIoOwner(owner);
       if (!await ensureWorkspacePermission(owner.handle, true)) {
         alert(t('msg.err.workFolderWriteDenied'));
         return false;
@@ -59660,7 +59667,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 한다 — 안 그러면 그 그림이 파일에서 빠진다. 사용자 조작이라 기다려도 되는 자리다.
     async function saveJsonDownload(owner) {
       owner = owner || projectIoOwner();
-      await drawingRecordingDrain(); assertProjectIoOwner(owner);
+      await drawingFlushPending(); assertProjectIoOwner(owner);
       await gengaRehydrateAll(owner.project); assertProjectIoOwner(owner);
       const baseline = projectUnsavedSnapshot(), copy = projectForJsonStorage();
       await drawingRecordingPrepareFile(copy, owner, 'inline'); assertProjectIoOwner(owner);
@@ -75157,6 +75164,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return paintScratchCanvas({ paintScratch: held }, key, w, h);
     }
     function paintReleaseStrokeBuffers(owner) {
+      paintInputCancelOwner(owner);
       imageBrushFinishStampRun(owner, false);
       paintMaterialWorkerRelease(owner && owner.livePaint);
       if (owner) { owner.widthCache = null; owner.roundPathCache = null; owner.pixelPointCache = null; owner.vectorPointView = null; }
@@ -75768,6 +75776,10 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       })();
       try { await runtime.running; }
       finally { runtime.running = null; drawingRecordingSchedule(runtime, runtime.pending.get(key) === request ? 80 : 0); }
+    }
+    async function drawingFlushPending(options) {
+      await paintInputDrain();
+      await drawingRecordingDrain(options);
     }
     async function drawingRecordingDrain(options) {
       const runtime = drawingRecordingRuntime;
@@ -81529,6 +81541,140 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
     }
 
+    // Large delivered batches keep their native sample order and yield between complete
+    // input+preview slices. Ordinary events stay synchronous. This is a cooperative budget,
+    // not a preemptive limit on Canvas calls or history commits.
+    let paintInputQueueState = null, paintInputLastStats = null;
+    let paintInputChannel = null, paintInputTicket = 0;
+    function paintInputEventCopy(event, samples) {
+      const out = {};
+      for (const key of ['type','pointerId','pointerType','isPrimary','button','buttons','clientX','clientY','pressure','tiltX','tiltY','altitudeAngle','azimuthAngle','twist','timeStamp','shiftKey','altKey','ctrlKey','metaKey','target','currentTarget','cancelable']) out[key] = event[key];
+      if (samples && samples.length) {
+        const last = samples[samples.length - 1];
+        for (const key of ['clientX','clientY','pressure','tiltX','tiltY','altitudeAngle','azimuthAngle','twist','timeStamp']) out[key] = last[key];
+        out.getCoalescedEvents = function() { return samples; };
+      }
+      out.preventDefault = function() {}; out.stopPropagation = function() {};
+      return out;
+    }
+    function paintInputQueuePost(q) {
+      if (q.posted || paintInputQueueState !== q) return;
+      if (!paintInputChannel) {
+        paintInputChannel = new MessageChannel();
+        paintInputChannel.port1.onmessage = function(event) {
+          const current = paintInputQueueState;
+          if (!current || !current.posted || current.ticket !== event.data) return;
+          current.posted = false; paintInputQueueStep(current);
+        };
+      }
+      q.posted = true; paintInputChannel.port2.postMessage(q.ticket);
+    }
+    function paintInputQueueDone(q, error) {
+      if (paintInputQueueState !== q) return;
+      paintInputQueueState = null; q.entries.length = 0;
+      q.stats.elapsedMs = performance.now() - q.started; q.stats.complete = true;
+      paintInputLastStats = q.stats; q.resolve(error || null);
+    }
+    function paintInputQueueAbort(q, error) {
+      const entry = q.entries.slice(q.head).find(function(e) { return e && e.event; });
+      paintInputQueueDone(q, error);
+      // Reuse the surface cancel route to release the session and its temporary buffers.
+      if (entry && entry.event.target && entry.event.target.isConnected) {
+        entry.event.target.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, pointerId: entry.event.pointerId, pointerType: entry.event.pointerType }));
+      }
+    }
+    function paintInputQueueStep(q) {
+      if (paintInputQueueState !== q || q.running) return;
+      if (state.project !== q.project) { q.stats.cancelled = true; paintInputQueueAbort(q); return; }
+      const entry = q.entries[q.head];
+      if (!entry) { paintInputQueueDone(q); return; }
+      const started = performance.now(); q.running = true;
+      try {
+        if (entry.action) { entry.action(); q.entries[q.head++] = null; }
+        else {
+          const n = entry.samples ? Math.min(q.chunk, entry.samples.length - entry.at) : 0;
+          const part = n ? entry.samples.slice(entry.at, entry.at + n) : null;
+          entry.handler(paintInputEventCopy(entry.event, part));
+          if (part) { entry.at += n; q.stats.processed += n; }
+          if (entry.present) entry.present();
+          if (!entry.samples || entry.at >= entry.samples.length) q.entries[q.head++] = null;
+        }
+      } catch (error) {
+        q.stats.failed = true; paintInputQueueAbort(q, error); throw error;
+      } finally { q.running = false; }
+      const ms = performance.now() - started;
+      q.stats.slices++; q.stats.workMs += ms; q.stats.maxSliceMs = Math.max(q.stats.maxSliceMs, ms);
+      if (entry.samples) q.stats.maxInputSliceMs = Math.max(q.stats.maxInputSliceMs, ms);
+      else q.stats.maxEndSliceMs = Math.max(q.stats.maxEndSliceMs, ms);
+      // Adapt sample count, never skip samples. A single native call can exceed this target.
+      if (entry.samples && ms > 0) q.chunk = Math.max(32, Math.min(128, Math.floor(q.chunk * Math.min(1.5, 16 / ms))));
+      if (q.head >= q.entries.length) paintInputQueueDone(q);
+      else if (!q.sync) paintInputQueuePost(q);
+    }
+    function paintInputQueueEvent(owner, event, handler, samples, present) {
+      let q = paintInputQueueState;
+      if (q && q.running) { q.owner = owner; return false; }
+      if (!q && (!samples || samples.length <= 32)) return false;
+      if (!q) {
+        q = { ticket: ++paintInputTicket, owner: owner, present: present, surface: event.currentTarget || event.target, project: state.project, entries: [], head: 0, chunk: 32, started: performance.now(),
+          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0 } };
+        q.done = new Promise(function(resolve) { q.resolve = resolve; }); paintInputQueueState = q;
+        if (paintDiagCur) (paintDiagCur.inputQueues || (paintDiagCur.inputQueues = [])).push(q.stats);
+      }
+      q.entries.push({ event: paintInputEventCopy(event), handler: handler, samples: samples, at: 0, present: present });
+      q.stats.samples += samples ? samples.length : 0;
+      q.stats.maxQueuedSamples = Math.max(q.stats.maxQueuedSamples, q.stats.samples - q.stats.processed);
+      if (event.type === 'pointerup') q.stats.deferredEnds++;
+      if (event.cancelable) event.preventDefault();
+      event.stopPropagation(); paintInputQueuePost(q); return true;
+    }
+    function paintInputDeferEvent(event, handler, present) {
+      const q = paintInputQueueState;
+      if (!q || q.running || q.present !== present) return false;
+      // Cancel belongs to its pointer and follows prior events, including a pending down.
+      // Dropping the whole FIFO here would also drop unrelated subsequent strokes.
+      return paintInputQueueEvent(q.owner, event, handler, event.type === 'pointermove' ? coalescedDrawEvents(event) : null, present);
+    }
+    function paintInputDeferAction(action) {
+      const q = paintInputQueueState;
+      if (!q || q.running) return false;
+      q.entries.push({ action: action }); paintInputQueuePost(q); return true;
+    }
+    function paintInputQueuedPointer(id) {
+      const q = paintInputQueueState;
+      return Boolean(q && q.entries.slice(q.head).some(function(e) { return e && e.event && e.event.pointerId === id; }));
+    }
+    function paintInputCancelOwner(owner) {
+      const q = paintInputQueueState;
+      if (q && !q.running && q.owner === owner) { q.stats.cancelled = true; paintInputQueueDone(q); }
+    }
+    function paintInputFlushSync() {
+      const q = paintInputQueueState;
+      if (!q || q.running) return;
+      q.stats.forcedDrains++; q.sync = true;
+      while (paintInputQueueState === q) paintInputQueueStep(q);
+    }
+    function paintInputBeforeInteraction(event) {
+      const q = paintInputQueueState;
+      if (!q || q.running) return;
+      // Native click follows pen-up on the drawing surface; it must not collapse the FIFO.
+      if ((event.type === 'pointerdown' || event.type === 'click') && q.surface && q.surface.contains(event.target)) return;
+      if (event.type === 'keydown' && (event.ctrlKey || event.metaKey) && /^(z|y)$/i.test(event.key)) return;
+      // Existing navigation/zoom/edit handlers read and mutate synchronously. Complete
+      // earlier delivered input before they change its coordinate system or destination.
+      paintInputFlushSync();
+    }
+    async function paintInputDrain() {
+      const q = paintInputQueueState;
+      if (!q || q.running) return;
+      const error = await q.done;
+      if (error) throw error;
+    }
+    function paintPresentQueuedInput() {
+      const op = state.paintRasterOp;
+      if (paintInputQueueState && paintInputQueueState.running) paintInputQueueState.owner = op;
+      if (op && op.previewRaf) paintLiveStrokeRedraw(op);
+    }
     function coalescedDrawEvents(event) {
       // Consume the coalesced list OR its parent, never both. An empty/unsupported
       // API still supplies the parent sample. Availability does not imply a sample rate.
@@ -82691,6 +82837,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function beginPaintStroke(event) {
+      if (paintInputDeferEvent(event, beginPaintStroke, paintPresentQueuedInput)) return;
       // ver744: middle-click drag = pan (parity with beginVideoPaintStroke, ver730's original "unify with
       // genga" intent — genga's gengaPreviewPointerDown allows this unconditionally). Must run BEFORE
       // memoPrimaryPointerDownAllowed, which only lets button-0 mouse presses through — a bare middle-click
@@ -82765,6 +82912,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1728: 위 경고를 한 번만 낸다.
     let paintMemoSurfaceLayerOpWarned = false;
     function continuePaintStroke(event) {
+      if (paintInputDeferEvent(event, continuePaintStroke, paintPresentQueuedInput)) return;
       if (continuePaintSpacePan(event)) return;
       if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) {
         return; // ver634: no paper stamp ghost — paper mode has no conte-layer access
@@ -82870,6 +83018,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function endPaintStroke(event) {
+      if (paintInputDeferEvent(event, endPaintStroke, paintPresentQueuedInput)) return;
       const endingStroke = state.paintRasterOp;
       try {
         paintDiagEnd();   // ver2411: 콘티·用紙 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
@@ -83096,6 +83245,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function beginVideoPaintStroke(event) {
+      if (paintInputDeferEvent(event, beginVideoPaintStroke, paintPresentQueuedInput)) return;
       // ver730: middle-click drag = pan (unify with genga). Must run BEFORE memoPrimaryPointerDownAllowed,
       // which only lets button-0 mouse presses through — a bare middle-click never reached any pan logic.
       if (beginPaintMiddleClickPan(event, document.getElementById('conteVideoStage'))) return;
@@ -83214,6 +83364,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function continueVideoPaintStroke(event) {
+      if (paintInputDeferEvent(event, continueVideoPaintStroke, paintPresentQueuedInput)) return;
       if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { continuePreviewPanelFlipTouch(event); return; } // ver727: parapara flip owns this pointer
       if (continuePaintSpacePan(event)) return;
       if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) {
@@ -83240,6 +83391,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (op.type === 'draw' && state.paintCurrentStroke) {
         // iPad/Pencil: expand coalesced samples so corners/direction changes are not dropped.
         const samples = coalescedDrawEvents(event);
+        if (paintInputQueueEvent(op, event, continueVideoPaintStroke, samples, paintPresentQueuedInput)) return;
         // ver767: a selection forces the whole-stroke redraw too — the live preview must show the stroke
         // already clipped (per-segment stamping would paint outside the marquee and only snap back at commit).
         // ver943: binarized strokes never take the outline detour — hard pixels have no AA-join problem,
@@ -83313,6 +83465,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function endVideoPaintStroke(event) {
+      if (paintInputDeferEvent(event, endVideoPaintStroke, paintPresentQueuedInput)) return;
       const endingStroke = state.paintRasterOp;
       try {
         paintDiagEnd();   // ver2411: 映像 획도 여기서 확정된다 — 원화(gengaPreviewPointerEnd)와 같은 자리
@@ -83420,6 +83573,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function cancelActivePaintRasterStroke(event) {
+      if (paintInputDeferEvent(event, cancelActivePaintRasterStroke, paintPresentQueuedInput)) return true;
       const endingStroke = state.paintRasterOp;
       try {
         paintFlushPendingBucketFill(event); // ver1736: pointerup 이 아니므로 파기된다 (cancel = drop)
@@ -112346,6 +112500,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function gengaPreviewPointerDown(ev) {
+      if (paintInputDeferEvent(ev, gengaPreviewPointerDown, gengaPresentQueuedInput)) return;
       const diagDownT = paintDiagOn ? performance.now() : 0;   // ver2429 A: 준비·시드를 포함한 펜다운 → 첫 픽셀
       if (!state.project || state.project.kind !== 'genga') return;
       gengaClearStandalone(); // drawing/flipping is a playhead op → ends any standalone delete-selection
@@ -112894,7 +113049,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (sess.binarizeOutline) paintBinarizeCanvasAlpha(sess.shapeBuf, gengaScanRectFor(sess, sess.shapeBuf));
       gengaShapeComposite(sess);
     }
+    function gengaPresentQueuedInput() {
+      const sess = gengaDrawSession;
+      if (paintInputQueueState && paintInputQueueState.running) paintInputQueueState.owner = sess;
+      if (sess && sess.outlineRaf) {
+        cancelAnimationFrame(sess.outlineRaf); sess.outlineRaf = 0;
+        gengaPenOutlineRedraw(sess); scheduleGengaPreviewRedraw();
+      } else if (sess && sess.penBufMode) gengaPenCompositeFlush(sess);
+    }
     function gengaPreviewPointerMove(ev) {
+      if (paintInputDeferEvent(ev, gengaPreviewPointerMove, gengaPresentQueuedInput)) return;
       gengaFlushPendingFirstDab(); // ver1669: 세그먼트 전에 유예분을 흡수한다
       if (ev.pointerType === 'touch' && gengaPointers.has(ev.pointerId)) gengaPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
       if (gengaPinch) { if (gengaPointers.size >= 2) gengaPinchMove(); if (ev.cancelable) ev.preventDefault(); return; } // pinch owns it
@@ -112941,6 +113105,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const target = penSess.penBufMode ? penSess.shapeBuf.getContext('2d') : penSess.ctx;
       // Walk every delivered sample; pointermove frequency and batch sizes are platform-dependent.
       const gengaSamples = coalescedDrawEvents(ev);
+      if (paintInputQueueEvent(penSess, ev, gengaPreviewPointerMove, gengaSamples, gengaPresentQueuedInput)) return;
       let drewAny = false;
       for (let si = 0; si < gengaSamples.length; si += 1) {
         const sample = gengaSamples[si];
@@ -113051,6 +113216,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps); // ver1104 / ver1667
     }
     function gengaPreviewPointerEnd(ev) {
+      if (paintInputDeferEvent(ev, gengaPreviewPointerEnd, gengaPresentQueuedInput)) return;
       const endingStroke = gengaDrawSession;
       try {
         paintDiagEnd();   // ver2399: 이 획의 진단을 확정한다(커밋 경로 어디로 가든 여기를 지난다)
@@ -113225,6 +113391,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function bindGestureStateJanitor() {
       if (gestureJanitorBound) return;
       gestureJanitorBound = true;
+      for (const type of ['pointerdown', 'click', 'keydown', 'wheel']) document.addEventListener(type, paintInputBeforeInteraction, { capture: true, passive: true });
       const janitor = function(ev) {
         const id = ev.pointerId;
         if (id == null) return;
@@ -113262,7 +113429,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         if (state.paintRasterOp && state.paintPointerId === id) {
           requestAnimationFrame(function() { // the canvas's pointerup/cancel handler ends it normally; this only fires on a leak
-            if (state.paintRasterOp && state.paintPointerId === id) {
+            if (state.paintRasterOp && state.paintPointerId === id && !paintInputQueuedPointer(id)) {
               cancelActivePaintRasterStroke({ pointerId: id, type: 'janitor', cancelable: false, preventDefault: function() {}, stopPropagation: function() {} });
             }
           });
@@ -113323,7 +113490,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 곡선 1단계 대기(pointerId === null)는 여기 안 걸린다 — 콘티의 pending raster op 과 같다.
         if (gengaDrawSession && gengaDrawSession.pointerId === id) {
           requestAnimationFrame(function() {
-            if (gengaDrawSession && gengaDrawSession.pointerId === id) { gengaEndDrawSession(); drawGengaPreview(); }
+            if (gengaDrawSession && gengaDrawSession.pointerId === id && !paintInputQueuedPointer(id)) { gengaEndDrawSession(); drawGengaPreview(); }
           });
         }
       };
@@ -113332,6 +113499,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver749 (fix_design 2-1): app/tab losing focus mid-drag delivers NO pointer event at all —
       // reset the genga drag states outright (blur has no competing normal handler, so no rAF needed).
       window.addEventListener('blur', function() {
+        if (paintInputQueueState) {
+          if (paintInputQueueState.stats.deferredEnds) paintInputFlushSync();
+          else { paintInputQueueState.stats.cancelled = true; paintInputQueueAbort(paintInputQueueState); }
+        }
         if (gengaDrawSession) { gengaEndDrawSession(); drawGengaPreview(); }
         if (gengaCamDrag || gengaSelDrag || gengaLasso) { gengaCancelCameraDrag(); gengaSelDrag = null; gengaLasso = null; drawGengaPreview(); } // ver2257 (D2): 파기는 한 벌로
         if (gengaFlipTouch) { gengaFlipTouch = null; gengaSetParaparaFrame(null); } // ver769: flip도 동반
