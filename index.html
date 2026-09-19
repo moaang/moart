@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2630</title>
+  <title>MoArt ver2631</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -20945,6 +20945,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       return end;
     }
+    // Derived extent for normalized timeline data; storage normalization and local creation share it.
+    function gengaDerivedTotalFrames(layers, audioClips, keyframes, fps, markIn, markOut) {
+      let maxFrame = gengaExposureEndFrame(layers, 1);
+      audioClips.forEach(function(c) { maxFrame = Math.max(maxFrame, c.startFrame + Math.ceil(c.durationSec * fps) - 1); });
+      keyframes.forEach(function(k) { maxFrame = Math.max(maxFrame, k.frame); });
+      for (const mark of [markIn, markOut]) {
+        const n = Math.round(Number(mark));
+        if (Number.isFinite(n)) maxFrame = Math.max(maxFrame, n);
+      }
+      return Math.max(1, maxFrame);
+    }
     function gengaTimelineContentExtent(gt) {
       if (!gt) return 0;
       const fps = Math.max(1, Number(gt.fps) || 24);
@@ -22323,6 +22334,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (command.gengaCameraEdit) { // ver704: genga camera = dedicated light undo/redo (cameraWork only)
         pushOther(command);
         applyGengaCameraHistoryState(payload);
+        return;
+      }
+      if (command.gengaKomaCreation) {
+        pushOther(command);
+        applyGengaKomaCreationHistory(command, undoing);
         return;
       }
       if (command.gengaVectorAppend) {
@@ -24792,6 +24808,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2631, items: [{ ja: '長いベクター線の確定と、空きフレームへの描画時の処理を軽くしました。', ko: '긴 벡터 획 확정과 빈 프레임에 그릴 때의 코마 생성 처리를 가볍게 했습니다.', en: 'Reduced the cost of committing long vector strokes and creating cels by drawing in empty frames.', zh: '减少了长矢量笔画确认及在空白帧绘画时新建单元的处理开销。' }] },
       { ver: 2630, items: [{ ja: 'ベクター線を描き足すたびに増えていた、ペンを離した後の処理を軽くしました。', ko: '벡터 획을 추가할수록 늘어나던 펜업 처리 비용을 줄였습니다.', en: 'Reduced pen-release work that grew as vector strokes accumulated.', zh: '减少了随矢量笔画累积而增加的松笔处理开销。' }] },
       { ver: 2629, items: [{ ja: '複数の先端を持つブラシの再読み込みと、共有素材の削除判定を修正しました。', ko: '복수 팁 브러시의 재로드와 공유 소재 삭제 판정을 수정했습니다.', en: 'Fixed reloading multi-tip brushes and preserving shared materials when deleting a brush.', zh: '修复多笔尖画笔重新加载及删除画笔时的共享素材保留。' }] },
       { ver: 2628, items: [{ ja: '描画済み領域の再処理を減らし、集中入力の確定とキャンセル時の余分な処理を削減しました。', ko: '이미 그린 영역의 반복 처리를 줄이고, 집중 입력 완료·취소 때의 불필요한 작업을 줄였습니다.', en: 'Reduced repeated processing of drawn areas and redundant work when finishing or cancelling concentrated pen input.', zh: '减少已绘制区域的重复处理，以及集中画笔输入完成或取消时的多余工作。' }] },
@@ -95291,6 +95308,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Only a synchronous append commit may hand ingestion an already-normalized vector array.
     // The owner removes the capability in finally; imported/stored data always takes normalization.
     const gengaPreparedVectorDrawings = new WeakSet();
+    const gengaPreparedVectorStrokes = new WeakSet();
     function gengaIngestDrawingAsset(d) {
       if (!d || typeof d !== 'object') return null;
       const strokes = gengaPreparedVectorDrawings.has(d) ? d.strokes : gengaNormVectorStrokes(d.strokes, gengaVectorStrokesIdCache);
@@ -96056,6 +96074,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // metadata under vectorDrawing; all payload shapes must stay scannable here.
     function gengaAddCommandRefs(snapshot, drawRefs, audioRefs) {
       if (!snapshot) return;
+      if (snapshot.createdDrawing) gengaForEachDrawingAsset(snapshot.createdDrawing, function(d) { if (d.ref) drawRefs.add(d.ref); }, function() {});
       if (snapshot.vectorDrawing) gengaForEachDrawingAsset(snapshot.vectorDrawing, function(d) { if (d.ref) drawRefs.add(d.ref); }, function() {});
       if (snapshot.gengaTimeline) { gengaAddProjectRefs(snapshot, drawRefs, audioRefs); return; }
       (snapshot.layers || []).forEach(function(entry) { gengaAddLayerRefs(entry && entry.layer, drawRefs); });
@@ -105533,14 +105552,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
         layers.length = 0; Array.prototype.push.apply(layers, out);
       })();
-      // ver1543: every layer counts the same, 用紙 included. The old code excluded 用紙 by role because its
-      // exposure carried a 1,000,000-frame sentinel — and a sub-layer copy of that exposure onto a role:'cel'
-      // layer walked straight past the exclusion and inflated totalFrames to a million. Now that 用紙 holds a
-      // real single koma (pre/postBehavior='hold' does the covering), there is no number to exclude and no
-      // by-role branch left to slip through.
-      // ver1635: 세 곳에 흩어져 있던 수학을 공용 커널로(gengaExposureEndFrame). let 을 유지하는 것은
-      // 아래에서 音声·カメラ·マーク가 계속 이 값을 늘리기 때문이다.
-      let maxFrame = gengaExposureEndFrame(layers, 1);
       const outp = gt.output && typeof gt.output === 'object' ? gt.output : {};
       // camera (black) = fixed output/composition frame; cameraWork (red) = the editable camera-work frame
       const cwk = gt.cameraWork && typeof gt.cameraWork === 'object' ? gt.cameraWork : {};
@@ -105578,17 +105589,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let audioLaneVol = Array.isArray(gt.audioLaneVol) ? gt.audioLaneVol.map(function(v) { return Math.max(0, Math.min(1, Number.isFinite(Number(v)) ? Number(v) : 1)); }) : [];
       // auto-expand: the timeline must at least cover every layer/audio/camera-keyframe existence range, and
       // any already-set In/Out (e.g. loaded from an older file).
-      audioClips.forEach(function(c) { maxFrame = Math.max(maxFrame, c.startFrame + Math.ceil(c.durationSec * fps) - 1); });
-      cwKeyframes.forEach(function(k) { maxFrame = Math.max(maxFrame, k.frame); });
-      const rawMarkIn = Math.round(Number(gt.markIn)), rawMarkOut = Math.round(Number(gt.markOut));
-      if (Number.isFinite(rawMarkIn)) maxFrame = Math.max(maxFrame, rawMarkIn);
-      if (Number.isFinite(rawMarkOut)) maxFrame = Math.max(maxFrame, rawMarkOut);
-      // ver1543: totalFrames is DERIVED — what the content actually reaches, recomputed here on every load and
-      // every command. The stored number used to be a floor as well ("never shrink the timeline"), which meant
-      // one bad save was permanent: the 1,000,000 a leaked 用紙 sentinel wrote could not be undone by fixing
-      // the layers, because the corrupt total won the Math.max against them. A derived value has no such
-      // memory — repair the holds and the count follows. See docs/genga_load_hang_handoff_2026-08-05.md.
-      const totalFrames = Math.max(1, maxFrame);
+      const totalFrames = gengaDerivedTotalFrames(layers, audioClips, cwKeyframes, fps, gt.markIn, gt.markOut);
       const markMax = Math.max(24, totalFrames); // timeline shows >=24 frames; In/Out can sit anywhere in the displayed range
       const clampMark = function(v) { const n = Math.round(Number(v)); return (n >= 1 && n <= markMax) ? n : null; };
       { // lanes: at most ONE empty lane may exist (so a clip can live on its own row below/above an empty one);
@@ -113533,7 +113534,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // [1..7 hold][new@8]. Reaching this branch proves no exposure covers `frame`, so the previous
           // instance's end is strictly before it and the new holdFrames is always >= the old one (never
           // shrinks). No previous instance (first drawing on the layer) → skip, same as before. Runs inside
-          // the full-command mutate, so undo restores creation + extension as one step.
+          // the command mutator, so undo restores creation + extension as one step.
           const ci = gengaInstanceIndexAtOrBefore(layer, frame);
           if (ci.idx >= 0) ci.sorted[ci.idx].holdFrames = frame - ci.sorted[ci.idx].startFrame;
           e = { id: newGengaExposureId(), startFrame: frame, holdFrames: 1, instanceValue: null, drawing: null };
@@ -113544,30 +113545,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // (남아 있으면 유지). 안 그러면 배지가 사실과 어긋난다.
         layer.vector = gengaVectorLayerHasStrokes(layer);
       };
-      // ver754 (PERF-9, the highest-frequency win): `partial` — a koma already covers this frame — is exactly
-      // the "no koma added" case. Verified vector appends store only their new stroke; other edits use
-      // the lean per-layer command instead of two whole-project clones. A commit that CREATES a koma grows gt.totalFrames (which only
-      // normalizeGengaTimeline derives) and keeps the full command. runGengaLayerEdit passes the same
-      // refreshOptions through on its cell-group fallback, so that path stays equivalent.
-      //
-      // skipChrome is the BIGGER half of this win, and it was measured, not assumed: a stroke changes the
-      // drawing and the undo stacks — nothing else — yet it used to run the whole chrome pass, whose
-      // dock/window layout reads (updatePaintUI → applyPaintColorDockState / applyPaintWindowState) force a
-      // synchronous reflow of the entire dope sheet. On a 30-layer / 3000-koma cut that was ~73ms of a ~97ms
-      // stroke, dwarfing the ~9ms the lean history itself saves. So: skip the pass, then hand-update the only
-      // two things a commit actually invalidates. (Tool/color/window state can't change here — those all
-      // funnel through selectPaintTool / updatePaintUI on their own.)
+      // Existing-koma edits only update drawing/UI state. Creation owns timing and derives the new
+      // extent; its history retains structure plus the new drawing, never the existing art.
       if (partial) {
         const options = Object.assign({}, historyOptions, { skipStage: true, skipInspector: true, skipChrome: true, gengaStrokeCommit: true });
         if (!runGengaVectorAppendCommand(label || '原画描画', liveLayer, frame, drawing, mutate, options)) {
           runGengaLayerEdit(label || '原画描画', layerId, mutate, options);
         }
-          updatePaintUndoRedoButtonsOnly();
-        // ver2204 (q2=A): 헤드 썸 재드로를 커밋 레이어로 좁힌다. 셀그룹 멤버는 여기 못 온다 —
-        // gengaLayerPatchScopeOk 가 2+ 멤버를 full runCommand 로 보내고(SCOPE RULES ①), 그 sync 도
-        // 타이밍·FX 만 미러하지 그림은 복사하지 않으므로 다른 레이어의 헤드 썸 픽셀은 안 변한다.
+        updatePaintUndoRedoButtonsOnly();
+        // Group timing/FX is unchanged by a drawing append; other heads keep their own pixels.
         gengaUpdateExpDom(layerId, frame); drawGengaLayerThumbs([layerId]); drawGengaPreview();
-      } else runCommand(label || '原画描画', mutate, historyOptions);
+      } else if (!runGengaKomaCreationCommand(label || '原画描画', liveLayer, frame, mutate, historyOptions)) {
+        runCommand(label || '原画描画', mutate, historyOptions);
+      }
     }
     // trim a paper-res canvas to its ink bbox and commit it (all drawing-type commits route here). The full
     // canvas is kept as the decode-race fallback so the preview never blinks while the new PNG decodes.
@@ -113676,7 +113666,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const from = Math.min(cache.fixedN, fixedN);
       for (let i = from; i < src.length; i++) {
         const p = src[i], q = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 };
-        if (Number.isFinite(Number(p.p))) q.p = Math.round(Number(p.p) * 100) / 100;
+        const pressure = Number(p.p);
+        if (Number.isFinite(pressure) && pressure >= 0 && pressure <= 1) q.p = Math.round(pressure * 100) / 100;
         q.w = Math.round(gengaScaleVectorRadius(radii[i], 1) * 100) / 100;
         cache.pts[i] = q; cache.radii[i] = gengaScaleVectorRadius(q.w, 1);
       }
@@ -113695,7 +113686,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 라이브와 같은 굵기·들어가기/빼기 계산으로 저장할 폭을 얻는다.
       const widths = paintStrokeRadii(src, base, sess, 1, sess, src.length);
       const pts = gengaVectorPointView(sess, src, widths.radii, widths.confirmedCount).pts;
-      return { pts: pts, color: sess.vectorColor || '#111111', roundBatch: 1 };
+      const stroke = { pts: pts, color: sess.vectorColor || '#111111', roundBatch: 1 };
+      sess.vectorPointView = null; // Completed session transfers its canonical points; it can no longer mutate them.
+      gengaPreparedVectorStrokes.add(stroke);
+      return stroke;
     }
     // 획 하나를 그림의 스트로크 배열에 더한다. **캐시(dataUrl/ref)는 버린다** — 판정대로
     // 스트로크가 정본이 되고, 그 덕에 좌표계가 하나로 통일된다.
@@ -113711,7 +113705,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const layer = gengaLayerById(layerId); if (!layer) return;
       const old = gengaDrawingStrokes(gengaExposureDrawing(layer, gengaExposureAt(layer, frame)));
       // Existing stored strokes already passed ingestion; never re-copy their points for an append.
-      const added = gengaNormVectorStrokes([stroke]);
+      const added = gengaPreparedVectorStrokes.has(stroke) ? [stroke] : gengaNormVectorStrokes([stroke]);
+      gengaPreparedVectorStrokes.delete(stroke);
       if (!added) return;
       const next = (old || []).concat(added);
       stroke = next[next.length - 1];
@@ -116523,6 +116518,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Existing-koma vector appends change one drawing, not the layer's timing/FX/other drawings.
     // Store only the added stroke. Earlier strokes remain owned by the live project; LIFO Undo of
     // later erase/transform/layer edits restores that prefix before this delta can be traversed.
+    // History owns a compact, lossless point buffer; live/import/export keeps the existing object schema.
+    function gengaPackHistoryStroke(stroke) {
+      const data = new Float64Array(stroke.pts.length * 4);
+      for (let i = 0; i < stroke.pts.length; i++) {
+        const p = stroke.pts[i], at = i * 4;
+        data[at] = p.x; data[at + 1] = p.y;
+        data[at + 2] = p.p === undefined ? NaN : p.p;
+        data[at + 3] = p.w === undefined ? NaN : p.w;
+      }
+      const meta = Object.assign({}, stroke); delete meta.pts;
+      return { meta: fastClone(meta), data: data };
+    }
+    function gengaUnpackHistoryStroke(packed) {
+      const stroke = Object.assign({ pts: null }, fastClone(packed.meta)), pts = new Array(packed.data.length / 4), d = packed.data;
+      for (let i = 0; i < pts.length; i++) {
+        const at = i * 4, p = { x: d[at], y: d[at + 1] };
+        if (!Number.isNaN(d[at + 2])) p.p = d[at + 2];
+        if (!Number.isNaN(d[at + 3])) p.w = d[at + 3];
+        pts[i] = p;
+      }
+      stroke.pts = pts; return stroke;
+    }
     function captureGengaVectorAppendState(layer, exp) {
       const key = gengaValueKey(exp.instanceValue);
       const owner = key === null ? exp : layer.sharedDrawings;
@@ -116535,7 +116552,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         vectorDrawing: metadata ? fastClone(metadata) : null };
     }
     function runGengaVectorAppendCommand(name, layer, frame, drawing, mutator, options) {
-      if (!gengaPreparedVectorDrawings.has(drawing) || !gengaLayerPatchScopeOk([layer.id])) return false;
+      if (!gengaPreparedVectorDrawings.has(drawing)) return false;
       const exp = gengaExposureAt(layer, frame);
       if (!exp || !Object.prototype.hasOwnProperty.call(exp, 'drawing')) return false;
       const key = gengaValueKey(exp.instanceValue);
@@ -116546,7 +116563,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const old = gengaDrawingStrokes(stored) || [], next = drawing.strokes;
       if (!next || next.length !== old.length + 1 || old.some(function(stroke, i) { return stroke !== next[i]; })) return false;
       const before = captureGengaVectorAppendState(layer, exp);
-      const append = { layerId: String(layer.id), expId: String(exp.id), key: key, stroke: fastClone(next[next.length - 1]) };
+      const append = { layerId: String(layer.id), expId: String(exp.id), key: key, stroke: gengaPackHistoryStroke(next[next.length - 1]) };
       mutator(state.project);
       const after = captureGengaVectorAppendState(layer, exp);
       if (!gengaFrameStackStrokeKeepOk([layer.id])) gengaFrameStackInvalidate();
@@ -116568,7 +116585,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const field = key === null ? 'drawing' : key;
       const current = owner && owner[field], strokes = gengaDrawingStrokes(current) || [];
       if (!exp || key !== edit.key || strokes.length !== expected.count) throw new Error('Vector append history target changed');
-      const next = undoing ? strokes.slice(0, target.count) : strokes.concat([fastClone(edit.stroke)]);
+      const next = undoing ? strokes.slice(0, target.count) : strokes.concat([gengaUnpackHistoryStroke(edit.stroke)]);
       const drawing = target.vectorDrawing ? fastClone(target.vectorDrawing) : null;
       if (drawing && next.length) drawing.strokes = next;
       if (target.present) owner[field] = drawing;
@@ -116580,6 +116597,77 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaUpdateExpDom(layer.id, exp.startFrame);
       drawGengaLayerThumbs([layer.id]); drawGengaPreview();
       gengaTimesheetUpdate(); updatePaintUndoRedoButtonsOnly(); gengaFxPanelUpdate();
+    }
+    // Creation changes timing and one new drawing. Existing drawings remain live-owned, including
+    // each cell-group member's independent art. LIFO history restores those IDs before replay.
+    function gengaLayerStructure(layer) {
+      const shell = Object.assign({}, layer, { sharedDrawings: {} });
+      shell.exposures = layer.exposures.map(function(e) { return Object.assign({}, e, { drawing: null }); });
+      return fastClone(shell);
+    }
+    function runGengaKomaCreationCommand(name, layer, frame, mutator, options) {
+      const gt = state.project.gengaTimeline;
+      if (!layer || gengaExposureAt(layer, frame) || !Number.isInteger(frame) || frame < 1) return false;
+      if (state.project.settings && state.project.settings.gengaAutoCreateKomaOnDraw === false) return false;
+      const members = layer.cellGroupId ? gt.layers.filter(function(l) { return l.cellGroupId === layer.cellGroupId; }) : [layer];
+      // The normal group contract requires matching slot IDs; malformed groups retain full normalization.
+      const ids = layer.exposures.map(function(e) { return String(e.id); });
+      if (new Set(ids).size !== ids.length || members.some(function(l) {
+        return l.exposures.length !== ids.length || l.exposures.some(function(e, i) { return String(e.id) !== ids[i]; });
+      })) return false;
+      const before = { layers: members.map(function(l) { return { id: l.id, layer: gengaLayerStructure(l) }; }), totalFrames: gt.totalFrames };
+      invalidateVideoTimelineCache();
+      mutator(state.project);
+      const created = gengaExposureAt(layer, frame);
+      if (!created || ids.includes(String(created.id))) return false;
+      updateGengaCelGroupsAfterEdit({ gengaTimeline: { layers: before.layers.map(function(e) { return e.layer; }) } },
+        { kind: 'genga', gengaTimeline: { layers: members } });
+      for (const member of members) {
+        const art = new Map(member.exposures.map(function(e) { return [String(e.id), e.drawing]; }));
+        const shared = member.sharedDrawings;
+        const normalized = normalizeGengaLayer(gengaLayerStructure(member));
+        normalized.sharedDrawings = shared;
+        for (const e of normalized.exposures) e.drawing = art.get(String(e.id)) || null;
+        replaceObjectContentsInPlace(member, normalized);
+      }
+      gt.totalFrames = gengaDerivedTotalFrames(gt.layers, gt.audioClips, gt.cameraWork.keyframes, gt.fps, gt.markIn, gt.markOut);
+      const stored = gengaExposureAt(layer, frame).drawing;
+      const metadata = stored ? Object.assign({}, stored) : null;
+      if (metadata) delete metadata.strokes;
+      const after = { layers: members.map(function(l) { return { id: l.id, layer: gengaLayerStructure(l) }; }), totalFrames: gt.totalFrames,
+        createdDrawing: metadata ? fastClone(metadata) : null, createdStrokes: stored && stored.strokes ? stored.strokes.map(gengaPackHistoryStroke) : null };
+      gengaFrameStackInvalidate();
+      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after,
+        gengaKomaCreation: { layerId: String(layer.id), expId: String(created.id) }, gengaPixels: options.gengaPixels,
+        gengaDrawingContext: options.gengaDrawingContext, recordingKind: 'drawing' }, options.selectionRider));
+      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] koma creation command detection failed', e); } }
+      state.redoStack = [];
+      refresh({ skipChrome: true }); updatePaintUndoRedoButtonsOnly();
+      return true;
+    }
+    function applyGengaKomaCreationHistory(command, undoing) {
+      const target = undoing ? command.before : command.after, edit = command.gengaKomaCreation;
+      // Validate every destination before mutating any of them.
+      const resolved = target.layers.map(function(entry) {
+        const layer = gengaLayerById(entry.id);
+        if (!layer) throw new Error('Koma creation history layer missing');
+        const art = new Map(layer.exposures.map(function(e) { return [String(e.id), e.drawing]; }));
+        for (const e of entry.layer.exposures) if (String(e.id) !== edit.expId && !art.has(String(e.id))) throw new Error('Koma creation history slot missing');
+        return { entry: entry, layer: layer, art: art };
+      });
+      for (const item of resolved) {
+        const next = fastClone(item.entry.layer); next.sharedDrawings = item.layer.sharedDrawings;
+        for (const e of next.exposures) {
+          if (String(e.id) === edit.expId) {
+            e.drawing = String(item.layer.id) === edit.layerId ? fastClone(command.after.createdDrawing) : null;
+            if (e.drawing && command.after.createdStrokes) e.drawing.strokes = command.after.createdStrokes.map(gengaUnpackHistoryStroke);
+          } else e.drawing = item.art.get(String(e.id));
+        }
+        replaceObjectContentsInPlace(item.layer, next);
+      }
+      state.project.gengaTimeline.totalFrames = target.totalFrames;
+      invalidateVideoTimelineCache(); gengaFrameStackInvalidate(); gengaInvalidateSelectionPixelsAfterHistory();
+      refresh({ skipChrome: true }); updatePaintUndoRedoButtonsOnly();
     }
     function captureGengaLayerPatchState(project, layerIds) {
       const gt = (project || state.project || {}).gengaTimeline;
