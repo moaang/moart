@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2627</title>
+  <title>MoArt ver2628</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -19972,7 +19972,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // APP: COMMANDS
     // structuredClone 우선 사용 (Chrome 98+, FF 94+, Safari 15.4+). 실패 시 JSON fallback.
-    // plain object/array 한정이므로 둘 다 안전. structuredClone이 보통 1.5~3배 빠름.
+    // 복사 비용은 데이터 모양과 엔진에 따라 다르다. 큰 벡터 이력은 별도로 계측한다.
     var __structuredCloneAvailable = (typeof structuredClone === 'function');
     // ## SECTION: UNDO / HISTORY COMMAND BUSES ...... fastClone, capture/apply pairs, runCommand family, undo/redo
     function fastClone(value) {
@@ -24787,6 +24787,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2628, items: [{ ja: '描画済み領域の再処理を減らし、集中入力の確定とキャンセル時の余分な処理を削減しました。', ko: '이미 그린 영역의 반복 처리를 줄이고, 집중 입력 완료·취소 때의 불필요한 작업을 줄였습니다.', en: 'Reduced repeated processing of drawn areas and redundant work when finishing or cancelling concentrated pen input.', zh: '减少已绘制区域的重复处理，以及集中画笔输入完成或取消时的多余工作。' }] },
       { ver: 2627, items: [{ ja: 'ペン入力が集中した時の処理を分割し、操作を受け付ける機会を増やしました。', ko: '펜 입력이 한꺼번에 몰릴 때 작업을 나눠, 다른 입력을 받을 기회를 늘렸습니다.', en: 'Split concentrated pen input into smaller tasks so the app can receive input more often.', zh: '将集中到达的画笔输入分批处理，让应用更频繁地响应操作。' }] },
       { ver: 2626, items: [{ ja: '長いベクター線の描画とペンを離した後の処理を軽くしました。Shift直線も表示どおり保存します。', ko: '긴 벡터 선을 그릴 때와 펜을 놓을 때의 반복 처리를 줄였습니다. Shift 직선도 보이는 그대로 저장합니다.', en: 'Reduced repeated work during long vector strokes and at pen release. Shift-constrained lines now save as displayed.', zh: '减少长矢量笔画绘制和松笔时的重复处理，Shift 直线也会按显示结果保存。' }] },
       { ver: 2625, items: [{ ja: 'インスペクターの尺入力欄で、秒を2桁に揃えるのをやめました（1+07 のように表示・入力します）。', ko: '인스펙터의 컷·패널 길이 입력칸에서 초를 2자리로 채우지 않습니다(1+07 처럼 보이고 입력됩니다).', en: 'The inspector duration fields no longer pad seconds to two digits (they show and accept 1+07).', zh: '检查器的尺输入框不再把秒补足两位（按 1+07 显示和输入）。' }] },
@@ -69052,7 +69053,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return c;
     }
     function paintMeshTipLevel(rs, batch) {
-      let wmax = 0, perU = 0;   // widest piece · px per whole period along the path (len / Δu)
+      let wmax = batch.tipWidth || 0, perU = batch.tipPeriod || 0; // material maxima or ribbon pieces
       for (let i = 0; i < batch.pieces.length; i += 1) {
         const p = batch.pieces[i];
         if (p.w > wmax) wmax = p.w;
@@ -69941,14 +69942,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!batch) { batch = paintRibbonMeshBatch(); batch.recipes = []; groups.set(key, batch); }
       // Only direct rendering needs per-dab Canvas fallback recipes. A failed worker resumes the main checkpoint.
       if (retainRecipes !== false) batch.recipes.push({ x: x, y: y, ds: ds, rad: rad, alpha: alpha });
-      // The existing mip selector uses piece width and period length; one dab spans the whole source.
-      batch.pieces.push({ w: ds.h, len: ds.w, u0: 0, u1: 1 });
-      const c = Math.cos(rad), sn = Math.sin(rad);
-      for (const corner of [0, 1, 2, 0, 2, 3]) {
-        const u = corner === 1 || corner === 2 ? 1 : 0, v = corner >= 2 ? 1 : 0;
-        const px = (u - 0.5) * ds.w, py = (v - 0.5) * ds.h;
-        paintMeshVertex(batch, x + px * c - py * sn, y + px * sn + py * c, u, v, alpha);
-      }
+      // Material dabs cover a whole period: the mip selector needs only the two maxima.
+      batch.tipWidth = Math.max(batch.tipWidth || 0, ds.h);
+      batch.tipPeriod = Math.max(batch.tipPeriod || 0, ds.w);
+      const c = Math.cos(rad), sn = Math.sin(rad), hw = ds.w / 2, hh = ds.h / 2;
+      const ax = x - hw * c + hh * sn, ay = y - hw * sn - hh * c;
+      const bx = x + hw * c + hh * sn, by = y + hw * sn - hh * c;
+      const cx = x + hw * c - hh * sn, cy = y + hw * sn + hh * c;
+      const dx = x - hw * c - hh * sn, dy = y - hw * sn + hh * c;
+      batch.data.push(ax, ay, 0, 0, alpha, bx, by, 1, 0, alpha, cx, cy, 1, 1, alpha,
+        ax, ay, 0, 0, alpha, cx, cy, 1, 1, alpha, dx, dy, 0, 1, alpha);
+      batch.x0 = Math.min(batch.x0, ax, bx, cx, dx); batch.y0 = Math.min(batch.y0, ay, by, cy, dy);
+      batch.x1 = Math.max(batch.x1, ax, bx, cx, dx); batch.y1 = Math.max(batch.y1, ay, by, cy, dy);
     }
     const paintMaterialMeshSources = new WeakMap();
     function paintMaterialMeshSource(lum, batch) {
@@ -71275,6 +71280,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintDabEllipse(ctx, x - ox, y - oy, dual.size, 1, false, 0, dual.aa, 0, false);
       }, null);
     }
+    // A retained destination owns its previous output. Other consumers still receive a full blit.
+    // null dirty means unchanged; undefined means the full result must replace the previous one.
+    function paintStrokeOutputBlit(ctx, source, box, host, dirty) {
+      const previous = host && host.outlineBounds;
+      if (!host) { ctx.drawImage(source, box.x, box.y, box.w, box.h, box.x, box.y, box.w, box.h); return box; }
+      if (!previous || dirty === undefined) {
+        if (previous) ctx.clearRect(previous.x, previous.y, previous.w, previous.h);
+        else ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        ctx.drawImage(source, box.x, box.y, box.w, box.h, box.x, box.y, box.w, box.h);
+        dirty = previous ? paintBoxUnion(previous, box) : { x: 0, y: 0, w: ctx.canvas.width, h: ctx.canvas.height };
+      } else if (dirty) {
+        ctx.clearRect(dirty.x, dirty.y, dirty.w, dirty.h);
+        ctx.drawImage(source, dirty.x, dirty.y, dirty.w, dirty.h, dirty.x, dirty.y, dirty.w, dirty.h);
+      }
+      return { x: box.x, y: box.y, w: box.w, h: box.h, dirty: dirty };
+    }
     function paintFillVariableWidthBody(ctx, pts, radii, color, opts) {
       opts = opts || {};
       const diagOn = (typeof paintDiagCur !== 'undefined') && paintDiagCur;   // ver2399: typeof 가드(골든 자립성)
@@ -71307,6 +71328,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 아래 블록의 휘도→알파를 반드시 지나야 한다. 종전에는 「alphaFor 없음 = 장 아님」이 성립했지만
       // flow 가 팁 없는 획에도 장을 켜면서 그 전제가 깨졌다. 판정을 s.inkMode 로 옮긴다.
       if (!mask && !alphaFor && !(s && s.inkMode) && !opts.waterEdge && !opts.dual) {
+        if (opts.outputHost) {
+          const previous = opts.outputHost.outlineBounds;
+          if (previous) ctx.clearRect(previous.x, previous.y, previous.w, previous.h);
+          else ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        }
         if (s) { ctx.drawImage(s.cv, 0, 0); return; }   // 팁: 세션에 쌓인 스탬프를 한 번에
         paintFillVariableWidthShape(ctx, pts, radii, color, tip, opts);
         return;
@@ -71372,8 +71398,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (diagOn) diagOn.boxes.push([wx, wy, ww, wh, incBox ? 1 : 0]);
       // 변화 없는 프레임은 같은 소유자의 완성 결과를 얹는다. 평균 알파 fallback은 제외한다.
       if (s && s.clean && sc.reused && reusableAlpha) {
-        ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh);
-        return { x: bx, y: by, w: bw, h: bh }; // Actual output extent for callers that clear a retained buffer.
+        return paintStrokeOutputBlit(ctx, sc.cv, { x: bx, y: by, w: bw, h: bh }, opts.outputHost, null);
       }
       sc.ctx.save();
       if (incBox) {
@@ -71645,10 +71670,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       sc.ctx.restore();   // ver1629: clip 해제
       const prevAlpha = ctx.globalAlpha;
       if (flatAlpha !== 1) ctx.globalAlpha = prevAlpha * flatAlpha; // ver1346: 장이 없을 때의 물러섬
-      // 최종 blit 은 **획 전체**다 — 목적지(ctx)는 프레임마다 비워지므로 증분이 성립하지 않는다.
-      ctx.drawImage(sc.cv, bx, by, bw, bh, bx, by, bw, bh); // ver1619
+      // Retained outputs propagate the same dirty region through alpha/grain and layer composition.
+      // Other callers clear their destination and still need the whole stroke.
+      const output = paintStrokeOutputBlit(ctx, sc.cv, { x: bx, y: by, w: bw, h: bh }, opts.outputHost,
+        incOk && flatAlpha === 1 ? { x: wx, y: wy, w: ww, h: wh } : undefined);
       ctx.globalAlpha = prevAlpha;
-      return { x: bx, y: by, w: bw, h: bh };
+      return output;
       } finally {   // ver2399: 진단
         if (diagOn && diagT0) { const d = performance.now() - diagT0;
           diagOn.fillMs += d; if (d > diagOn.fillMax) diagOn.fillMax = d; }
@@ -75186,7 +75213,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const store = owner.paintScratch || (owner.paintScratch = {});
       let buf = store[key];
       if (!buf) { buf = document.createElement('canvas'); store[key] = buf; }
-      if (buf.width !== w || buf.height !== h) { buf.width = w; buf.height = h; return buf; }
+      if (buf.width !== w || buf.height !== h) {
+        if (buf.width !== w) buf.width = w;
+        if (buf.height !== h) buf.height = h;
+        return buf;
+      }
       const ctx = buf.getContext('2d');
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.globalCompositeOperation = 'source-over';
@@ -81592,7 +81623,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       try {
         if (entry.action) { entry.action(); q.entries[q.head++] = null; }
         else {
-          const n = entry.samples ? Math.min(q.chunk, entry.samples.length - entry.at) : 0;
+          // A synchronous boundary cannot yield. Replaying the same event in tiny chunks
+          // would only repeat tail rendering and composition before anything can be displayed.
+          const n = entry.samples ? Math.min(q.sync ? Infinity : q.chunk, entry.samples.length - entry.at) : 0;
           const part = n ? entry.samples.slice(entry.at, entry.at + n) : null;
           entry.handler(paintInputEventCopy(entry.event, part));
           if (part) { entry.at += n; q.stats.processed += n; }
@@ -81617,13 +81650,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!q && (!samples || samples.length <= 32)) return false;
       if (!q) {
         q = { ticket: ++paintInputTicket, owner: owner, present: present, surface: event.currentTarget || event.target, project: state.project, entries: [], head: 0, chunk: 32, started: performance.now(),
-          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0 } };
+          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, discarded: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0 } };
         q.done = new Promise(function(resolve) { q.resolve = resolve; }); paintInputQueueState = q;
         if (paintDiagCur) (paintDiagCur.inputQueues || (paintDiagCur.inputQueues = [])).push(q.stats);
       }
       q.entries.push({ event: paintInputEventCopy(event), handler: handler, samples: samples, at: 0, present: present });
       q.stats.samples += samples ? samples.length : 0;
-      q.stats.maxQueuedSamples = Math.max(q.stats.maxQueuedSamples, q.stats.samples - q.stats.processed);
+      q.stats.maxQueuedSamples = Math.max(q.stats.maxQueuedSamples, q.stats.samples - q.stats.processed - q.stats.discarded);
       if (event.type === 'pointerup') q.stats.deferredEnds++;
       if (event.cancelable) event.preventDefault();
       event.stopPropagation(); paintInputQueuePost(q); return true;
@@ -81631,8 +81664,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintInputDeferEvent(event, handler, present) {
       const q = paintInputQueueState;
       if (!q || q.running || q.present !== present) return false;
-      // Cancel belongs to its pointer and follows prior events, including a pending down.
-      // Dropping the whole FIFO here would also drop unrelated subsequent strokes.
+      // An uncommitted cancelled stroke has no pixels to preserve. Drop only the trailing
+      // moves of that pointer; never cross a release, down, action or another pointer.
+      // The cancel itself still takes the normal surface route in FIFO order.
+      if (event.type === 'pointercancel') {
+        while (q.entries.length > q.head) {
+          const last = q.entries[q.entries.length - 1];
+          if (!last || !last.samples || last.event.type !== 'pointermove' || last.event.pointerId !== event.pointerId) break;
+          q.stats.discarded += last.samples.length - last.at; q.entries.pop();
+        }
+      }
       return paintInputQueueEvent(q.owner, event, handler, event.type === 'pointermove' ? coalescedDrawEvents(event) : null, present);
     }
     function paintInputDeferAction(action) {
@@ -112098,7 +112139,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
     }
     // ver606: genga shape helpers — rebuild the session canvas = seeded base + shape buffer (one composite)
-    function gengaShapeComposite(sess) {
+    function gengaShapeComposite(sess, changedRect) {
+      if (changedRect === null) return; // retained outline did not change
       // ver767: same kernel conte uses (this body was its byte-for-byte twin). genga draws in PAPER coords and
       // gengaSel.mask is a paper-sized canvas, so the selection clip needs no offset — 0,0.
       // ver1452: 이 함수는 **포인터 이동마다** 불린다(gengaShapeDragUpdate·gengaPenOutlineRedraw). 선택영역이
@@ -112113,11 +112155,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         alpha: sess.shapeOpacity, // ver609
         replaceAlpha: !sess.shapeEraser && !sess.shapeAlphaLock && paintStrokeReplacesAlpha(sess),
         clip: gengaStrokeClipFor(sess),
-        // ver2300 (F4): 펜 세션은 이번 획의 누적 상자(inkScan)만 다시 합성한다 — 펜 경로의 모든
-        // 붓질(세그먼트 양끝·아웃라인 방출점·Shift 직선 끝점)이 gengaScanMark 를 지나므로 창 밖
-        // 버퍼는 늘 비어 있다(수채 흐림의 바깥 픽셀도 gengaScanMark가 포함한다). **누적**이라 Shift 전환 같은 「지난 프레임에 그렸던
-        // 것의 소거」도 창 안이다. 도형·라쏘 세션(sess.shape)은 종전 전체 경로 그대로.
-        rect: (!sess.shape && (sess.penOutline || sess.penBufMode)) ? gengaScanClamp(sess.inkScan, sess.canvas) : null
+        // Retained outlines supply the changed output rectangle, including erased tail pixels.
+        // Other pen consumers use the accumulated scan; shapes/lasso retain the full surface.
+        rect: changedRect || ((!sess.shape && (sess.penOutline || sess.penBufMode)) ? gengaScanClamp(sess.inkScan, sess.canvas) : null)
       });
     }
     // ver767: an active selection over this session's layer/frame confines the stroke to its inside (the paint tool /
@@ -113007,11 +113047,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const b = sess.shapeBuf.getContext('2d');
       b.save();
       b.setTransform(1, 0, 0, 1, 0, 0);
-      // Clear exactly the previous fill's output, including effects outside timeline/history scan bounds.
-      // Unknown bounds (first frame or the direct shape path) retain the full clear.
-      const clearBox = sess.outlineBounds;
-      if (clearBox) b.clearRect(clearBox.x, clearBox.y, clearBox.w, clearBox.h);
-      else b.clearRect(0, 0, sess.shapeBuf.width, sess.shapeBuf.height);
+      // Binarization changes the retained alpha, so that path rebuilds the complete output.
+      // Other outlines let the common fill replace only its proven changed region.
+      if (sess.binarizeOutline) {
+        const clearBox = sess.outlineBounds;
+        if (clearBox) b.clearRect(clearBox.x, clearBox.y, clearBox.w, clearBox.h);
+        else b.clearRect(0, 0, sess.shapeBuf.width, sess.shapeBuf.height);
+      }
       // ver1345 (REGRESSION FIX): was `sess.pressureFactor(p) * paintTiltWidthFactor(sess, t)`.
       // `sess.pressureFactor` was a closure applying the 筆圧→굵기 curve **unconditionally** (gone as of ver2233) —
       // it never looks at pressureSize. That was survivable only because penOutlineMode used to REQUIRE
@@ -113042,12 +113084,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (sess.outlineRaf) { cancelAnimationFrame(sess.outlineRaf); sess.outlineRaf = 0; }
         gengaPenOutlineRedraw(sess); drawGengaPreview();
       } : null;
-      sess.outlineBounds = paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { onMaterialReady: onMaterialReady, roundBatch: sess.roundBatch, tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, pointRevision: sess.arc ? sess.arc.revision : 0, final: gengaDrawSession !== sess, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess), dual: paintDualFrom(sess) });
+      sess.outlineBounds = paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { outputHost: sess.binarizeOutline ? null : sess, onMaterialReady: onMaterialReady, roundBatch: sess.roundBatch, tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, pointRevision: sess.arc ? sess.arc.revision : 0, final: gengaDrawSession !== sess, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess), dual: paintDualFrom(sess) });
       b.restore();
       // ver1617: 2値化+팁·종이결. 도형이 쓰는 그 함수와 그 rect 최적화를 그대로 쓴다(gengaShapeRedraw
       // 참고) — 용지 전체를 임계화하면 원화에서 1회 4.17ms 라 스캔 영역으로 좁히는 것이 그 자리의 규칙이다.
       if (sess.binarizeOutline) paintBinarizeCanvasAlpha(sess.shapeBuf, gengaScanRectFor(sess, sess.shapeBuf));
-      gengaShapeComposite(sess);
+      gengaShapeComposite(sess, sess.outlineBounds && sess.outlineBounds.dirty);
     }
     function gengaPresentQueuedInput() {
       const sess = gengaDrawSession;
