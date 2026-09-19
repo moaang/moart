@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2632</title>
+  <title>MoArt ver2633</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24808,6 +24808,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2633, items: [{ ja: '素材ブラシでペンを離した後の待機と、確定時の重複描画を減らしました。', ko: '소재 브러시의 펜업 후 대기와 확정 시 중복 그리기를 줄였습니다.', en: 'Reduced waiting after pen release and duplicate final rendering for material brushes.', zh: '减少了素材笔刷抬笔后的等待和确认时的重复绘制。' }] },
       { ver: 2632, items: [{ ja: '素材ブラシの描画処理と、描画によるコマ作成・取り消しの表示更新を軽くしました。', ko: '소재 브러시의 그리기 처리와 그리기로 만든 코마의 화면 갱신·실행 취소를 가볍게 했습니다.', en: 'Reduced material-brush rendering work and UI refresh costs when drawing creates a cel or is undone.', zh: '降低了素材笔刷绘制以及绘画新建单元和撤销时的界面更新开销。' }] },
       { ver: 2631, items: [{ ja: '長いベクター線の確定と、空きフレームへの描画時の処理を軽くしました。', ko: '긴 벡터 획 확정과 빈 프레임에 그릴 때의 코마 생성 처리를 가볍게 했습니다.', en: 'Reduced the cost of committing long vector strokes and creating cels by drawing in empty frames.', zh: '减少了长矢量笔画确认及在空白帧绘画时新建单元的处理开销。' }] },
       { ver: 2630, items: [{ ja: 'ベクター線を描き足すたびに増えていた、ペンを離した後の処理を軽くしました。', ko: '벡터 획을 추가할수록 늘어나던 펜업 처리 비용을 줄였습니다.', en: 'Reduced pen-release work that grew as vector strokes accumulated.', zh: '减少了随矢量笔画累积而增加的松笔处理开销。' }] },
@@ -70051,6 +70052,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const m = s && s.materialWorker;
       if (!m) return;
       m.closed = true; clearTimeout(m.timeout);
+      paintInputMaterialSettled(m);
       const st = paintMaterialWorkerState;
       if (st) { st.jobs.delete(m.id); st.worker.postMessage({ id: m.id, release: true }); }
       s.materialWorker = null;
@@ -70093,7 +70095,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       m.timeout = setTimeout(function() { if (!m.closed && m.inflight) opts.onMaterialReady(); }, 210);
       const stats = host.materialWorkerStats || (host.materialWorkerStats = { posted: 0, published: 0, failed: 0, rasterMs: 0, geometryBytes: 0, roundTripMaxMs: 0 });
       const publish = function(result) {
+        const ending = Boolean(m.inputWait);
         clearTimeout(m.timeout); m.inflight = false;
+        paintInputMaterialSettled(m);
         if (m.closed || host.livePaint !== s) { if (result.patch) result.patch.close(); if (result.tail) result.tail.close(); return; }
         if (result.error) { stats.failed++; s.workerDisabled = true; paintMaterialWorkerRelease(s); opts.onMaterialReady(); return; }
         if (result.patch) {
@@ -70108,6 +70112,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.tailBox = plan.tailBox; s.box = plan.box; s.newBox = plan.rect; s.clean = !plan.rect;
         m.present = true; stats.published++; stats.rasterMs += result.ms;
         stats.roundTripMaxMs = Math.max(stats.roundTripMaxMs, performance.now() - m.started);
+        if (ending) {
+          // The queued release will color/composite this patch with the final tail once.
+          // Keep its dirty rectangle: finalization otherwise replaces it with only the tail.
+          s.unpresentedBox = paintBoxUnion(s.unpresentedBox, plan.rect);
+          stats.finalMerges = (stats.finalMerges || 0) + 1;
+          return;
+        }
         opts.onMaterialReady();
         // At most one outstanding job; the owner's points retain every input sample while the worker runs.
         if (m.requestedN > s.done || m.requestedRevision !== s.pointRevision) {
@@ -72003,6 +72014,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (fieldMode) { c0.fillStyle = '#000'; c0.fillRect(0, 0, w, h); }
         else c0.clearRect(0, 0, w, h);
       }
+      const unpresentedBox = canResume ? s.unpresentedBox : null;
+      s.unpresentedBox = null;
       const cx = s.cv.getContext('2d');
       cx.setTransform(1, 0, 0, 1, 0, 0);
       cx.globalAlpha = 1;
@@ -72128,6 +72141,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           cvChanged = true;
         }
       } else s.newBox = null;
+      if (unpresentedBox) { s.newBox = paintBoxUnion(s.newBox, unpresentedBox); cvChanged = true; }
       s.clean = !cvChanged;   // ver2302: 스킵 판정의 정본 — true 면 s.cv 가 지난 호출 그대로다
       s.done = n; s.pointRevision = pointRevision; s.final = Boolean(opts.final);
       return s;
@@ -81536,8 +81550,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       out.preventDefault = function() {}; out.stopPropagation = function() {};
       return out;
     }
+    function paintInputMaterialSettled(material) {
+      const wait = material && material.inputWait;
+      if (!wait) return;
+      material.inputWait = null;
+      const q = wait.queue;
+      q.materialWait = null; q.stats.workerWaitMs += performance.now() - wait.started;
+      // A worker message resumes the existing FIFO without waiting for a display frame.
+      // Release/timeout and synchronous drains detach the same waiter exactly once.
+      if (paintInputQueueState === q && !q.sync) paintInputQueuePost(q);
+    }
     function paintInputQueuePost(q) {
-      if (q.posted || q.workerWaitRaf || paintInputQueueState !== q) return;
+      if (q.posted || q.materialWait || paintInputQueueState !== q) return;
       if (!paintInputChannel) {
         paintInputChannel = new MessageChannel();
         paintInputChannel.port1.onmessage = function(event) {
@@ -81551,7 +81575,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintInputQueueDone(q, error) {
       if (paintInputQueueState !== q) return;
       paintInputQueueState = null; q.entries.length = 0;
-      if (q.workerWaitRaf) cancelAnimationFrame(q.workerWaitRaf);
+      paintInputMaterialSettled(q.materialWait);
       q.stats.elapsedMs = performance.now() - q.started; q.stats.complete = true;
       paintInputLastStats = q.stats; q.resolve(error || null);
     }
@@ -81571,11 +81595,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // Keep pointer-up in the same FIFO while an already submitted material job finishes.
       // Other synchronous UI actions still flush from the published checkpoint; never replay them.
       if (!q.sync && entry.event && entry.event.type === 'pointerup' && q.owner && q.owner.livePaint && q.owner.livePaint.materialWorker && q.owner.livePaint.materialWorker.inflight) {
-        const waitAt = performance.now();
-        q.workerWaitRaf = requestAnimationFrame(function() {
-          q.workerWaitRaf = 0; q.stats.workerWaitMs += performance.now() - waitAt;
-          if (paintInputQueueState === q) paintInputQueuePost(q);
-        });
+        const material = q.owner.livePaint.materialWorker;
+        if (!material.inputWait) material.inputWait = { queue: q, started: performance.now() };
+        q.materialWait = material;
         return;
       }
       const started = performance.now(); q.running = true;
@@ -81587,8 +81609,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const n = entry.samples ? Math.min(q.sync ? Infinity : q.chunk, entry.samples.length - entry.at) : 0;
           const part = n ? entry.samples.slice(entry.at, entry.at + n) : null;
           entry.handler(paintInputEventCopy(entry.event, part));
+          const handled = performance.now();
           if (part) { entry.at += n; q.stats.processed += n; }
           if (entry.present) entry.present();
+          if (entry.samples) {
+            q.stats.maxInputHandlerMs = Math.max(q.stats.maxInputHandlerMs, handled - started);
+            q.stats.maxInputPresentMs = Math.max(q.stats.maxInputPresentMs, performance.now() - handled);
+          }
           if (!entry.samples || entry.at >= entry.samples.length) q.entries[q.head++] = null;
         }
       } catch (error) {
@@ -81609,7 +81636,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!q && !force && (!samples || samples.length <= 32)) return false;
       if (!q) {
         q = { ticket: ++paintInputTicket, owner: owner, present: present, surface: event.currentTarget || event.target, project: state.project, entries: [], head: 0, chunk: 32, started: performance.now(),
-          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, discarded: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0, workerWaitMs: 0 } };
+          stats: { scope: 'FIFO may span consecutive strokes; slices include brush render, UI present is separately scheduled', samples: 0, processed: 0, discarded: 0, slices: 0, workMs: 0, maxSliceMs: 0, maxInputSliceMs: 0, maxInputHandlerMs: 0, maxInputPresentMs: 0, maxEndSliceMs: 0, maxQueuedSamples: 0, forcedDrains: 0, deferredEnds: 0, workerWaitMs: 0 } };
         q.done = new Promise(function(resolve) { q.resolve = resolve; }); paintInputQueueState = q;
         if (paintDiagCur) (paintDiagCur.inputQueues || (paintDiagCur.inputQueues = [])).push(q.stats);
       }
