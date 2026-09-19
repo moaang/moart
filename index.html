@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2628</title>
+  <title>MoArt ver2629</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24787,6 +24787,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2629, items: [{ ja: '複数の先端を持つブラシの再読み込みと、共有素材の削除判定を修正しました。', ko: '복수 팁 브러시의 재로드와 공유 소재 삭제 판정을 수정했습니다.', en: 'Fixed reloading multi-tip brushes and preserving shared materials when deleting a brush.', zh: '修复多笔尖画笔重新加载及删除画笔时的共享素材保留。' }] },
       { ver: 2628, items: [{ ja: '描画済み領域の再処理を減らし、集中入力の確定とキャンセル時の余分な処理を削減しました。', ko: '이미 그린 영역의 반복 처리를 줄이고, 집중 입력 완료·취소 때의 불필요한 작업을 줄였습니다.', en: 'Reduced repeated processing of drawn areas and redundant work when finishing or cancelling concentrated pen input.', zh: '减少已绘制区域的重复处理，以及集中画笔输入完成或取消时的多余工作。' }] },
       { ver: 2627, items: [{ ja: 'ペン入力が集中した時の処理を分割し、操作を受け付ける機会を増やしました。', ko: '펜 입력이 한꺼번에 몰릴 때 작업을 나눠, 다른 입력을 받을 기회를 늘렸습니다.', en: 'Split concentrated pen input into smaller tasks so the app can receive input more often.', zh: '将集中到达的画笔输入分批处理，让应用更频繁地响应操作。' }] },
       { ver: 2626, items: [{ ja: '長いベクター線の描画とペンを離した後の処理を軽くしました。Shift直線も表示どおり保存します。', ko: '긴 벡터 선을 그릴 때와 펜을 놓을 때의 반복 처리를 줄였습니다. Shift 직선도 보이는 그대로 저장합니다.', en: 'Reduced repeated work during long vector strokes and at pen release. Shift-constrained lines now save as displayed.', zh: '减少长矢量笔画绘制和松笔时的重复处理，Shift 直线也会按显示结果保存。' }] },
@@ -62513,8 +62514,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const brushPreviewAssetIds = new WeakMap();
     let brushPreviewAssetSequence = 0;
     function paintBrushPreviewAssets(brush) {
-      return [brush.tipId, brush.paperTexId].map(function(id) {
-        if (!id) return 0;
+      return brushLibraryMaterialRefs({ brush: brush }).map(function(id) {
         const image = paintGetTip(id);
         if (!image) return null;
         if (!brushPreviewAssetIds.has(image)) brushPreviewAssetIds.set(image, ++brushPreviewAssetSequence);
@@ -62630,7 +62630,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintBrushPreviewRefresh(assetId) {
       document.querySelectorAll('canvas[data-brush-preview], canvas.pb-preview-canvas').forEach(function(canvasEl) {
         const job = brushPreviewRequests.get(canvasEl);
-        if (!job || (assetId && job.brush.tipId !== assetId && job.brush.paperTexId !== assetId)) return;
+        if (!job || (assetId && !brushLibraryMaterialRefs({ brush: job.brush }).includes(assetId))) return;
         paintBrushPreviewRequest(canvasEl, job.brush, Object.assign({}, job.opts, { pressureGain: paintPressureGainMul() }));
       });
     }
@@ -64361,7 +64361,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // New strokes snapshot the effective renderer; stored strokes never consult this preference.
-    // 0: detailed, 1: Canvas material sampling, 2: Canvas sampling + stroke-wide multiply grain.
+    // 0: detailed, 1: fast material sampling, 2: fast sampling + stroke-wide multiply grain.
+    // paintAttachTip selects the Canvas/GPU sampler once; both use this eligibility rule.
     // Eligibility depends on rendering features, not whether a newer importer stamped the brush.
     // Keep order-sensitive/mixing/AA0 paths intact; OFF preserves the brush's original sampler.
     function paintMaterialFastMode(get) {
@@ -64374,42 +64375,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         && !g('paperTexStress') ? 2 : 1;
     }
 
-    // ── ver621→ver641: variable-width pressure brush ─────────────────────────────────────────────
-    // Pressure(size) strokes render as ONE filled shape instead of N stroked segments. Segment
-    // stroking is what caused the "ink pooling" blobs: the canvas spec stamps a round join whose
-    // radius equals the CURRENT lineWidth at every direction change, so a pressed zigzag drops a
-    // full-width disc at each corner. ver621's first version built that one shape as a single
-    // left/right offset-outline polygon; ver641 replaced the path-building step below
-    // (paintTraceVariableWidthPath) with dense dab stamping instead — the offset outline
-    // self-intersected into holes on fat/fast zigzags. The per-point radius math here
-    // (paintVariableWidthRadii) is unchanged by that switch; only how the radii become a path did.
-    //
-    // paintVariableWidthRadii: per-point radius from pressure, then a DISTANCE-based slew limit in
-    // both directions (radius may only change by `slew` px per px of travel). This is the geometric
-    // generalization of the ver616 temporal slew: a pressure spike while the pen barely moves (corner
-    // press, Apple-Pencil lift spike) physically cannot balloon the width.
-    // ver642: Apple Pencil / iOS reports an ERRATIC pressure signal — a touchdown spike, occasional
-    // mid-stroke spikes during light drawing, and a lift spike. This is documented on Apple's own
-    // developer forums as a raw-force characteristic (identical on Touch.force and PointerEvent.pressure,
-    // so it's NOT an API-choice bug), and pro apps (major pro paint apps) tame it by filtering values that
-    // jump drastically from their neighbours. We already streamline POSITION (手ブレ補正) and ease
-    // pressure (筆圧カーブ) — the missing piece is spike rejection on the pressure stream itself. Left
-    // raw, each spike became an isolated fat DAB (ver641) = the "wild fluctuation". A short median
-    // window kills 1–2 sample spikes; a light bidirectional low-pass then softens the rest. Intentional
-    // pressure trends (a sustained firm line, a deliberate taper) pass through unchanged (verified: a
-    // steady stroke's body radius is identical before/after).
-    // ver1239: put the ACTIVE tool's textured tip on a stroke. One helper rather than four copies, so the
-    // rule 'which strokes may be textured' has exactly one statement.
-    // ver1345: 호출부가 더 이상 `paintStrokeWantsPressure` 안에 있지 않다. 옛 주석은 "필압 없는
-    // 스트로크는 팁을 렌더할 수 없으니 필압 분기 안에서만 부른다"고 했는데, 그 전제는 ver1338에
-    // 무너졌다 — 팁이 있으면 그것만으로 whole-path(=팁 렌더 가능)가 강제된다
-    // (paintStrokeWantsWholePath). 전제가 사라진 뒤에도 게이트가 남아 있어서 **마우스로 그리면
-    // conte에서만 팁이 사라지는** 엔진 편측 결함이 됐다(genga는 무조건 부른다).
-    // ver2391: `get` — 읽는 곳을 갈아끼울 수 있다(paintAttachMix/Flow/Taper 와 같은 규격). 없으면
-    //   paintBrushGet(기존 호출부 넷은 그대로). **브러시 라이브러리 썸네일이 이 함수를 부른다** —
-    //   그전에는 이 목록을 손으로 베껴 두었고, 축이 늘 때마다 빠졌다(ver1239·1335·1336·1337·1718 이
-    //   각각 한 자리씩 고친 「거짓말」이 그것이고, ver2338 의 適用方向·ver2073 의 리본·比較暗·
-    //   ver2303 의 描点ごと가 또 빠져 있었다). 한 벌이면 다시는 안 빠진다.
+    // Snapshot brush-tip settings for new strokes and library previews. Both engines use this path.
+    // Rendering reads the snapshot, never the current tool settings; existing stored strokes keep their sampler.
+    // Tip presence alone selects whole-path rendering (paintStrokeWantsWholePath), even without pressure.
     function paintAttachTip(stroke, get) {
       const g = get || paintBrushGet;
       if (g('blendMode') === 'replace-alpha') stroke.replaceAlpha = true;
@@ -66151,24 +66119,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return null;
     }
-    // ver2064: 등록이 실패한 참조를 엔트리에서 걷어낸다. `.sut` 는 한 파일이 여러 툴을 담고
-    // 그것들이 팁 하나를 공유하므로 ref 로 훑는다(PNG 경로는 엔트리가 하나라 콜백 안에서 끝난다).
-    // 조용히 두면 **존재하지 않는 팁을 가리키는 엔트리**가 저장되고, 증상은 「임포트가 가끔
-    // 안 된다」로 위장한다 — paintGetTip 이 null 을 주면 원형 dab 으로 조용히 강등되기 때문이다.
-    function brushLibraryDropDeadRef(ref, kind, why) {
-      if (!ref) return 0;
-      const lib = brushLibraryLoad();
-      let hit = 0;
-      lib.entries.forEach(function(en) {
-        if (!en || !en.brush) return;
-        if (kind === 'tip' && en.tipRef === ref) { en.brush.tipId = ''; en.tipRef = null; hit += 1; }
-        else if (kind === 'paper' && en.brush.paperTexId === ref) { en.brush.paperTexId = ''; hit += 1; }
-        else return;
-        if (Array.isArray(en.notes)) en.notes.push(why);
-      });
-      if (hit) { brushLibrarySave(); brushLibraryRenderGrid(); }
-      console.error('[brushLibrary] ' + why + ' (ref=' + ref + ', entries=' + hit + ')');
-      return hit;
+    // Catalog refs must not depend on the runtime bitmap registry: boot starts with that registry empty.
+    // Imported entries retain tipRef; presets saved from current settings may only have brush.tipId.
+    // Hydration, deletion and preview invalidation share every multi-tip material and paper texture.
+    function brushLibraryMaterialRefs(entry) {
+      const brush = entry && entry.brush;
+      const refs = [entry && entry.tipRef, brush && brush.tipId, brush && brush.paperTexId];
+      if (brush && typeof brush.tipIds === 'string') refs.push(...brush.tipIds.split(','));
+      return Array.from(new Set(refs.filter(function(ref) { return typeof ref === 'string' && ref.length > 0; })));
     }
     function brushLibraryRegisterTipFromDataUrl(ref, dataUrl, onReady) {
       const img = new Image();
@@ -66183,14 +66141,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 팁 소실이 부팅을 죽여선 안 된다. 등록 완료마다 그리드 재렌더(열려 있을 때만 실제 그림).
     async function brushLibraryHydrateTips() {
       const lib = brushLibraryLoad();
-      // ver1337: 팁과 종이결이 같은 'bt:' 저장 경로와 같은 비트맵 레지스트리를 쓰므로 한 루프로 복원한다.
-      // ⚠entry.brush.paperTexId 도 반드시 포함해야 한다 — 빠뜨리면 리로드 후 종이결만 조용히 사라져
-      // 획이 매끈해지고, 증상이 "임포트가 가끔 안 된다"로 위장한다(ver1332 §3-1과 같은 함정).
-      const refs = [];
-      lib.entries.forEach(function(e) {
-        if (e.tipRef) refs.push(e.tipRef);
-        const pt = e.brush && e.brush.paperTexId;
-        if (pt) refs.push(pt);
+      const refs = new Set();
+      lib.entries.forEach(function(entry) {
+        brushLibraryMaterialRefs(entry).forEach(function(ref) { refs.add(ref); });
       });
       for (const ref of refs) {
         if (!ref || paintGetTip(ref)) continue;
@@ -66338,14 +66291,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!await askConfirm(t('brushLib.confirmDelete') + (e.name || ''), { okLabel: t('menu.delete'), danger: true })) return;
       if (!lib.entries.includes(e)) return;
       if (!brushLibraryEdit(function(p) { p.items.splice(p.items.indexOf(e), 1); })) return;
-      // 같은 .sut의 멀티툴 엔트리가 tipRef를 공유할 수 있다 — 마지막 참조일 때만 픽셀 행/런타임 등록 해제.
-      // ver1337: 종이결 ref도 같은 규칙. 참조 판정은 tipRef와 brush.paperTexId **양쪽**을 훑어야 한다
-      // (한쪽만 보면 아직 쓰이는 비트맵을 지워 다른 엔트리의 종이결이 사라진다).
-      const tipIdsOf = function(x) { return x && x.brush && typeof x.brush.tipIds === 'string' && x.brush.tipIds ? x.brush.tipIds.split(',') : []; };   // ver2587
+      // Only the last catalog reference releases a bitmap; current presets and multi-tip entries count too.
       const stillUsed = function(ref) {
-        return lib.entries.some(function(x) { return x.tipRef === ref || (x.brush && x.brush.paperTexId === ref) || tipIdsOf(x).indexOf(ref) >= 0; });
+        return lib.entries.some(function(entry) { return brushLibraryMaterialRefs(entry).includes(ref); });
       };
-      [e.tipRef, e.brush && e.brush.paperTexId].concat(tipIdsOf(e)).forEach(function(ref) {
+      brushLibraryMaterialRefs(e).forEach(function(ref) {
         if (!ref || stillUsed(ref)) return;
         deleteWorkspaceDbValue('bt:' + ref).catch(function(err) { console.error('[persist] brush tip cleanup failed', err); }); // ver1539
         paintUnregisterTip(ref);
@@ -66698,6 +66648,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       brushLibrarySetStatus((importedTip ? t('brushLib.imported') : t('brushLib.importedNoTip')) + fileName);
       return true;
     }
+    // CSP 자동 간격: 0은 고정(BrushInterval), 1/2/3은 넓음/보통/좁음이다.
+    // approx는 원형 대조 계수이며 미검증 조합에도 쓰는 공용 근사다. material은 정적 소재 팁 대조용이다.
+    // blend의 좁음은 해당 혼색 조합의 PNG 반복 주기로 확인했다(sut_fidelity_2026-09-10.md §5).
+    // 적용 가능한 조합은 brushLibraryApplySutVariant가 고르며, 미검증 조합은 비고를 남긴다.
+    // material: native 32/128px and 25/100% thickness controls, tests/sut_native_2552.
+    // Its pitch is diameter * thickness * coefficient, independent of stroke direction.
+    // ver2595: 원형 팁의 자동 간격 계수도 소재와 같은 .12/.08/.04 — native 2595(LAB Circ0918: 원형·AA3·크기 32/64 의 가장자리 스펙트럼
+    //   2.56/3.84/5.12 = 크기 × .08/.12/.08, 농도 20 의 겹침 수 → 狭い .040). 종전 approx .07/.05/.03 은 형상 역산 추정이었다.
+    const PAINT_SUT_AUTO_INTERVAL = { 1: { approx: 0.12, material: 0.12 }, 2: { approx: 0.08, material: 0.08 }, 3: { approx: 0.04, material: 0.04, blend: 0.04 } };
+    const PAINT_SUT_AUTO_INTERVAL_NAME = { 0: '固定', 1: '広い', 2: '普通', 3: '狭い' };
+    // ver2584: 2-ブラシ 원형의 자동 간격 계수 — 普通 = .08 이 native 5절(30px → 2.4px, 2,050픽셀 ≤1)로 확정.
+    // ver2595: 広い .12 · 狭い .04 도 실측(濃度 20 의 over 누적, 오차 2.6/3.2 로 다른 계수보다 뚜렷).
+    const PAINT_SUT_DUAL_AUTO_INTERVAL = { 1: 0.12, 2: 0.08, 3: 0.04 };
     // ver1621: .sut 의 `Brush*Effector` BLOB — **필압·기울기 설정이 여기 산다.** ver1618 은 이것을
     // 「표본이 둘뿐이라 별건」으로 남겼는데, 구조는 KennethEvans/VS-CSPBrushInfo(CSPBrushParam.cs 의
     // interpretEffector)가 이미 역설계해 두었다. CSP 공식 문서가 아니고 그 저자도 「CSP 버전에 따라
@@ -66710,19 +66673,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //
     // 길이/플래그는 unsigned, 최소·최대는 signed다. 색 변화의 rMin=-100도 보존한다.
     // 필압/기울기 곡선은 섹션별로 읽으며 헤더의 최소·최대와 혼동하지 않는다.
-    // CSP 자동 간격: 0은 고정(BrushInterval), 1/2/3은 넓음/보통/좁음이다.
-    // approx는 연필 원본 형상에서 역산한 공용 근사(pencilr_texture_gap_2026-09-02.md §4-B).
-    // blend의 좁음은 해당 혼색 조합의 PNG 반복 주기로 확인했다(sut_fidelity_2026-09-10.md §5).
-    // 적용 가능한 조합은 brushLibraryApplySutVariant가 고르며, 미검증 조합은 비고를 남긴다.
-    // material: native 32/128px and 25/100% thickness controls, tests/sut_native_2552.
-    // Its pitch is diameter * thickness * coefficient, independent of stroke direction.
-    // ver2595: 원형 팁의 자동 간격 계수도 소재와 같은 .12/.08/.04 — native 2595(LAB Circ0918: 원형·AA3·크기 32/64 의 가장자리 스펙트럼
-    //   2.56/3.84/5.12 = 크기 × .08/.12/.08, 농도 20 의 겹침 수 → 狭い .040). 종전 approx .07/.05/.03 은 형상 역산 추정이었다.
-    const PAINT_SUT_AUTO_INTERVAL = { 1: { approx: 0.12, material: 0.12 }, 2: { approx: 0.08, material: 0.08 }, 3: { approx: 0.04, material: 0.04, blend: 0.04 } };
-    const PAINT_SUT_AUTO_INTERVAL_NAME = { 0: '固定', 1: '広い', 2: '普通', 3: '狭い' };
-    // ver2584: 2-ブラシ 원형의 자동 간격 계수 — 普通 = .08 이 native 5절(30px → 2.4px, 2,050픽셀 ≤1)로 확정.
-    // ver2595: 広い .12 · 狭い .04 도 실측(濃度 20 의 over 누적, 오차 2.6/3.2 로 다른 계수보다 뚜렷).
-    const PAINT_SUT_DUAL_AUTO_INTERVAL = { 1: 0.12, 2: 0.08, 3: 0.04 };
     function paintSutParseEffector(blob) {
       try {
         const u8 = (blob instanceof Uint8Array) ? blob
@@ -66972,7 +66922,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // the new mixing and its verified automatic spacing; other combinations keep their separate paths.
       brush.mixBlend = mixingEnabled && mixingMode === 0
         && !ribbonOn && texPerDab && (textureMode === 2 || textureMode === 3 || textureMode === 4);
-      const autoIv = ctx.autoIv = num(v.BrushAutoIntervalType);
+      const autoIv = num(v.BrushAutoIntervalType);
       const iv = ctx.iv = num(v.BrushInterval);
       const autoEntry = PAINT_SUT_AUTO_INTERVAL[autoIv];
       const autoThickness = num(v.BrushThickness);
@@ -67271,13 +67221,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「向きの影響元」 — what the tip turns with. Decided here, in one place, from two columns:
     //   BrushRibbon (ストローク設定 「リボン」) wins when set: the tip follows the path as a continuous band and
     //   CSP locks 間隔 there, so the file's BrushInterval is a leftover (PAINT_RIBBON_SPACING instead).
-    //   BrushRotationEffector otherwise. Its bits, per the CSP popup order and the native line-direction
-    //   probe (docs/tests/sut_native_20260917/README.md §7): low bits 0x03 = 「なし」 base, 0x10 = ペンの向き,
-    //   0x20 = ペン軸の回転, 0x40 = 線の方向, 0x80 = ランダム (with BrushRotationRandomScale, 100 % = ±180°).
-    //   Only 線の方向 (with or without ランダム) turns the tip in the app; ペンの向き is left fixed because the web
-    //   azimuth is a pen-only value that made the same brush draw differently with a mouse and a tablet, and
-    //   the CSP strokes measured showed no such rotation; ペン軸の回転 has no barrel-twist axis in the app.
-    //   Unverified 0x40 combinations keep the line-direction reading and say so.
+    //   BrushRotationEffector otherwise: 03 fixed and 43/C3 line-direction (+ random for C3) are the native
+    //   cases wired below. Other values use the ordered fallbacks in SUT_ROTATION_SOURCE, not independent
+    //   Effector input switches. Keep unknown-combination notes; a raw bit alone does not prove CSP behaviour.
+    //   Pen direction/barrel rotation are not applied. Current decoding evidence and remaining combinations:
+    //   docs/sut_remaining_interpretation_2026-09-14.md (direction), docs/csp_sut_brush_params_2026-08-22.md.
     const SUT_ROTATION_SOURCE = [
       { key: 'none',   when: function(r) { return r === 3; } },
       { key: 'line',   when: function(r) { return r === 0x43 || r === 0xC3; } },
@@ -67465,9 +67413,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           + ' (색 변화 실행 미지원' + (enabled == null ? ' · 활성 여부 미확인' : '') + ')');
       });
     }
-    // Settings the app has no counterpart for. This list is a promise — an axis that becomes supported must
-    // leave it (a supported axis left here produced a false 「대응 없음」 note once). Defaults are not listed:
-    // a default value is noise, not a setting this brush uses. Parent activation is checked before warning.
+    // Potentially unsupported settings. sutStepUnsupported excludes inactive settings and combinations already
+    // applied by earlier steps; partially supported axes remain here. Defaults do not produce warnings.
     const SUT_UNSUPPORTED_SETTINGS = [
       ['BrushHardness', 100, '팁 경도(가장자리 무름) — 원형 붓끝에만 걸린다(소재 붓끝이면 CSP 도구 속성에서도 비활성)'],
       ['UseDualBrush', 0, '듀얼 브러시(붓끝을 두 겹으로)'],
@@ -67503,10 +67450,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
     // .sut Variant → the app's brush settings. Values are what the samples and the native probes showed; what is
-    // certain and what is an estimate both go into `notes` (the brush library shows them per entry), and an
-    // uncertain value is recorded there rather than applied. The call sequence below IS the step order (later
-    // steps read earlier fields and flags; the import golden compares notes in this order) — a step is
-    // inserted where its inputs are ready, never appended.
+    // certain and what is an estimate both go into `notes` (the brush library shows them per entry).
+    // Each axis records whether it applies a measured rule, an approximation or no mapping.
+    // The call sequence below owns dependency order; the import golden also compares note order.
     function brushLibraryApplySutVariant(brush, v, notes, preparedTip, tipPaths) {
       if (!v) return;
       const ctx = {
@@ -67782,44 +67728,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 휘도→알파 필터, 경로 스무딩(라쏘)과 손떨림 보정(pulled string).
     // ===========================================================================================
     // 팁 원본과 합성 캐시는 아래 공용 스탬퍼에서 관리한다.
-    // ── ver1625: 혼색(下地混色) — 팁 dab 이 아래 색을 물고 간다 ────────────────────────────────
-    // CSP 의 「下地混色」과 같은 축이다: 絵の具量(BrushMixColor) · 色延び(BrushMixColorExtension).
-    // 유화·파스텔·색연필이 종이 위의 색을 끌고 가며 섞이는 것이 이 축이고, 앱에는 그 개념 자체가
-    // 없어서 임포트한 .sut 가 혼색을 켜 두어도 통째로 버려졌다.
-    //   carried ← 브러시 색                            (획 시작)
-    //   dab 마다  under   = 아래 색(획 시작 시점의 캔버스)
-    //            carried = under + (carried - under) * ext   // 色延び: 문 색이 얼마나 오래 버티나
-    //            out     = carried + (브러시색 - carried) * amt  // 絵の具量: 새 물감이 얼마나 나오나
-    // ★ ver1627: 감쇠는 **거리 기준**이다 — `ext` 는 「반지름 하나만큼 갔을 때」 남는 비율이고, dab
-    //   하나에 실제로 걸리는 값은 `ext^(이동거리/반지름)` 이다. 처음에는 dab 당 그대로 곱했는데,
-    //   그러면 같은 색延び라도 **간격이 촘촘한 브러시일수록 색이 훨씬 빨리 끊긴다**(사용자 실사용
-    //   보고: 「너무 짧게 얼룩 지고 층이 생긴다」). 실제로 기본 간격은 지름의 0.15 배라 반지름 하나를
-    //   가는 데 dab 이 세 번 넘게 찍히고, 그만큼 세 제곱으로 줄었다.
-    //   거리로 정규화하면 간격이 **수식에서 사라진다**: 간격 s 로 거리 D 를 가면 dab 수는 D/s 이므로
-    //       (ext^(s/R))^(D/s) = ext^(D/R)
-    //   — s 가 소거된다. 즉 spacing 을 어떻게 잡아도 「같은 거리에서 같은 만큼 끌린다」가 보장된다.
-    //   Krita 도 스머지가 간격에 의존하되 "to a much lesser extent" 라고 적는다(순수 dab 지수는 표준이
-    //   아니다). 첫 dab 은 이전 점이 없으므로 한 걸음(=R) 간 것으로 친다.
-    // ext=1 이면 carried 가 안 변해 붓이 처음 문 색을 끝까지 끌고 가고(=색이 길게 늘어난다), ext=0 이면
-    // 반지름 하나 만에 그 자리 색을 물어 색이 끌리지 않는다 — 이름 그대로다. amt=1 이면 브러시 색만 나와
-    // **혼색이 없는 것과 같고**, amt=0 이면 새 물감 없이 문 색만 문질러 늘린다(손가락 도구).
-    // ★ 두 번째 식이 **원색 쪽으로** 섞는 것이 요점이다. 처음에 `out = lerp(under, carried, amt)` 로
-    //   썼더니 carried 가 under 로 수렴한 뒤 out 도 under 가 되어 **두 번째 dab 부터 획이 사라졌다**
-    //   (CSP 기본값 絵の具量 50 · 色延び 10 으로 실측: 240,240,248 → 이후 전부 아래 색). 붓에서는 새
-    //   물감이 계속 나오므로 놓는 색은 원색과 문 색 사이여야 한다. 그렇게 고치면 기본값이 「매 dab
-    //   반반 섞인 색을 놓으며, 문 색은 금방 그 자리 색을 따라간다」가 되어 CSP 의 서술과 맞는다.
-    // 두 파라미터가 곱이 아니라 **서로 다른 두 lerp** 인 것도 요점이다 — 하나는 붓이 기억하는 색을,
-    // 하나는 그 위에 새로 나오는 물감의 양을 정한다.
-    // 아래 바탕은 획 시작에 한 번만 읽는다. 기존 혼색은 중심 픽셀 조회와 팁 틴트 캐시를 쓰고,
-    // 새 Blend는 paintMixBlendField의 접촉 영역과 앞선 dab을 읽는다. 매 프레임 화면을 다시 읽지
-    // 않으므로 같은 획의 표시를 다음 프레임의 바탕으로 삼지 않는다. 혼색을 끄면
-    // paintMixOptionsFrom이 null을 주고 세션이 mixer를 만들지 않는다.
-    // 팁이 있는 붓에만 걸린다 — 원형 dab 은 경로를 한 번에 fill 하는 단일 도형이라 dab 마다 색을
-    // 갈 자리가 없다(억지로 dab 사슬로 바꾸면 그 자체가 성능 후퇴다). UI 의 enabled() 가 그 사실을
-    // 회색으로 드러낸다. ver1627 부터 筆圧→不透明度(잉크 장)와도 **함께 쓸 수 있다** — 그쪽이 회색조
-    // 한 장이라 마지막에 한 색으로 채우던 것을, 색 장을 나란히 쌓아 RGB 만 갈아끼우게 바꿨다.
-    // 색을 8 단위로 접는다 — **반올림**이라 255 가 255 로 남는다(`& 0xF8` 로 자르면 248 이 되어 순백을
-    // 칠할 수 없고 모든 색이 미세하게 어두워진다. 첫 판이 그랬고 실측이 잡았다). 33 단계 · 최대 오차 4.
+    // Mixing dispatch lives in paintMixerMake: mix.model='csp' uses paintMixerMakeCsp; otherwise
+    // mix.blend selects the earlier contact-field model, and the legacy path samples the base pixel.
+    // The legacy path carries color by ext^(distance/radius); this is not the CSP model's update law.
+    // Each mixer owns held color and mutable-tail backup/restore. The caller supplies the pre-stroke base.
+    // Circle/material eligibility and coverage are selected by paintInkSessionStep, not by this helper section.
     // ver1633: dab 하나의 필압. 걷기는 점과 점 **사이**에 dab 을 놓으므로 양 끝점을 t 로 보간한다
     // (필압 알파 av[] 가 잉크 장에서 쓰는 것과 같은 식이다 — 거기는 알파로 변환한 값이라 원시 필압이
     // 필요한 이 자리에서는 다시 쓸 수 없다). 두 스탬퍼가 각자 적으면 갈라지므로 여기 한 벌만 둔다.
@@ -71338,15 +71251,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return;
       }
       const w = Math.max(1, ctx.canvas.width), h = Math.max(1, ctx.canvas.height);
-      // ver1619: 이 아래는 **캔버스 전체를 네 번** 훑고 있었다(스크래치 클리어 → 잉크 장 복사 →
-      // 패턴 곱 → 되돌리기). 원화 용지 1754×1240 = 217만 픽셀이라 그레인을 켜는 것만으로 프레임당
-      // +1.4ms 였다(실측). 그런데 획이 지나간 범위는 그 2~3% 뿐이다.
-      // 같은 파일의 ver1370(paintInkFieldToAlpha)이 이미 그 답을 쓰고 있었다 — 세션이 dab 을 찍으며
-      // 쌓아 둔 s.box 만 훑는다. 그레인 경로에는 그것이 안 걸려 있었을 뿐이다.
-      // 안전한 이유: box 는 획이 커질수록 **커지기만 한다**(단조 증가). 그래서 (1) 이번 클리어가
-      // 지난 프레임이 남긴 것을 반드시 덮고, (2) destination-in 이 box 밖 목적지를 지우지만 그곳은
-      // 방금 클리어해 이미 비어 있다. 세션이 없으면(s.box 없음) 종전대로 전체를 쓴다.
-      // Ink fields and round batches retain s.box; other shape paths derive bounds from points/radii.
+      // Limit effects to the current stroke bounds. Confirmed output is retained; the mutable tail can shrink.
+      // paintInkSessionStep tracks the changed region, including the old tail, and paintStrokeOutputBlit replaces
+      // the previous destination bounds when an incremental dirty region is unavailable.
       const gbox = paintStrokeScratchBox(s && s.box, pts, radii, w, h);
       // ver2599: ぼかし幅 은 미리보기든 커밋이든 **항상** 건다. 처음에는 비용 때문에 「획을 놓을 때만」으로
       // 두려 했고 그 판정을 `!opts.liveHost` 로 썼는데, **그 등식이 거짓이다** — 도형·Shift 직선은 그리는 중에도
