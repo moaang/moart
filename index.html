@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2634</title>
+  <title>MoArt ver2635</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24808,6 +24808,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2635, items: [{ ja: '素材ブラシの描点計算をバックグラウンドに移し、速い連続入力の座標変換を軽くしました。', ko: '소재 브러시의 자국 계산을 백그라운드로 옮기고 빠른 연속 입력의 좌표 변환을 가볍게 했습니다.', en: 'Moved material brush dab calculations to the background and reduced coordinate conversion work during rapid input.', zh: '将素材笔刷的笔触计算移至后台，减少快速连续输入时的坐标转换处理量。' }] },
       { ver: 2634, items: [{ ja: '素材ブラシの色と紙質の処理をバックグラウンドに移し、描画結果を受け取る際の負荷を減らしました。', ko: '소재 브러시의 색·종이결 처리를 백그라운드로 옮겨 결과를 받을 때의 부하를 줄였습니다.', en: 'Moved material brush color and texture processing to the background to reduce load when drawing results arrive.', zh: '将素材笔刷的颜色和纸纹处理移至后台，降低接收绘制结果时的负载。' }] },
       { ver: 2633, items: [{ ja: '素材ブラシでペンを離した後の待機と、確定時の重複描画を減らしました。', ko: '소재 브러시의 펜업 후 대기와 확정 시 중복 그리기를 줄였습니다.', en: 'Reduced waiting after pen release and duplicate final rendering for material brushes.', zh: '减少了素材笔刷抬笔后的等待和确认时的重复绘制。' }] },
       { ver: 2632, items: [{ ja: '素材ブラシの描画処理と、描画によるコマ作成・取り消しの表示更新を軽くしました。', ko: '소재 브러시의 그리기 처리와 그리기로 만든 코마의 화면 갱신·실행 취소를 가볍게 했습니다.', en: 'Reduced material-brush rendering work and UI refresh costs when drawing creates a cel or is undone.', zh: '降低了素材笔刷绘制以及绘画新建单元和撤销时的界面更新开销。' }] },
@@ -69964,6 +69965,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // gray field + tail checkpoint for failure/synchronous completion; queued pen-up awaits publication.
     let paintMaterialWorkerPolicy = 'auto';
     let paintMaterialWorkerState = null, paintMaterialWorkerFailed = false, paintMaterialWorkerId = 0;
+    // One opacity rule for generic ink dabs and material geometry on either thread.
+    function paintInkDabAlphaFor(pts, av, tip, flow) {
+      const fl = Number.isFinite(flow) && flow > 0 && flow < 1 ? flow : 1;
+      const curve = tip && tip.flowCurve, gain = tip && tip.pressureGain || 1;
+      const jitter = Math.max(0, Math.min(1, (Number(tip && tip.jitFlow) || 0) / 100));
+      const seed = (Number(tip && tip.seed) || 0) >>> 0;
+      return function(i, t, di) {
+        const a0 = av[i] != null ? av[i] : 1, a1 = av[i + 1] != null ? av[i + 1] : a0;
+        let a = Math.max(0, Math.min(1, paintLerpSmooth(a0, a1, t)));
+        if (curve) a = a * fl * paintCurveEvalPts(curve, paintDabPressure(pts, i, t, gain));
+        else if (fl < 1) a = a * fl;
+        if (jitter) a = a * (1 - jitter * paintJitterUnit(seed, di, 4));
+        return a;
+      };
+    }
+    // Pure material geometry. No canvas or asset lookup; the same walk serves sync recovery and worker.
+    function paintMaterialWalk(pts, radii, tip, image, av, flow, walk, emit) {
+      const alpha = paintInkDabAlphaFor(pts, av, tip, flow);
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      const ok = paintWalkTipDabs(pts, radii, tip, function(x, y, d, rad, i, t, di) {
+        const thick = paintDabThickness(tip, pts, i, t, di), ds = paintNativeDabSize(image, d, thick, tip);
+        emit(x, y, ds, rad, alpha(i, t, di) * ds.opacity);
+        const half = Math.max(2, d) * 0.7072 + 1;
+        x0 = Math.min(x0, x - half); y0 = Math.min(y0, y - half);
+        x1 = Math.max(x1, x + half); y1 = Math.max(y1, y + half);
+      }, walk);
+      return ok && x0 !== Infinity ? { x0: x0, y0: y0, x1: x1, y1: y1 } : null;
+    }
     function paintMaterialWorkerBoot() {
       const fields = new Map();
       function closeField(f) {
@@ -69999,21 +70028,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           const start = performance.now(), ctx = f.cv.getContext('2d');
           if (f.tailBox && f.tailBak) paintInkTailCanvasRestore(ctx, f.tailBak, f.tailBox);
-          function draw(list) {
+          const pts = [], radii = [], av = [], data = m.points;
+          for (let i = 0; i < data.length; i += 7) {
+            pts.push({ x: data[i], y: data[i + 1], p: data[i + 2], t: data[i + 3], a: Number.isNaN(data[i + 4]) ? null : data[i + 4] });
+            radii.push(data[i + 5]); av.push(data[i + 6]);
+          }
+          const lum = f.assets.get(m.asset), walk = m.walk;
+          let geometryDabs = 0;
+          function draw(walk) {
+            const groups = new Map();
+            const box = paintMaterialWalk(pts, radii, m.tip, lum, av, m.flow, walk, function(x, y, ds, rad, a) {
+              geometryDabs++; paintMaterialMeshAdd(groups, lum, x, y, ds, rad, a, false);
+            });
+            const batches = Array.from(groups.values(), batch => ({ img: paintMaterialMeshSource(lum, batch), batch: batch }));
             ctx.globalCompositeOperation = 'lighten';
-            const batches = [];
-            for (const item of list) {
-              const lum = f.assets.get(item.asset), groups = new Map(), d = item.dabs;
-              for (let i = 0; i < d.length; i += 6) paintMaterialMeshAdd(groups, lum, d[i], d[i + 1], { w: d[i + 2], h: d[i + 3] }, d[i + 4], d[i + 5], false);
-              for (const batch of groups.values()) batches.push({ img: paintMaterialMeshSource(lum, batch), batch: batch });
-            }
             if (!paintMeshDrawBatches(ctx, batches, 'max', true)) throw new Error('Material mesh unavailable');
             ctx.globalCompositeOperation = 'source-over';
+            return box;
           }
-          draw(m.confirmed);
+          const b = draw(walk);
+          m.tailBox = walk.pointLimit < pts.length ? paintStrokeScratchBox(null, pts, radii, m.w, m.h, true, m.tip, Math.max(0, walk.pointLimit - 1)) : null;
           f.tailBox = m.tailBox;
           if (m.tailBox) f.tailBak = paintInkTailCanvasBackup(f.cv, f.tailBak, m.tailBox);
-          draw(m.tail);
+          const tb = walk.pointLimit < pts.length ? draw(Object.assign({}, walk, { pointLimit: pts.length })) : null;
+          const box = b && tb ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) } : b || tb;
+          m.rect = paintBoxUnion(box ? paintStrokeScratchBox(box, null, null, m.w, m.h, true) : null, m.previousTail);
+          m.box = box && m.previousBox ? { x0: Math.min(box.x0, m.previousBox.x0), y0: Math.min(box.y0, m.previousBox.y0), x1: Math.max(box.x1, m.previousBox.x1), y1: Math.max(box.y1, m.previousBox.y1) } : box || m.previousBox;
           // Synchronous snapshots: a release/next job cannot mutate these while publication is queued.
           if (m.rect) {
             const c = new OffscreenCanvas(m.rect.w, m.rect.h);
@@ -70037,7 +70077,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             c.getContext('2d').drawImage(f.tailBak, 0, 0, m.tailBox.w, m.tailBox.h, 0, 0, m.tailBox.w, m.tailBox.h);
             tail = c.transferToImageBitmap();
           }
-          postMessage({ id: m.id, patch: patch, tail: tail, shaded: shaded, ms: performance.now() - start }, [patch, tail, shaded].filter(Boolean));
+          postMessage({ id: m.id, patch: patch, tail: tail, shaded: shaded, rect: m.rect, box: m.box, tailBox: m.tailBox, walk: m.walk, geometryDabs: geometryDabs, ms: performance.now() - start }, [patch, tail, shaded].filter(Boolean));
         } catch (e) {
           if (patch) patch.close(); if (tail) tail.close(); if (shaded) shaded.close();
           closeField(fields.get(m.id)); fields.delete(m.id);
@@ -70053,16 +70093,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function' || typeof createImageBitmap !== 'function') return null;
       let url;
       try {
-        const body = 'const document={createElement:()=>new OffscreenCanvas(1,1)},paintMaterialMeshSources=new WeakMap(),paintMeshInkShader=true;let paintMeshGlState=null,paintMeshGlFailed=false,paintGrainBakedCanvas=null,paintGrainBakedKey="",paintGrainBakedTile=null;\n' +
+        const body = 'const document={createElement:()=>new OffscreenCanvas(1,1)},paintMaterialMeshSources=new WeakMap(),paintMeshInkShader=true,PAINT_DIR_LEAD_PX=' + JSON.stringify(PAINT_DIR_LEAD_PX) + ';let paintMeshGlState=null,paintMeshGlFailed=false,paintGrainBakedCanvas=null,paintGrainBakedKey="",paintGrainBakedTile=null;\n' +
           [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore,
-            paintRibbonMeshBatch, paintMaterialMeshAdd, paintMeshTipLevel, paintMaterialMeshSource, paintGrainBakedFull, paintGrainPatternTransform].map(fn => fn.toString()).join('\n') +
+            paintRibbonMeshBatch, paintMaterialMeshAdd, paintMeshTipLevel, paintMaterialMeshSource, paintGrainBakedFull, paintGrainPatternTransform, paintMaterialWalk, paintWalkTipDabs, paintInkDabAlphaFor,
+            paintDabThickness, paintNativeDabSize, paintDabSize, paintTipSmallDab, paintDabPressure, paintCurveEvalPts,
+            paintCurveBezierSeg, paintLerpSmooth, paintLerpAngleDeg, paintJitterUnit, paintStrokeScratchBox, paintBoxUnion].map(fn => fn.toString()).join('\n') +
           '\n(' + paintMaterialWorkerBoot.toString() + ')();';
         url = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
         const st = { worker: new Worker(url), ready: false, jobs: new Map() };
         paintMaterialWorkerState = st;
         st.worker.onmessage = function(event) {
           const m = event.data;
-          if ('ready' in m) { if (!m.ready) { paintMaterialWorkerFailed = true; st.worker.terminate(); } else st.ready = true; return; }
+          if ('ready' in m) {
+            if (!m.ready) {
+              paintMaterialWorkerFailed = true; st.worker.terminate();
+              const jobs = Array.from(st.jobs.values()); st.jobs.clear();
+              for (const job of jobs) job({ error: 'Material worker unavailable' });
+            } else st.ready = true;
+            return;
+          }
           const job = st.jobs.get(m.id); st.jobs.delete(m.id);
           if (!job) { if (m.patch) m.patch.close(); if (m.tail) m.tail.close(); if (m.shaded) m.shaded.close(); return; }
           job(m);
@@ -70106,18 +70155,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const tip = opts.tip;
       if (!grew || !s.done || !tipImage || !tip || tip.sampling !== 'mesh' || !tip.darken || tip.ribbon
           || tip.ids || s.grainPD || s.coverageMode || s.mixTipFor || s.colorCtx) return false;
-      if (!m && paintMaterialWorkerPolicy !== 'on' && !(s.walk.materialMs >= 4)) return false;
+      // A large unsent geometry tail is work even before the first timed raster batch.
+      if (!m && paintMaterialWorkerPolicy !== 'on' && !(s.walk.materialMs >= 4) && pts.length - (s.walk.seg || 0) < 128) return false;
       const st = paintMaterialWorkerGet();
-      if (!st || !st.ready) return false;
+      if (!st) return false; // Messages queue behind worker boot; a rejected boot fails its jobs explicitly.
       if (!m) m = s.materialWorker = { id: ++paintMaterialWorkerId, assets: new Map(), seeded: false, closed: false };
-      const walk = Object.assign({}, s.walk, { pointLimit: confirmN }), confirmed = [], tail = [];
-      const b = paintStampInkField(cx, pts, radii, tip, tipImage, s.av, walk, null, null, s.flow, null, confirmed);
-      const tailBox = confirmN < pts.length ? paintStrokeScratchBox(null, pts, radii, s.w, s.h, true, tip, Math.max(0, confirmN - 1)) : null;
-      const tb = confirmN < pts.length ? paintStampInkField(cx, pts, radii, tip, tipImage, s.av, Object.assign({}, walk, { pointLimit: pts.length, cacheTail: true }), null, null, s.flow, null, tail) : null;
-      const box = b && tb ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) } : b || tb;
-      const rect = paintBoxUnion(box ? paintStrokeScratchBox(box, null, null, s.w, s.h, true) : null, s.tailBox);
-      const plan = { walk: walk, done: pts.length, pointRevision: opts.pointRevision || 0, tailBox: tailBox, rect: rect,
-        box: box && s.box ? { x0: Math.min(box.x0, s.box.x0), y0: Math.min(box.y0, s.box.y0), x1: Math.max(box.x1, s.box.x1), y1: Math.max(box.y1, s.box.y1) } : box || s.box };
+      const from = Math.max(0, (s.walk.seg || 0) - 1), points = new Float64Array((pts.length - from) * 7);
+      for (let i = from, k = 0; i < pts.length; i++, k += 7) {
+        const p = pts[i];
+        points[k] = p.x; points[k + 1] = p.y; points[k + 2] = p.p == null ? 1 : p.p;
+        points[k + 3] = p.t; points[k + 4] = p.a == null ? NaN : p.a;
+        points[k + 5] = radii[i]; points[k + 6] = s.av[i];
+      }
+      const walk = { seg: (s.walk.seg || 0) - from, pointLimit: confirmN - from, carry: s.walk.carry,
+        lead: s.walk.lead, dabIndex: s.walk.dabIndex, firstEmitted: s.walk.firstEmitted };
+      const plan = { done: pts.length, pointRevision: opts.pointRevision || 0 }, diagnostic = paintDiagCur;
       m.inflight = true; m.started = performance.now(); s.clean = true; s.newBox = null;
       m.timeout = setTimeout(function() { if (!m.closed && m.inflight) opts.onMaterialReady(); }, 210);
       const stats = host.materialWorkerStats || (host.materialWorkerStats = { posted: 0, published: 0, failed: 0, rasterMs: 0, geometryBytes: 0, roundTripMaxMs: 0 });
@@ -70127,6 +70179,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintInputMaterialSettled(m);
         if (m.closed || host.livePaint !== s) { if (result.patch) result.patch.close(); if (result.tail) result.tail.close(); if (result.shaded) result.shaded.close(); return; }
         if (result.error) { stats.failed++; stats.lastFailure = result.error; s.workerDisabled = true; paintMaterialWorkerRelease(s); opts.onMaterialReady(); return; }
+        stats.geometryDabs = (stats.geometryDabs || 0) + result.geometryDabs;
+        if (diagnostic && paintDiagCur === diagnostic) diagnostic.dabs += result.geometryDabs;
+        plan.rect = result.rect; plan.box = result.box; plan.tailBox = result.tailBox;
+        const dirs = s.walk.dirDeg || [];
+        if (result.walk.dirDeg) {
+          for (let i = 0; i < result.walk.dirDeg.length; i++) dirs[from + i] = result.walk.dirDeg[i];
+          dirs.length = plan.done;
+        }
+        plan.walk = Object.assign({}, s.walk, result.walk, { seg: result.walk.seg + from, pointLimit: confirmN,
+          dirDeg: result.walk.dirDeg ? dirs : s.walk.dirDeg });
         if (result.patch) {
           cx.save(); cx.setTransform(1,0,0,1,0,0); cx.globalAlpha = 1; cx.globalCompositeOperation = 'source-over'; cx.filter = 'none';
           cx.drawImage(result.patch, plan.rect.x, plan.rect.y); cx.restore(); result.patch.close();
@@ -70168,25 +70230,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
       };
       (async function() {
-        const transfers = [], assets = [], msg = { id: m.id, w: s.w, h: s.h, rect: rect, tailBox: tailBox, previousTail: s.tailBox, assets: assets };
+        const transfers = [points.buffer], assets = [], msg = { id: m.id, w: s.w, h: s.h, points: points, walk: walk,
+          tip: tip, flow: s.flow, previousTail: s.tailBox, previousBox: s.box, assets: assets };
         try {
           if (!m.seeded) {
             msg.seed = await createImageBitmap(s.cv); transfers.push(msg.seed);
             if (s.tailBox && s.tailBak) { msg.seedTail = await createImageBitmap(s.tailBak); transfers.push(msg.seedTail); }
           }
-          async function serialize(groups) {
-            const out = [];
-            for (const capture of groups) {
-              const img = capture.lum;
-              let id = m.assets.get(img);
-              if (!id) { id = m.assets.size + 1; m.assets.set(img, id); const bitmap = await createImageBitmap(img); assets.push({ id: id, image: bitmap }); transfers.push(bitmap); }
-              // Keep the original double values until the shared vertex builder rounds them for GL.
-              const dabs = new Float64Array(capture.dabs);
-              out.push({ asset: id, dabs: dabs }); transfers.push(dabs.buffer);
-            }
-            return out;
+          const lum = paintTipLumFor(tipImage, tip.id || '');
+          if (!lum) throw new Error('Missing material luminance');
+          let asset = m.assets.get(lum);
+          if (!asset) {
+            asset = m.assets.size + 1; m.assets.set(lum, asset);
+            const image = await createImageBitmap(lum); assets.push({ id: asset, image: image }); transfers.push(image);
           }
-          msg.confirmed = await serialize(confirmed); msg.tail = await serialize(tail);
+          msg.asset = asset;
           const grain = opts.grain;
           msg.shadeEnabled = !opts.waterEdge && !opts.dual && /^#[0-9a-f]{6}$/i.test(s.color)
             && (!grain || grain.mode === 'multiply');
@@ -70207,7 +70265,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
           }
           if (m.closed) { for (const item of transfers) if (item.close) item.close(); return; }
-          const geometryBytes = msg.confirmed.concat(msg.tail).reduce((n, item) => n + item.dabs.byteLength, 0);
+          if (paintMaterialWorkerFailed) throw new Error('Material worker unavailable');
+          const geometryBytes = points.byteLength;
+          stats.geometryPoints = (stats.geometryPoints || 0) + points.length / 7;
           st.jobs.set(m.id, publish); st.worker.postMessage(msg, transfers); m.seeded = true; stats.posted++; stats.geometryBytes += geometryBytes;
         } catch (e) { for (const item of transfers) if (item.close) item.close(); publish({ error: String(e) }); }
       })();
@@ -70219,7 +70279,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // **상태 있는** 함수라, 두 번 걸으면 색이 두 배로 감쇠한다.
     // max/screen 선택은 팁 유무·darken·flow의 조합으로 정한다. screen은 같은 dab을 다시 찍으면 누적된다.
     // 라이브는 임시 꼬리를 복원한 뒤 다시 찍고, 혼색은 원래 dab 순서를 유지한다.
-    function paintStampInkField(fctx, pts, radii, tip, tipImage, av, resume, mixTipFor, cctx, flow, grainPD, captureMesh) {
+    function paintStampInkField(fctx, pts, radii, tip, tipImage, av, resume, mixTipFor, cctx, flow, grainPD) {
       const coverage = Boolean(tip && tip.replaceAlpha);
       const lum = tipImage ? paintTipLumFor(tipImage, (tip && tip.id) || '') : null;
       if (tipImage && !lum) return null;
@@ -70445,8 +70505,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Fast snapshots rasterize at the destination dab size, not the original material resolution.
       // Historical blank sampling and CSP/coverage/mixing keep their previous opaque-mask path.
       const nativeDab = tip && (tip.sampling === 'canvas' || tip.sampling === 'mesh') && !coverage && !mixTipFor && !tip.ribbon;
-      const materialMesh = nativeDab && tip.sampling === 'mesh' && tip.darken && !grainPD && !tipSet && !cctx ? (captureMesh ? [] : new Map()) : null;
-      const materialStart = materialMesh && !captureMesh ? performance.now() : 0;
+      const materialMesh = nativeDab && tip.sampling === 'mesh' && tip.darken && !grainPD && !tipSet && !cctx ? new Map() : null;
+      if (materialMesh) {
+        const start = performance.now();
+        const box = paintMaterialWalk(pts, radii, tip, lum, av, flow, resume, function(x, y, ds, rad, a) {
+          paintMaterialMeshAdd(materialMesh, lum, x, y, ds, rad, a);
+        });
+        fctx.save(); fctx.globalCompositeOperation = 'lighten'; fctx.globalAlpha = 1; fctx.filter = 'none';
+        paintMaterialMeshFlush(fctx, lum, materialMesh); fctx.restore();
+        if (resume) resume.materialMs = Math.max(resume.materialMs || 0, performance.now() - start);
+        return box;
+      }
       let dctx = null, dw = 0, dh = 0;
       // perDab는 grainBake에 직접 굽는다. 사용하지 않는 원본 크기 팁 scratch는 준비하지 않는다.
       // 리본은 아래 Canvas 폴백에서 이 scratch를 사용한다.
@@ -70466,12 +70535,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 팁 없는 원형 브러시의 필압 실루엣은 기존 flow100 max 규칙을 유지한다.
       const darken = Boolean(tip && tip.darken);   // ver2060
       const flowCurve = (tip && tip.flowCurve) || null;   // ver2060
-      // ver2343: dab 마다의 농도 랜덤. 걷기는 자리·크기·회전만 정하므로(ver1356 배너) 알파에 걸리는
-      // 이 축은 **스탬퍼 몫**이고, 같은 흩뿌림을 재현하려면 걷기가 넘겨 주는 dab 번호(di)로 해시한다.
-      // 채널 4 는 크기·각도·흩뿌림(0~3)이 안 쓰는 자리다. 「아래로만 흔든다」 — 설정한 농도를 넘지
-      // 않는 것이 크기 지터와 같은 규칙이고, CSP 의 [최소치] 도 그 뜻이다(pencilr 3-A).
-      const jFlow = Math.max(0, Math.min(1, (Number(tip && tip.jitFlow) || 0) / 100));
-      const jSeed = (Number(tip && tip.seed) || 0) >>> 0;
+      const dabAlpha = paintInkDabAlphaFor(pts, av, tip, flow);
       fctx.globalCompositeOperation = (darken || (!lum && fl >= 1)) ? 'lighten' : 'screen';
       fctx.globalAlpha = 1;
       fctx.filter = 'none';
@@ -70568,15 +70632,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (selK < 0) return;
         const lum = tipSet ? tipSet.lums[selK] : lum0, cspChain = tipSet ? tipSet.chains[selK] : cspChain0, tipImage = tipSet ? tipSet.imgs[selK] : tipImage0;
         const dw = tipSet && lum ? lum.width : dw0, dh = tipSet && lum ? lum.height : dh0;
-        const a0 = av[i] != null ? av[i] : 1;
-        const a1 = av[i + 1] != null ? av[i + 1] : a0;
-        let a = Math.max(0, Math.min(1, paintLerpSmooth(a0, a1, t)));   // ver2401
-        if (flowCurve) a = a * fl * paintCurveEvalPts(flowCurve, paintDabPressure(pts, i, t, pGain));   // ver2060
-        else if (fl < 1) a = a * fl;   // ver1784: dab 한 번이 얹는 양. 겹침은 위 screen 이 쌓는다.
-        if (jFlow) a = a * (1 - jFlow * paintJitterUnit(jSeed, di, 4));   // ver2343: dab 마다의 농도 랜덤
-        // ver1630: 혼색 색을 **먼저** 구한다 — mixTipFor 는 부를 때마다 문 색·문 알파를 갱신하는
-        // 상태 있는 함수라 dab 당 정확히 한 번만 부른다. 기존 혼색은 알파를 곱하고,
-        // Blend는 아래 grainBake에서 완성 마스크를 읽고 목표 농도로 보간한다.
+        let a = dabAlpha(i, t, di);
         let cimg = null;
         const thk = paintDabThickness(tip, pts, i, t, di);
         const ds = lum ? (nativeDab ? paintNativeDabSize(lum, d, thk, tip)
@@ -70614,9 +70670,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               g2.setTransform(1, 0, 0, 1, 0, 0);
             }, dabCache && !(coverage && cspChain) ? [selK, rad, ds.w, ds.h, a, cspChain ? d : '', cspChain ? thk : '', cspChain ? tip.antialias : '', Boolean(tip.thickVert)].join('|') : null, a === 1);
           } else if (nativeDab) {
-            if (materialMesh && captureMesh) materialMesh.push(x, y, ds.w, ds.h, rad, a);
-            else if (materialMesh) paintMaterialMeshAdd(materialMesh, lum, x, y, ds, rad, a);
-            else paintNativeMaterialDab(fctx, lum, x, y, ds, rad, a);
+            paintNativeMaterialDab(fctx, lum, x, y, ds, rad, a);
           } else {
             // 작업 캔버스: 검정 위에 흰 팁을 필압 알파로 → 휘도 = 팁알파×필압알파, 불투명.
             // ver2582: with the CSP sampler the window (already rotated) is baked at its own size and blitted at its origin.
@@ -70689,14 +70743,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (x + half > x1) x1 = x + half;
         if (y + half > y1) y1 = y + half;
       }, resume);
-      if (materialMesh) {
-        if (captureMesh) captureMesh.push({ lum: lum0, dabs: materialMesh });
-        else {
-          paintMaterialMeshFlush(fctx, lum0, materialMesh);
-          // Worker eligibility includes the main-thread dab/vertex preparation it can now reduce.
-          if (resume) resume.materialMs = Math.max(resume.materialMs || 0, performance.now() - materialStart);
-        }
-      }
       if (grainFlush) grainFlush();   // ver2387: 모은 dab 을 한 번에 굽는다 — 조건이 안 서면 하나씩
       if (blendDab) mixTipFor.flushBlend(fctx, cctx);
       fctx.filter = 'none';
@@ -81764,8 +81810,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintInputFlushSync() {
       const q = paintInputQueueState;
       if (!q || q.running) return;
+      const started = performance.now();
       q.stats.forcedDrains++; q.sync = true;
-      while (paintInputQueueState === q) paintInputQueueStep(q);
+      try { while (paintInputQueueState === q) paintInputQueueStep(q); }
+      finally {
+        const ms = performance.now() - started;
+        q.stats.syncDrainMs = (q.stats.syncDrainMs || 0) + ms;
+        q.stats.maxSyncDrainMs = Math.max(q.stats.maxSyncDrainMs || 0, ms);
+      }
     }
     function paintInputBeforeInteraction(event) {
       const q = paintInputQueueState;
@@ -112024,17 +112076,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // used to compute (uiPointerX(ev.clientX) - rect.left) / uz by hand — the main pointer path, the FX gizmo's
     // press and its drag, and the ユビパラ edge test — and a mirror added to each of them separately is four
     // chances to get the sign wrong. One place instead. Pass a cached rect when you already measured one.
-    function gengaClientToCanvasXY(clientX, clientY, rect) {
+    function gengaClientToCanvasXY(clientX, clientY, rect, batch) {
       // ver1324 정리: rect가 넘어오면(핫패스 전 호출부) 캔버스 조회 자체가 불필요했다 — 폴백에서만 찾는다.
       const r = rect || (function() { const c = document.getElementById('gengaPreviewCanvas'); return c ? c.getBoundingClientRect() : null; })();
       if (!r) return null;
-      const uz = uiReadScale() || 1;
+      const view = batch && (batch.view || (batch.view = { scale: uiReadScale() || 1,
+        pointerScale: uiPointerToRectScale(), rotation: gengaViewRotValue(), flip: gengaViewFlipSign() }));
+      const uz = view ? view.scale : uiReadScale() || 1;
       const w = r.width / uz, h = r.height / uz;
-      const px = (uiPointerX(clientX) - r.left) / uz, py = (uiPointerY(clientY) - r.top) / uz;
+      const px = ((view ? clientX * view.pointerScale : uiPointerX(clientX)) - r.left) / uz;
+      const py = ((view ? clientY * view.pointerScale : uiPointerY(clientY)) - r.top) / uz;
       // ver1005: the canvas is drawn mirrored and/or rotated about its own centre — undo both, in that order,
       // through the shared kernel. At rot 0 with no mirror this is an identity, so every existing caller is
       // byte-identical to before either feature existed.
-      const d = viewInverseOffset(px - w / 2, py - h / 2, gengaViewRotValue(), gengaViewFlipSign());
+      const d = viewInverseOffset(px - w / 2, py - h / 2, view ? view.rotation : gengaViewRotValue(), view ? view.flip : gengaViewFlipSign());
       return { x: d.x + w / 2, y: d.y + h / 2, w: w, h: h };
     }
     // A rect that covers the whole canvas WHATEVER the view rotation is. The dim masks below punch a hole in a
@@ -112049,11 +112104,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // that is NOT tied to the selected layer — camera-frame editing above all — must use THIS. gengaPreviewPointerXY
     // adds the selected layer's FX inverse on top, which is right for DRAWING (pen lands on the un-transformed
     // drawing canvas) but wrong for the camera frame (drawn in raw paper space, independent of any layer's FX).
-    function gengaPreviewPointerXYRaw(ev) {
+    function gengaPreviewPointerXYRaw(ev, batch) {
       const canvas = document.getElementById('gengaPreviewCanvas');
       if (!canvas || !gengaPreviewXform) return null;
       let rect;
-      if (gengaPointerGestureOpen) {
+      if (batch && batch.rect) rect = batch.rect;
+      else if (gengaPointerGestureOpen) {
         if (!gengaPointerCanvasRect || gengaPointerCanvasRect.el !== canvas) gengaPointerCanvasRect = { el: canvas, rect: canvas.getBoundingClientRect() };
         rect = gengaPointerCanvasRect.rect;
       } else {
@@ -112061,20 +112117,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       // (clientX - rect.left) is VIEWPORT px but ox/scale live in the canvas's LOCAL px (clientWidth-based)
       // — normalize or the pen lands offset from where it visibly touches at UI scale != 100%.
-      const c = gengaClientToCanvasXY(ev.clientX, ev.clientY, rect); // ver1002: local px, mirror already undone
+      if (batch) batch.rect = rect;
+      const c = gengaClientToCanvasXY(ev.clientX, ev.clientY, rect, batch);
       if (!c) return null;
-      return { x: (c.x - gengaPreviewXform.ox) / gengaPreviewXform.scale, y: (c.y - gengaPreviewXform.oy) / gengaPreviewXform.scale };
+      const xf = batch ? batch.xform || (batch.xform = gengaPreviewXform) : gengaPreviewXform;
+      return { x: (c.x - xf.ox) / xf.scale, y: (c.y - xf.oy) / xf.scale };
     }
-    function gengaPreviewPointerXY(ev) {
-      let p = gengaPreviewPointerXYRaw(ev);
+    function gengaPreviewPointerXY(ev, batch) {
+      let p = gengaPreviewPointerXYRaw(ev, batch);
       if (!p) return null;
       // if the drawing layer has an active FX transform, the on-screen paper point is the TRANSFORMED position —
       // map it back so the pen lands where it's seen (the drawing canvas itself is un-transformed).
-      const gt = state.project && state.project.gengaTimeline, layer = ensureGengaSelectedLayer();
-      if (gt && layer) {
-        const fx = gengaFxAt(layer, gengaCurrentFrame());
-        if (fx && (fx.x || fx.y || fx.scale !== 1 || fx.rot)) p = gengaFxInverseXY(p.x, p.y, fx, Math.max(1, gt.paper.w), Math.max(1, gt.paper.h));
+      if (!batch || !batch.layerRead) {
+        const gt = state.project && state.project.gengaTimeline, layer = ensureGengaSelectedLayer();
+        const fx = gt && layer ? gengaFxAt(layer, gengaCurrentFrame()) : null;
+        if (batch) { batch.fx = fx; batch.pw = gt ? Math.max(1, gt.paper.w) : 1; batch.ph = gt ? Math.max(1, gt.paper.h) : 1; batch.layerRead = true; }
+        else if (fx && (fx.x || fx.y || fx.scale !== 1 || fx.rot)) p = gengaFxInverseXY(p.x, p.y, fx, Math.max(1, gt.paper.w), Math.max(1, gt.paper.h));
       }
+      if (batch && batch.fx && (batch.fx.x || batch.fx.y || batch.fx.scale !== 1 || batch.fx.rot)) p = gengaFxInverseXY(p.x, p.y, batch.fx, batch.pw, batch.ph);
       return p;
     }
     // Bucket references use original pixels without layer opacity, blend or FX. Layers are
@@ -113211,10 +113271,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // Walk every delivered sample; pointermove frequency and batch sizes are platform-dependent.
       const gengaSamples = coalescedDrawEvents(ev);
       if (paintInputQueueEvent(penSess, ev, gengaPreviewPointerMove, gengaSamples, gengaPresentQueuedInput)) return;
+      // The canvas/view/layer transform cannot change inside this synchronous sample loop.
+      // A queued next event creates a new snapshot, including after native pointerup closed the gesture cache.
+      const pointerBatch = {};
       let drewAny = false;
       for (let si = 0; si < gengaSamples.length; si += 1) {
         const sample = gengaSamples[si];
-        let p = gengaPreviewPointerXY(sample); if (!p) continue;
+        let p = gengaPreviewPointerXY(sample, pointerBatch); if (!p) continue;
         // ver1636: **원본 이벤트**를 넘긴다(conte 와 같은 규격). 커널은 `event.type` 으로 pointerup 을
         // 알아채 catch-up 하는데, coalesced 샘플의 type 은 언제나 pointermove 라 sample 을 넘기면 그
         // 판정이 영영 성립하지 않는다. 지금은 아래 gengaPreviewPointerEnd 가 pointerup 을 replay 하므로 이
