@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2629</title>
+  <title>MoArt ver2630</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -20511,7 +20511,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return mb * 1024 * 1024;
     }
 
-    // A history payload is a structuredClone of project data - finite and acyclic. Hitting this cap means a NEW
+    // History snapshots and edit deltas are finite and acyclic. Hitting this cap means a NEW
     // payload shape reached history that this walk under-prices. Warn rather than silently returning a low
     // number: a low number makes the budget KEEP memory it thinks is free, the direction that hurts.
     const HISTORY_BYTES_MAX_NODES = 400000;
@@ -20568,7 +20568,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ONE measurement per command, cached ON the command. Payloads are immutable after the push (undo/redo only
-    // READ before/after - every apply* fastClones out of them), so the number cannot go stale. This keeps the
+    // READ stored data and detach it before mutable restoration), so the number cannot go stale. This keeps the
     // accounting off the hot path: a push measures one NEW command, then sums at most 40 cached numbers.
     function historyCommandCost(command) {
       if (!command || typeof command !== 'object') return null;
@@ -22323,6 +22323,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (command.gengaCameraEdit) { // ver704: genga camera = dedicated light undo/redo (cameraWork only)
         pushOther(command);
         applyGengaCameraHistoryState(payload);
+        return;
+      }
+      if (command.gengaVectorAppend) {
+        pushOther(command);
+        applyGengaVectorAppendHistory(command, undoing);
         return;
       }
       if (command.gengaLayerPatchEdit) { // ver754: genga per-layer light undo/redo (drawing / FX)
@@ -24787,6 +24792,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2630, items: [{ ja: 'ベクター線を描き足すたびに増えていた、ペンを離した後の処理を軽くしました。', ko: '벡터 획을 추가할수록 늘어나던 펜업 처리 비용을 줄였습니다.', en: 'Reduced pen-release work that grew as vector strokes accumulated.', zh: '减少了随矢量笔画累积而增加的松笔处理开销。' }] },
       { ver: 2629, items: [{ ja: '複数の先端を持つブラシの再読み込みと、共有素材の削除判定を修正しました。', ko: '복수 팁 브러시의 재로드와 공유 소재 삭제 판정을 수정했습니다.', en: 'Fixed reloading multi-tip brushes and preserving shared materials when deleting a brush.', zh: '修复多笔尖画笔重新加载及删除画笔时的共享素材保留。' }] },
       { ver: 2628, items: [{ ja: '描画済み領域の再処理を減らし、集中入力の確定とキャンセル時の余分な処理を削減しました。', ko: '이미 그린 영역의 반복 처리를 줄이고, 집중 입력 완료·취소 때의 불필요한 작업을 줄였습니다.', en: 'Reduced repeated processing of drawn areas and redundant work when finishing or cancelling concentrated pen input.', zh: '减少已绘制区域的重复处理，以及集中画笔输入完成或取消时的多余工作。' }] },
       { ver: 2627, items: [{ ja: 'ペン入力が集中した時の処理を分割し、操作を受け付ける機会を増やしました。', ko: '펜 입력이 한꺼번에 몰릴 때 작업을 나눠, 다른 입력을 받을 기회를 늘렸습니다.', en: 'Split concentrated pen input into smaller tasks so the app can receive input more often.', zh: '将集中到达的画笔输入分批处理，让应用更频繁地响应操作。' }] },
@@ -95282,9 +95288,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver2021: 이 함수는 저장 직전의 **화이트리스트 재구성**이다 — 여기 안 적힌 필드는 조용히
     // 사라진다. 종전에는 ref 도 dataUrl 도 없으면 null 을 돌려줬으므로, 스트로크만 든 그림은
     // 저장하는 순간 통째로 없어졌다. strokes 를 실어 나르고, 스트로크만 있어도 살려 보낸다.
+    // Only a synchronous append commit may hand ingestion an already-normalized vector array.
+    // The owner removes the capability in finally; imported/stored data always takes normalization.
+    const gengaPreparedVectorDrawings = new WeakSet();
     function gengaIngestDrawingAsset(d) {
       if (!d || typeof d !== 'object') return null;
-      const strokes = gengaNormVectorStrokes(d.strokes, gengaVectorStrokesIdCache);
+      const strokes = gengaPreparedVectorDrawings.has(d) ? d.strokes : gengaNormVectorStrokes(d.strokes, gengaVectorStrokesIdCache);
       if (d.ref) {
         if (!gengaDrawStore.has(d.ref) && typeof d.dataUrl === 'string' && d.dataUrl) gengaDrawStorePut(d.ref, d.dataUrl);
         const out = { ref: String(d.ref), w: Math.max(1, Math.round(Number(d.w) || 1)), h: Math.max(1, Math.round(Number(d.h) || 1)) };
@@ -96043,9 +96052,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // instead — invisible to a gengaTimeline-only scan. That gap is not cosmetic: loadJsonFile prunes
     // WITHOUT clearing the stacks (the other four prune sites clear them first), so an unseen ref would be
     // dropped from gengaDrawStore while a live undo still needs it → that undo would restore a BLANK
-    // drawing (the store is never re-hydrated mid-session). Both shapes must stay scannable here.
+    // drawing (the store is never re-hydrated mid-session). Vector append deltas additionally retain drawing
+    // metadata under vectorDrawing; all payload shapes must stay scannable here.
     function gengaAddCommandRefs(snapshot, drawRefs, audioRefs) {
       if (!snapshot) return;
+      if (snapshot.vectorDrawing) gengaForEachDrawingAsset(snapshot.vectorDrawing, function(d) { if (d.ref) drawRefs.add(d.ref); }, function() {});
       if (snapshot.gengaTimeline) { gengaAddProjectRefs(snapshot, drawRefs, audioRefs); return; }
       (snapshot.layers || []).forEach(function(entry) { gengaAddLayerRefs(entry && entry.layer, drawRefs); });
     }
@@ -113534,8 +113545,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         layer.vector = gengaVectorLayerHasStrokes(layer);
       };
       // ver754 (PERF-9, the highest-frequency win): `partial` — a koma already covers this frame — is exactly
-      // the "no koma added" case, so every stroke onto an existing koma takes the lean per-layer command
-      // instead of two whole-project clones. A commit that CREATES a koma grows gt.totalFrames (which only
+      // the "no koma added" case. Verified vector appends store only their new stroke; other edits use
+      // the lean per-layer command instead of two whole-project clones. A commit that CREATES a koma grows gt.totalFrames (which only
       // normalizeGengaTimeline derives) and keeps the full command. runGengaLayerEdit passes the same
       // refreshOptions through on its cell-group fallback, so that path stays equivalent.
       //
@@ -113547,7 +113558,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // two things a commit actually invalidates. (Tool/color/window state can't change here — those all
       // funnel through selectPaintTool / updatePaintUI on their own.)
       if (partial) {
-        runGengaLayerEdit(label || '原画描画', layerId, mutate, Object.assign({}, historyOptions, { skipStage: true, skipInspector: true, skipChrome: true, gengaStrokeCommit: true })); // ver2209: 이 커밋은 프레임 캐시를 살린다 (scope 불가로 full runCommand 로 넘어가면 그쪽 무효화가 이긴다)
+        const options = Object.assign({}, historyOptions, { skipStage: true, skipInspector: true, skipChrome: true, gengaStrokeCommit: true });
+        if (!runGengaVectorAppendCommand(label || '原画描画', liveLayer, frame, drawing, mutate, options)) {
+          runGengaLayerEdit(label || '原画描画', layerId, mutate, options);
+        }
           updatePaintUndoRedoButtonsOnly();
         // ver2204 (q2=A): 헤드 썸 재드로를 커밋 레이어로 좁힌다. 셀그룹 멤버는 여기 못 온다 —
         // gengaLayerPatchScopeOk 가 2+ 멤버를 full runCommand 로 보내고(SCOPE RULES ①), 그 sync 도
@@ -113696,8 +113710,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
       const layer = gengaLayerById(layerId); if (!layer) return;
       const old = gengaDrawingStrokes(gengaExposureDrawing(layer, gengaExposureAt(layer, frame)));
-      const next = gengaNormVectorStrokes((old || []).concat([stroke]));
-      if (!next) return;
+      // Existing stored strokes already passed ingestion; never re-copy their points for an append.
+      const added = gengaNormVectorStrokes([stroke]);
+      if (!added) return;
+      const next = (old || []).concat(added);
       stroke = next[next.length - 1];
       const pw = gt.paper.w, ph = gt.paper.h;
       const prior = old && gengaVectorBakeCache.get(gengaVectorStrokesKey(old));
@@ -113709,7 +113725,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (strokeCanvas) ctx.drawImage(strokeCanvas, 0, 0);
       else gengaDrawVectorStrokes(ctx, [stroke]);
       budgetedMapSet(gengaVectorBakeCache, gengaVectorStrokesKey(next), bake, GENGA_VECTOR_BAKE_MAX_ITEMS, 'vector');
-      gengaCommitDrawing(layerId, frame, { w: pw, h: ph, strokes: next }, label || '原画描画');
+      const drawing = { w: pw, h: ph, strokes: next };
+      gengaPreparedVectorDrawings.add(drawing);
+      try { gengaCommitDrawing(layerId, frame, drawing, label || '原画描画'); }
+      finally { gengaPreparedVectorDrawings.delete(drawing); }
     }
     // The full paper remains the ink upper bound; only the changed rectangle limits tile replacement.
     // Allow the existing AA margin around canvas composites. These edits retain synchronous tile
@@ -116500,6 +116519,67 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!layer.cellGroupId) return true;
         return gt.layers.filter(function(l) { return l.cellGroupId === layer.cellGroupId; }).length < 2;
       });
+    }
+    // Existing-koma vector appends change one drawing, not the layer's timing/FX/other drawings.
+    // Store only the added stroke. Earlier strokes remain owned by the live project; LIFO Undo of
+    // later erase/transform/layer edits restores that prefix before this delta can be traversed.
+    function captureGengaVectorAppendState(layer, exp) {
+      const key = gengaValueKey(exp.instanceValue);
+      const owner = key === null ? exp : layer.sharedDrawings;
+      const field = key === null ? 'drawing' : key;
+      const drawing = owner && owner[field];
+      const metadata = drawing ? Object.assign({}, drawing) : null;
+      if (metadata) delete metadata.strokes;
+      return { vector: layer.vector, count: (gengaDrawingStrokes(drawing) || []).length,
+        present: Boolean(owner && Object.prototype.hasOwnProperty.call(owner, field)),
+        vectorDrawing: metadata ? fastClone(metadata) : null };
+    }
+    function runGengaVectorAppendCommand(name, layer, frame, drawing, mutator, options) {
+      if (!gengaPreparedVectorDrawings.has(drawing) || !gengaLayerPatchScopeOk([layer.id])) return false;
+      const exp = gengaExposureAt(layer, frame);
+      if (!exp || !Object.prototype.hasOwnProperty.call(exp, 'drawing')) return false;
+      const key = gengaValueKey(exp.instanceValue);
+      if (key !== null && (!layer.sharedDrawings || exp.drawing !== null)) return false;
+      const stored = key === null ? exp.drawing : layer.sharedDrawings[key];
+      // Fill source graphs have independent ownership and are not an append-only vector edit.
+      if ((stored && stored.fillModel) || drawing.fillModel) return false;
+      const old = gengaDrawingStrokes(stored) || [], next = drawing.strokes;
+      if (!next || next.length !== old.length + 1 || old.some(function(stroke, i) { return stroke !== next[i]; })) return false;
+      const before = captureGengaVectorAppendState(layer, exp);
+      const append = { layerId: String(layer.id), expId: String(exp.id), key: key, stroke: fastClone(next[next.length - 1]) };
+      mutator(state.project);
+      const after = captureGengaVectorAppendState(layer, exp);
+      if (!gengaFrameStackStrokeKeepOk([layer.id])) gengaFrameStackInvalidate();
+      pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after,
+        gengaVectorAppend: append, gengaStrokeCommit: true, gengaDrawingContext: options.gengaDrawingContext,
+        recordingKind: 'drawing' }, options.selectionRider));
+      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] vector append command detection failed', e); } }
+      state.redoStack = [];
+      refresh(Object.assign({}, options, { gengaRenderPlan: { scope: 'partial', layerIds: [String(layer.id)], audio: false } }));
+      return true;
+    }
+    function applyGengaVectorAppendHistory(command, undoing) {
+      const edit = command.gengaVectorAppend, layer = gengaLayerById(edit.layerId);
+      const exp = layer && (layer.exposures || []).find(function(e) { return String(e.id) === edit.expId; });
+      const target = undoing ? command.before : command.after;
+      const expected = undoing ? command.after : command.before;
+      const key = exp && gengaValueKey(exp.instanceValue);
+      const owner = key === null ? exp : layer && layer.sharedDrawings;
+      const field = key === null ? 'drawing' : key;
+      const current = owner && owner[field], strokes = gengaDrawingStrokes(current) || [];
+      if (!exp || key !== edit.key || strokes.length !== expected.count) throw new Error('Vector append history target changed');
+      const next = undoing ? strokes.slice(0, target.count) : strokes.concat([fastClone(edit.stroke)]);
+      const drawing = target.vectorDrawing ? fastClone(target.vectorDrawing) : null;
+      if (drawing && next.length) drawing.strokes = next;
+      if (target.present) owner[field] = drawing;
+      else delete owner[field];
+      layer.vector = target.vector;
+      onionClearGhostCache();
+      if (!gengaFrameStackStrokeKeepOk([layer.id])) gengaFrameStackInvalidate();
+      gengaInvalidateSelectionPixelsAfterHistory();
+      gengaUpdateExpDom(layer.id, exp.startFrame);
+      drawGengaLayerThumbs([layer.id]); drawGengaPreview();
+      gengaTimesheetUpdate(); updatePaintUndoRedoButtonsOnly(); gengaFxPanelUpdate();
     }
     function captureGengaLayerPatchState(project, layerIds) {
       const gt = (project || state.project || {}).gengaTimeline;
