@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2625</title>
+  <title>MoArt ver2626</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24785,6 +24785,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2626, items: [{ ja: '長いベクター線の描画とペンを離した後の処理を軽くしました。Shift直線も表示どおり保存します。', ko: '긴 벡터 선을 그릴 때와 펜을 놓을 때의 반복 처리를 줄였습니다. Shift 직선도 보이는 그대로 저장합니다.', en: 'Reduced repeated work during long vector strokes and at pen release. Shift-constrained lines now save as displayed.', zh: '减少长矢量笔画绘制和松笔时的重复处理，Shift 直线也会按显示结果保存。' }] },
       { ver: 2625, items: [{ ja: 'インスペクターの尺入力欄で、秒を2桁に揃えるのをやめました（1+07 のように表示・入力します）。', ko: '인스펙터의 컷·패널 길이 입력칸에서 초를 2자리로 채우지 않습니다(1+07 처럼 보이고 입력됩니다).', en: 'The inspector duration fields no longer pad seconds to two digits (they show and accept 1+07).', zh: '检查器的尺输入框不再把秒补足两位（按 1+07 显示和输入）。' }] },
       { ver: 2624, items: [{ ja: 'ベクター線の確定した輪郭を再利用し、素材ブラシのGPUバッファとコンテの座標変換の重複を減らしました。', ko: '벡터 선의 확정된 윤곽을 재사용하고, 소재 브러시의 GPU 버퍼와 콘티 좌표 변환의 중복을 줄였습니다.', en: 'Reused confirmed vector-stroke paths and reduced material-brush GPU allocations and repeated storyboard coordinate conversion.', zh: '复用矢量笔画已确定的路径，减少素材笔刷 GPU 缓冲区分配和分镜坐标的重复转换。' }] },
       { ver: 2623, items: [{ ja: '画面全体に広がる線の更新範囲を修正し、描画中の不要な配列コピーを減らしました。', ko: '화면 전체로 뻗는 선의 갱신 범위를 바로잡고, 그리는 중 불필요한 배열 복사를 줄였습니다.', en: 'Fixed update bounds for strokes spanning the canvas and reduced unnecessary array copies while drawing.', zh: '修复跨越整个画布的笔画更新范围，并减少绘制时不必要的数组复制。' }] },
@@ -65048,7 +65049,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // A batch is opaque grayscale before max blending. Direct white path fills would
     // accumulate edge coverage even under lighten, changing a repeatedly traced thin line.
     function paintRoundBatch(s, ctx, pts, radii, from, end) {
-      const box = paintStrokeScratchBox(null, pts, radii, s.w, s.h, true, null, from, end);
+      const box = paintStrokeScratchBox(null, s.roundBoundsPoints || pts, s.roundBoundsRadii || radii, s.w, s.h, true, null, from, end);
       if (!box) return;
       let mask = s.roundMask;
       if (!mask) { mask = s.roundMask = document.createElement('canvas'); mask.width = box.w; mask.height = box.h; }
@@ -65058,7 +65059,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const mc = mask.getContext('2d');
       mc.setTransform(1, 0, 0, 1, 0, 0); mc.globalAlpha = 1; mc.globalCompositeOperation = 'source-over';
       mc.fillStyle = '#000'; mc.fillRect(0, 0, box.w, box.h);
-      mc.setTransform(1, 0, 0, 1, -box.x, -box.y);
+      const m = s.roundTransform;
+      if (m) mc.setTransform(m.a, m.b, m.c, m.d, m.e - box.x, m.f - box.y);
+      else mc.setTransform(1, 0, 0, 1, -box.x, -box.y);
       mc.beginPath(); paintTraceVariableWidthPath(mc, pts, radii, from, end); mc.fillStyle = '#fff'; mc.fill();
       ctx.globalCompositeOperation = 'lighten';
       ctx.drawImage(mask, 0, 0, box.w, box.h, box.x, box.y, box.w, box.h);
@@ -75156,7 +75159,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintReleaseStrokeBuffers(owner) {
       imageBrushFinishStampRun(owner, false);
       paintMaterialWorkerRelease(owner && owner.livePaint);
-      if (owner) { owner.widthCache = null; owner.roundPathCache = null; owner.pixelPointCache = null; }
+      if (owner) { owner.widthCache = null; owner.roundPathCache = null; owner.pixelPointCache = null; owner.vectorPointView = null; }
       if (!owner || !owner.strokeBuffers) return;
       for (const key of ['base', 'stroke']) {
         const canvas = owner.strokeBuffers[key]; if (!canvas) continue;
@@ -95136,9 +95139,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     //   [{ pts: [{x, y, p?, w?}], color?, radius? }] — w is the point radius; numeric 0 is an ink break.
     // 좌표는 소수 첫째 자리에서 끊는다: 원본 float 를 그대로 실으면 파일이 3 배가 되고(실측:
     // 200 점 11.4KB -> 3.7KB), 화면에서 0.1px 차이는 보이지 않는다.
-    function gengaNormVectorStrokes(raw) {
+    function gengaNormVectorStrokes(raw, renderIds) {
       if (!Array.isArray(raw) || !raw.length) return null;
-      const out = [];
+      const out = [], identity = renderIds && renderIds.get(raw);
+      let sameRender = Boolean(identity);
       for (let i = 0; i < raw.length; i++) {
         const s = raw[i];
         if (!s || !Array.isArray(s.pts) || !s.pts.length) continue;
@@ -95153,16 +95157,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // 그 점의 반경(px). 직접 그린 획과 CLIP의 저장된 폭을 같은 형식으로 보존한다.
           const w = Number(p.w);
           if (Number.isFinite(w) && (w > 0 || p.w === 0)) q.w = Math.round(w * 100) / 100;
+          if (p.x !== q.x || p.y !== q.y || p.w !== q.w) sameRender = false;
           pts.push(q);
         }
         if (!pts.length) continue;
         const o = { pts: pts };
+        if (s.roundBatch === 1) o.roundBatch = 1;
         if (typeof s.color === 'string' && s.color) o.color = s.color;
         if (s.opacity != null && Number.isFinite(Number(s.opacity))) o.opacity = Math.max(0, Math.min(1, Number(s.opacity)));
         const r = Number(s.radius);
         if (Number.isFinite(r) && r > 0) o.radius = Math.round(r * 100) / 100;
+        if (pts.length !== s.pts.length || s.color !== o.color || s.opacity !== o.opacity || s.radius !== o.radius || s.roundBatch !== o.roundBatch) sameRender = false;
         out.push(o);
       }
+      // Normalization clones arrays even when their render data is already canonical.
+      // Asset ingestion supplies its cache; standalone normalization has no global state.
+      // Preserve cache identity only after proving every rendered value unchanged.
+      if (sameRender && out.length === raw.length) renderIds.set(out, identity);
       return out.length ? out : null;
     }
     function gengaDrawingStrokes(d) { return (d && Array.isArray(d.strokes) && d.strokes.length) ? d.strokes : null; }
@@ -95171,7 +95182,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 저장하는 순간 통째로 없어졌다. strokes 를 실어 나르고, 스트로크만 있어도 살려 보낸다.
     function gengaIngestDrawingAsset(d) {
       if (!d || typeof d !== 'object') return null;
-      const strokes = gengaNormVectorStrokes(d.strokes);
+      const strokes = gengaNormVectorStrokes(d.strokes, gengaVectorStrokesIdCache);
       if (d.ref) {
         if (!gengaDrawStore.has(d.ref) && typeof d.dataUrl === 'string' && d.dataUrl) gengaDrawStorePut(d.ref, d.dataUrl);
         const out = { ref: String(d.ref), w: Math.max(1, Math.round(Number(d.w) || 1)), h: Math.max(1, Math.round(Number(d.h) || 1)) };
@@ -95316,6 +95327,39 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const radius = Number(value);
       return value === 0 ? 0 : Math.max(PAINT_RADII_FLOOR, (Number.isFinite(radius) ? radius : PAINT_RADII_FLOOR) * factor);
     }
+    // New vector strokes use the same fixed blocks as the live round brush. The mask
+    // is made in the destination pixel grid, so zoom/rotation/nonuniform transforms
+    // still rasterize vector geometry at the requested resolution, not a paper bitmap.
+    function gengaDrawVectorRoundBatch(ctx, pts, radii, color) {
+      const m = ctx.getTransform();
+      const boundsPoints = pts.map(function(p) { return { x: m.a * p.x + m.c * p.y + m.e, y: m.b * p.x + m.d * p.y + m.f }; });
+      const scale = Math.max(Math.hypot(m.a, m.c), Math.hypot(m.b, m.d));
+      const boundsRadii = radii.map(function(r) { return Math.max(PAINT_RADII_FLOOR, r) * scale; });
+      const box = paintStrokeScratchBox(null, boundsPoints, boundsRadii, ctx.canvas.width, ctx.canvas.height, true);
+      if (!box) return;
+      const w = box.w, h = box.h;
+      for (const p of boundsPoints) { p.x -= box.x; p.y -= box.y; }
+      // A short stroke on a large page must not allocate two page-sized surfaces.
+      const field = document.createElement('canvas'); field.width = w; field.height = h;
+      const result = document.createElement('canvas'); result.width = w; result.height = h;
+      const s = { cv: field, w: w, h: h, roundTransform: { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e - box.x, f: m.f - box.y },
+        roundBoundsPoints: boundsPoints, roundBoundsRadii: boundsRadii };
+      const fc = field.getContext('2d'), rc = result.getContext('2d');
+      try {
+        fc.fillStyle = '#000'; fc.fillRect(0, 0, w, h);
+        for (let at = 0; at < pts.length - 1; at += 128) paintRoundBatch(s, fc, pts, radii, at, Math.min(pts.length, at + 129));
+        if (pts.length === 1) paintRoundBatch(s, fc, pts, radii, 0, 1);
+        s.box = { x0: 0, y0: 0, x1: w, y1: h };
+        const filter = paintLumToAlphaFilter();
+        if (filter) {
+          rc.filter = filter; rc.drawImage(field, 0, 0); rc.filter = 'none';
+          rc.globalCompositeOperation = 'source-in'; rc.fillStyle = color; rc.fillRect(0, 0, w, h);
+        } else if (!paintInkFieldToAlpha({ cv: result, ctx: rc }, s, w, h, color)) throw new Error('Vector mask conversion failed');
+        ctx.save();
+        try { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(result, box.x, box.y); }
+        finally { ctx.restore(); }
+      } finally { paintReleaseCanvas(field); paintReleaseCanvas(result); paintReleaseCanvas(s.roundMask); }
+    }
     function gengaDrawVectorStrokes(ctx, strokes, defaultColor) {
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
@@ -95332,10 +95376,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (Number.isFinite(Number(pts[0].w))) {
           const radii = new Array(pts.length);
           for (let j = 0; j < pts.length; j++) radii[j] = gengaScaleVectorRadius(pts[j].w, 1);
-          ctx.beginPath();
-          paintTraceVariableWidthPath(ctx, pts, radii);
-          ctx.fillStyle = color;
-          ctx.fill();
+          if (st.roundBatch === 1) gengaDrawVectorRoundBatch(ctx, pts, radii, color);
+          else {
+            ctx.beginPath(); paintTraceVariableWidthPath(ctx, pts, radii);
+            ctx.fillStyle = color; ctx.fill();
+          }
           ctx.globalAlpha = alpha;
           continue;
         }
@@ -95385,18 +95430,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // (계획문서 §3 실측: 2,000 스트로크 실시간 180ms — tldraw 도 기본 4,000 상한을 둔다).
     const GENGA_VECTOR_DIRECT_MAX = 4000;
     // 코마 썸네일은 <img src> 라 dataURL 이 필요하다. 썸네일 크기로 작게 구워 캐시에 얹는다
-    // (스트로크 배열이 바뀌면 WeakMap 항목째 죽으므로 무효화가 따라온다).
-    // ver2217 (8-7): 풀용지를 굽지 않는다 — 썸네일 크기 캔버스에 스케일 ctx 로 패스를 직접 긋는다
-    // (gengaDrawVectorStrokes 는 좌표계를 안 가려 그대로 재사용된다). 결과 문자열만 캐시한다.
+    // Render identity plus paper dimensions owns the thumbnail; canonical clones may share it.
+    // Reuse an existing paper bake; otherwise draw directly at thumbnail resolution.
+    // Thumbnail requests must never allocate a new paper-sized bake.
     function gengaVectorThumbDataUrl(strokes, pw, ph) {
-      const key = gengaVectorStrokesKey(strokes);
+      const renderKey = gengaVectorStrokesKey(strokes), key = renderKey + '|' + pw + 'x' + ph;
       const cached = gengaVectorThumbCache.get(key);
       if (cached) return cached;
       const tw = GENGA_THUMB_PX, th = Math.max(1, Math.round(GENGA_THUMB_PX * ph / Math.max(1, pw)));
       const cv = document.createElement('canvas'); cv.width = tw; cv.height = th;
       const ctx = cv.getContext('2d');
-      ctx.setTransform(tw / pw, 0, 0, th / ph, 0, 0);
-      gengaDrawVectorStrokes(ctx, strokes);
+      const baked = gengaVectorBakeCache.get(renderKey);
+      if (baked && baked.width === pw && baked.height === ph) ctx.drawImage(baked, 0, 0, tw, th);
+      else {
+        ctx.setTransform(tw / pw, 0, 0, th / ph, 0, 0);
+        gengaDrawVectorStrokes(ctx, strokes);
+      }
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       const url = cv.toDataURL('image/png');
       paintReleaseCanvas(cv);
@@ -111074,15 +111123,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!layer) return;
         const dr = gengaNearestDrawing(layer, frame);
         const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
-        // ver2217 (8-7): 벡터는 풀용지를 굽지 않는다 — 이 작은 캔버스에 스케일 ctx 로 패스를
-        // 직접 긋는다(스트로크 좌표는 용지 좌표계 그대로라 placement 개념이 없다 — 옛 else
-        // 가지가 place.x/y=0·w/h=pw/ph 로 항상 전체 채움이었던 것과 같은 결과다).
+        // Reuse only an existing paper bake; a thumbnail alone never creates one.
         const thumbVec = dr ? gengaDrawingStrokes(dr) : null;
         if (thumbVec) {
-          ctx.save();
-          ctx.setTransform(cv.width / pw, 0, 0, cv.height / ph, 0, 0);
-          gengaDrawVectorStrokes(ctx, thumbVec);
-          ctx.restore();
+          const baked = gengaVectorBakeCache.get(gengaVectorStrokesKey(thumbVec));
+          if (baked && baked.width === pw && baked.height === ph) ctx.drawImage(baked, 0, 0, cv.width, cv.height);
+          else {
+            ctx.save(); ctx.setTransform(cv.width / pw, 0, 0, cv.height / ph, 0, 0);
+            gengaDrawVectorStrokes(ctx, thumbVec); ctx.restore();
+          }
           return;
         }
         const thumbSrc = gengaLayerThumbSource(dr, drawGengaLayerThumbs);
@@ -112818,11 +112867,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // in itself, so use it and do not re-multiply tilt here.
       // ver1697: Shift 직선이면 **첫 점과 끝점 둘만** 그린다. sess.pts 는 그대로 두므로 Shift 를
       // 떼면 그 자리에서 원래 궤적이 돌아온다(콘티의 paintStrokeLineView 와 같은 계약).
-      const outPts = (sess.shiftLine === true && sess.lineEnd && sess.pts.length)
+      let outPts = (sess.shiftLine === true && sess.lineEnd && sess.pts.length)
         ? [sess.pts[0], sess.lineEnd] : (gengaDrawSession === sess ? paintArcLivePoints(sess.pts, sess.arc) : sess.pts);
       const liveHostForFill = paintIncrementalInkHost(sess, null, sess.shiftLine);
       const widthState = paintStrokeRadii(outPts, sess.penBaseWidth, sess, 1, liveHostForFill, sess.arc && outPts === sess.arc.livePoints ? sess.pts.length : outPts.length);
-      const radii = widthState.radii;
+      let radii = widthState.radii;
+      if (sess.vector) {
+        const view = gengaVectorPointView(sess, outPts, radii, liveHostForFill ? widthState.confirmedCount : 0);
+        outPts = view.pts; radii = view.radii;
+      }
       // ver1247: shared with conte's whole-path branch — this is where 原画 gained textured tips.
       // ver1337: genga의 이 버퍼는 용지 크기 그대로라 원점이 (0,0) — 그레인이 용지에 고정된다
       // ver1343: alphaFor는 세션의 정본 필드(pressure/pressureAlpha)로 판정 — tip 유무와 독립이므로
@@ -112834,7 +112887,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (sess.outlineRaf) { cancelAnimationFrame(sess.outlineRaf); sess.outlineRaf = 0; }
         gengaPenOutlineRedraw(sess); drawGengaPreview();
       } : null;
-      sess.outlineBounds = paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { onMaterialReady: onMaterialReady, roundBatch: sess.vector ? 0 : sess.roundBatch, tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, pointRevision: sess.arc ? sess.arc.revision : 0, final: gengaDrawSession !== sess, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess), dual: paintDualFrom(sess) });
+      sess.outlineBounds = paintFillVariableWidthBody(b, outPts, radii, sess.penColor, { onMaterialReady: onMaterialReady, roundBatch: sess.roundBatch, tip: paintTipOptionsFrom(sess), grain: paintGrainOptionsFrom(sess), alphaFor: paintStrokeAlphaFor(sess), mix: paintMixOptionsFrom(sess), mixBase: sess.shapeBase || null, liveHost: liveHostForFill, confirmedCount: widthState.confirmedCount, pointRevision: sess.arc ? sess.arc.revision : 0, final: gengaDrawSession !== sess, strokeKey: sess.strokeKey, flow: paintStrokeFlowVal(sess), waterEdge: paintWaterEdgeFrom(sess), dual: paintDualFrom(sess) });
       b.restore();
       // ver1617: 2値化+팁·종이결. 도형이 쓰는 그 함수와 그 rect 최적화를 그대로 쓴다(gengaShapeRedraw
       // 참고) — 용지 전체를 임계화하면 원화에서 1회 4.17ms 라 스캔 영역으로 좁히는 것이 그 자리의 규칙이다.
@@ -113141,10 +113194,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
           return;
         }
-        // ver2029 (A-3a): 벡터 세션은 픽셀이 아니라 **스트로크**를 커밋한다. 세션 캔버스는
-        // 화면에 보여 준 미리보기였을 뿐이라 그대로 버린다.
+        // Vector points remain authoritative. An eligible finalized shape uses the same
+        // saved precision/block boundaries, so its pixels can seed the disposable bake.
         if (sess.vector) {
-          gengaCommitVectorStroke(sess.layerId, sess.frame, gengaSessionToVectorStroke(sess), '原画描画');
+          gengaCommitVectorStroke(sess.layerId, sess.frame, gengaSessionToVectorStroke(sess), '原画描画',
+            sess.livePaint && sess.livePaint.roundMode && !paintWaterEdgeFrom(sess) && !paintDualFrom(sess) && sess.penColor === sess.vectorColor && !sess.shiftLine && sess.pts.length > 1 ? sess.shapeBuf : null);
           safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
           return;
         }
@@ -113478,25 +113532,36 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         layer.vector = gengaVectorLayerHasStrokes(layer);
       }, { recordingKind: 'drawing' });
     }
+    // Saved vector precision is also the live renderer's input. Retain only the proven
+    // immutable prefix; taper/pressure/Shift changes rebuild the mutable suffix.
+    function gengaVectorPointView(sess, src, radii, fixedN) {
+      let cache = sess.vectorPointView;
+      if (!cache || !sess.widthCache || cache.widths !== sess.widthCache || src.length < cache.pts.length || !fixedN) {
+        cache = sess.vectorPointView = { pts: [], radii: [], fixedN: 0, widths: sess.widthCache };
+      }
+      const from = Math.min(cache.fixedN, fixedN);
+      for (let i = from; i < src.length; i++) {
+        const p = src[i], q = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 };
+        if (Number.isFinite(Number(p.p))) q.p = Math.round(Number(p.p) * 100) / 100;
+        q.w = Math.round(gengaScaleVectorRadius(radii[i], 1) * 100) / 100;
+        cache.pts[i] = q; cache.radii[i] = gengaScaleVectorRadius(q.w, 1);
+      }
+      cache.pts.length = src.length; cache.radii.length = src.length; cache.fixedN = fixedN;
+      return cache;
+    }
     // 세션이 모은 점을 스트로크 한 벌로. 필압이 굵기에 걸려 있으면 점마다 반경(w)을 싣는다.
     function gengaSessionToVectorStroke(sess) {
       let src = (sess.pts && sess.pts.length) ? sess.pts : null;
       if (!src || !src.length) return null;
+      if (sess.shiftLine === true && sess.lineEnd) src = [src[0], sess.lineEnd];
       // ver2370: 탭(1점)은 필압대로 — 어택 캡이 낮춘 첫 점 대신 보관해 둔 원값(pFirstRaw)으로.
       // 획(2점 이상)의 머리는 캡 값이 맞다(시작 원값 dab 이 「동그라미」로 들키던 자리).
       if (src.length === 1 && sess.pFirstRaw != null) src = [{ x: src[0].x, y: src[0].y, p: sess.pFirstRaw, t: src[0].t, a: src[0].a }];
       const base = Math.max(0.5, Number(sess.penBaseWidth) || 1);
       // 라이브와 같은 굵기·들어가기/빼기 계산으로 저장할 폭을 얻는다.
-      const radii = paintStrokeRadii(src, base, sess, 1, null).radii;
-      const pts = [];
-      for (let i = 0; i < src.length; i++) {
-        const p = src[i];
-        const q = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 };
-        if (Number.isFinite(Number(p.p))) q.p = Math.round(Number(p.p) * 100) / 100;
-        q.w = Math.round(gengaScaleVectorRadius(radii[i], 1) * 100) / 100;
-        pts.push(q);
-      }
-      return { pts: pts, color: sess.vectorColor || '#111111' };
+      const widths = paintStrokeRadii(src, base, sess, 1, sess, src.length);
+      const pts = gengaVectorPointView(sess, src, widths.radii, widths.confirmedCount).pts;
+      return { pts: pts, color: sess.vectorColor || '#111111', roundBatch: 1 };
     }
     // 획 하나를 그림의 스트로크 배열에 더한다. **캐시(dataUrl/ref)는 버린다** — 판정대로
     // 스트로크가 정본이 되고, 그 덕에 좌표계가 하나로 통일된다.
@@ -113506,14 +113571,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 사라졌다**(래스터는 같은 조작에서 코마가 생긴다. 실측 재현: 빈 프레임 · 벡터 레이어 · 획 →
     // 그림 없음 + undo 스텝만 하나). 다음 스트로크 배열은 형제 gengaCommitVectorErase 와 같은
     // 관례로 **커밋 밖에서** 정한다 — 커맨드 안은 대입만.
-    function gengaCommitVectorStroke(layerId, frame, stroke, label) {
+    function gengaCommitVectorStroke(layerId, frame, stroke, label, strokeCanvas) {
       if (!stroke) return;
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
       const layer = gengaLayerById(layerId); if (!layer) return;
       const old = gengaDrawingStrokes(gengaExposureDrawing(layer, gengaExposureAt(layer, frame)));
-      const next = (old ? old.slice() : []);
-      next.push(stroke);
-      gengaCommitDrawing(layerId, frame, { w: gt.paper.w, h: gt.paper.h, strokes: next }, label || '原画描画');
+      const next = gengaNormVectorStrokes((old || []).concat([stroke]));
+      if (!next) return;
+      stroke = next[next.length - 1];
+      const pw = gt.paper.w, ph = gt.paper.h;
+      const prior = old && gengaVectorBakeCache.get(gengaVectorStrokesKey(old));
+      const bake = document.createElement('canvas'); bake.width = pw; bake.height = ph;
+      const ctx = bake.getContext('2d');
+      if (prior && prior.width === pw && prior.height === ph) {
+        ctx.drawImage(prior, 0, 0);
+      } else if (old) gengaDrawVectorStrokes(ctx, old);
+      if (strokeCanvas) ctx.drawImage(strokeCanvas, 0, 0);
+      else gengaDrawVectorStrokes(ctx, [stroke]);
+      budgetedMapSet(gengaVectorBakeCache, gengaVectorStrokesKey(next), bake, GENGA_VECTOR_BAKE_MAX_ITEMS, 'vector');
+      gengaCommitDrawing(layerId, frame, { w: pw, h: ph, strokes: next }, label || '原画描画');
     }
     // The full paper remains the ink upper bound; only the changed rectangle limits tile replacement.
     // Allow the existing AA margin around canvas composites. These edits retain synchronous tile
@@ -114119,6 +114195,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         moved++;
         const ns = { pts: np };
+        if (st.roundBatch === 1) ns.roundBatch = 1;
         if (st.color) ns.color = st.color;
         if (st.opacity != null) ns.opacity = st.opacity;
         if (Number.isFinite(Number(st.radius))) ns.radius = gengaScaleVectorRadius(st.radius, wScale);
@@ -119049,6 +119126,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             pts.push(q);
           }
           const ns = { pts: pts };
+          if (s0.roundBatch === 1) ns.roundBatch = 1;
           if (s0.color) ns.color = s0.color;
           if (s0.opacity != null) ns.opacity = s0.opacity;
           if (Number.isFinite(Number(s0.radius))) ns.radius = Math.round(gengaScaleVectorRadius(s0.radius, f) * 100) / 100;
