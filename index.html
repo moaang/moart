@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2635</title>
+  <title>MoArt ver2636</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24808,6 +24808,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2636, items: [{ ja: '速い入力の後、ペンを離すまでにたまった描点もバックグラウンドで処理し、描画完了の待ち時間を短縮しました。', ko: '빠른 입력 뒤 펜을 떼기 전 쌓인 자국도 백그라운드에서 이어 처리해 그리기 완료 대기를 줄였습니다.', en: 'Continue pending material brush work in the background when releasing the pen, reducing completion waits after rapid input.', zh: '抬笔时继续在后台处理积压的素材笔刷笔触，缩短快速输入后的绘制完成等待时间。' }] },
       { ver: 2635, items: [{ ja: '素材ブラシの描点計算をバックグラウンドに移し、速い連続入力の座標変換を軽くしました。', ko: '소재 브러시의 자국 계산을 백그라운드로 옮기고 빠른 연속 입력의 좌표 변환을 가볍게 했습니다.', en: 'Moved material brush dab calculations to the background and reduced coordinate conversion work during rapid input.', zh: '将素材笔刷的笔触计算移至后台，减少快速连续输入时的坐标转换处理量。' }] },
       { ver: 2634, items: [{ ja: '素材ブラシの色と紙質の処理をバックグラウンドに移し、描画結果を受け取る際の負荷を減らしました。', ko: '소재 브러시의 색·종이결 처리를 백그라운드로 옮겨 결과를 받을 때의 부하를 줄였습니다.', en: 'Moved material brush color and texture processing to the background to reduce load when drawing results arrive.', zh: '将素材笔刷的颜色和纸纹处理移至后台，降低接收绘制结果时的负载。' }] },
       { ver: 2633, items: [{ ja: '素材ブラシでペンを離した後の待機と、確定時の重複描画を減らしました。', ko: '소재 브러시의 펜업 후 대기와 확정 시 중복 그리기를 줄였습니다.', en: 'Reduced waiting after pen release and duplicate final rendering for material brushes.', zh: '减少了素材笔刷抬笔后的等待和确认时的重复绘制。' }] },
@@ -70174,7 +70175,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       m.timeout = setTimeout(function() { if (!m.closed && m.inflight) opts.onMaterialReady(); }, 210);
       const stats = host.materialWorkerStats || (host.materialWorkerStats = { posted: 0, published: 0, failed: 0, rasterMs: 0, geometryBytes: 0, roundTripMaxMs: 0 });
       const publish = function(result) {
-        const ending = Boolean(m.inputWait);
+        const endQueue = (m.inputWait && m.inputWait.queue) || paintInputQueueState;
+        const endEntry = endQueue && endQueue.entries[endQueue.head];
+        // Publication can win the race against the FIFO's first wait check.
+        const ending = Boolean(endQueue && !endQueue.sync && endQueue.owner === host
+          && endEntry && endEntry.event && endEntry.event.type === 'pointerup');
         clearTimeout(m.timeout); m.inflight = false;
         paintInputMaterialSettled(m);
         if (m.closed || host.livePaint !== s) { if (result.patch) result.patch.close(); if (result.tail) result.tail.close(); if (result.shaded) result.shaded.close(); return; }
@@ -70215,7 +70220,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.tailBox = plan.tailBox; s.box = plan.box; s.newBox = plan.rect; s.clean = !plan.rect;
         m.present = true; stats.published++; stats.rasterMs += result.ms;
         stats.roundTripMaxMs = Math.max(stats.roundTripMaxMs, performance.now() - m.started);
-        if (ending) {
+        if (ending && !(m.requestedN > s.done || m.requestedRevision !== s.pointRevision)) {
           // Keep this patch for the queued release. An already shaded patch only needs output;
           // otherwise its ink must be colored together with the final tail.
           s.unpresentedBox = paintBoxUnion(s.unpresentedBox, plan.rect);
@@ -70226,7 +70231,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         opts.onMaterialReady();
         // At most one outstanding job; the owner's points retain every input sample while the worker runs.
         if (m.requestedN > s.done || m.requestedRevision !== s.pointRevision) {
-          requestAnimationFrame(function() { if (!m.closed) opts.onMaterialReady(); });
+          if (ending && paintInputQueueState === endQueue && !endQueue.sync) {
+            // The release stays behind its remaining geometry. Give submission its own FIFO task
+            // instead of adding another render to this publication callback.
+            endQueue.entries.splice(endQueue.head, 0, { action: function() {
+              if (!m.closed && !endQueue.sync && paintInputQueueState === endQueue) {
+                stats.endCatchups = (stats.endCatchups || 0) + 1;
+                opts.onMaterialReady();
+              }
+            } });
+          }
+          else requestAnimationFrame(function() { if (!m.closed) opts.onMaterialReady(); });
         }
       };
       (async function() {
