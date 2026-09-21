@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2646</title>
+  <title>MoArt ver2647</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -71514,6 +71514,203 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           w, h, Number(grain.originX) || 0, Number(grain.originY) || 0, grain.rotation);
         return { tile: maskTile, canvas: bakedMask };
     }
+    function paintStrokeApplyGrain(sc, mask, grain, grainDepth, host, work) {
+      const { x: wx, y: wy, w: ww, h: wh } = work;
+      const w = sc.cv.width, h = sc.cv.height;
+      if (mask && grain.mode !== 'multiply') {
+        paintApplyGrainPixels(sc.ctx, wx, wy, ww, wh, grain, grainDepth / 100,
+          (Number(grain.originX) || 0) + wx, (Number(grain.originY) || 0) + wy, false);
+      } else if (mask) {
+        // ver2205: **destination-in 을 풀용지 스크래치에서 하지 않는다.** destination-in 은 「그리지
+        // 않은 곳의 목적지를 지우는」 전체 서피스 연산이라, clip 이 결과를 지켜도 브라우저는 서피스
+        // 전체를 다시 합성한다 — 3508×2480 실기 실측에서 이 fillRect 하나가 **매 move 55~85ms**
+        // (.sut 획마다의 턱걸림 본체, HANDOFF 1-00 6번 ★별건 ①)였다. 작업 구역 크기의 임시
+        // 캔버스로 모양을 가져와 거기서 곱하고, sc 에는 clear+source-over 로 되얹는다 — 전체 연산이
+        // 구역 크기가 되고 sc 는 GPU 경로에 남는다. 패턴 원점은 구역 이동만큼 보정한다(용지 고정
+        // 위상 불변 — 픽셀 등가는 A/B 하네스로 실측).
+        const gmW = Math.max(1, ww), gmH = Math.max(1, wh);
+        const gmTmp = host ? paintScratchCanvas(host, 'grainMaskWork', gmW, gmH)
+          : (function() { const c = document.createElement('canvas'); c.width = gmW; c.height = gmH; return c; })();
+        const gmCtx = gmTmp.getContext('2d');
+        gmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);   // 이번 구역의 모양
+        // ★ver2402: **배율을 패턴 변환이 아니라 «타일»에 굽는다** — per-dab 경로가 ver2339 에
+        //   이미 간 길이고, 그 주석이 이유를 직접 적어 두었다: 「반복 주기가 정수여야 위상이
+        //   안 어긋난다」. 획 단위 마스크만 배율을 `setTransform` 에 넣고 있었다.
+        //   그러면 반복 주기가 `타일 × k` 라 **비정수**가 되고(300 × 0.93 = 279 는 정수지만
+        //   일반 k 에서는 아니다), 게다가 오프셋은 **작업 구역 원점(wx,wy)** 이라 구역마다 위상이
+        //   **다르게** 어긋난다 — 구역 경계에 결의 이음매가 서고, 구역은 프레임마다 달라지므로
+        //   그 이음매가 **생겼다 없어졌다 옮겨 다닌다**(제보 「흰 격자가 막 생겼다 안 생겼다
+        //   이동했다 한다」). ver2397 이 배율을 28 → 93 % 로 올린 뒤 눈에 띄기 시작한 것도 맞물린다.
+        //   구운 타일은 크기가 정수라 주기가 정수이고, 변환이 평행이동뿐이라 구역이 바뀌어도
+        //   같은 픽셀이 같은 용지 좌표에 온다. **per-dab 과 획 단위가 이제 같은 규칙**이다
+        //   (종전에는 두 경로가 서로 다른 위상을 냈다 — 같은 붓인데 描点ごと 스위치로 결이 옮겨졌다).
+        const baked = paintStrokeGrainBaked(mask, grain, grainDepth, w, h);
+        const maskTile = baked.tile, bakedMask = baked.canvas;
+        if (bakedMask) {
+          gmCtx.globalCompositeOperation = 'destination-in';
+          gmCtx.drawImage(bakedMask, wx, wy, ww, wh, 0, 0, ww, wh);
+          gmCtx.globalCompositeOperation = 'source-over';
+        } else {
+        // 폴백 — 패턴을 못 만들면 종전 길로 간다(값을 지어내지 않는다).
+        const pat = gmCtx.createPattern(maskTile, 'repeat');
+        if (pat) {
+          // 용지 좌표 기준으로 타일을 놓는다 — 배율은 타일에 구워졌으므로 **평행이동만** 남는다.
+          if (typeof DOMMatrix === 'function' && pat.setTransform) {
+            pat.setTransform(paintGrainPatternTransform(grain.rotation, (Number(grain.originX) || 0) + wx, (Number(grain.originY) || 0) + wy));
+          }
+          gmCtx.globalCompositeOperation = 'destination-in';
+          gmCtx.fillStyle = pat;
+          gmCtx.fillRect(0, 0, ww, wh);
+          gmCtx.globalCompositeOperation = 'source-over';
+        }
+        }
+        // 곱해진 구역을 되얹는다 — 작업 구역 밖은 방금 클리어했거나(전체) clip 이 지키고 있다(증분).
+        sc.ctx.clearRect(wx, wy, ww, wh);
+        sc.ctx.drawImage(gmTmp, 0, 0, ww, wh, wx, wy, ww, wh);
+      }
+    }
+    function paintStrokeApplyDual(sc, pts, color, dual, host, work) {
+      const { x: wx, y: wy, w: ww, h: wh } = work;
+      // ── ver2584: 2-ブラシ 곱하기(native 5절) ─────────────────────────────────────
+      // 출력 = round(메인 α × 보조 획 α / 255). 보조 획 = 같은 경로에 보조 크기의 원형 자국(AA 등급은 paintDabEllipse 의
+      // CSP 커널)을 보조 자동 간격(크기 × 비율, 1px 하한)으로 over 로 쌓은 띠 — 크기 연동 OFF 라 필압과 무관한 상수 반경,
+      // 첫 자국은 누른 점. 마스크는 획 전체의 함수라(보조 반경이 메인보다 크면 뒤 자국이 앞 픽셀을 덮는다) 증분을 끄고
+      // (incOk) 작업 구역 전체를 다시 만든다 — 수채 경계와 같은 이유. 곱은 구역 크기 임시 캔버스에서(destination-in 을
+      // 풀용지 스크래치에 걸지 않는다 — 위 그레인 블록의 ver2205 사유).
+      if (dual && ww > 0 && wh > 0 && pts.length) {
+        const dmTmp = host ? paintScratchCanvas(host, 'dualMaskWork', ww, wh)
+          : (function() { const c = document.createElement('canvas'); c.width = ww; c.height = wh; return c; })();
+        const dmCtx = dmTmp.getContext('2d');
+        dmCtx.setTransform(1, 0, 0, 1, 0, 0); dmCtx.globalCompositeOperation = 'source-over'; dmCtx.filter = 'none';
+        dmCtx.clearRect(0, 0, ww, wh);
+        dmCtx.globalAlpha = dual.flow / 100;
+        dmCtx.fillStyle = '#000000';
+        paintDualMaskDabs(dmCtx, pts, dual, wx, wy);
+        dmCtx.globalAlpha = 1;
+        if (dual.mode === 'multiply') {
+          dmCtx.globalCompositeOperation = 'source-in';   // 색은 메인 획, α = 메인 × 마스크
+          dmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
+          dmCtx.globalCompositeOperation = 'source-over';
+          sc.ctx.clearRect(wx, wy, ww, wh);
+          sc.ctx.drawImage(dmTmp, 0, 0, ww, wh, wx, wy, ww, wh);
+        } else {
+          // ver2595: 다른 適用方法 — 픽셀마다 α' = f(m, d)(PAINT_DUAL_MODE_FNS, native 2595). 색은 메인 획의 것이고 보조 획만 있는
+          // 픽셀(m = 0, 합집합 계열)은 획 색으로 태어난다; 획 색의 알파는 보조 α 에 곱한다. 읽기는 수채 경계와 같은 읽기용 스크래치로.
+          const rc = paintWaterEdgeReader(ww, wh), fn = paintDualModeFn(dual.mode);
+          if (rc && fn) {
+            rc.globalCompositeOperation = 'copy';
+            rc.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
+            rc.globalCompositeOperation = 'source-over';
+            let mi = null, di = null;
+            try { mi = rc.getImageData(0, 0, ww, wh); di = dmCtx.getImageData(0, 0, ww, wh); } catch (e) { mi = di = null; }
+            if (mi && di) {
+              const md = mi.data, dd = di.data, col = paintDualColorRgb(color), ca = col[3];
+              for (let i = 0; i < md.length; i += 4) {
+                const m0 = md[i + 3], d0 = dd[i + 3];
+                if (!m0 && !d0) continue;
+                const a = fn(m0 / 255, d0 * ca / 255);
+                const val = a <= 0 ? 0 : (a >= 1 ? 255 : Math.round(a * 255));
+                if (val === m0) continue;
+                if (!m0 && val) { md[i] = col[0]; md[i + 1] = col[1]; md[i + 2] = col[2]; }
+                md[i + 3] = val;
+              }
+              rc.putImageData(mi, 0, 0);
+              sc.ctx.clearRect(wx, wy, ww, wh);
+              sc.ctx.drawImage(rc.canvas, 0, 0, ww, wh, wx, wy, ww, wh);
+            }
+          }
+        }
+      }
+    }
+    function paintStrokeApplyWaterEdge(sc, color, wEdge, host, work, wEdgeBlurPx, gboxBlurPad) {
+      const { x: wx, y: wy, w: ww, h: wh } = work;
+      const w = sc.cv.width, h = sc.cv.height;
+      // ── ver2393: 水彩境界 ─────────────────────────────────────────────────────────
+      // 완성된 획 모양의 **가장자리 안쪽 R px 띠**를 한 번 더 겹쳐 진하게 한다.
+      //  · 침식: Canvas2D 에 erode 가 없으므로 **8 방향 offset 의 destination-in 교집합**으로 만든다.
+      //    프레임마다 작업 구역 전체를 처리한다. dab 단위 종이결과는 별도 비용이다.
+      //  · 띠 = 모양 − 침식(destination-out). 그 띠를 알파 `fill` 로 모양 위에 source-over 하면
+      //    a' = a + (1−a)·fill 이 되어 실측(본체 0.506 → 띠 0.682)이 그대로 재현된다.
+      //  · 띠의 알파는 획 모양에서 얻고 색은 아래에서 현재 획 색으로 채운다.
+      // 수채 경계일 때 incOk가 부분 후처리를 막는다. 획 전체의 원래 알파에 종이결을 적용한
+      // sc를 읽어야 한다. paintStrokeWantsWholePath는 이 함수로 보내는 판정이며,
+      // liveHost의 dab 누적이나 sc.reused를 끄는 판정은 아니다.
+      if (wEdge && wEdge.csp && ww > 0 && wh > 0) {
+        // ver2585: CSP 의 픽셀 식(native 6절). 작업 구역을 ceil(範囲)+1(ver2599: + 흐림 반경) 만큼 넓혀 읽기용 스크래치로 복사해 고치고
+        // (paintWaterEdgeCsp), 작업 구역 몫만 되얹는다 — 넓힌 자리는 거리를 바르게 재려고 읽은 것이다(ver2394 의 격자 사고).
+        const wPad = Math.ceil(wEdge.radius) + 1 + gboxBlurPad;   // ver2599: 흐림 꼬리까지 읽는다(작업 구역을 넓힌 폭과 같다)
+        const px0 = Math.max(0, wx - wPad), py0 = Math.max(0, wy - wPad);
+        const px1 = Math.min(w, wx + ww + wPad), py1 = Math.min(h, wy + wh + wPad);
+        const eW = px1 - px0, eH = py1 - py0;
+        const rc = (eW > 0 && eH > 0) ? paintWaterEdgeReader(eW, eH) : null;
+        if (rc) {
+          rc.globalCompositeOperation = 'copy';
+          rc.drawImage(sc.cv, px0, py0, eW, eH, 0, 0, eW, eH);
+          rc.globalCompositeOperation = 'source-over';
+          let img = null;
+          try { img = rc.getImageData(0, 0, eW, eH); } catch (e) { img = null; }
+          if (img && paintWaterEdgeCsp(img.data, eW, eH, 4, 3, wEdge.radius, wEdge.power, wEdge.value, wEdgeBlurPx, color)) {
+            rc.putImageData(img, 0, 0);
+            sc.ctx.clearRect(wx, wy, ww, wh);
+            sc.ctx.drawImage(rc.canvas, wx - px0, wy - py0, ww, wh, wx, wy, ww, wh);
+          }
+        }
+      } else if (wEdge && ww > 2 && wh > 2) {
+        // ★ver2394: **작업 구역보다 R 만큼 넓게 읽는다.** ver2393 은 구역(wx,wy,ww,wh)만 읽어 침식했는데,
+        //   구역 밖은 빈 픽셀이라 **구역 경계가 「획의 가장자리」로 오인**되어 거기에 띠가 생겼다.
+        //   그 구역은 타일 경계로 정렬돼 있으므로(ver2207) 화면에는 **격자 무늬**로 나타난다 —
+        //   제보 「이상한 선들 뭐임? 에러같음」의 정체이고, ver2393 이 낸 회귀다.
+        //   여유는 침식 반경이면 충분하다(그 밖의 픽셀은 침식 결과에 닿지 않는다). 캔버스 밖으로는
+        //   못 나가므로 clamp 하고, 잘린 만큼은 그 자리가 정말 캔버스 끝이라 오인이 아니다.
+        const wPad = Math.ceil(wEdge.radius) + 1;
+        const px0 = Math.max(0, wx - wPad), py0 = Math.max(0, wy - wPad);
+        const px1 = Math.min(w, wx + ww + wPad), py1 = Math.min(h, wy + wh + wPad);
+        const eW = Math.max(1, px1 - px0), eH = Math.max(1, py1 - py0);
+        const inX = wx - px0, inY = wy - py0;   // 확장 캔버스 안에서 작업 구역의 자리
+        const weTmp = function(key) {
+          return host ? paintScratchCanvas(host, key, eW, eH)
+            : (function() { const c = document.createElement('canvas'); c.width = eW; c.height = eH; return c; })();
+        };
+        const weReset = function(c) {
+          const x = c.getContext('2d');
+          x.setTransform(1, 0, 0, 1, 0, 0); x.globalCompositeOperation = 'source-over';
+          x.globalAlpha = 1; x.filter = 'none'; x.clearRect(0, 0, eW, eH); return x;
+        };
+        // ★ 침식을 **획 그림 자체**로 하면 안 된다: `destination-in` 은 알파를 **곱하므로**
+        //   반투명한 획(잉크 장 본체 α≈0.5)을 8 번 겹치면 α⁹ ≈ 0 이 되어 침식본이 통째로
+        //   사라지고, 그러면 띠 = 획 전체가 되어 **획이 균일하게 진해진다**(첫 판이 그랬다 —
+        //   실측 단면이 115 → 136 으로 봉우리 없이 평행이동했다). 그래서 먼저 알파를 **포화**시킨
+        //   마스크를 만들고 침식·차집합은 그 위에서 한다. 낮은 알파는 여전히 반투명할 수 있다.
+        const satCtx = weReset(weTmp('waterEdgeSat'));
+        for (let k = 0; k < 8; k += 1) satCtx.drawImage(sc.cv, px0, py0, eW, eH, 0, 0, eW, eH);
+        const satTmp = satCtx.canvas;
+        const eroCtx = weReset(weTmp('waterEdgeEro'));
+        eroCtx.drawImage(satTmp, 0, 0);
+        const R = wEdge.radius, D = R * 0.70710678;
+        const offs = [[R, 0], [-R, 0], [0, R], [0, -R], [D, D], [D, -D], [-D, D], [-D, -D]];
+        eroCtx.globalCompositeOperation = 'destination-in';
+        for (let oi = 0; oi < offs.length; oi += 1) eroCtx.drawImage(satTmp, offs[oi][0], offs[oi][1]);
+        eroCtx.globalCompositeOperation = 'source-over';
+        // 띠 마스크 = 포화본 − 침식본. 그 위를 획 색으로 채운다 — **불투명한 띠**여야
+        //   source-over 가 a' = a + (1−a)·fill 을 내고 실측(본체 0.506 → 띠 0.682)과 맞는다.
+        //   획 그림을 그대로 겹치면 실효 알파가 a·fill 이 되어 절반밖에 안 오른다.
+        //   혼색 획은 색이 픽셀마다 다르지만 띠는 가장자리라 본체 색과 거의 같다(근사임을 적어 둔다).
+        // 침식이 끝나면 포화 마스크를 다시 읽지 않는다. 같은 버퍼에서 띠를 만들어 사본을 없앤다.
+        const bndCtx = satCtx;
+        bndCtx.globalCompositeOperation = 'destination-out';
+        bndCtx.drawImage(eroCtx.canvas, 0, 0);
+        bndCtx.globalCompositeOperation = 'source-in';
+        bndCtx.fillStyle = color || '#111111';
+        bndCtx.fillRect(0, 0, eW, eH);
+        bndCtx.globalCompositeOperation = 'source-over';
+        // 되얹는 것은 **작업 구역 몫만**이다 — 여유분은 침식을 바르게 하려고 읽은 것이고, 그 자리는
+        // 이번 프레임의 clip 밖이라 건드리면 안 된다(증분에서 지난 결과를 덮는다).
+        const prevWe = sc.ctx.globalAlpha;
+        sc.ctx.globalAlpha = prevWe * wEdge.fill;
+        sc.ctx.drawImage(bndCtx.canvas, inX, inY, ww, wh, wx, wy, ww, wh);
+        sc.ctx.globalAlpha = prevWe;
+      }
+    }
     function paintFillVariableWidthBody(ctx, pts, radii, color, opts) {
       opts = opts || {};
       const diagOn = (typeof paintDiagCur !== 'undefined') && paintDiagCur;   // ver2399: typeof 가드(골든 자립성)
@@ -71689,201 +71886,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           paintFillVariableWidthShape(sc.ctx, pts, radii, color, tip);
         }
       }
-      if (mask && grain.mode !== 'multiply') {
-        paintApplyGrainPixels(sc.ctx, wx, wy, ww, wh, grain, grainDepth / 100,
-          (Number(grain.originX) || 0) + wx, (Number(grain.originY) || 0) + wy, false);
-      } else if (mask) {
-        // ver2205: **destination-in 을 풀용지 스크래치에서 하지 않는다.** destination-in 은 「그리지
-        // 않은 곳의 목적지를 지우는」 전체 서피스 연산이라, clip 이 결과를 지켜도 브라우저는 서피스
-        // 전체를 다시 합성한다 — 3508×2480 실기 실측에서 이 fillRect 하나가 **매 move 55~85ms**
-        // (.sut 획마다의 턱걸림 본체, HANDOFF 1-00 6번 ★별건 ①)였다. 작업 구역 크기의 임시
-        // 캔버스로 모양을 가져와 거기서 곱하고, sc 에는 clear+source-over 로 되얹는다 — 전체 연산이
-        // 구역 크기가 되고 sc 는 GPU 경로에 남는다. 패턴 원점은 구역 이동만큼 보정한다(용지 고정
-        // 위상 불변 — 픽셀 등가는 A/B 하네스로 실측).
-        const gmW = Math.max(1, ww), gmH = Math.max(1, wh);
-        const gmTmp = opts.liveHost ? paintScratchCanvas(opts.liveHost, 'grainMaskWork', gmW, gmH)
-          : (function() { const c = document.createElement('canvas'); c.width = gmW; c.height = gmH; return c; })();
-        const gmCtx = gmTmp.getContext('2d');
-        gmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);   // 이번 구역의 모양
-        // ★ver2402: **배율을 패턴 변환이 아니라 «타일»에 굽는다** — per-dab 경로가 ver2339 에
-        //   이미 간 길이고, 그 주석이 이유를 직접 적어 두었다: 「반복 주기가 정수여야 위상이
-        //   안 어긋난다」. 획 단위 마스크만 배율을 `setTransform` 에 넣고 있었다.
-        //   그러면 반복 주기가 `타일 × k` 라 **비정수**가 되고(300 × 0.93 = 279 는 정수지만
-        //   일반 k 에서는 아니다), 게다가 오프셋은 **작업 구역 원점(wx,wy)** 이라 구역마다 위상이
-        //   **다르게** 어긋난다 — 구역 경계에 결의 이음매가 서고, 구역은 프레임마다 달라지므로
-        //   그 이음매가 **생겼다 없어졌다 옮겨 다닌다**(제보 「흰 격자가 막 생겼다 안 생겼다
-        //   이동했다 한다」). ver2397 이 배율을 28 → 93 % 로 올린 뒤 눈에 띄기 시작한 것도 맞물린다.
-        //   구운 타일은 크기가 정수라 주기가 정수이고, 변환이 평행이동뿐이라 구역이 바뀌어도
-        //   같은 픽셀이 같은 용지 좌표에 온다. **per-dab 과 획 단위가 이제 같은 규칙**이다
-        //   (종전에는 두 경로가 서로 다른 위상을 냈다 — 같은 붓인데 描点ごと 스위치로 결이 옮겨졌다).
-        const baked = paintStrokeGrainBaked(mask, grain, grainDepth, w, h);
-        const maskTile = baked.tile, bakedMask = baked.canvas;
-        if (bakedMask) {
-          gmCtx.globalCompositeOperation = 'destination-in';
-          gmCtx.drawImage(bakedMask, wx, wy, ww, wh, 0, 0, ww, wh);
-          gmCtx.globalCompositeOperation = 'source-over';
-        } else {
-        // 폴백 — 패턴을 못 만들면 종전 길로 간다(값을 지어내지 않는다).
-        const pat = gmCtx.createPattern(maskTile, 'repeat');
-        if (pat) {
-          // 용지 좌표 기준으로 타일을 놓는다 — 배율은 타일에 구워졌으므로 **평행이동만** 남는다.
-          if (typeof DOMMatrix === 'function' && pat.setTransform) {
-            pat.setTransform(paintGrainPatternTransform(grain.rotation, (Number(grain.originX) || 0) + wx, (Number(grain.originY) || 0) + wy));
-          }
-          gmCtx.globalCompositeOperation = 'destination-in';
-          gmCtx.fillStyle = pat;
-          gmCtx.fillRect(0, 0, ww, wh);
-          gmCtx.globalCompositeOperation = 'source-over';
-        }
-        }
-        // 곱해진 구역을 되얹는다 — 작업 구역 밖은 방금 클리어했거나(전체) clip 이 지키고 있다(증분).
-        sc.ctx.clearRect(wx, wy, ww, wh);
-        sc.ctx.drawImage(gmTmp, 0, 0, ww, wh, wx, wy, ww, wh);
-      }
-      // ── ver2584: 2-ブラシ 곱하기(native 5절) ─────────────────────────────────────
-      // 출력 = round(메인 α × 보조 획 α / 255). 보조 획 = 같은 경로에 보조 크기의 원형 자국(AA 등급은 paintDabEllipse 의
-      // CSP 커널)을 보조 자동 간격(크기 × 비율, 1px 하한)으로 over 로 쌓은 띠 — 크기 연동 OFF 라 필압과 무관한 상수 반경,
-      // 첫 자국은 누른 점. 마스크는 획 전체의 함수라(보조 반경이 메인보다 크면 뒤 자국이 앞 픽셀을 덮는다) 증분을 끄고
-      // (incOk) 작업 구역 전체를 다시 만든다 — 수채 경계와 같은 이유. 곱은 구역 크기 임시 캔버스에서(destination-in 을
-      // 풀용지 스크래치에 걸지 않는다 — 위 그레인 블록의 ver2205 사유).
-      const dual = opts.dual;
-      if (dual && ww > 0 && wh > 0 && pts.length) {
-        const dmTmp = opts.liveHost ? paintScratchCanvas(opts.liveHost, 'dualMaskWork', ww, wh)
-          : (function() { const c = document.createElement('canvas'); c.width = ww; c.height = wh; return c; })();
-        const dmCtx = dmTmp.getContext('2d');
-        dmCtx.setTransform(1, 0, 0, 1, 0, 0); dmCtx.globalCompositeOperation = 'source-over'; dmCtx.filter = 'none';
-        dmCtx.clearRect(0, 0, ww, wh);
-        dmCtx.globalAlpha = dual.flow / 100;
-        dmCtx.fillStyle = '#000000';
-        paintDualMaskDabs(dmCtx, pts, dual, wx, wy);
-        dmCtx.globalAlpha = 1;
-        if (dual.mode === 'multiply') {
-          dmCtx.globalCompositeOperation = 'source-in';   // 색은 메인 획, α = 메인 × 마스크
-          dmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
-          dmCtx.globalCompositeOperation = 'source-over';
-          sc.ctx.clearRect(wx, wy, ww, wh);
-          sc.ctx.drawImage(dmTmp, 0, 0, ww, wh, wx, wy, ww, wh);
-        } else {
-          // ver2595: 다른 適用方法 — 픽셀마다 α' = f(m, d)(PAINT_DUAL_MODE_FNS, native 2595). 색은 메인 획의 것이고 보조 획만 있는
-          // 픽셀(m = 0, 합집합 계열)은 획 색으로 태어난다; 획 색의 알파는 보조 α 에 곱한다. 읽기는 수채 경계와 같은 읽기용 스크래치로.
-          const rc = paintWaterEdgeReader(ww, wh), fn = paintDualModeFn(dual.mode);
-          if (rc && fn) {
-            rc.globalCompositeOperation = 'copy';
-            rc.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);
-            rc.globalCompositeOperation = 'source-over';
-            let mi = null, di = null;
-            try { mi = rc.getImageData(0, 0, ww, wh); di = dmCtx.getImageData(0, 0, ww, wh); } catch (e) { mi = di = null; }
-            if (mi && di) {
-              const md = mi.data, dd = di.data, col = paintDualColorRgb(color), ca = col[3];
-              for (let i = 0; i < md.length; i += 4) {
-                const m0 = md[i + 3], d0 = dd[i + 3];
-                if (!m0 && !d0) continue;
-                const a = fn(m0 / 255, d0 * ca / 255);
-                const val = a <= 0 ? 0 : (a >= 1 ? 255 : Math.round(a * 255));
-                if (val === m0) continue;
-                if (!m0 && val) { md[i] = col[0]; md[i + 1] = col[1]; md[i + 2] = col[2]; }
-                md[i + 3] = val;
-              }
-              rc.putImageData(mi, 0, 0);
-              sc.ctx.clearRect(wx, wy, ww, wh);
-              sc.ctx.drawImage(rc.canvas, 0, 0, ww, wh, wx, wy, ww, wh);
-            }
-          }
-        }
-      }
-      // ── ver2393: 水彩境界 ─────────────────────────────────────────────────────────
-      // 완성된 획 모양의 **가장자리 안쪽 R px 띠**를 한 번 더 겹쳐 진하게 한다.
-      //  · 침식: Canvas2D 에 erode 가 없으므로 **8 방향 offset 의 destination-in 교집합**으로 만든다.
-      //    프레임마다 작업 구역 전체를 처리한다. dab 단위 종이결과는 별도 비용이다.
-      //  · 띠 = 모양 − 침식(destination-out). 그 띠를 알파 `fill` 로 모양 위에 source-over 하면
-      //    a' = a + (1−a)·fill 이 되어 실측(본체 0.506 → 띠 0.682)이 그대로 재현된다.
-      //  · 띠의 알파는 획 모양에서 얻고 색은 아래에서 현재 획 색으로 채운다.
-      // 수채 경계일 때 incOk가 부분 후처리를 막는다. 획 전체의 원래 알파에 종이결을 적용한
-      // sc를 읽어야 한다. paintStrokeWantsWholePath는 이 함수로 보내는 판정이며,
-      // liveHost의 dab 누적이나 sc.reused를 끄는 판정은 아니다.
-      const wEdge = opts.waterEdge;
-      if (wEdge && wEdge.csp && ww > 0 && wh > 0) {
-        // ver2585: CSP 의 픽셀 식(native 6절). 작업 구역을 ceil(範囲)+1(ver2599: + 흐림 반경) 만큼 넓혀 읽기용 스크래치로 복사해 고치고
-        // (paintWaterEdgeCsp), 작업 구역 몫만 되얹는다 — 넓힌 자리는 거리를 바르게 재려고 읽은 것이다(ver2394 의 격자 사고).
-        const wPad = Math.ceil(wEdge.radius) + 1 + gboxBlurPad;   // ver2599: 흐림 꼬리까지 읽는다(작업 구역을 넓힌 폭과 같다)
-        const px0 = Math.max(0, wx - wPad), py0 = Math.max(0, wy - wPad);
-        const px1 = Math.min(w, wx + ww + wPad), py1 = Math.min(h, wy + wh + wPad);
-        const eW = px1 - px0, eH = py1 - py0;
-        const rc = (eW > 0 && eH > 0) ? paintWaterEdgeReader(eW, eH) : null;
-        if (rc) {
-          rc.globalCompositeOperation = 'copy';
-          rc.drawImage(sc.cv, px0, py0, eW, eH, 0, 0, eW, eH);
-          rc.globalCompositeOperation = 'source-over';
-          let img = null;
-          try { img = rc.getImageData(0, 0, eW, eH); } catch (e) { img = null; }
-          if (img && paintWaterEdgeCsp(img.data, eW, eH, 4, 3, wEdge.radius, wEdge.power, wEdge.value, wEdgeBlurPx, color)) {
-            rc.putImageData(img, 0, 0);
-            sc.ctx.clearRect(wx, wy, ww, wh);
-            sc.ctx.drawImage(rc.canvas, wx - px0, wy - py0, ww, wh, wx, wy, ww, wh);
-          }
-        }
-      } else if (wEdge && ww > 2 && wh > 2) {
-        // ★ver2394: **작업 구역보다 R 만큼 넓게 읽는다.** ver2393 은 구역(wx,wy,ww,wh)만 읽어 침식했는데,
-        //   구역 밖은 빈 픽셀이라 **구역 경계가 「획의 가장자리」로 오인**되어 거기에 띠가 생겼다.
-        //   그 구역은 타일 경계로 정렬돼 있으므로(ver2207) 화면에는 **격자 무늬**로 나타난다 —
-        //   제보 「이상한 선들 뭐임? 에러같음」의 정체이고, ver2393 이 낸 회귀다.
-        //   여유는 침식 반경이면 충분하다(그 밖의 픽셀은 침식 결과에 닿지 않는다). 캔버스 밖으로는
-        //   못 나가므로 clamp 하고, 잘린 만큼은 그 자리가 정말 캔버스 끝이라 오인이 아니다.
-        const wPad = Math.ceil(wEdge.radius) + 1;
-        const px0 = Math.max(0, wx - wPad), py0 = Math.max(0, wy - wPad);
-        const px1 = Math.min(w, wx + ww + wPad), py1 = Math.min(h, wy + wh + wPad);
-        const eW = Math.max(1, px1 - px0), eH = Math.max(1, py1 - py0);
-        const inX = wx - px0, inY = wy - py0;   // 확장 캔버스 안에서 작업 구역의 자리
-        const weTmp = function(key) {
-          return opts.liveHost ? paintScratchCanvas(opts.liveHost, key, eW, eH)
-            : (function() { const c = document.createElement('canvas'); c.width = eW; c.height = eH; return c; })();
-        };
-        const weReset = function(c) {
-          const x = c.getContext('2d');
-          x.setTransform(1, 0, 0, 1, 0, 0); x.globalCompositeOperation = 'source-over';
-          x.globalAlpha = 1; x.filter = 'none'; x.clearRect(0, 0, eW, eH); return x;
-        };
-        // ★ 침식을 **획 그림 자체**로 하면 안 된다: `destination-in` 은 알파를 **곱하므로**
-        //   반투명한 획(잉크 장 본체 α≈0.5)을 8 번 겹치면 α⁹ ≈ 0 이 되어 침식본이 통째로
-        //   사라지고, 그러면 띠 = 획 전체가 되어 **획이 균일하게 진해진다**(첫 판이 그랬다 —
-        //   실측 단면이 115 → 136 으로 봉우리 없이 평행이동했다). 그래서 먼저 알파를 **포화**시킨
-        //   마스크를 만들고 침식·차집합은 그 위에서 한다. 낮은 알파는 여전히 반투명할 수 있다.
-        const satCtx = weReset(weTmp('waterEdgeSat'));
-        for (let k = 0; k < 8; k += 1) satCtx.drawImage(sc.cv, px0, py0, eW, eH, 0, 0, eW, eH);
-        const satTmp = satCtx.canvas;
-        const eroCtx = weReset(weTmp('waterEdgeEro'));
-        eroCtx.drawImage(satTmp, 0, 0);
-        const R = wEdge.radius, D = R * 0.70710678;
-        const offs = [[R, 0], [-R, 0], [0, R], [0, -R], [D, D], [D, -D], [-D, D], [-D, -D]];
-        eroCtx.globalCompositeOperation = 'destination-in';
-        for (let oi = 0; oi < offs.length; oi += 1) eroCtx.drawImage(satTmp, offs[oi][0], offs[oi][1]);
-        eroCtx.globalCompositeOperation = 'source-over';
-        // 띠 마스크 = 포화본 − 침식본. 그 위를 획 색으로 채운다 — **불투명한 띠**여야
-        //   source-over 가 a' = a + (1−a)·fill 을 내고 실측(본체 0.506 → 띠 0.682)과 맞는다.
-        //   획 그림을 그대로 겹치면 실효 알파가 a·fill 이 되어 절반밖에 안 오른다.
-        //   혼색 획은 색이 픽셀마다 다르지만 띠는 가장자리라 본체 색과 거의 같다(근사임을 적어 둔다).
-        // 침식이 끝나면 포화 마스크를 다시 읽지 않는다. 같은 버퍼에서 띠를 만들어 사본을 없앤다.
-        const bndCtx = satCtx;
-        bndCtx.globalCompositeOperation = 'destination-out';
-        bndCtx.drawImage(eroCtx.canvas, 0, 0);
-        bndCtx.globalCompositeOperation = 'source-in';
-        bndCtx.fillStyle = color || '#111111';
-        bndCtx.fillRect(0, 0, eW, eH);
-        bndCtx.globalCompositeOperation = 'source-over';
-        // 되얹는 것은 **작업 구역 몫만**이다 — 여유분은 침식을 바르게 하려고 읽은 것이고, 그 자리는
-        // 이번 프레임의 clip 밖이라 건드리면 안 된다(증분에서 지난 결과를 덮는다).
-        const prevWe = sc.ctx.globalAlpha;
-        sc.ctx.globalAlpha = prevWe * wEdge.fill;
-        sc.ctx.drawImage(bndCtx.canvas, inX, inY, ww, wh, wx, wy, ww, wh);
-        sc.ctx.globalAlpha = prevWe;
-      }
+      // Effect order is part of the pixel contract. These helpers share the existing scratch.
+      const work = { x: wx, y: wy, w: ww, h: wh };
+      paintStrokeApplyGrain(sc, mask, grain, grainDepth, opts.liveHost, work);
+      paintStrokeApplyDual(sc, pts, color, opts.dual, opts.liveHost, work);
+      paintStrokeApplyWaterEdge(sc, color, opts.waterEdge, opts.liveHost, work, wEdgeBlurPx, gboxBlurPad);
       sc.ctx.restore();   // ver1629: clip 해제
       const prevAlpha = ctx.globalAlpha;
       if (flatAlpha !== 1) ctx.globalAlpha = prevAlpha * flatAlpha; // ver1346: 장이 없을 때의 물러섬
       // A ready worker patch needs output but no repeated postprocessing. Include it with the new tail.
       // Other callers clear their destination and still need the whole stroke.
       const output = paintStrokeOutputBlit(ctx, sc.cv, { x: bx, y: by, w: bw, h: bh }, opts.outputHost,
-        incOk && flatAlpha === 1 ? paintBoxUnion({ x: wx, y: wy, w: ww, h: wh }, s.outputDirty) : undefined);
+        incOk && flatAlpha === 1 ? paintBoxUnion(work, s.outputDirty) : undefined);
       ctx.globalAlpha = prevAlpha;
       return output;
       } finally {   // ver2399: 진단
@@ -72163,6 +72177,158 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const thickness = Number(tip.thick);
       return flow * Math.min(1, 3 * (spacing > 0 ? spacing : 0.15) / (thickness > 0 ? thickness : 1));
     }
+    function paintInkSessionInit(s, host, ctx, opts, tipImage) {
+      const w = s.w, h = s.h, color = s.color;
+      // live holds geometry that still needs a following point; opts.final below ends that hold.
+      s.walk = { seg: 0, carry: 0, dabIndex: 0, firstEmitted: false, live: Boolean(host), cacheTail: false,
+        dabCache: host ? { entries: new Map(), bytes: 0 } : null };
+      s.av = [];
+      s.done = 0; s.roundFixed = 0;
+      s.alphaConverted = false;
+      s.tailBox = null;   // ver2341: 굳히지 않은 꼬리가 지금 어디 있나(백업 캔버스는 재사용한다)
+      s.tailMix = null;
+      s.box = null; // ver1370: 이 스트로크가 장에서 실제로 건드린 범위(휘도→알파를 JS로 옮길 때의 작업 구역)
+      s.newBox = null; // ver1629: **이번 호출**에 새로 찍은 범위(그레인 증분 합성의 작업 구역)
+      // ver1625: 혼색. **아래 색은 여기서 한 번만 읽는다** — 세션 수명이 곧 획 수명이라 이 자리가
+      // 「획 시작 전」의 유일한 정의다.
+      // ver1710: 그 캔버스를 **호출부가 넘긴다**(opts.mixBase). 종전에는 여기서 host 객체의 필드를
+      // 뒤졌는데(host.modeBaseCanvas || host.shapeBase), host 는 「증분 잉크 세션을 이어 그릴
+      // 주인」이지 「아래 색이 있는 캔버스」가 아니다 — **다른 명제를 한 값으로 겸했다.** 도형과
+      // Shift 직선은 host 를 넘기면 그림이 굳으므로(ver1699) 반드시 null 인데, 그 순간 아래 색까지
+      // 같이 사라져 매 프레임 씻기는 빈 버퍼를 물었다. 콘티 자유선은 미리보기만 host 를 넘기고
+      // 커밋은 안 넘겨서 **둘이 다른 아래 색을 봤다**(ver1452 가 2値化에서 고친 것과 같은 계열).
+      // 못 받으면 ctx.canvas — 재베이크는 ctx 자체가 순서대로 그려지는 중이라 그것이 곧 아래 색이다.
+      // 혼색은 같은 세션의 별도 색 장을 사용한다.
+      s.mixTipFor = (opts.mix && (tipImage || opts.mix.model === 'csp'))   // ver2586: CSP 모델은 원형 팁도 장의 마스크로 줍는다
+        ? paintMixerMake(opts.mixBase || ctx.canvas, w, h, color, opts.mix)
+        : null;
+      // ver1627: 잉크 모드(筆圧→不透明度)에서 혼색을 쓰려면 색이 픽셀마다 달라야 하는데, 잉크 장은
+      // 회색조 한 장이라 **마지막에 한 색으로** 채우는 구조였다 — 그래서 ver1625 는 둘을 배타로 뒀다.
+      // 여기서 색 장을 한 장 더 들면 그 제약이 사라진다: 알파는 잉크 장, RGB 는 색 장.
+      // 브러시 원색으로 **불투명하게** 시작하는 것이 요점이다. 비워 두면 팁 가장자리처럼 알파가 낮은
+      // 곳에서 source-in 이 알파를 한 번 더 곱해 ver1350 의 「제곱 문제」가 그대로 재현된다.
+      if (s.inkMode && !s.roundMode && s.mixTipFor) {
+        if (!s.colorField) s.colorField = document.createElement('canvas');
+        if (s.colorField.width !== w) s.colorField.width = w;
+        if (s.colorField.height !== h) s.colorField.height = h;
+        s.colorCtx = s.colorField.getContext('2d');
+        s.colorCtx.setTransform(1, 0, 0, 1, 0, 0);
+        s.colorCtx.globalAlpha = 1;
+        s.colorCtx.globalCompositeOperation = 'source-over';
+        s.colorCtx.filter = 'none';
+        s.colorCtx.fillStyle = color || '#111111';
+        s.colorCtx.fillRect(0, 0, w, h);
+      } else { s.colorField = null; s.colorCtx = null; }
+      const c0 = s.cv.getContext('2d');
+      c0.setTransform(1, 0, 0, 1, 0, 0);
+      c0.globalAlpha = 1;
+      c0.globalCompositeOperation = 'source-over';
+      c0.filter = 'none';
+      // 잉크 장은 **불투명 검정**에서 시작한다(값 0). 이 불투명이 합성을 정확하게 만든다 —
+      // flow 100 이면 lighten(=max), 100 미만이면 screen(=1-(1-a)^N 누적). ver1784 가 그 분기를 넣었다.
+      if (s.inkMode) { c0.fillStyle = '#000'; c0.fillRect(0, 0, w, h); }
+      else c0.clearRect(0, 0, w, h);
+    }
+    function paintInkSessionRoundStep(s, cx, pts, radii, confirmN, host, opts) {
+      const w = s.w, h = s.h, n = pts.length;
+      const prevTail = paintInkTailRestore(s, cx);
+      const from = s.roundFixed;
+      // Union consumers need an explicit full rectangle; null here means no affected pixels.
+      const dirty = paintStrokeScratchBox(null, pts, radii, w, h, true, null, from);
+      s.newBox = paintBoxUnion(dirty, prevTail);
+      if (dirty) {
+        const box = s.box;
+        s.box = { x0: Math.min(box ? box.x0 : dirty.x, dirty.x), y0: Math.min(box ? box.y0 : dirty.y, dirty.y),
+          x1: Math.max(box ? box.x1 : 0, dirty.x + dirty.w), y1: Math.max(box ? box.y1 : 0, dirty.y + dirty.h) };
+      }
+      // Fixed point boundaries, independent of event/rAF grouping. Partial AA overlap is
+      // max-composited per block on an opaque field, then colored by the common alpha path.
+      const fixedTo = Math.floor(Math.max(0, confirmN - 1) / 128) * 128;
+      for (let at = from; at < fixedTo; at += 128) paintRoundBatch(s, cx, pts, radii, at, at + 129);
+      s.roundFixed = fixedTo;
+      if (fixedTo < n - 1 || n === 1) {
+        if (host && !opts.final) paintInkTailBackup(s, pts, radii, fixedTo + 1, w, h);
+        paintRoundBatch(s, cx, pts, radii, fixedTo, n);
+      }
+      return Boolean(dirty || prevTail);
+    }
+    function paintInkSessionStampStep(s, cx, pts, radii, opts, tipImage, confirmN) {
+      const w = s.w, h = s.h, flow = s.flow;
+      const tailHold = confirmN < pts.length;
+      const ribbon = Boolean(opts.tip && opts.tip.ribbon);
+      const confirmedPts = ribbon && tailHold ? pts.slice(0, confirmN) : pts;
+      const confirmedRadii = ribbon && tailHold ? radii.slice(0, confirmN) : radii;
+      let cvChanged = false;
+      const grainPD = s.grainPD, n = pts.length;
+      // ver2341: 지난 프레임 꼬리를 되돌리고 → 확정 구간만 이어 찍고 → 꼬리를 새로 찍는다.
+      const prevTail = paintInkTailRestore(s, cx);
+      // 계산에 필요한 뒤 이웃은 보존하고, 실제로 찍을 끝만 제한한다.
+      if (s.walk.dabCache) {
+        if (!s.walk.dabCache.keepKeys) s.walk.dabCache.keepKeys = new Set();
+        else s.walk.dabCache.keepKeys.clear();
+      }
+      s.walk.pointLimit = confirmN;
+      const b = paintStampInkField(cx, confirmedPts, confirmedRadii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);
+      let tb = null;
+      if (tailHold) {
+        paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
+        // 진행량은 복사한다. 점에서 유도한 접선 캐시는 공유해 확정 구간도 뒤 이웃의 방향을 본다.
+        tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }), s.mixTipFor, s.colorCtx, flow, grainPD);
+      }
+      // 확정한 마스크는 다시 쓰지 않는다. 이번 임시 꼬리에 필요한 것만 남긴다.
+      paintInkDabCachePrune(s.walk.dabCache);
+      const b2 = (b && tb)
+        ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) }
+        : (b || tb);
+      // ver1629: 스탬퍼가 돌려주는 것이 **이번 호출이 건드린 범위**다 — 그레인 증분이 다시 만들
+      // 구역이 정확히 이것이다. s.box 는 그것들의 합집합(스트로크 전체)이라 쓰임이 다르다.
+      // ver2341: 되돌린 지난 꼬리 자리도 이번 프레임에 다시 만들어야 한다(그 자리가 바뀌었다).
+      s.newBox = paintBoxUnion(b2 ? paintStrokeScratchBox(b2, null, null, w, h, true) : null, prevTail);
+      if (prevTail) cvChanged = true;   // 되돌리기 자체가 s.cv 를 바꿨다
+      if (b2) {
+        // ver2302: b2 = 실제 찍은 좌표 범위. 캔버스와 겹칠 때만 변화다(밖은 클립되어 s.cv 불변).
+        if (b2.x1 > 0 && b2.y1 > 0 && b2.x0 < w && b2.y0 < h) cvChanged = true;
+        s.box = s.box
+          ? { x0: Math.min(s.box.x0, b2.x0), y0: Math.min(s.box.y0, b2.y0),
+              x1: Math.max(s.box.x1, b2.x1), y1: Math.max(s.box.y1, b2.y1) }
+          : b2;
+      }
+      return cvChanged;
+    }
+    function paintInkSessionTipStep(s, cx, pts, radii, opts, tipImage, confirmN) {
+      const w = s.w, h = s.h, flow = s.flow;
+      const tailHold = confirmN < pts.length;
+      const ribbon = Boolean(opts.tip && opts.tip.ribbon);
+      const confirmedPts = ribbon && tailHold ? pts.slice(0, confirmN) : pts;
+      const confirmedRadii = ribbon && tailHold ? radii.slice(0, confirmN) : radii;
+      let cvChanged = false;
+      const color = s.color, n = pts.length;
+      // ver2341: 잉크 장 분기와 **같은 순서** — 되돌리고 · 확정만 찍고 · 꼬리를 새로 찍는다.
+      const prevTail = paintInkTailRestore(s, cx);
+      // ver1629: 이번에 새로 들어온 점들의 범위 = 이번 프레임에 dab 이 찍힐 범위. 직전 점 하나를
+      // 포함해야 한다 — dab 은 **점과 점 사이**에 놓이므로, 새 점만 재면 그 앞 구간이 빠진다.
+      const from = Math.max(0, s.done - 1);
+      s.newBox = paintBoxUnion(paintStrokeScratchBox(null, pts, radii, w, h, true, null, from), prevTail);
+      // ver2302: 이번 구간이 캔버스에 닿는가(위 배너). raw 상자의 x/y 는 0 클램프라 항상 ≥0 이므로
+      // 우하단 검사만 남고, 좌상단 밖은 raw 자체가 null 이다.
+      const rawBox = paintStrokeScratchBox(null, pts, radii, 1e9, 1e9, false, null, from);
+      if (rawBox && rawBox.x < w && rawBox.y < h) cvChanged = true;
+      if (prevTail) cvChanged = true;   // 되돌리기 자체가 s.cv 를 바꿨다
+      // ver1625: 혼색이면 dab 마다 틴트하므로 **원본 팁**을 넘긴다(미리 틴트하면 그 색을 다시
+      // 덮어쓰는 헛일이 된다). 아니면 종전대로 한 번 틴트한 한 장.
+      // ver2589: a ribbon never mixes (piece chain, not dabs — paintStampTexturedPath), so it takes the tinted tip even
+      // with a mixer; it used to get the raw material (black) whenever mixing was on.
+      const tipSrc = (s.mixTipFor && !(opts.tip && opts.tip.ribbon)) ? tipImage : paintTintedTip(tipImage, color);
+      s.walk.pointLimit = confirmN;
+      paintStampTexturedPath(cx, confirmedPts, confirmedRadii, tipSrc, opts.tip, s.walk, s.mixTipFor, flow);
+      if (tailHold) {
+        paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
+        paintStampTexturedPath(cx, pts, radii, tipSrc, opts.tip, Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }), s.mixTipFor, flow);
+        s.newBox = paintBoxUnion(s.newBox, s.tailBox);
+        cvChanged = true;
+      }
+      return cvChanged;
+    }
     function paintInkSessionStep(host, ctx, pts, radii, color, opts) {
       if (host && host.materialFinal) opts = Object.assign({}, opts, { final: true });
       const n = pts.length;
@@ -72215,55 +72381,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         s.coverageMode = coverage; s.coverageValid = false;
         s.w = w; s.h = h; s.color = color; s.tipId = tipId; s.inkMode = fieldMode; s.roundMode = roundMode; s.flow = flow;   // ver1784
         s.grainKey = grainKey;   // ver2303
-        // live holds geometry that still needs a following point; opts.final below ends that hold.
-        s.walk = { seg: 0, carry: 0, dabIndex: 0, firstEmitted: false, live: Boolean(host), cacheTail: false,
-          dabCache: host ? { entries: new Map(), bytes: 0 } : null };
-        s.av = [];
-        s.done = 0; s.roundFixed = 0;
-        s.alphaConverted = false;
-        s.tailBox = null;   // ver2341: 굳히지 않은 꼬리가 지금 어디 있나(백업 캔버스는 재사용한다)
-        s.tailMix = null;
-        s.box = null; // ver1370: 이 스트로크가 장에서 실제로 건드린 범위(휘도→알파를 JS로 옮길 때의 작업 구역)
-        s.newBox = null; // ver1629: **이번 호출**에 새로 찍은 범위(그레인 증분 합성의 작업 구역)
-        // ver1625: 혼색. **아래 색은 여기서 한 번만 읽는다** — 세션 수명이 곧 획 수명이라 이 자리가
-        // 「획 시작 전」의 유일한 정의다.
-        // ver1710: 그 캔버스를 **호출부가 넘긴다**(opts.mixBase). 종전에는 여기서 host 객체의 필드를
-        // 뒤졌는데(host.modeBaseCanvas || host.shapeBase), host 는 「증분 잉크 세션을 이어 그릴
-        // 주인」이지 「아래 색이 있는 캔버스」가 아니다 — **다른 명제를 한 값으로 겸했다.** 도형과
-        // Shift 직선은 host 를 넘기면 그림이 굳으므로(ver1699) 반드시 null 인데, 그 순간 아래 색까지
-        // 같이 사라져 매 프레임 씻기는 빈 버퍼를 물었다. 콘티 자유선은 미리보기만 host 를 넘기고
-        // 커밋은 안 넘겨서 **둘이 다른 아래 색을 봤다**(ver1452 가 2値化에서 고친 것과 같은 계열).
-        // 못 받으면 ctx.canvas — 재베이크는 ctx 자체가 순서대로 그려지는 중이라 그것이 곧 아래 색이다.
-        // 혼색은 같은 세션의 별도 색 장을 사용한다.
-        s.mixTipFor = (opts.mix && (tipImage || opts.mix.model === 'csp'))   // ver2586: CSP 모델은 원형 팁도 장의 마스크로 줍는다
-          ? paintMixerMake(opts.mixBase || ctx.canvas, w, h, color, opts.mix)
-          : null;
-        // ver1627: 잉크 모드(筆圧→不透明度)에서 혼색을 쓰려면 색이 픽셀마다 달라야 하는데, 잉크 장은
-        // 회색조 한 장이라 **마지막에 한 색으로** 채우는 구조였다 — 그래서 ver1625 는 둘을 배타로 뒀다.
-        // 여기서 색 장을 한 장 더 들면 그 제약이 사라진다: 알파는 잉크 장, RGB 는 색 장.
-        // 브러시 원색으로 **불투명하게** 시작하는 것이 요점이다. 비워 두면 팁 가장자리처럼 알파가 낮은
-        // 곳에서 source-in 이 알파를 한 번 더 곱해 ver1350 의 「제곱 문제」가 그대로 재현된다.
-        if (inkMode && s.mixTipFor) {
-          if (!s.colorField) s.colorField = document.createElement('canvas');
-          if (s.colorField.width !== w) s.colorField.width = w;
-          if (s.colorField.height !== h) s.colorField.height = h;
-          s.colorCtx = s.colorField.getContext('2d');
-          s.colorCtx.setTransform(1, 0, 0, 1, 0, 0);
-          s.colorCtx.globalAlpha = 1;
-          s.colorCtx.globalCompositeOperation = 'source-over';
-          s.colorCtx.filter = 'none';
-          s.colorCtx.fillStyle = color || '#111111';
-          s.colorCtx.fillRect(0, 0, w, h);
-        } else { s.colorField = null; s.colorCtx = null; }
-        const c0 = s.cv.getContext('2d');
-        c0.setTransform(1, 0, 0, 1, 0, 0);
-        c0.globalAlpha = 1;
-        c0.globalCompositeOperation = 'source-over';
-        c0.filter = 'none';
-        // 잉크 장은 **불투명 검정**에서 시작한다(값 0). 이 불투명이 합성을 정확하게 만든다 —
-        // flow 100 이면 lighten(=max), 100 미만이면 screen(=1-(1-a)^N 누적). ver1784 가 그 분기를 넣었다.
-        if (fieldMode) { c0.fillStyle = '#000'; c0.fillRect(0, 0, w, h); }
-        else c0.clearRect(0, 0, w, h);
+        paintInkSessionInit(s, host, ctx, opts, tipImage);
       }
       const unpresentedBox = canResume ? s.unpresentedBox : null;
       const unpresentedShaded = unpresentedBox && s.unpresentedShaded && s.key != null
@@ -72280,9 +72398,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const ribbon = Boolean(opts.tip && opts.tip.ribbon);
       const confirmN = host && !opts.final ? (ribbon ? Math.max(0, n - PAINT_RIBBON_TAIL_HOLD)
         : Math.max(0, Math.min(n, Number(opts.confirmedCount) || 0))) : n;
-      const tailHold = confirmN < n;
-      const confirmedPts = ribbon && tailHold ? pts.slice(0, confirmN) : pts;
-      const confirmedRadii = ribbon && tailHold ? radii.slice(0, confirmN) : radii;
       const pointRevision = opts.pointRevision || 0;
       const movedTail = pointRevision !== s.pointRevision;
       const grew = n > s.done || movedTail || Boolean(opts.final) !== s.final;
@@ -72298,26 +72413,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 리셋(canResume 실패)은 clear/fill 로 이미 s.cv 를 바꿨으므로 그 자체가 변화다.
       let cvChanged = !canResume;
       if (roundMode && grew) {
-        const prevTail = paintInkTailRestore(s, cx);
-        const from = s.roundFixed;
-        // Union consumers need an explicit full rectangle; null here means no affected pixels.
-        const dirty = paintStrokeScratchBox(null, pts, radii, w, h, true, null, from);
-        s.newBox = paintBoxUnion(dirty, prevTail);
-        if (dirty) {
-          const box = s.box;
-          s.box = { x0: Math.min(box ? box.x0 : dirty.x, dirty.x), y0: Math.min(box ? box.y0 : dirty.y, dirty.y),
-            x1: Math.max(box ? box.x1 : 0, dirty.x + dirty.w), y1: Math.max(box ? box.y1 : 0, dirty.y + dirty.h) };
-        }
-        // Fixed point boundaries, independent of event/rAF grouping. Partial AA overlap is
-        // max-composited per block on an opaque field, then colored by the common alpha path.
-        const fixedTo = Math.floor(Math.max(0, confirmN - 1) / 128) * 128;
-        for (let at = from; at < fixedTo; at += 128) paintRoundBatch(s, cx, pts, radii, at, at + 129);
-        s.roundFixed = fixedTo;
-        if (fixedTo < n - 1 || n === 1) {
-          if (host && !opts.final) paintInkTailBackup(s, pts, radii, fixedTo + 1, w, h);
-          paintRoundBatch(s, cx, pts, radii, fixedTo, n);
-        }
-        cvChanged = Boolean(dirty || prevTail) || cvChanged;
+        cvChanged = paintInkSessionRoundStep(s, cx, pts, radii, confirmN, host, opts) || cvChanged;
       } else if (roundMode) s.newBox = null;
       else if (inkMode) {
         // alphaFor 없이도 팁·종이결·혼색·coverage가 필드를 켠다. 그때는 필압 알파를 1로 둔다.
@@ -72329,70 +72425,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const raw = Number(alphaOf(pts[i].p, pts[i].t));
           s.av[i] = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 1;
         }
+        // Worker publication owns progress while delegated. Never run the synchronous finish below.
         if (paintMaterialWorkerStep(s, host, cx, pts, radii, opts, tipImage, confirmN, grew)) return s;
         // ver1370: 찍은 범위를 세션에 누적한다. 증분 호출이라 한 번의 반환은 **그 프레임에 새로 찍은
         // dab**의 범위뿐이므로, 스트로크 전체 범위는 여기서 합집합으로 쌓아야 한다. 휘도→알파를 JS로
         // 옮겨야 하는 브라우저(iOS/WebKit)에서 훑을 구역이 이것 — 캔버스 전체가 아니라 획이 지나간 곳만.
         if (grew) {
-          // ver2341: 지난 프레임 꼬리를 되돌리고 → 확정 구간만 이어 찍고 → 꼬리를 새로 찍는다.
-          const prevTail = paintInkTailRestore(s, cx);
-          // 계산에 필요한 뒤 이웃은 보존하고, 실제로 찍을 끝만 제한한다.
-          if (s.walk.dabCache) {
-            if (!s.walk.dabCache.keepKeys) s.walk.dabCache.keepKeys = new Set();
-            else s.walk.dabCache.keepKeys.clear();
-          }
-          s.walk.pointLimit = confirmN;
-          const b = paintStampInkField(cx, confirmedPts, confirmedRadii, opts.tip, tipImage, s.av, s.walk, s.mixTipFor, s.colorCtx, flow, grainPD);
-          let tb = null;
-          if (tailHold) {
-            paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
-            // 진행량은 복사한다. 점에서 유도한 접선 캐시는 공유해 확정 구간도 뒤 이웃의 방향을 본다.
-            tb = paintStampInkField(cx, pts, radii, opts.tip, tipImage, s.av, Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }), s.mixTipFor, s.colorCtx, flow, grainPD);
-          }
-          // 확정한 마스크는 다시 쓰지 않는다. 이번 임시 꼬리에 필요한 것만 남긴다.
-          paintInkDabCachePrune(s.walk.dabCache);
-          const b2 = (b && tb)
-            ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) }
-            : (b || tb);
-          // ver1629: 스탬퍼가 돌려주는 것이 **이번 호출이 건드린 범위**다 — 그레인 증분이 다시 만들
-          // 구역이 정확히 이것이다. s.box 는 그것들의 합집합(스트로크 전체)이라 쓰임이 다르다.
-          // ver2341: 되돌린 지난 꼬리 자리도 이번 프레임에 다시 만들어야 한다(그 자리가 바뀌었다).
-          s.newBox = paintBoxUnion(b2 ? paintStrokeScratchBox(b2, null, null, w, h, true) : null, prevTail);
-          if (prevTail) cvChanged = true;   // 되돌리기 자체가 s.cv 를 바꿨다
-          if (b2) {
-            // ver2302: b2 = 실제 찍은 좌표 범위. 캔버스와 겹칠 때만 변화다(밖은 클립되어 s.cv 불변).
-            if (b2.x1 > 0 && b2.y1 > 0 && b2.x0 < w && b2.y0 < h) cvChanged = true;
-            s.box = s.box
-              ? { x0: Math.min(s.box.x0, b2.x0), y0: Math.min(s.box.y0, b2.y0),
-                  x1: Math.max(s.box.x1, b2.x1), y1: Math.max(s.box.y1, b2.y1) }
-              : b2;
-          }
+          cvChanged = paintInkSessionStampStep(s, cx, pts, radii, opts, tipImage, confirmN) || cvChanged;
         } else s.newBox = null;
       } else if (grew) {
-        // ver2341: 잉크 장 분기와 **같은 순서** — 되돌리고 · 확정만 찍고 · 꼬리를 새로 찍는다.
-        const prevTail = paintInkTailRestore(s, cx);
-        // ver1629: 이번에 새로 들어온 점들의 범위 = 이번 프레임에 dab 이 찍힐 범위. 직전 점 하나를
-        // 포함해야 한다 — dab 은 **점과 점 사이**에 놓이므로, 새 점만 재면 그 앞 구간이 빠진다.
-        const from = Math.max(0, s.done - 1);
-        s.newBox = paintBoxUnion(paintStrokeScratchBox(null, pts, radii, w, h, true, null, from), prevTail);
-        // ver2302: 이번 구간이 캔버스에 닿는가(위 배너). raw 상자의 x/y 는 0 클램프라 항상 ≥0 이므로
-        // 우하단 검사만 남고, 좌상단 밖은 raw 자체가 null 이다.
-        const rawBox = paintStrokeScratchBox(null, pts, radii, 1e9, 1e9, false, null, from);
-        if (rawBox && rawBox.x < w && rawBox.y < h) cvChanged = true;
-        if (prevTail) cvChanged = true;   // 되돌리기 자체가 s.cv 를 바꿨다
-        // ver1625: 혼색이면 dab 마다 틴트하므로 **원본 팁**을 넘긴다(미리 틴트하면 그 색을 다시
-        // 덮어쓰는 헛일이 된다). 아니면 종전대로 한 번 틴트한 한 장.
-        // ver2589: a ribbon never mixes (piece chain, not dabs — paintStampTexturedPath), so it takes the tinted tip even
-        // with a mixer; it used to get the raw material (black) whenever mixing was on.
-        const tipSrc = (s.mixTipFor && !(opts.tip && opts.tip.ribbon)) ? tipImage : paintTintedTip(tipImage, color);
-        s.walk.pointLimit = confirmN;
-        paintStampTexturedPath(cx, confirmedPts, confirmedRadii, tipSrc, opts.tip, s.walk, s.mixTipFor, flow);
-        if (tailHold) {
-          paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
-          paintStampTexturedPath(cx, pts, radii, tipSrc, opts.tip, Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }), s.mixTipFor, flow);
-          s.newBox = paintBoxUnion(s.newBox, s.tailBox);
-          cvChanged = true;
-        }
+        cvChanged = paintInkSessionTipStep(s, cx, pts, radii, opts, tipImage, confirmN) || cvChanged;
       } else s.newBox = null;
       if (unpresentedShaded) s.outputDirty = unpresentedBox;
       else if (unpresentedBox) { s.newBox = paintBoxUnion(s.newBox, unpresentedBox); cvChanged = true; }
