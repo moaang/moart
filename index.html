@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2653</title>
+  <title>MoArt ver2654</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24777,6 +24777,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2654, items: [{ ja: 'サブレイヤーからコマの長さや位置を変えるときも、グループ全体のプレビューが一緒に動くよう修正しました。ドラッグ中の重複処理も減らしました。', ko: '서브레이어에서 코마 길이·위치를 바꿀 때 그룹 전체의 미리보기가 함께 움직이도록 수정했습니다. 드래그 중 반복 처리도 줄였습니다.', en: 'Fixed grouped timing previews when dragging from a sub-layer, and reduced repeated work during timeline drags.', zh: '修复从子图层拖动时的整组曝光预览，并减少时间轴拖动中的重复处理。' }] },
       { ver: 2653, items: [{ ja: 'レイヤーの並べ替えで、古い挿入線が重なる表示を整理しました。移動中の行から下の文字が透ける問題も修正しました。', ko: '레이어 정렬에 옛 삽입선이 겹치는 표시를 정리했습니다. 이동 중인 행 아래로 다른 글자가 비치던 문제도 수정했습니다.', en: 'Removed overlapping insertion lines during layer sorting and prevented underlying controls from showing through dragged rows.', zh: '清理了图层排序时重叠的旧插入线，并修复拖动行透出下方文字的问题。' }] },
       { ver: 2651, items: [{ ja: 'セリフブロックと原画・コンテのレイヤーを、周囲の行が移動先を示すドラッグで並べ替えられます。順序は離した時だけ確定し、原画の移動中の位置計算を減らしました。', ko: '대사 블록과 원화·콘티 레이어를 주변 행이 자리를 보여주는 드래그로 정렬합니다. 놓을 때만 순서를 확정하며 원화 드래그 중 위치 계산을 줄였습니다.', en: 'Dialogue blocks and animation/storyboard layers now show neighboring rows shifting during drag sorting. Order changes only on drop, with fewer position calculations during animation-layer drags.', zh: '对白块和原画、分镜图层支持拖动排序，邻近行会预览插入位置。仅在松开时确认顺序，并减少原画图层拖动中的位置计算。' }] },
       { ver: 2650, items: [{ ja: '動画の音声が欠けたまま完了する問題を修正しました。音声エンコーダーの対応確認、AAC設定、処理待ち・再試行を改善しました。', ko: '영상에서 음성이 누락된 채 완료되던 문제를 수정했습니다. 오디오 인코더 지원 확인, AAC 설정, 처리 대기·재시도를 개선했습니다.', en: 'Fixed video exports completing with missing audio. Improved audio capability checks, AAC configuration, processing waits and retries.', zh: '修复视频在音频缺失时仍完成导出的问题，改进音频编码支持检测、AAC配置、处理等待与重试。' }] },
@@ -106854,20 +106855,27 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!ids.length && layerId != null) ids.push(String(layerId));
       renderGengaView(null, { scope: 'partial', layerIds: ids, audio: false });
     }
-    // ver931: real-time drag mirror — the OTHER lanes in layerId's セルサブレイヤー group (if any), resolved
-    // ONCE at drag-start. Every koma-drag pointermove tick then just WRITES a few extra inline styles onto
-    // these already-captured elements (same shape as the existing earlier/later/prevEl capture right below
-    // this function) — cost scales with the group's own member count, never with total layer count or
-    // timeline length, and never triggers renderGengaView(); the commit-time runCommand()'s existing
-    // updateGengaCelGroupsAfterEdit + keyed row refresh makes the result durable.
-    // Returns [] (zero cost) for the vast majority of layers, which aren't in any group.
-    function gengaCelGroupDragMirrorLanes(layerId) {
-      const layer = gengaLayerById(layerId);
-      if (!layer || !layer.cellGroupId) return [];
-      return gengaCelGroupMembers(state.project.gengaTimeline, layerId)
-        .filter(function(m) { return String(m.id) !== String(layerId); })
-        .map(function(m) { return document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(String(m.id)) + '"]'); })
-        .filter(Boolean);
+    // Exposure IDs are shared inside a cel group: resolve cards within each member lane, never globally.
+    // Capture DOM and behavior-label widths before any preview writes. One map then owns every member's
+    // preview, including the pressed lane, for single, ripple and whole-region drags.
+    function gengaCaptureExposureDragPreview(layerId, placeholders) {
+      const cards = new Map();
+      const lanes = gengaCelGroupMembers(state.project.gengaTimeline, layerId).map(function(member) {
+        const lane = gengaLaneEl(member.id);
+        if (!lane) return null; // unmounted member: commit rendering owns its next mount
+        lane.querySelectorAll('.genga-exp[data-genga-exp]').forEach(function(el) {
+          const id = el.getAttribute('data-genga-exp');
+          if (!cards.has(id)) cards.set(id, []);
+          cards.get(id).push(el);
+        });
+        const pre = lane.querySelector('.genga-postbehavior[data-genga-behavior="pre"]');
+        return { box: lane.querySelector('.genga-content-box'), pre: pre,
+          post: lane.querySelector('.genga-postbehavior[data-genga-behavior="post"]'), preWidth: pre ? pre.offsetWidth : 0,
+          placeholders: placeholders ? Array.from(lane.querySelectorAll('.genga-exp-empty')).map(function(el) {
+            return { el: el, left: parseFloat(getComputedStyle(el).left) || 0 };
+          }) : [] };
+      }).filter(Boolean);
+      return { cards: cards, lanes: lanes };
     }
     function gengaNextCelSubLayerName(gt, refLayer) {
       const baseName = String(refLayer.name || 'Layer').replace(/-\d+$/, '');
@@ -118639,7 +118647,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const layerObj = gengaLayerById(layerId);
       const sorted = layerObj ? gengaSortedExposures(layerObj) : [];
       const sIdx = sorted.findIndex(function(x) { return String(x.id) === String(expId); });
+      const preview = gengaCaptureExposureDragPreview(layerId, false);
       gengaExpDrag = {
+        preview: preview, blocks: preview.cards.get(String(expId)) || [],
         block: block, layerId: layerId, expId: expId,
         mode: expZone,   // ver1588: 핸들 클래스 직접 판정이었다 — 이제 gengaExpZoneAt 한 곳이 정한다
         startX: ev.clientX, origStart: exp.startFrame, origHold: exp.holdFrames,
@@ -118647,21 +118657,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver804: the head handle may now eat THROUGH earlier komas (the sheet tool: the left handle changes the cell
         // count without changing layer timing), so every earlier koma needs a live preview, not just prev.
         earlier: (sIdx >= 0 ? sorted.slice(0, sIdx) : []).map(function(x) {
-          return { id: String(x.id), startFrame: x.startFrame, holdFrames: x.holdFrames,
-            el: document.querySelector('#gengaStage .genga-exp[data-genga-exp="' + cssEscapeValue(String(x.id)) + '"]') };
+          return { id: String(x.id), startFrame: x.startFrame, holdFrames: x.holdFrames, els: preview.cards.get(String(x.id)) || [] };
         }),
-        later: sIdx >= 0 ? sorted.slice(sIdx + 1).map(function(x) { return { id: String(x.id), origStart: x.startFrame, holdFrames: x.holdFrames, el: document.querySelector('#gengaStage .genga-exp[data-genga-exp="' + cssEscapeValue(String(x.id)) + '"]') }; }) : []
+        later: sIdx >= 0 ? sorted.slice(sIdx + 1).map(function(x) { return { id: String(x.id), origStart: x.startFrame, holdFrames: x.holdFrames, els: preview.cards.get(String(x.id)) || [] }; }) : []
       };
-      // ver931: real-time セルサブレイヤー mirror — same element-capture shape as earlier/later/prevEl above,
-      // just against each sibling lane instead of this one.
-      gengaExpDrag.mirrorLanes = gengaCelGroupDragMirrorLanes(layerId).map(function(lane) {
-        return {
-          lane: lane,
-          block: lane.querySelector('.genga-exp[data-genga-exp="' + cssEscapeValue(String(expId)) + '"]'),
-          earlier: gengaExpDrag.earlier.map(function(x) { return { el: lane.querySelector('.genga-exp[data-genga-exp="' + cssEscapeValue(x.id) + '"]') }; }),
-          later: gengaExpDrag.later.map(function(x) { return { el: lane.querySelector('.genga-exp[data-genga-exp="' + cssEscapeValue(x.id) + '"]') }; })
-        };
-      });
       // ver990: document+BUBBLE strand — the shape this drag has always had, kept verbatim. The kernel adds
       // owning-pointer filtering, so a palm landing mid-drag can no longer steer a koma or end the gesture on
       // its own release. Commit and cancel both route through gengaExpPointerUp because it owns three modes'
@@ -118670,9 +118669,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       beginDragStrand(ev, {
         key: 'genga-koma-drag',
         on: 'document',
+        raf: true,
         onMove: gengaExpPointerMove,
         onCancel: function() { gengaExpPointerUp({ type: 'pointercancel' }); },
-        onCommit: function() { gengaExpPointerUp({ type: 'pointerup' }); }
+        onCommit: function(ue) { gengaExpPointerMove(ue); gengaExpPointerUp(ue); }
       });
       // ver2607: 여기 있던 gengaArmRippleHold 호출도 코마 카드의 단일 홀드 소유자가 가졌다 —
       // 잠금 레이어·리사이즈 핸들에서 먼저 리턴하는 이 함수 안에서는 메뉴를 열 길이 없었다.
@@ -118731,28 +118731,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       out.set(String(d.expId), self);
       return { out: out, self: self };
     }
-    // ver2268: 코마를 끄는 두 경로(단일 `gengaExpPointerMove` · 다중 `gengaBatchDragMove`)가 레인의
-    // 내용 상자와 전/후 거동 표식을 **글자까지 같은 몸**으로 옮기고 있었다. 갈림값은 레인·범위·셀 폭뿐이다.
-    function gengaApplyLaneBoxAndBehavior(targetLane, minStart, maxEnd, cw) {
-      const box = targetLane.querySelector('.genga-content-box');
-      if (box && minStart !== Infinity) { box.style.left = ((minStart - 1) * cw) + 'px'; box.style.width = ((maxEnd - minStart + 1) * cw) + 'px'; }
-      const postBtn = targetLane.querySelector('.genga-postbehavior[data-genga-behavior="post"]');
-      if (postBtn) postBtn.style.left = (maxEnd * cw) + 'px'; // ver530: post notation starts at the cell after the last koma
-      const preBtn = targetLane.querySelector('.genga-postbehavior[data-genga-behavior="pre"]');
-      if (preBtn) preBtn.style.left = ((minStart - 1) * cw - (preBtn.offsetWidth || cw)) + 'px'; // right-anchored: end at the cell before the first koma
+    // Single and batch drags use the same captured lane controls; no read after preview style writes.
+    function gengaApplyLaneBoxAndBehavior(preview, minStart, maxEnd, cw) {
+      preview.lanes.forEach(function(row) {
+        if (row.box && minStart !== Infinity) { row.box.style.left = ((minStart - 1) * cw) + 'px'; row.box.style.width = ((maxEnd - minStart + 1) * cw) + 'px'; }
+        if (row.post) row.post.style.left = (maxEnd * cw) + 'px';
+        if (row.pre) row.pre.style.left = ((minStart - 1) * cw - (row.preWidth || cw)) + 'px';
+      });
     }
     function gengaExpPointerMove(ev) {
       // ver2607: 여기 있던 무장 가드를 지운다 — 무장이 gengaExpDrag 를 null 로 만드므로 아래 줄과 같은 말이었다.
       const d = gengaExpDrag; if (!d) return;
       const cw = gengaCelW();
       const delta = gengaCelDelta(ev.clientX - d.startX);
-      const mirrors = d.mirrorLanes || []; // ver931: [] for the vast majority of (non-grouped) layers — zero cost
+      if (d.previewDelta === delta && (d.mode !== 'move' || d.previewY === ev.clientY)) return;
+      d.previewDelta = delta; d.previewY = ev.clientY;
+      // Cross-lane hit testing reads layout, so do it before changing card geometry.
+      if (d.mode === 'move') gengaCrossLayerDragTrack(d, ev, [d.block]);
       if (d.mode === 'tail') {
         // exposure handle: extend/shrink this koma's hold; LATER komas ripple along (both directions)
         d.nextHold = Math.max(1, d.origHold + delta);
         const w = (d.nextHold * cw - 1) + 'px';
-        d.block.style.width = w;
-        mirrors.forEach(function(m) { if (m.block) m.block.style.width = w; });
+        d.blocks.forEach(function(el) { el.style.width = w; });
         // ver2336: 뒤 코마는 자리를 비켜 줘야만 움직인다 — 커밋과 **같은 두 함수**를 부른다.
         // 빈 칸 수는 드래그 중 안 변하므로 첫 move 에서 한 번만 잰다.
         if (d.gapAfter == null) {
@@ -118761,12 +118761,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         const shift = gengaTailRippleShift(d.nextHold - d.origHold, d.gapAfter);
         d.tailShift = shift;
-        (d.later || []).forEach(function(b, i) {
+        (d.later || []).forEach(function(b) {
           const left = ((b.origStart + shift - 1) * cw + 1) + 'px';
-          if (b.el) b.el.style.left = left;
-          mirrors.forEach(function(m) { const me = m.later[i] && m.later[i].el; if (me) me.style.left = left; });
+          b.els.forEach(function(el) { el.style.left = left; });
         });
-            } else if (d.mode === 'head') {
+      } else if (d.mode === 'head') {
         // ver1122: everything the head handle does is decided by gengaHeadDragLayout — see its note. Here we
         // only paint that layout: the self card, then every earlier/later card (and their cel-group mirrors).
         const layout = gengaHeadDragLayout(d, delta);
@@ -118774,23 +118773,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         d.selfGone = !!layout.self.gone;
         d.nextStart = layout.self.gone ? d.origStart : layout.self.start;
         d.nextHold = layout.self.gone ? 0 : layout.self.hold;
-        const paint = function(el, mirrorEls, spec) {
-          if (!el || !spec) return;
-          if (spec.gone) { el.style.display = 'none'; (mirrorEls || []).forEach(function(me) { if (me) me.style.display = 'none'; }); return; }
+        const paint = function(els, spec) {
+          if (!spec) return;
           const left = ((spec.start - 1) * cw + 1) + 'px', width = (Math.max(1, spec.hold) * cw - 1) + 'px';
-          el.style.display = ''; el.style.left = left; el.style.width = width;
-          (mirrorEls || []).forEach(function(me) { if (me) { me.style.display = ''; me.style.left = left; me.style.width = width; } });
+          els.forEach(function(el) {
+            el.style.display = spec.gone ? 'none' : '';
+            if (!spec.gone) { el.style.left = left; el.style.width = width; }
+          });
         };
-        paint(d.block, mirrors.map(function(m) { return m.block; }), layout.self);
-        (d.earlier || []).forEach(function(x, i) { paint(x.el, mirrors.map(function(m) { return m.earlier[i] && m.earlier[i].el; }), layout.out.get(String(x.id))); });
-        (d.later || []).forEach(function(x, i) { paint(x.el, mirrors.map(function(m) { return m.later[i] && m.later[i].el; }), layout.out.get(String(x.id))); });
+        paint(d.blocks, layout.self);
+        (d.earlier || []).forEach(function(x) { paint(x.els, layout.out.get(x.id)); });
+        (d.later || []).forEach(function(x) { paint(x.els, layout.out.get(x.id)); });
       } else {
         d.nextStart = Math.max(1, d.origStart + delta);
         const left = ((d.nextStart - 1) * cw + 1) + 'px';
-        d.block.style.left = left;
-        mirrors.forEach(function(m) { if (m.block) m.block.style.left = left; });
-        // ver1130: a single-koma body drag can cross layers too — same kernel as the batch drag.
-        gengaCrossLayerDragTrack(d, ev, [d.block]);
+        d.blocks.forEach(function(el) { el.style.left = left; });
       }
       // live: keep the content-box + pre/post behavior buttons following the koma edges during the drag (no commit lag)
       const lane = d.block.parentElement;
@@ -118821,22 +118818,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
               if (en > maxEnd) maxEnd = en;
             });
           }
-          // ver931: a セルサブレイヤー sibling's exposures start identical to this layer's (last synced on
-          // commit) and receives the SAME pointer delta, so minStart/maxEnd computed once above apply
-          // unchanged to every mirror lane too — no need to re-walk each sibling's own exposures.
-          const applyBoxAndBehavior = function(targetLane) { gengaApplyLaneBoxAndBehavior(targetLane, minStart, maxEnd, cw); };
-          applyBoxAndBehavior(lane);
-          mirrors.forEach(function(m) { applyBoxAndBehavior(m.lane); });
+          gengaApplyLaneBoxAndBehavior(d.preview, minStart, maxEnd, cw);
         }
       }
     }
     function gengaExpPointerUp(ev) {
       const d = gengaExpDrag; gengaExpDrag = null; if (!d) return; // ver990: unbinding belongs to beginDragStrand now
-      if (ev && ev.type === 'pointercancel') { rerenderGengaLayerRows(d.layerId); return; } // discard only the touched row previews, no full timeline rebuild
+      gengaClearCrossLayerDragFeedback();
+      if (ev && ev.type === 'pointercancel') { rerenderGengaLayerRows(d.layerId); return; }
       // ver1126: a body drag that ended over another layer's lane is a cross-layer move — same machinery the
       // selection/region drag uses, so cel groups behave identically. Only the 'move' mode can cross (the
       // head/tail handles resize in place).
-      document.querySelectorAll('#gengaStage .genga-lane.genga-drop-target').forEach(function(el) { el.classList.remove('genga-drop-target'); });
       if (d.mode === 'move' && d.targetLayerId && String(d.targetLayerId) !== String(d.layerId)) {
         gengaMoveKomasToLayer(d.layerId, [d.expId], d.nextStart - d.origStart, d.targetLayerId);
         selectGengaLayer(String(d.targetLayerId));
@@ -119223,7 +119215,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // an empty cell no longer moves the region.
       return null;
     }
-    // Whole existence-region drag = every koma of the layer moves together. Bound to right/middle button.
+    // Whole existence-region drag = every koma of the layer moves together. Right-drag or an armed touch gesture.
     function gengaStartWholeRegionDrag(ev, layerId) {
       const layer = gengaLayerById(layerId); if (!layer || layer.locked) return false;
       const s = gengaSortedExposures(layer); if (!s.length) return false;
@@ -119346,38 +119338,27 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!pointerDragCanStart('genga-koma-drag', ev)) return false;
       const layer = gengaLayerById(layerId); if (!layer) return;
       const idset = new Set(cand.komaIds);
+      const preview = gengaCaptureExposureDragPreview(layerId, cand.kind === 'all');
+      const sourceLane = gengaLaneEl(layerId);
       const blocks = [];
       (layer.exposures || []).forEach(function(e) {
         if (!idset.has(String(e.id))) return;
-        blocks.push({ id: String(e.id), origStart: e.startFrame, holdFrames: e.holdFrames, el: document.querySelector('#gengaStage .genga-exp[data-genga-exp="' + cssEscapeValue(String(e.id)) + '"]') });
+        const els = preview.cards.get(String(e.id)) || [];
+        blocks.push({ origStart: e.startFrame,
+          els: els, el: els.find(function(el) { return el.parentElement === sourceLane; }) || null });
       });
-      // whole-region drag: the placeholder cards move live with the komas (the whole strip slides as one)
-      let phBlocks = null;
-      if (cand.kind === 'all') {
-        const lane0 = document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(String(layerId)) + '"]');
-        if (lane0) phBlocks = Array.from(lane0.querySelectorAll('.genga-exp-empty')).map(function(el) { return { el: el, baseLeft: parseFloat(getComputedStyle(el).left) || 0 }; });
-      }
-      // ver931: real-time セルサブレイヤー mirror — same shape as gengaExpDrag's mirrorLanes: resolved once
-      // here, then gengaBatchDragMove just writes a few extra inline styles per frame. [] (zero cost) unless
-      // this layer is actually grouped.
-      const mirrorLanes = gengaCelGroupDragMirrorLanes(layerId).map(function(lane) {
-        const els = {};
-        blocks.forEach(function(b) { els[b.id] = lane.querySelector('.genga-exp[data-genga-exp="' + cssEscapeValue(b.id) + '"]'); });
-        const ph = phBlocks ? Array.from(lane.querySelectorAll('.genga-exp-empty')).map(function(el) { return { el: el, baseLeft: parseFloat(getComputedStyle(el).left) || 0 }; }) : null;
-        return { lane: lane, els: els, phBlocks: ph };
-      });
-      gengaBatchDrag = { layerId: String(layerId), idset: idset, kind: cand.kind, selStart: cand.selStart, selEnd: cand.selEnd, startX: ev.clientX, delta: 0, blocks: blocks, phBlocks: phBlocks, mirrorLanes: mirrorLanes };
+      gengaBatchDrag = { layerId: String(layerId), idset: idset, kind: cand.kind, selStart: cand.selStart, selEnd: cand.selEnd, startX: ev.clientX, delta: 0, blocks: blocks, preview: preview };
       selectGengaLayer(layerId);
-      // ver990: document+BUBBLE, and anyButton because gengaStartWholeRegionDrag delegates here on the RIGHT and
-      // MIDDLE buttons — the kernel's left-only guard would otherwise reject exactly that press. Cancel keeps
+      // document+BUBBLE; anyButton accepts the right-button whole-region path. Cancel keeps
       // routing through gengaBatchDragUp, which discards by repainting only the slid rows.
       beginDragStrand(ev, {
         key: 'genga-koma-drag',
         on: 'document',
         anyButton: true,
+        raf: true,
         onMove: gengaBatchDragMove,
         onCancel: function() { gengaBatchDragUp({ type: 'pointercancel' }); },
-        onCommit: function(ue) { gengaBatchDragUp(ue); }
+        onCommit: function(ue) { gengaBatchDragMove(ue); gengaBatchDragUp(ue); }
       });
       return true;
     }
@@ -119398,6 +119379,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // d.targetLayerId (null when the hover is not a legal drop). Nothing commits here — release does.
     function gengaLaneEl(layerId) {
       return document.querySelector('#gengaStage .genga-lane[data-genga-layer="' + cssEscapeValue(String(layerId)) + '"]');
+    }
+    function gengaClearCrossLayerDragFeedback() {
+      document.querySelectorAll('#gengaStage .genga-drop-target, #gengaStage .genga-drop-deny').forEach(function(el) {
+        el.classList.remove('genga-drop-target', 'genga-drop-deny');
+      });
+      document.body.classList.remove('genga-drop-blocked');
     }
     function gengaCrossLayerDragTrack(d, ev, els) {
       const srcLane = gengaLaneEl(d.layerId);
@@ -119502,37 +119489,33 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const d = gengaBatchDrag; if (!d) return;
       const layer = gengaLayerById(d.layerId); if (!layer) return;
       const cw = gengaCelW();
-      let delta = gengaBatchClampDelta(layer, d.idset, gengaCelDelta(ev.clientX - d.startX));
+      const rawDelta = gengaCelDelta(ev.clientX - d.startX);
+      if (!d.moved && Math.abs(ev.clientX - d.startX) > 4) d.moved = true;
+      if (d.previewDelta === rawDelta && d.previewY === ev.clientY) return;
+      d.previewDelta = rawDelta; d.previewY = ev.clientY;
+      const delta = gengaBatchClampDelta(layer, d.idset, rawDelta);
       d.delta = delta;
-      if (!d.moved && Math.abs(ev.clientX - d.startX) > 4) d.moved = true; // ver1156: any real drag counts
-      const mirrors = d.mirrorLanes || []; // ver931: [] for the vast majority of (non-grouped) layers — zero cost
+      const lane = gengaCrossLayerDragTrack(d, ev, d.blocks.map(function(b) { return b.el; }));
       d.blocks.forEach(function(b) {
         const left = ((b.origStart + delta - 1) * cw + 1) + 'px';
-        if (b.el) b.el.style.left = left;
-        mirrors.forEach(function(m) { const me = m.els[b.id]; if (me) me.style.left = left; });
+        b.els.forEach(function(el) { el.style.left = left; });
       });
-      if (d.phBlocks) d.phBlocks.forEach(function(p, i) { // region placeholders slide along
-        if (p.el) p.el.style.left = (p.baseLeft + delta * cw) + 'px';
-        mirrors.forEach(function(m) { const mp = m.phBlocks && m.phBlocks[i]; if (mp && mp.el) mp.el.style.left = (mp.baseLeft + delta * cw) + 'px'; });
+      d.preview.lanes.forEach(function(row) {
+        row.placeholders.forEach(function(p) { p.el.style.left = (p.left + delta * cw) + 'px'; });
       });
-      // ver1130: cross-layer drop visual via the shared kernel.
-      const lane = gengaCrossLayerDragTrack(d, ev, d.blocks.map(function(b) { return b.el; }));
       if (lane) {
         let minStart = Infinity, maxEnd = 0;
         (layer.exposures || []).forEach(function(e) { const shift = d.idset.has(String(e.id)) ? delta : 0; const st = e.startFrame + shift, en = st + e.holdFrames - 1; if (st < minStart) minStart = st; if (en > maxEnd) maxEnd = en; });
-        // ver931: same reasoning as gengaExpPointerMove — a mirror sibling's exposures start identical and
-        // get the same delta, so minStart/maxEnd computed once above apply unchanged to every mirror lane.
-        const applyBoxAndBehavior = function(targetLane) { gengaApplyLaneBoxAndBehavior(targetLane, minStart, maxEnd, cw); };
-        applyBoxAndBehavior(lane);
-        mirrors.forEach(function(m) { applyBoxAndBehavior(m.lane); });
+        gengaApplyLaneBoxAndBehavior(d.preview, minStart, maxEnd, cw);
         if (d.kind === 'sel') { const selDiv = lane.querySelector('.genga-cel-sel'); if (selDiv) selDiv.style.left = ((d.selStart + delta - 1) * cw) + 'px'; } // selection rect is interaction-state, not exposure data — primary lane only
       }
     }
     function gengaBatchDragUp(ev) {
       const d = gengaBatchDrag; gengaBatchDrag = null; if (!d) return; // ver990: unbinding belongs to beginDragStrand now
-      if (ev && ev.type === 'pointercancel') { rerenderGengaLayerRows(d.layerId); return; } // discard only the slid row previews, no full timeline rebuild
+      gengaClearCrossLayerDragFeedback();
+      if (ev && ev.type === 'pointercancel') { rerenderGengaLayerRows(d.layerId); return; }
       // right-drag that actually moved → suppress the trailing contextmenu (fires after pointerup). A no-move
-      // right-click leaves the flag clear so the normal context menu opens. Backstop-clear in case no menu fires.
+      // right-click leaves the flag clear so the normal context menu opens; the next gesture clears stale guards.
       if (d.fromRightBtn && (d.delta || d.moved)) trailingClickGuard.arm('gengaRegionMenu'); // ver1156/1164: right-DRAG (even clamped / sub-frame) never opens the menu — event-bounded guard, not a timer
       // swallow the trailing click after a selection-drag or a REAL move (else the lane click would clear the
       // selection / jump the playhead). A plain no-move click on a region placeholder must still fall through
@@ -119541,9 +119524,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaArmCelSelClickGuard(); // ver970: event-bounded, see the declaration
       }
       const crossLayer = !!d.targetLayerId && String(d.targetLayerId) !== String(d.layerId);
-      document.querySelectorAll('#gengaStage .genga-lane.genga-drop-target').forEach(function(el) { el.classList.remove('genga-drop-target'); });
-      document.querySelectorAll('#gengaStage .genga-lane.genga-drop-deny').forEach(function(el) { el.classList.remove('genga-drop-deny'); }); // ver1938
-      document.body.classList.remove('genga-drop-blocked');                                                                                  // ver1938
       if (!d.delta && !crossLayer) { if (d.kind === 'sel') rerenderGengaLayerRows(d.layerId); return; }
       const delta = d.delta, idset = d.idset;
       if (crossLayer) {
@@ -119635,7 +119615,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // so the inline editor and the cell picker cannot drift apart — they share the same-value conflict prompt,
     // the same undo label (原画インスタンス値, one word in the history), and the same cell-group mirroring.
     // ver1499 정정: 그 미러링을 하는 것은 gengaApplyInstanceValue 가 **아니라** runCommand 의 post-pass
-    // updateGengaCelGroupsAfterEdit(:18317) 이다 — instanceValue 까지 형제 레이어에 복사한다(:18342).
+    // updateGengaCelGroupsAfterEdit 이다 — instanceValue 까지 형제 레이어에 복사한다.
     // 원래 주석이 주체를 잘못 지목해 「일괄 확정」을 짤 때 멤버 루프를 손으로 짤 뻔했다. 결론(멤버 루프를
     // 짜면 두 번째 정본이 된다)은 그대로 맞다.
     // onSettled(committed) runs on every exit including the cancel of the conflict prompt.
