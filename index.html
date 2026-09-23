@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2660</title>
+  <title>MoArt ver2661</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24784,6 +24784,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2661, items: [{ ja: '動画出力をキャンセルした後、残りの音声の読み込み・ミックスが続く問題を修正しました。', ko: '영상 출력을 취소한 뒤 남은 오디오를 계속 읽고 믹스하던 문제를 수정했습니다.', en: 'Stopped remaining audio loading and mixing after video export cancellation.', zh: '修复取消视频导出后仍继续加载和混合剩余音频的问题。' }] },
       { ver: 2660, items: [{ ja: 'レイヤーをまとめて削除・復元するとき、画面外のコマの不要なレイアウト計算を減らしました。', ko: '여러 레이어를 삭제·복원할 때 화면 밖 코마의 불필요한 레이아웃 계산을 줄였습니다.', en: 'Reduced unnecessary layout work for offscreen cels when deleting and restoring multiple layers.', zh: '减少批量删除和恢复图层时屏幕外单元格的不必要布局计算。' }] },
       { ver: 2659, items: [{ ja: 'オニオンスキンの初回表示で同じ絵を作り直す無駄を減らし、非表示にした後のキャッシュ整理を修正しました。', ko: '어니언 스킨 첫 표시의 불필요한 재생성을 줄이고, 끈 뒤의 캐시 정리를 수정했습니다.', en: 'Avoided rebuilding onion ghosts after their first display and fixed cache cleanup after hiding them.', zh: '减少洋葱皮首次显示后的重复生成，并修复隐藏后的缓存清理。' }, { ja: '描画直後に保存すると絵の準備不足でZIP保存に失敗する問題を修正しました。', ko: '그린 직후 그림 준비가 끝나지 않아 ZIP 저장이 실패하던 문제를 수정했습니다.', en: 'Fixed ZIP save failures when drawings were still being prepared immediately after a stroke.', zh: '修复刚完成笔画、图像尚未准备好时ZIP保存失败的问题。' }] },
       { ver: 2658, items: [{"ja":"ガイドブックを現行の操作に合わせて更新しました。文字・手順・実際のツールアイコンを見やすくし、検索から目的の項目へ直接移動できます。小さい画面では目次を開閉できます。","ko":"가이드북을 현재 조작에 맞춰 갱신했습니다. 글자·단계·실제 도구 아이콘을 읽기 쉽게 정리하고 검색에서 해당 항목으로 바로 이동합니다. 좁은 화면에서는 목차를 접을 수 있습니다.","en":"Updated the guidebook for current controls, with clearer text, steps and real tool icons. Search jumps directly to the relevant section, and small screens get collapsible contents.","zh":"按当前操作更新了指南，优化文字、步骤和实际工具图标。搜索可直达相关小节，小屏幕可折叠目录。"}] },
@@ -91183,6 +91184,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         poll();
       });
     }
+    // Preparation may outlive the UI wait (e.g. decodeAudioData cannot be aborted).
+    // Its own closed latch survives the next export resetting the shared cancel flag.
+    async function prepareMediaExportAudio(prepare, control, phase) {
+      let closed = false;
+      const owned = Object.assign({}, control, { shouldCancel: function() { return closed || Boolean(control.shouldCancel && control.shouldCancel()); } });
+      try { return await waitForMediaExport(prepare(owned), owned, phase); }
+      finally { closed = true; }
+    }
     // WebKit #302253 emits an ES_Descriptor instead of AudioSpecificConfig. Parse only
     // the documented descriptor structure; never infer bytes from a UA or fixed offset.
     function normalizeExportAacMetadata(meta, sampleRate, channels) {
@@ -91290,8 +91299,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return cache;
     }
 
-    function decodeAudioForExport(ctx, url) {
-      return fetch(url).then(function(r) { return r.arrayBuffer(); }).then(function(buf) { return ctx.decodeAudioData(buf); });
+    async function decodeAudioForExport(ctx, url, control) {
+      checkMediaExport(control);
+      const bytes = await fetch(url).then(function(r) { return r.arrayBuffer(); });
+      checkMediaExport(control);
+      return ctx.decodeAudioData(bytes);
     }
 
     // Real-time webm capture (canvas.captureStream + MediaRecorder) + audio mix of all non-muted clips,
@@ -91301,7 +91313,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver966 이 고속 경로(runWebCodecsExport)에 한 일을 실시간에도 한다. 이 커널이 갖는 것은
     // **가드·captureStream·MediaRecorder·프레임 루프·blob** 이고, 엔진이 주는 것은 spec 뿐이다:
     //   renderFrame(canvas, frame)  — 그 프레임을 캔버스에 그린다(첫 호출이 캔버스 크기를 정한다)
-    //   audio.prepare(ctx, onStatus) → opaque  — 디코드/믹스. 커널은 그 값을 들여다보지 않는다
+    //   audio.prepare(ctx, onStatus, control) → opaque  — 디코드/믹스. 커널은 그 값을 들여다보지 않는다
     //   audio.start(ctx, dest, t0, opaque) → 클립수  — recorder.start 뒤 t0 기준으로 재생 시작
     // 오디오가 두 단계인 것은 **디코드는 녹화 전에, 재생 시작은 녹화 후**여야 하기 때문이다.
     // 원화에 폴백이 없어 iOS 에서 WebCodecs 가 떨어지면 동영상을 못 내던 것이 이 판의 동기다.
@@ -91326,7 +91338,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           audioDest = audioCtx.createMediaStreamDestination();
           const silence = audioCtx.createConstantSource(); silence.offset.value = 0;
           silence.connect(audioDest); silence.start();
-          prepared = await waitForMediaExport(spec.audio.prepare(audioCtx, onStatus), control, 'record audio');
+          prepared = await prepareMediaExportAudio(function(owned) { return spec.audio.prepare(audioCtx, onStatus, owned); }, control, 'record audio');
           if (!prepared) throw new Error(t('msg.export.audioMixFailed'));
         }
         stream = canvas.captureStream(fps);
@@ -91414,15 +91426,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         fps: Number(opts.outFps) || fps, sourceFps: fps, startFrame: startFrame, endFrame: endFrame,
         renderFrame: function(canvas, frame) { return renderConteVideoFrameToCanvas(canvas, frame, renderOpts); },
         audio: !audioClips.length ? null : {
-          prepare: async function(audioCtx, status) {
+          prepare: async function(audioCtx, status, control) {
             const scheduled = [];
             const clips = audioClips;
             let done = 0, recFailed = 0;
             for (let i = 0; i < clips.length; i += 1) {
+              checkMediaExport(control);
               const url = await ensurePlaybackAudioUrlForClip(clips[i]);
+              checkMediaExport(control);
               if (!url) { recFailed += 1; continue; }
               let buffer = null;
-              try { buffer = await decodeAudioForExport(audioCtx, url); } catch (e) { recFailed += 1; continue; }
+              try { buffer = await decodeAudioForExport(audioCtx, url, control); } catch (e) { checkMediaExport(control); recFailed += 1; continue; }
+              checkMediaExport(control);
               if (buffer) scheduled.push({ clip: clips[i], buffer: buffer });
               done += 1;
               if (status && done % 8 === 0) status(t('msg.export.loadingAudio', done, clips.length));
@@ -91459,6 +91474,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // machine allows instead of recording in real time. The caller (runConteExportVideo) falls back to
     // recordConteVideoWebm for encoder failures; cancellation and missing assets stop export.
     async function mixAudioForExportOffline(project, startFrame, endFrame, fps, sampleRate, options) {
+      const control = options && options.control;
+      checkMediaExport(control);
       const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
       if (!OAC) return null;
       const clips = audioExportClipsInFrameRange(project, startFrame, endFrame);
@@ -91469,11 +91486,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let failedClips = 0; // Video export requires every clip; other callers retain their chosen strictness.
       for (let i = 0; i < clips.length; i += 1) {
         const clip = clips[i];
+        checkMediaExport(control);
         const url = await ensurePlaybackAudioUrlForClip(clip);
+        checkMediaExport(control);
         if (!url) { failedClips += 1; continue; }
         let buf;
-        try { const ab = await fetch(url).then(function(r) { return r.arrayBuffer(); }); buf = await octx.decodeAudioData(ab); }
-        catch (e) { failedClips += 1; continue; }
+        try { buf = await decodeAudioForExport(octx, url, control); }
+        catch (e) { checkMediaExport(control); failedClips += 1; continue; }
+        checkMediaExport(control);
         const cs = Math.round(Number(clip.startFrame) || 0);
         const offsetSec = (cs - startFrame) / fps;
 
@@ -91492,7 +91512,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       if (failedClips && options && options.strict) throw Object.assign(new Error(t('msg.export.audioMixFailed') + ' (' + failedClips + '/' + clips.length + ')'), {code: 'EXPORT_AUDIO_UNAVAILABLE'});
       if (failedClips) console.warn('[exportMix] ' + failedClips + '/' + clips.length + ' clip(s) failed to load/schedule — they are missing from the export audio'); // ver750 (fix_design P3-B)
-      return await octx.startRendering();
+      checkMediaExport(control);
+      const rendered = await octx.startRendering();
+      checkMediaExport(control);
+      return rendered;
     }
     async function encodeAudioBufferForExport(audioEncoder, audioBuffer, sampleRate, control) {
       const total = audioBuffer.length;
@@ -91585,7 +91608,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let audioBuffer = null, audioOK = false;
       if (hasAudio) {
         if (onStatus) onStatus(t('msg.export.mixingAudio'));
-        audioBuffer = await waitForMediaExport(spec.mixAudio(), control, 'audio mix');
+        audioBuffer = await prepareMediaExportAudio(function(owned) { return spec.mixAudio(owned); }, control, 'audio mix');
         audioOK = !!audioBuffer;
         if (!audioOK) throw new Error(t('msg.export.audioMixFailed'));
       }
@@ -91700,7 +91723,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         noEncoderErrorKey: 'msg.export.noAudioVideoEncoder',
         muxFrameRate: muxFrameRate,
         onPrepared: function() { videoExportResetFrameCache(); if (onStatus) onStatus(t('msg.export.fastPreparing')); },
-        mixAudio: function() { return mixAudioForExportOffline(project, startFrame, endFrame, fps, sampleRate, {strict: true}); },
+        mixAudio: function(control) { return mixAudioForExportOffline(project, startFrame, endFrame, fps, sampleRate, {strict: true, control: control}); },
         prepareFrames: async function() {
           const cache = await preloadVideoExportBitmaps(project, onStatus);
           renderOpts = { outWidth: outW, outHeight: outH, frameCrop: frameCrop, showCameraFrame: showCameraFrame, cache: cache, videoMedia: opts.videoMedia !== false, videoMediaSeek: true, subtitle: opts.subtitle !== false, bold: opts.bold !== false, cutInfo: opts.cutInfo !== false, cacheFrames: true, strict: true };
@@ -97275,6 +97298,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
     }
     async function gengaMixAudioOffline(startFrame, endFrame, fps, sampleRate, onStatus, options) {
+      const control = options && options.control;
+      checkMediaExport(control);
       const gt = state.project.gengaTimeline; const clips = options && options.clips || gt.audioClips || [];
       if (!clips.length) return null;
       const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext; if (!OAC) return null;
@@ -97288,7 +97313,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // onStatus as well as the console because the target device (iPad) has no console to read.
       let failedClips = 0;
       for (const c of clips) {
-        const buf = await gengaDecodeAudio(c.ref); if (!buf) { failedClips += 1; continue; }
+        checkMediaExport(control);
+        const buf = await gengaDecodeAudio(c.ref);
+        checkMediaExport(control);
+        if (!buf) { failedClips += 1; continue; }
         const window = gengaAudioWindow(c, buf, fps, startSec);
         if (!window.remaining) continue;
         const when = Math.max(0, window.startSec - startSec);
@@ -97306,7 +97334,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (onStatus) onStatus(t('msg.export.audioLoadFailedPartial', failedClips, clips.length));
       }
       if (!any && !(options && options.strict)) return null;
-      return await oac.startRendering();
+      checkMediaExport(control);
+      const rendered = await oac.startRendering();
+      checkMediaExport(control);
+      return rendered;
     }
     // ver1557: 원화의 **실시간 폴백**. 이것이 없어서 iOS 처럼 WebCodecs 가 떨어지는 환경에서는
     // 원화 동영상 출력이 그대로 실패했다(제보 A). 콘티는 처음부터 이 경로가 있었다.
@@ -97338,7 +97369,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         fps: Number(opts.outFps) || fps, sourceFps: fps, startFrame: startFrame, endFrame: endFrame + 1, // 커널은 end 를 제외로 받는다(고속은 포함 계산이라 +1)
         renderFrame: function(canvas, frame) { return gengaRenderExportFrame(canvas, frame, outW, outH); },
         audio: (opts.audio !== false && gengaExportAudioClips(gt, startFrame, endFrame, fps).length ? {
-          prepare: function(audioCtx, status) { return gengaMixAudioOffline(startFrame, endFrame, fps, audioCtx.sampleRate || 48000, status, {strict: true, clips: gengaExportAudioClips(gt, startFrame, endFrame, fps)}); },
+          prepare: function(audioCtx, status, control) { return gengaMixAudioOffline(startFrame, endFrame, fps, audioCtx.sampleRate || 48000, status, {strict: true, clips: gengaExportAudioClips(gt, startFrame, endFrame, fps), control: control}); },
           start: function(audioCtx, audioDest, t0, buffer) {
             if (!buffer) return 0;
             const src = audioCtx.createBufferSource();
@@ -97411,7 +97442,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         noEncoderErrorKey: 'msg.export.noVideoEncoder',
         onPrepared: function() { if (onStatus) onStatus(t('msg.export.preparing')); },
         // ver841: onStatus threads into the mixer so a PARTIAL clip loss reaches the user, not just a total failure
-        mixAudio: function() { return gengaMixAudioOffline(startFrame, endFrame, fps, 48000, onStatus, {strict: true, clips: clips}); },
+        mixAudio: function(control) { return gengaMixAudioOffline(startFrame, endFrame, fps, 48000, onStatus, {strict: true, clips: clips, control: control}); },
         prepareFrames: function() { return gengaPreloadExportImages(onStatus); }, // ver853
         recFrames: recFrames,
         shouldCancel: function() { return Boolean(state.videoExportCancel); },
