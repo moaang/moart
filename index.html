@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2662</title>
+  <title>MoArt ver2663</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -19835,10 +19835,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // had this option (only 'workspace' folder file or fully inline bitmapDataUrl), unlike audio and unlike
     // genga's own drawings (gengaDrawStore + 'gd:' IndexedDB keys). Added so a bulk ZIP import (hundreds of
     // panel images at once) can keep them OUT of state.project instead of inlining every one as base64.
-    // ver2221: 이 둘은 낱말 순서만 달라 이름이 서로를 속였다 — 하나는 ref 로 키를 **만들고**
-    // 하나는 drawing 에 **저장된** 키를 꺼낸다. 바꿔 써도 조용히 빈 문자열이 될 뿐이라 드러나지 않는다.
-    function layerDrawingIndexedDbKeyFromRef(ref) {
-      return INDEXED_DB_LAYER_DRAWING_KEY_PREFIX + String(ref || '');
+    // New pixels get a new key; readers must use the descriptor saved on that drawing version.
+    function newLayerDrawingIndexedDbKey(ref) {
+      return INDEXED_DB_LAYER_DRAWING_KEY_PREFIX + newPrefixedId(ref || 'drawing');
     }
 
     function layerDrawingIndexedDbKeyStored(drawing) {
@@ -24784,6 +24783,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2663, items: [{ ja: 'コンテの以前の版の絵が上書きされる問題と、使用中のブラシ素材が削除される問題を修正し、未使用素材の整理を改善しました。', ko: '콘티 이전 버전의 그림 덮어쓰기와 사용 중인 브러시 소재 삭제를 막고, 미사용 자산 정리를 개선했습니다.', en: 'Preserved earlier storyboard drawings and active brush materials, and improved unused asset cleanup.', zh: '修复旧版分镜图像被覆盖及使用中的笔刷素材被删除的问题，并改进闲置资源清理。' }] },
       { ver: 2662, items: [{ ja: '再生を停止した後や再開した後に、以前の映像・音声の先読みが続く問題を修正しました。', ko: '재생을 정지하거나 다시 시작한 뒤에도 이전 영상·음성 예열이 계속되던 문제를 수정했습니다.', en: 'Stopped stale video and audio preloading after playback stops or restarts.', zh: '修复停止或重新播放后仍继续预加载旧视频和音频的问题。' }] },
       { ver: 2661, items: [{ ja: '動画出力をキャンセルした後、残りの音声の読み込み・ミックスが続く問題を修正しました。', ko: '영상 출력을 취소한 뒤 남은 오디오를 계속 읽고 믹스하던 문제를 수정했습니다.', en: 'Stopped remaining audio loading and mixing after video export cancellation.', zh: '修复取消视频导出后仍继续加载和混合剩余音频的问题。' }] },
       { ver: 2660, items: [{ ja: 'レイヤーをまとめて削除・復元するとき、画面外のコマの不要なレイアウト計算を減らしました。', ko: '여러 레이어를 삭제·복원할 때 화면 밖 코마의 불필요한 레이아웃 계산을 줄였습니다.', en: 'Reduced unnecessary layout work for offscreen cels when deleting and restoring multiple layers.', zh: '减少批量删除和恢复图层时屏幕外单元格的不必要布局计算。' }] },
@@ -55947,6 +55947,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver2444: 저장/참조 변경은 진행 중인 GC를 취소한다. 입력과 저장이 GC를 기다리지 않는다.
     // 세대는 scan 이전부터 delete 완료까지 유효해야 하며, 보유 해제 뒤에도 되돌리지 않는다.
     let storageRootEpoch = 0;
+    const storedAssetSaveLeases = new Map();
+    let brushMaterialImports = 0;
     const storageDeleteTransactions = new Set();
     let storageDeleteQueue = Promise.resolve();
     function storageRootsChanged() {
@@ -56276,25 +56278,30 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    async function putWorkspaceDbValue(key, value) {
+    async function putWorkspaceDbValue(key, value, options) {
       if (!indexedDbAvailable()) return false;
-      storageRootsChanged();
-      for (let attempt = 0; ; attempt += 1) {
-        const db = await openWorkspaceDb();
-        try {
-          await workspaceDbOp(db, 'put ' + key, function(resolve, reject) {
-            const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
-            tx.objectStore(WORKSPACE_STORE_NAME).put(value, key);
-            tx.oncomplete = function() { resolve(); };
-            tx.onabort = function() { reject(tx.error || new Error(t('msg.idb.txAbortedFor', key))); };
-            tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', key))); };
-          });
-          return true;
-        } catch (error) {
-          if (attempt === 0 && error && error.name === 'WorkspaceDbStallError') continue; // fresh connection, one retry
-          throw error;
+      const held = String(key).indexOf('bt:') === 0 ? [key] : [];
+      storageLeaseChange(storedAssetSaveLeases, held, 1);
+      try {
+        storageRootsChanged();
+        for (let attempt = 0; ; attempt += 1) {
+          const db = await openWorkspaceDb();
+          try {
+            await workspaceDbOp(db, 'put ' + key, function(resolve, reject) {
+              const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+              const store = tx.objectStore(WORKSPACE_STORE_NAME);
+              if (options && options.insertOnly) store.add(value, key); else store.put(value, key);
+              tx.oncomplete = function() { resolve(); };
+              tx.onabort = function() { reject(tx.error || new Error(t('msg.idb.txAbortedFor', key))); };
+              tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', key))); };
+            });
+            return true;
+          } catch (error) {
+            if (attempt === 0 && error && error.name === 'WorkspaceDbStallError') continue; // fresh connection, one retry
+            throw error;
+          }
         }
-      }
+      } finally { storageLeaseChange(storedAssetSaveLeases, held, -1); }
     }
 
     // ver2444: 자동/수동 정리의 공통 진입부. 요청 목록은 후보일 뿐이며 최신 root로 다시 판정한다.
@@ -56335,6 +56342,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               storageDeleteTransactions.delete(tx);
               removed.forEach(function(k) {
                 if (k.indexOf(DRAWING_RECORDING_KEY_PREFIX) === 0) drawingRecordingDurableRefs.delete(k.slice(DRAWING_RECORDING_KEY_PREFIX.length));
+                if (k.indexOf('bt:') === 0) paintUnregisterTip(k.slice(3));
                 if (k.indexOf('gd:') === 0) {
                   const ref = k.slice(3);
                   gengaPersistedRefs.delete(ref);
@@ -56516,26 +56524,30 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // Layer-drawing counterpart of storeAudioBlobInIndexedDb/readAudioBlobFromIndexedDb -- same idea, keep
     // the blob OUT of state.project (and out of every autosave/undo snapshot), a lightweight {kind,key,...}
-    // ref lives on drawing.bitmapStorage instead. ref (not clip.id) is the key since layerDrawings is keyed
-    // by drawingRef, not clip id -- there is no "clip" here, just the project.layerDrawings[ref] record.
+    // ref lives on drawing.bitmapStorage instead. The logical drawing ref is NOT a pixel identity:
+    // old versions and copies may share an asset. New writes use insert-only keys; reads use stored keys.
     async function storeLayerDrawingBlobInIndexedDb(ref, drawing, blob, mime, owner) {
       owner = owner || projectIoOwner(); assertProjectIoOwner(owner);
       if (!ref || !drawing || !blob) return false;
-      const key = layerDrawingIndexedDbKeyFromRef(ref);
+      const key = newLayerDrawingIndexedDbKey(ref);
       const bitmapMime = mime || blob.type || drawing.bitmapStorage && drawing.bitmapStorage.mime || 'image/png';
       const size = Math.round(Number(blob.size) || 0);
       const savedAt = new Date().toISOString();
-      await putWorkspaceDbValue(key, { blob: blob, mime: bitmapMime, size: size, savedAt: savedAt });
-      assertProjectIoOwner(owner);
-      drawing.bitmapStorage = { kind: 'indexeddb', key: key, mime: bitmapMime, size: size, savedAt: savedAt };
-      // Unlike audio (whose playback path checks state.workspaceObjectUrls.audio[id] before ever looking at
-      // clip.audioDataUrl), EVERY layer-drawing render site reads drawing.bitmapDataUrl directly -- there is
-      // no such fallback for layers. Leaving this blank (as originally written, copying the audio pattern)
-      // made every IndexedDB-backed drawing permanently invisible even though its data was safely stored.
-      // A blob: URL is a short opaque string, not the underlying bytes -- keeping it here costs nothing in
-      // JSON/clone size (same as workspace-file storage already does at externalizeLayerDrawingsToWorkspace).
-      drawing.bitmapDataUrl = replaceWorkspaceObjectUrl('layers', ref, blob);
-      return true;
+      storageLeaseChange(storedAssetSaveLeases, [key], 1);
+      try {
+        if (!await putWorkspaceDbValue(key, { blob: blob, mime: bitmapMime, size: size, savedAt: savedAt }, { insertOnly: true })) throw new Error('Drawing storage unavailable');
+        assertProjectIoOwner(owner);
+        drawing.bitmapStorage = { kind: 'indexeddb', key: key, mime: bitmapMime, size: size, savedAt: savedAt };
+        // Unlike audio (whose playback path checks state.workspaceObjectUrls.audio[id] before ever looking at
+        // clip.audioDataUrl), EVERY layer-drawing render site reads drawing.bitmapDataUrl directly -- there is
+        // no such fallback for layers. Leaving this blank (as originally written, copying the audio pattern)
+        // made every IndexedDB-backed drawing permanently invisible even though its data was safely stored.
+        // A blob: URL is a short opaque string, not the underlying bytes -- keeping it here costs nothing in
+        // JSON/clone size (same as workspace-file storage already does at externalizeLayerDrawingsToWorkspace).
+        drawing.bitmapDataUrl = replaceWorkspaceObjectUrl('layers', ref, blob);
+        storageRootsChanged();
+        return true;
+      } finally { storageLeaseChange(storedAssetSaveLeases, [key], -1); }
     }
 
     async function readLayerDrawingBlobFromIndexedDb(ref, drawing) {
@@ -56892,7 +56904,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const id = ensureCurrentProjectId();
       const seq = ++projectSaveSeqNext;
       projectSaveLatestSeq.set(id, seq);
-      let leaseRefs = [], audioSnapshot = [], recordingKeys = [];
+      let leaseRefs = [], audioSnapshot = [], recordingKeys = [], storedKeys = [];
       const head = projectSaveHeads.get(id) || projectSaveBeginEdit(id, null);
       head.saves += 1;
       try {
@@ -56901,6 +56913,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const syncWall = Boolean(opts && opts.syncWall);
         gengaFlushPendingDrawingEncodes(syncWall ? null : { deltaAsync: true });
         const snapshot = projectForJsonStorage({ portable: false });
+        storedKeys = Array.from(storedAssetKeysFrom(snapshot));
+        storageLeaseChange(storedAssetSaveLeases, storedKeys, 1);
         const recordingHandle = state.workspaceHandle;
         const recordingRefs = new Set();
         drawingRecordingAddProjectRefs(snapshot, recordingRefs);
@@ -56963,6 +56977,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gengaSaveLeaseRelease(leaseRefs);
         storageLeaseChange(audioSaveLeaseKeys, audioSnapshot.map(function(item) { return item.key; }), -1);
         storageLeaseChange(drawingRecordingSaveLeases, recordingKeys, -1);
+        storageLeaseChange(storedAssetSaveLeases, storedKeys, -1);
       }
     }
     async function saveProjectToIndexedDbAutosave(opts) {
@@ -57269,7 +57284,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
+    // Read actual storage descriptors, never derive pixel keys from logical drawing refs.
+    // This also walks history/clipboard/fill assets; cycles and non-JSON pixel objects are ignored.
+    function storedAssetKeysFrom(value, keys, seen) {
+      keys = keys || new Set(); seen = seen || new Set();
+      if (!value || typeof value !== 'object' || seen.has(value)) return keys;
+      if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return keys;
+      seen.add(value);
+      const key = layerDrawingIndexedDbKeyStored(value);
+      if (key) keys.add(key);
+      if (value.tipRef) keys.add('bt:' + value.tipRef);
+      if (value.tipId || value.tipIds || value.paperTexId) brushLibraryMaterialRefs({ brush: value }).forEach(function(ref) { keys.add('bt:' + ref); });
+      Object.values(value).forEach(function(child) { storedAssetKeysFrom(child, keys, seen); });
+      return keys;
+    }
+    function brushMaterialReferencedKeys() {
+      const keys = new Set();
+      [brushLibraryLoad(), state.customPanels, state.paintBrushByTool].forEach(function(value) { storedAssetKeysFrom(value, keys); });
+      [BRUSH_LIBRARY_LS_KEY, CUSTOM_PANEL_STORAGE_KEY].forEach(function(key) { storedAssetKeysFrom(JSON.parse(localStorage.getItem(key) || 'null'), keys); });
+      // Read persisted slots even if a tool has not been selected/hydrated in this session.
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i), match = /^memoBrush2_.+_(tipId|tipIds|paperTexId)$/.exec(key);
+        if (match) storedAssetKeysFrom({ [match[1]]: localStorage.getItem(key) }, keys);
+      }
+      return keys;
+    }
     async function storageLiveRefsScan(onProgress, measured) {
+      const storedKeys = new Set(); let storedUnknown = 0;
+      try {
+        [state.project, state.undoStack, state.redoStack, state.conteLayerClipboard, tlTut && tlTut.saved].forEach(function(value) { storedAssetKeysFrom(value, storedKeys); });
+        brushMaterialReferencedKeys().forEach(function(key) { storedKeys.add(key); });
+        storedAssetSaveLeases.forEach(function(_n, key) { storedKeys.add(key); });
+      } catch (error) { storedUnknown += 1; console.error('[storage] asset roots unreadable', error); }
       const drawRefs = new Set(), audioRefs = new Set(), recordingRefs = new Set();
       drawingRecordingAddProjectRefs(state.project, recordingRefs);
       drawingRecordingSaveLeases.forEach(function(_n, key) { recordingRefs.add(key.slice(DRAWING_RECORDING_KEY_PREFIX.length)); });
@@ -57333,7 +57379,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         } catch (error) {
           console.error('[storage] saved payload unreadable: ' + payloadKeys[i], error);
         }
-        if (parsed) { gengaAddProjectRefs(parsed, drawRefs, audioRefs);
+        if (parsed) { storedAssetKeysFrom(parsed, storedKeys); gengaAddProjectRefs(parsed, drawRefs, audioRefs);
           try { drawingRecordingAddProjectRefs(parsed, recordingRefs); } catch (error) { unknown += 1; console.error('[storage] timelapse roots unreadable', error); }
         }   // ④⑤
         else unknown += 1;
@@ -57366,13 +57412,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (deltaFrontier.length) unknown += 1; // An unfinished dependency walk cannot authorize deletion.
       return { keys: keys, drawRefs: drawRefs, audioRefs: audioRefs, recordingRefs: recordingRefs, conteAudioAlive: conteAudioAlive, conteVideoAlive: conteVideoAlive,
-               unknown: unknown + liveTextUnknown, payloadCount: payloadKeys.length };
+               storedKeys: storedKeys, unknown: unknown + liveTextUnknown + storedUnknown, payloadCount: payloadKeys.length };
     }
 
     // ver2443 (F5 · §5-C): 이 행을 **지금 진행 중인 저장**이 붙잡고 있는가. scan 이 훑은 뒤 실제
     // 삭제까지 사이에 시작된 저장의 필수 조각을 지우지 않기 위한 마지막 확인이다.
     // 그림 본체/변경분과 양 엔진 음원의 저장/진행 쓰기를 같은 경계에서 보호한다.
     function storageRowHeldBySave(key) {
+      if (storedAssetSaveLeases.has(key) || (key.indexOf('bt:') === 0 && (brushMaterialImports || strokeInProgress()))) return true;
       if (audioSaveLeaseKeys.has(key) || audioPersistJobs.has(key) || drawingRecordingSaveLeases.has(key) || drawingRecordingAssetJobs.has(key)) return true;
       const bucket = storageKeyBucket(key);
       if (bucket !== 'gd' && bucket !== 'gdd') return false;
@@ -57398,6 +57445,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const b = storageKeyBucket(k);
         let referenced;
         if (k.indexOf('ib:') === 0) referenced = !imageRefs || imageRefs.has(k.slice(3));
+        else if (b === 'conteDraw' || k.indexOf('bt:') === 0) referenced = !live.storedKeys || live.storedKeys.has(k) || storageRowHeldBySave(k);
         else if (b === 'gd' || b === 'gt') referenced = live.drawRefs.has(k.slice(3));   // ver2197: 썸은 본체와 같은 운명
         else if (b === 'gdd') referenced = live.drawRefs.has(k.slice(4));           // ver2440: 변경분 행도 본체와 같은 운명 — 확정된 것은 persist 가 이미 지웠고, 남은 것은 참조가 말한다
         else if (b === 'ga') referenced = live.audioRefs.has(k.slice(3));
@@ -57413,7 +57461,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const vid = k.slice(INDEXED_DB_VIDEO_KEY_PREFIX.length);
           referenced = !live.conteVideoAlive || live.conteVideoAlive.has(vid);
         }
-        else return; // 그림·음성 행이 아니면 이 판정의 대상이 아니다(프로젝트 payload·버전·팁)
+        else return; // Project payload/version/metadata rows are not asset candidates.
         if (referenced) kept += 1; else unused.push(k);
       });
       return { unused: unused, kept: kept };
@@ -57511,7 +57559,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         try { await putWorkspaceDbValue(STORAGE_SWEEP_STREAK_KEY, next); }
         catch (error) { console.error('[storage] streak write failed — 다음 판이 처음부터 센다', error); }
         if (deletedCount) console.info('[storage] swept ' + deletedCount + ' unreferenced row(s)');
-        return { blocked: 0, deleted: deletedCount, pending: Object.keys(next).length };
+        return { blocked: 0, deleted: deletedCount, pending: Object.keys(next).length,
+          observing: Object.keys(next).some(function(k) { return next[k] < STORAGE_SWEEP_STREAK_LIMIT; }) };
       } finally {
         storageSweepRunning = false;
       }
@@ -57528,7 +57577,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (strokeInProgress()) { storageSweepTimer = setTimeout(run, GENGA_BG_STROKE_DEFER_MS); return; }
         storageSweepLastAt = performance.now();
         storageSweepUnreferenced()
-          .then(function(res) { if (res) console.debug('[storage] sweep(' + reason + ')', res); })
+          .then(function(res) {
+            if (res) console.debug('[storage] sweep(' + reason + ')', res);
+            // Finish the observation window, without endlessly retrying a blocked/failed deletion.
+            if (res && res.observing) scheduleStorageSweep('pending');
+          })
           .catch(function(error) { console.error('[storage] sweep(' + reason + ') failed', error); });
       }, delay);
     }
@@ -61583,6 +61636,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintBrushSetFor(toolKey, name, value) {
       paintBrushSlot(toolKey)[name] = value;
       try { localStorage.setItem('memoBrush2_' + toolKey + '_' + name, PAINT_BRUSH_SETTING_SPEC[name].ser(value)); } catch (e) {}
+      if (name === 'tipId' || name === 'tipIds' || name === 'paperTexId') { storageRootsChanged(); scheduleStorageSweep('brush-change'); }
     }
     function paintBrushSet(name, value) { paintBrushSetFor(paintBrushToolKey(), name, value); }
     // ver2001 (판정 q4=A): 「조정 끝난 펜은 내보내기」— 지금 선택된 도구(paintBrushToolKey()) 하나의
@@ -63630,7 +63684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       saveCustomPanels(); // persist migration / cleanup immediately so a later delete sticks
     }
     function saveCustomPanels() {
-      storageRootsChanged();
+      storageRootsChanged(); scheduleStorageSweep('brush-presets');
       try {
         localStorage.setItem(CUSTOM_PANEL_STORAGE_KEY, JSON.stringify({
           slots: state.customPanels || [],
@@ -66255,12 +66309,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 부팅 하이드레이트: 'bt:' 행 → paintRegisterTip. 행이 없으면 원형 dab으로 조용히 강등(throw 금지) —
     // 팁 소실이 부팅을 죽여선 안 된다. 등록 완료마다 그리드 재렌더(열려 있을 때만 실제 그림).
     async function brushLibraryHydrateTips() {
-      const lib = brushLibraryLoad();
-      const refs = new Set();
-      lib.entries.forEach(function(entry) {
-        brushLibraryMaterialRefs(entry).forEach(function(ref) { refs.add(ref); });
-      });
-      for (const ref of refs) {
+      let keys;
+      try { keys = brushMaterialReferencedKeys(); }
+      catch (error) { console.error('[brushLibrary] material roots unreadable', error); return; }
+      for (const key of keys) {
+        if (key.indexOf('bt:') !== 0) continue;
+        const ref = key.slice(3);
         if (!ref || paintGetTip(ref)) continue;
         try {
           const url = await getWorkspaceDbValue('bt:' + ref);
@@ -66406,15 +66460,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!await askConfirm(t('brushLib.confirmDelete') + (e.name || ''), { okLabel: t('menu.delete'), danger: true })) return;
       if (!lib.entries.includes(e)) return;
       if (!brushLibraryEdit(function(p) { p.items.splice(p.items.indexOf(e), 1); })) return;
-      // Only the last catalog reference releases a bitmap; current presets and multi-tip entries count too.
-      const stillUsed = function(ref) {
-        return lib.entries.some(function(entry) { return brushLibraryMaterialRefs(entry).includes(ref); });
-      };
-      brushLibraryMaterialRefs(e).forEach(function(ref) {
-        if (!ref || stillUsed(ref)) return;
-        deleteWorkspaceDbValue('bt:' + ref).catch(function(err) { console.error('[persist] brush tip cleanup failed', err); }); // ver1539
-        paintUnregisterTip(ref);
-      });
+      // Shared deletion rechecks catalog, current tools, presets and other editors before releasing pixels.
+      try { await deleteWorkspaceDbValues(brushLibraryMaterialRefs(e).map(function(ref) { return 'bt:' + ref; })); }
+      catch (error) { console.error('[persist] brush tip cleanup failed', error); }
+      scheduleStorageSweep('brush-delete');
       if (brushLibrarySelectedId === id) brushLibrarySelectedId = null;
       if (e.brush && e.brush.imageBrushRef) imageBrushReleaseAsset(e.brush.imageBrushRef).catch(imageBrushReportFailure);
       brushLibraryRenderGrid();
@@ -66483,49 +66532,52 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       brushLibraryRenderGrid();
     }
     // ── 임포트 파이프라인 (스펙 §4) — 드롭된 파일이 유일한 입력, 특정 파일을 코드에 박지 않는다 ──
-    function brushLibraryImportPngFile(file, options) { // 파일 및 미디어 가져오기가 같은 등록 경로를 쓴다
-      return new Promise(function(resolve) {
-        const rd = new FileReader();
-        rd.onload = function() {
-          const dataUrl = String(rd.result || '');
-          const ref = brushLibraryNewRef();
-          const aborted = function() { return options && options.shouldAbort && options.shouldAbort(); };
-          if (aborted()) { resolve(false); return; }
-          brushLibraryRegisterTipFromDataUrl(ref, dataUrl, async function(ok) {
-            if (!ok || aborted()) { paintUnregisterTip(ref); brushLibrarySetStatus(t('brushLib.importFailed') + file.name); resolve(false); return; }
-            const lib = brushLibraryLoad();
-            let entry = null, committed = false;
-            try {
-              if (!(await putWorkspaceDbValue('bt:' + ref, dataUrl))) throw new Error('Brush storage unavailable');
-              if (aborted()) { await deleteWorkspaceDbValue('bt:' + ref); paintUnregisterTip(ref); resolve(false); return; }
-              entry = {
-                t: 'p',
-                id: 'bl_' + Date.now().toString(36) + '_' + (brushLibrarySeq++).toString(36),
-                name: file.name.replace(/\.png$/i, ''), category: 'imported',
-                source: { kind: 'png', file: file.name, importedAt: new Date().toISOString() },
-                brush: { tool: 'pen', tipId: ref, tipSpacing: 0 }, tipRef: ref, notes: []
-              };
-              lib.entries.push(entry);
-              brushLibrarySave({ strict: true }); committed = true;
-              brushLibraryRenderGrid();
-              brushLibrarySetStatus(t('brushLib.imported') + file.name);
-              resolve(true);
-            } catch (error) {
-              if (!committed) {
-                if (entry) lib.entries = lib.entries.filter(function(item) { return item !== entry; });
-                paintUnregisterTip(ref);
-                try { await deleteWorkspaceDbValue('bt:' + ref); }
-                catch (cleanupError) { console.error('[brush import] Asset cleanup failed:', cleanupError); }
+    async function brushLibraryImportPngFile(file, options) { // 파일 및 미디어 가져오기가 같은 등록 경로를 쓴다
+      brushMaterialImports += 1; storageRootsChanged();
+      try {
+        return await new Promise(function(resolve) {
+          const rd = new FileReader();
+          rd.onload = function() {
+            const dataUrl = String(rd.result || '');
+            const ref = brushLibraryNewRef();
+            const aborted = function() { return options && options.shouldAbort && options.shouldAbort(); };
+            if (aborted()) { resolve(false); return; }
+            brushLibraryRegisterTipFromDataUrl(ref, dataUrl, async function(ok) {
+              if (!ok || aborted()) { paintUnregisterTip(ref); brushLibrarySetStatus(t('brushLib.importFailed') + file.name); resolve(false); return; }
+              const lib = brushLibraryLoad();
+              let entry = null, committed = false;
+              try {
+                if (!(await putWorkspaceDbValue('bt:' + ref, dataUrl))) throw new Error('Brush storage unavailable');
+                if (aborted()) { await deleteWorkspaceDbValue('bt:' + ref); paintUnregisterTip(ref); resolve(false); return; }
+                entry = {
+                  t: 'p',
+                  id: 'bl_' + Date.now().toString(36) + '_' + (brushLibrarySeq++).toString(36),
+                  name: file.name.replace(/\.png$/i, ''), category: 'imported',
+                  source: { kind: 'png', file: file.name, importedAt: new Date().toISOString() },
+                  brush: { tool: 'pen', tipId: ref, tipSpacing: 0 }, tipRef: ref, notes: []
+                };
+                lib.entries.push(entry);
+                brushLibrarySave({ strict: true }); committed = true;
+                brushLibraryRenderGrid();
+                brushLibrarySetStatus(t('brushLib.imported') + file.name);
+                resolve(true);
+              } catch (error) {
+                if (!committed) {
+                  if (entry) lib.entries = lib.entries.filter(function(item) { return item !== entry; });
+                  paintUnregisterTip(ref);
+                  try { await deleteWorkspaceDbValue('bt:' + ref); }
+                  catch (cleanupError) { console.error('[brush import] Asset cleanup failed:', cleanupError); }
+                }
+                console.error('[brush import]', error);
+                showToast(t('brushLib.importFailed') + file.name, { warn: true });
+                resolve(committed);
               }
-              console.error('[brush import]', error);
-              showToast(t('brushLib.importFailed') + file.name, { warn: true });
-              resolve(committed);
-            }
-          });
-        };
-        rd.onerror = function() { brushLibrarySetStatus(t('brushLib.importFailed') + file.name); resolve(false); };
-        rd.readAsDataURL(file);
-      });
+            });
+          };
+          rd.onerror = function() { brushLibrarySetStatus(t('brushLib.importFailed') + file.name); resolve(false); };
+          rd.readAsDataURL(file);
+        });
+      } finally { brushMaterialImports -= 1; storageRootsChanged(); scheduleStorageSweep('brush-import'); }
     }
     // SUT reference records: BE lengths, UTF-16LE path, then opaque metadata.
     // The record length includes its own four bytes. Malformed lists cannot select a different material.
@@ -66684,84 +66736,87 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Join Node -> Variant by ID and each Variant reference -> MaterialFile.OriginalPath.
     // Embedded row order and inactive materials do not determine the brush.
     async function brushLibraryImportSutBytes(bytes, fileName) {
-      const db = sqliteLoadDatabase(bytes), schema = sqliteGetSchema(db);
-      const nodes = schema.Node ? sqliteReadTableRows(db, 'Node', schema).rows : [];
-      const variants = schema.Variant ? sqliteReadTableRows(db, 'Variant', schema).rows : [];
-      const materials = schema.MaterialFile ? sqliteReadTableRows(db, 'MaterialFile', schema).rows : [];
-      const tools = [];
-      for (const node of nodes) {
-        if (node == null || node.NodeVariantID == null) continue;
-        const variant = variants.find(function(v) { return v && v.VariantID != null && v.VariantID === node.NodeVariantID; });
-        if (variant) tools.push({ node: node, variant: variant });
-      }
-      if (!tools.length) { brushLibrarySetStatus(t('brushLib.importFailed') + fileName); return false; }
-      const prepared = new Map();
-      const select = async function(v, key, paths, paper, notes) {
-        if (!paper && Number(v.BrushUsePatternImage) === 0) return null;
-        if (!paths) { notes.push(key + ' 참조 목록 손상/미해독 — 소재 미적용'); return null; }
-        if (!paths.length) {
-          if (!paper && Number(v.BrushUsePatternImage) === 1) notes.push(key + ' 참조 없음 — 붓끝 소재 미적용');
-          return null;
+      brushMaterialImports += 1; storageRootsChanged();
+      try {
+        const db = sqliteLoadDatabase(bytes), schema = sqliteGetSchema(db);
+        const nodes = schema.Node ? sqliteReadTableRows(db, 'Node', schema).rows : [];
+        const variants = schema.Variant ? sqliteReadTableRows(db, 'Variant', schema).rows : [];
+        const materials = schema.MaterialFile ? sqliteReadTableRows(db, 'MaterialFile', schema).rows : [];
+        const tools = [];
+        for (const node of nodes) {
+          if (node == null || node.NodeVariantID == null) continue;
+          const variant = variants.find(function(v) { return v && v.VariantID != null && v.VariantID === node.NodeVariantID; });
+          if (variant) tools.push({ node: node, variant: variant });
         }
-        const flipHorizontal = !paper && Number(v.BrushPatternReverseHorizontal) === 1;
-        const flipVertical = !paper && Number(v.BrushPatternReverseVertical) === 1;
-        // ver2587: a tip list with several materials prepares them all (繰り返し方法 cycles them — sutStepTipOrder);
-        // paper keeps its first reference as before.
-        const many = !paper && paths.length > 1;
-        const results = [];
-        for (const pth of (many ? paths : [paths[0]])) {
-          const matches = materials.filter(function(m) { return m && m.OriginalPath === pth; });
-          if (matches.length !== 1) {
-            notes.push(key + ' 참조 소재 ' + (matches.length ? '중복' : '누락') + (many ? '(' + pth + ')' : '') + ' — 미적용');
-            if (!many) return null;
-            continue;
+        if (!tools.length) { brushLibrarySetStatus(t('brushLib.importFailed') + fileName); return false; }
+        const prepared = new Map();
+        const select = async function(v, key, paths, paper, notes) {
+          if (!paper && Number(v.BrushUsePatternImage) === 0) return null;
+          if (!paths) { notes.push(key + ' 참조 목록 손상/미해독 — 소재 미적용'); return null; }
+          if (!paths.length) {
+            if (!paper && Number(v.BrushUsePatternImage) === 1) notes.push(key + ' 참조 없음 — 붓끝 소재 미적용');
+            return null;
           }
-          const cacheKey = JSON.stringify([paper, pth, flipHorizontal, flipVertical]);
-          if (!prepared.has(cacheKey)) prepared.set(cacheKey, brushLibraryPrepareSutMaterial(matches[0], paper, flipHorizontal, flipVertical));
-          const r = await prepared.get(cacheKey);
-          if (r.note) notes.push(r.note);
-          results.push(r);
+          const flipHorizontal = !paper && Number(v.BrushPatternReverseHorizontal) === 1;
+          const flipVertical = !paper && Number(v.BrushPatternReverseVertical) === 1;
+          // ver2587: a tip list with several materials prepares them all (繰り返し方法 cycles them — sutStepTipOrder);
+          // paper keeps its first reference as before.
+          const many = !paper && paths.length > 1;
+          const results = [];
+          for (const pth of (many ? paths : [paths[0]])) {
+            const matches = materials.filter(function(m) { return m && m.OriginalPath === pth; });
+            if (matches.length !== 1) {
+              notes.push(key + ' 참조 소재 ' + (matches.length ? '중복' : '누락') + (many ? '(' + pth + ')' : '') + ' — 미적용');
+              if (!many) return null;
+              continue;
+            }
+            const cacheKey = JSON.stringify([paper, pth, flipHorizontal, flipVertical]);
+            if (!prepared.has(cacheKey)) prepared.set(cacheKey, brushLibraryPrepareSutMaterial(matches[0], paper, flipHorizontal, flipVertical));
+            const r = await prepared.get(cacheKey);
+            if (r.note) notes.push(r.note);
+            results.push(r);
+          }
+          // ver2591: the stored BrushPatternImageArray order IS the usage order, for the ribbon and for ordinary dabs alike, first
+          // entry first — LAB MultiDab0917 with three tips stored [268×222, 12×16, 64×64] draws ribbon periods B A S and dabs
+          // B A S (docs/tests/sut_dab_order_2591). ver2590 reversed the list because its native strokes came from LAB Ribbon0917
+          // (tips added 12×16 first) while the exported file was LAB Multi0917 (stored 268×222 first) — two brushes, not a rule.
+          const good = results.filter(function(r) { return r && r.ref; });
+          if (!many) return results[0] || null;
+          if (!good.length) return results[0] || null;
+          const first = Object.assign({}, good[0], { refs: good.map(function(r) { return r.ref; }) });
+          notes.push(key + ' 소재 ' + paths.length + '개 → ' + first.refs.length + '개 등록 — 繰り返し方法 으로 순환 (ver2587)');
+          return first;
+        };
+        const lib = brushLibraryLoad();
+        let importedTip = false;
+        for (const pair of tools) {
+          const v = pair.variant, notes = [];
+          const tipPaths = paintSutMaterialPaths(v.BrushPatternImageArray);   // parsed once; the ordering warning in brushLibraryApplySutVariant reads the same list
+          const tip = await select(v, 'BrushPatternImageArray', tipPaths, false, notes);
+          const paper = await select(v, 'TextureImage', paintSutMaterialPaths(v.TextureImage), true, notes);
+          const brush = { tool: 'pen', tipId: tip ? tip.ref : '', tipSpacing: 0 };
+          if (paper && paper.ref) { brush.paperTexId = paper.ref; brush.paperTexDepth = 100; brush.paperTexScale = 100; }
+          brushLibraryApplySutVariant(brush, v, notes, tip, tipPaths);
+          if (paper && paper.scaleMul !== 1 && brush.paperTexId && Number(brush.paperTexScale) > 0) {
+            const raw = Number(brush.paperTexScale), scaled = Math.round(raw * paper.scaleMul);
+            brush.paperTexScale = Math.max(10, Math.min(400, scaled));
+            notes.push('종이결 배율 ' + raw + ' → ' + brush.paperTexScale + '% (원본/썸네일 비율 환산)'
+              + (scaled > 400 ? ' — 상한 400%' : ''));
+          }
+          if (tip && tip.scaling > 0) brush.tipScaling = tip.scaling; // Preserved metadata; no render multiplier.
+          const tipRef = brush.tipId || null;
+          importedTip = importedTip || !!tipRef;
+          lib.entries.push({
+            t: 'p', id: 'bl_' + Date.now().toString(36) + '_' + (brushLibrarySeq++).toString(36),
+            name: (pair.node.NodeName != null && String(pair.node.NodeName)) || fileName.replace(/\.sut$/i, ''),
+            category: 'imported', source: { kind: 'sut', file: fileName, importedAt: new Date().toISOString() },
+            brush: brush, tipRef: tipRef, notes: notes
+          });
         }
-        // ver2591: the stored BrushPatternImageArray order IS the usage order, for the ribbon and for ordinary dabs alike, first
-        // entry first — LAB MultiDab0917 with three tips stored [268×222, 12×16, 64×64] draws ribbon periods B A S and dabs
-        // B A S (docs/tests/sut_dab_order_2591). ver2590 reversed the list because its native strokes came from LAB Ribbon0917
-        // (tips added 12×16 first) while the exported file was LAB Multi0917 (stored 268×222 first) — two brushes, not a rule.
-        const good = results.filter(function(r) { return r && r.ref; });
-        if (!many) return results[0] || null;
-        if (!good.length) return results[0] || null;
-        const first = Object.assign({}, good[0], { refs: good.map(function(r) { return r.ref; }) });
-        notes.push(key + ' 소재 ' + paths.length + '개 → ' + first.refs.length + '개 등록 — 繰り返し方法 으로 순환 (ver2587)');
-        return first;
-      };
-      const lib = brushLibraryLoad();
-      let importedTip = false;
-      for (const pair of tools) {
-        const v = pair.variant, notes = [];
-        const tipPaths = paintSutMaterialPaths(v.BrushPatternImageArray);   // parsed once; the ordering warning in brushLibraryApplySutVariant reads the same list
-        const tip = await select(v, 'BrushPatternImageArray', tipPaths, false, notes);
-        const paper = await select(v, 'TextureImage', paintSutMaterialPaths(v.TextureImage), true, notes);
-        const brush = { tool: 'pen', tipId: tip ? tip.ref : '', tipSpacing: 0 };
-        if (paper && paper.ref) { brush.paperTexId = paper.ref; brush.paperTexDepth = 100; brush.paperTexScale = 100; }
-        brushLibraryApplySutVariant(brush, v, notes, tip, tipPaths);
-        if (paper && paper.scaleMul !== 1 && brush.paperTexId && Number(brush.paperTexScale) > 0) {
-          const raw = Number(brush.paperTexScale), scaled = Math.round(raw * paper.scaleMul);
-          brush.paperTexScale = Math.max(10, Math.min(400, scaled));
-          notes.push('종이결 배율 ' + raw + ' → ' + brush.paperTexScale + '% (원본/썸네일 비율 환산)'
-            + (scaled > 400 ? ' — 상한 400%' : ''));
-        }
-        if (tip && tip.scaling > 0) brush.tipScaling = tip.scaling; // Preserved metadata; no render multiplier.
-        const tipRef = brush.tipId || null;
-        importedTip = importedTip || !!tipRef;
-        lib.entries.push({
-          t: 'p', id: 'bl_' + Date.now().toString(36) + '_' + (brushLibrarySeq++).toString(36),
-          name: (pair.node.NodeName != null && String(pair.node.NodeName)) || fileName.replace(/\.sut$/i, ''),
-          category: 'imported', source: { kind: 'sut', file: fileName, importedAt: new Date().toISOString() },
-          brush: brush, tipRef: tipRef, notes: notes
-        });
-      }
-      brushLibrarySave(); brushLibraryRenderGrid();
-      brushLibrarySetStatus((importedTip ? t('brushLib.imported') : t('brushLib.importedNoTip')) + fileName);
-      return true;
+        brushLibrarySave(); brushLibraryRenderGrid();
+        brushLibrarySetStatus((importedTip ? t('brushLib.imported') : t('brushLib.importedNoTip')) + fileName);
+        return true;
+      } finally { brushMaterialImports -= 1; storageRootsChanged(); scheduleStorageSweep('brush-import'); }
     }
     // CSP 자동 간격: 0은 고정(BrushInterval), 1/2/3은 넓음/보통/좁음이다.
     // approx는 원형 대조 계수이며 미검증 조합에도 쓰는 공용 근사다. material은 정적 소재 팁 대조용이다.
