@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2661</title>
+  <title>MoArt ver2662</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -18316,7 +18316,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       gengaTimelineScrollLeft: 0,
       gengaTimelineLayerScrollTop: 0,
       gengaTimelineAudioScrollTop: 0,
-      videoCachePrimePending: false,
+      videoCachePrimeTimer: null,
       timelineRuntimeRoot: null,
       timelinePlayheadEls: [],
       conteKfMarkerEls: null,     // ver1068 (A2): timeline keyframe diamonds, cached for the playhead highlight
@@ -24784,6 +24784,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2662, items: [{ ja: '再生を停止した後や再開した後に、以前の映像・音声の先読みが続く問題を修正しました。', ko: '재생을 정지하거나 다시 시작한 뒤에도 이전 영상·음성 예열이 계속되던 문제를 수정했습니다.', en: 'Stopped stale video and audio preloading after playback stops or restarts.', zh: '修复停止或重新播放后仍继续预加载旧视频和音频的问题。' }] },
       { ver: 2661, items: [{ ja: '動画出力をキャンセルした後、残りの音声の読み込み・ミックスが続く問題を修正しました。', ko: '영상 출력을 취소한 뒤 남은 오디오를 계속 읽고 믹스하던 문제를 수정했습니다.', en: 'Stopped remaining audio loading and mixing after video export cancellation.', zh: '修复取消视频导出后仍继续加载和混合剩余音频的问题。' }] },
       { ver: 2660, items: [{ ja: 'レイヤーをまとめて削除・復元するとき、画面外のコマの不要なレイアウト計算を減らしました。', ko: '여러 레이어를 삭제·복원할 때 화면 밖 코마의 불필요한 레이아웃 계산을 줄였습니다.', en: 'Reduced unnecessary layout work for offscreen cels when deleting and restoring multiple layers.', zh: '减少批量删除和恢复图层时屏幕外单元格的不必要布局计算。' }] },
       { ver: 2659, items: [{ ja: 'オニオンスキンの初回表示で同じ絵を作り直す無駄を減らし、非表示にした後のキャッシュ整理を修正しました。', ko: '어니언 스킨 첫 표시의 불필요한 재생성을 줄이고, 끈 뒤의 캐시 정리를 수정했습니다.', en: 'Avoided rebuilding onion ghosts after their first display and fixed cache cleanup after hiding them.', zh: '减少洋葱皮首次显示后的重复生成，并修复隐藏后的缓存清理。' }, { ja: '描画直後に保存すると絵の準備不足でZIP保存に失敗する問題を修正しました。', ko: '그린 직후 그림 준비가 끝나지 않아 ZIP 저장이 실패하던 문제를 수정했습니다.', en: 'Fixed ZIP save failures when drawings were still being prepared immediately after a stroke.', zh: '修复刚完成笔画、图像尚未准备好时ZIP保存失败的问题。' }] },
@@ -45675,36 +45676,44 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.timelineStatus = t('status.audio.playbackMissed', total, detail);
     }
 
+    // A stopped/replaced run must not launch another decode after an async boundary.
+    function playbackCacheWarmGuard(project) {
+      const token = state.videoPlaybackStartToken, generation = state.audioPlaybackGeneration;
+      return function() { return state.videoPlaying && state.project === project && token === state.videoPlaybackStartToken && generation === state.audioPlaybackGeneration; };
+    }
+    async function warmPlaybackAudioBuffer(clip, url, current) {
+      if (current && !current()) return null;
+      const ctx = await ensurePlaybackAudioContext();
+      if (!ctx || (current && !current())) return null;
+      const plan = await audioClipDecodePlan(clip, url);
+      if (plan === 'html' || (current && !current())) return null;
+      return plan === 'slice' ? audioBufferSliceForClip(ctx, clip, url) : audioBufferForClip(ctx, clip, url);
+    }
     // 재생 시작 직후의 클립은 프리캐시(primePlaybackCachesForRange)가 120ms 뒤에나 도는 데다 await 도
     // 안 되므로 **첫 클립이 늘 미준비**였다. 시작 시점에 겹치거나 곧 시작할 클립만 짧게 기다린다.
     // 상한을 두는 이유: 큰 소스의 첫 디코드는 초 단위라 무한정 기다리면 재생 버튼이 먹통으로 보인다.
     // 상한을 넘기면 그대로 시작하고, 못 낸 소리는 위 카운터가 잡아 보고한다.
     async function warmPlaybackAudioForStart(project, startFrame, fps) {
+      const current = playbackCacheWarmGuard(project);
       const clips = (state.playbackClipQueue || []).filter(function(clip) {
         return clip && clip.startFrame <= startFrame + fps && audioClipHasSource(project, clip);
       }).slice(0, 4);
       if (!clips.length) return;
       const work = Promise.all(clips.map(function(clip) {
         return ensurePlaybackAudioUrlForClip(clip).then(function(url) {
-          if (!url) return null;
-          return ensurePlaybackAudioContext().then(function(ctx) {
-            if (!ctx) return null;
-            return audioClipDecodePlan(clip, url).then(function(plan) {
-              if (plan === 'html') return null;
-              return plan === 'slice' ? audioBufferSliceForClip(ctx, clip, url) : audioBufferForClip(ctx, clip, url);
-            });
-          });
-        }).catch(function(error) { noteAudioPlaybackMiss(clip, 'warm-failed'); return null; });
+          return url ? warmPlaybackAudioBuffer(clip, url, current) : null;
+        }).catch(function(error) { if (current()) noteAudioPlaybackMiss(clip, 'warm-failed'); return null; });
       }));
       const cap = new Promise(function(resolve) { setTimeout(resolve, AUDIO_PLAYBACK_WARM_CAP_MS); });
       await Promise.race([work, cap]);
     }
 
     function primePlaybackCachesForRange(project, startFrame, totalFrames) {
-      if (state.videoCachePrimePending) return;
-      state.videoCachePrimePending = true;
-      setTimeout(function() {
-        state.videoCachePrimePending = false;
+      if (state.videoCachePrimeTimer || !state.videoPlaying || state.project !== project) return;
+      const current = playbackCacheWarmGuard(project);
+      state.videoCachePrimeTimer = setTimeout(function() {
+        state.videoCachePrimeTimer = null;
+        if (!current()) return;
         warmVideoCachesAroundFrame(project, startFrame);
         const fps = fpsForProject(project);
         const preloadEnd = Math.min(totalFrames, startFrame + fps * 10);
@@ -45712,7 +45721,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return clip.startFrame + clip.durationFrames >= startFrame && clip.startFrame <= preloadEnd && audioClipHasSource(project, clip);
         }).slice(0, 12).forEach(function(clip) {
           ensurePlaybackAudioUrlForClip(clip).then(function(url) {
-            if (url) preloadAudioBufferForClip(clip);
+            if (url && current()) preloadAudioBufferForClip(clip, current);
           });
         });
       }, 120);
@@ -45895,6 +45904,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function stopTimelinePlayback(shouldRender) {
       state.videoPlaybackStartToken += 1;
+      if (state.videoCachePrimeTimer) clearTimeout(state.videoCachePrimeTimer);
+      state.videoCachePrimeTimer = null;
       if (state.videoPlaybackTimer) clearInterval(state.videoPlaybackTimer);
       state.videoPlaybackTimer = null;
       if (state.videoPlaybackRaf) cancelAnimationFrame(state.videoPlaybackRaf);
@@ -52901,17 +52912,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function preloadAudioBufferForClip(clip) {
+    function preloadAudioBufferForClip(clip, current) {
       const audioUrl = clip && state.workspaceObjectUrls.audio[clip.id];
       if (!audioUrl || state.audioBufferCache[audioClipSourceKey(clip) || audioUrl] || audioClipCachedSliceBuffer(clip)) return;
-      ensurePlaybackAudioContext().then(function(ctx) {
-        if (!ctx) return null;
-        return audioClipDecodePlan(clip, audioUrl).then(function(plan) {
-          if (plan === 'slice') return audioBufferSliceForClip(ctx, clip, audioUrl);
-          if (plan === 'html') return null; // streamed at play time -- nothing to pre-decode
-          return audioBufferForClip(ctx, clip, audioUrl);
-        });
-      }).catch(function(error) { noteAudioPlaybackMiss(clip, 'preload-failed'); }); // ver1528: 삼키지 않는다
+      warmPlaybackAudioBuffer(clip, audioUrl, current).catch(function(error) {
+        if (!current || current()) noteAudioPlaybackMiss(clip, 'preload-failed');
+      }); // Current playback failures remain visible; superseded warm-up cannot mark a new run.
     }
 
     // Decode-cache identity of a clip's SOURCE AUDIO FILE. Clips share sources heavily (real data: one
