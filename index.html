@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2677</title>
+  <title>MoArt ver2678</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -24990,6 +24990,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2678, items: [{ ja: '未使用データの自動整理が、アプリに戻った後や別のウィンドウによる保留後にも続くよう修正しました。', ko: '미사용 데이터 자동 정리가 앱 복귀 후나 다른 창 때문에 보류된 뒤에도 이어지도록 수정했습니다.', en: 'Automatic unused-data cleanup now resumes after returning to the app and retries after another window has held deletion.', zh: '修复未使用数据自动清理在返回应用或因其他窗口暂停后无法继续的问题。' }] },
       { ver: 2677, items: [{ ja: '長いWAVの波形・再生・スクラブで必要な区間だけを読み、メモリ使用量を削減しました。動画再生の細かな速度補正が繰り返される問題も改善しました。', ko: '긴 WAV의 파형·재생·스크럽을 구간 단위로 읽어 메모리 사용량을 줄였습니다. 영상 재생의 작은 속도 보정이 반복되던 문제도 개선했습니다.', en: 'Reduced memory use for long WAV waveforms, playback and scrubbing by decoding short sections. Reduced repeated small playback-rate corrections during video playback.', zh: '通过分段解码减少长WAV波形、播放和拖动预听的内存占用，并减少视频播放中反复发生的小幅速度校正。' }] },
       { ver: 2676, items: [{ ja: '動画再生の小さなずれを補正し、音声付き動画の読み込み処理を軽くしました。素材の差し替え・時間の解釈でリンク音声の長さが変わる問題と、原画の再生準備中のフレームレート変更を修正しました。', ko: '영상 재생의 작은 시간차를 보정하고 음성 포함 영상의 가져오기 처리를 줄였습니다. 소재 교체·시간 해석 때 링크 음성 길이가 바뀌던 문제와 원화 재생 준비 중 레이트 변경을 수정했습니다.', en: 'Corrected small video playback offsets and reduced repeated audio decoding during video import. Fixed linked audio duration changes during source replacement or interpretation, and rate changes while animation playback prepares.', zh: '校正视频播放的小幅时间偏差，减少导入视频时的重复音频解码。修复替换素材或更改时间解释时链接音频长度改变，以及原画播放准备期间帧率更新的问题。' }] },
       { ver: 2675, items: [
@@ -58700,22 +58701,28 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     const STORAGE_SWEEP_INTERVAL_MS = 60000;
-    let storageSweepTimer = 0, storageSweepLastAt = 0;
+    let storageSweepTimer = 0, storageSweepLastAt = 0, storageSweepRequested = false;
     function scheduleStorageSweep(reason) {
+      storageSweepRequested = true;
       if (storageSweepTimer || storageSweepRunning || document.hidden) return;
       const delay = Math.max(2000, STORAGE_SWEEP_INTERVAL_MS - (performance.now() - storageSweepLastAt));
       storageSweepTimer = setTimeout(function run() {
         storageSweepTimer = 0;
-        if (document.hidden) return; // The next successful foreground save schedules it again.
+        if (document.hidden) return; // Keep the request; visibilitychange resumes it.
         if (strokeInProgress()) { storageSweepTimer = setTimeout(run, GENGA_BG_STROKE_DEFER_MS); return; }
+        storageSweepRequested = false;
         storageSweepLastAt = performance.now();
         storageSweepUnreferenced()
           .then(function(res) {
             if (res) console.debug('[storage] sweep(' + reason + ')', res);
-            // Finish the observation window, without endlessly retrying a blocked/failed deletion.
-            if (res && res.observing) scheduleStorageSweep('pending');
+            // Mature candidates can still be held by another window or a changed root.
+            // Recheck at the normal interval; never weaken the shared deletion guard.
+            if (res && res.pending) storageSweepRequested = true;
           })
-          .catch(function(error) { console.error('[storage] sweep(' + reason + ') failed', error); });
+          .catch(function(error) { console.error('[storage] sweep(' + reason + ') failed', error); })
+          .finally(function() {
+            if (storageSweepRequested) scheduleStorageSweep('pending');
+          });
       }, delay);
     }
 
@@ -90971,11 +90978,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       document.addEventListener('visibilitychange', function() {
         if (document.visibilityState === 'hidden') flushIndexedDbAutosave();
-        else resumePlaybackAudioContextIfNeeded(); // iOS suspends the AudioContext in the background → re-arm on return
+        else {
+          resumePlaybackAudioContextIfNeeded(); // iOS suspends audio in the background.
+          scheduleStorageSweep('foreground');
+        }
       });
       document.addEventListener('pointerdown', resumePlaybackAudioContextIfNeeded, true);
       document.addEventListener('touchend', resumePlaybackAudioContextIfNeeded, true);
       window.addEventListener('pagehide', flushIndexedDbAutosave);
+      scheduleStorageSweep('startup'); // Also inspect leftovers when no new save occurs.
       // ver902: warn before leaving, because the in-memory project (and its undo stack) does NOT survive a
       // reload/close. beforeunload fires no matter HOW the user leaves (F5, Ctrl+R, Ctrl+W, tab close, back)
       // — a single method-agnostic guard, which key-interception cannot match (Ctrl+W etc. are
