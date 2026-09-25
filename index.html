@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2692</title>
+  <title>MoArt ver2693</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25053,6 +25053,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2693, items: [{ ja: 'ピッチを保つ速度変更の音声準備で、一時的に使うメモリを減らしました。', ko: '피치를 유지하는 속도 변경 음성 준비에서 일시적으로 쓰는 메모리를 줄였습니다.', en: 'Reduced temporary memory used while preparing pitch-preserving speed changes for audio.', zh: '减少了保持音高的变速音频准备时占用的临时内存。' }] },
       { ver: 2692, items: [{ ja: '原画タイムラインの最初の表示と、長い空白区間があるレイヤーの更新・編集開始を軽くしました。', ko: '원화 타임라인의 첫 표시와, 긴 빈 구간이 있는 레이어의 갱신·편집 시작을 가볍게 했습니다.', en: 'Sped up the first genga timeline display and the updates and edit starts of layers with long empty gaps.', zh: '加快了原画时间轴的首次显示，以及含长空白区间图层的更新与开始编辑。' }] },
       { ver: 2691, items: [{ ja: 'カメラが直線上を折り返すとき、軌跡の折り返し点が消える問題を修正しました。', ko: '카메라가 직선 위에서 되돌아올 때 궤적의 방향 전환점이 사라지는 문제를 수정했습니다.', en: 'Fixed missing turning points in camera paths that reverse along a straight line.', zh: '修复摄像机沿直线折返时轨迹转折点消失的问题。' }] },
       { ver: 2690, items: [{ ja: '選択範囲の変形後に、履歴が保持する画像のメモリ量を正しく集計するよう修正しました。', ko: '선택 영역 변형 후 실행 취소 이력이 보유하는 그림 메모리의 집계 누락을 수정했습니다.', en: 'Fixed undo memory accounting after applying selection transforms.', zh: '修复应用选区变换后撤销历史图像内存的统计遗漏。' }] },
@@ -54855,8 +54856,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const win = new Float32Array(frame);
       for (let i = 0; i < frame; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (frame - 1));
       const outLen = Math.max(1, Math.round(n * factor));
-      const out = new Float32Array(outLen + frame);
-      const norm = new Float32Array(outLen + frame);
+      // The only PCM-sized array: overlap-add, then in-place normalization. Samples at and past outLen were
+      // never read, so windows stop at outLen instead of allocating a frame of tail.
+      const out = new Float32Array(outLen);
       // Widen only the hot search window once; correlation addition order stays unchanged.
       const search = new Float64Array(frame + 2 * seek);
       const target = new Float64Array(frame); // Reused continuation scratch, not an output buffer.
@@ -54885,20 +54887,29 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (start < 0) start = 0;
         if (start + frame > n) start = Math.max(0, n - frame);
-        for (let k = 0; k < frame; k++) { out[synPos + k] += (input[start + k] || 0) * win[k]; norm[synPos + k] += win[k]; }
+        const span = Math.min(frame, outLen - synPos);
+        for (let k = 0; k < span; k++) out[synPos + k] += (input[start + k] || 0) * win[k];
         hasTarget = true;
         for (let k = 0; k < frame; k++) target[k] = input[start + synHop + k] || 0;
         anaPos += anaHop; synPos += synHop;
       }
-      const res = new Float32Array(outLen);
-      for (let i = 0; i < outLen; i++) res[i] = norm[i] > 1e-6 ? out[i] / norm[i] : 0;
-      return res;
+      // Window weights are input-independent. synHop >= frame / 2, so a sample has at most two windows: the
+      // earlier one first, rounded to Float32 exactly as the former per-sample weight array accumulated them.
+      // The first hop sees only window 0; every later hop repeats one synHop-long weight period.
+      const weight = new Float32Array(synHop);
+      for (let k = 0; k < synHop; k++) weight[k] = k + synHop < frame ? win[k + synHop] + win[k] : win[k];
+      for (let base = 0; base < outLen; base += synHop) {
+        const weights = base ? weight : win, end = Math.min(synHop, outLen - base);
+        for (let k = 0; k < end; k++) { const w = weights[k]; out[base + k] = w > 1e-6 ? out[base + k] / w : 0; }
+      }
+      return out;
     }
     // One buffer job at a time: queued clips keep their existing source, not copied PCM.
     let audioStretchQueue = Promise.resolve();
     function timeStretchTrimmedBuffer(ctx, buffer, startSample, lenSample, factor, check) {
       const run = audioStretchQueue.then(function() { return timeStretchBufferJob(ctx, buffer, startSample, lenSample, factor, check); });
-      audioStretchQueue = run.catch(function() {}); // A canceled job cannot poison the next one.
+      // A canceled job cannot poison the next one, and the queue must not keep the finished AudioBuffer.
+      audioStretchQueue = run.then(function() {}, function() {});
       return run;
     }
     async function timeStretchBufferJob(ctx, buffer, startSample, lenSample, factor, check) {
