@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2685</title>
+  <title>MoArt ver2686</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25043,6 +25043,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2686, items: [{ ja: '原画タイムラインの初回表示と音声の速度変換を軽量化し、ZIP保存時の画像文字列と大きなデータのコピーを削減しました。', ko: '원화 타임라인 첫 표시와 오디오 배속 계산을 가볍게 하고, ZIP 저장의 이미지 문자열과 대형 데이터 복사를 줄였습니다.', en: 'Reduced initial animation timeline and audio time-stretch costs, and removed image string conversions and large data copies from ZIP saves.', zh: '减轻原画时间轴首次显示和音频变速计算的负担，减少ZIP保存时的图像字符串转换与大型数据复制。' }] },
       { ver: 2685, items: [{ ja: '多数の原画を含むファイル保存・ZIP出力時の画像メモリを削減しました。タイムライン初回表示と無音区間を含む音声の速度変換も改善しました。', ko: '그림이 많은 파일 저장·ZIP 출력의 이미지 메모리 보유를 줄였습니다. 타임라인 첫 표시와 무음 구간이 포함된 오디오의 배속 변환도 개선했습니다.', en: 'Reduced drawing memory retained during file saves and ZIP exports. Improved initial timeline rendering and time stretching of audio with silent sections.', zh: '减少含有大量原画的文件保存和ZIP导出时的图像内存占用，改善时间轴首次显示和含静音段音频的变速处理。' }] },
       { ver: 2683, items: [{ ja: '大きなプロジェクトの保存・初回表示・画像読み込みの負荷を軽減し、音声と一時キャンバスのメモリ保持を改善しました。', ko: '큰 프로젝트의 저장·첫 화면·그림 로드 부담을 줄이고 오디오와 임시 캔버스의 메모리 보유를 개선했습니다.', en: 'Reduced large-project save, initial timeline and drawing-load work, and improved audio and temporary canvas memory lifetimes.', zh: '减少大型项目保存、时间轴首次显示和图像加载的负担，改善音频和临时画布的内存管理。' }] },
       { ver: 2682, items: [{ ja: 'プロジェクト切り替え前の保存と固定プロジェクトの保護を改善しました。一時的な自動保存エラーは待機中に一度だけ再試行します。', ko: '프로젝트 전환 전 저장과 고정 프로젝트 보존을 개선했습니다. 일시적인 자동저장 오류는 유휴 상태에서 한 번 재시도합니다.', en: 'Improved save-before-switch and pinned project protection. Transient autosave failures retry once while idle.', zh: '改进切换项目前的保存和固定项目保护。临时自动保存错误会在空闲时重试一次。' }] },
@@ -54812,7 +54813,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const outLen = Math.max(1, Math.round(n * factor));
       const out = new Float32Array(outLen + frame);
       const norm = new Float32Array(outLen + frame);
-      const target = new Float32Array(frame); // Reused continuation scratch, not an output buffer.
+      // Widen only the hot search window once; correlation addition order stays unchanged.
+      const search = new Float64Array(frame + 2 * seek);
+      const target = new Float64Array(frame); // Reused continuation scratch, not an output buffer.
       let anaPos = 0, synPos = 0, hasTarget = false, finiteInput;
       while (synPos < outLen) {
         let start = anaPos;
@@ -54825,15 +54828,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             const first = Math.max(-seek, -anaPos), last = Math.min(seek, n - frame - anaPos);
             start = anaPos + (first <= last ? first : 0);
           } else {
-            let best = -Infinity, bestD = 0;
-            for (let d = -seek; d <= seek; d++) {
-              const p = anaPos + d;
-              if (p < 0 || p + frame > n) continue;
+            let best = -Infinity;
+            const first = Math.max(0, anaPos - seek), last = Math.min(n - frame, anaPos + seek);
+            const count = last - first;
+            for (let k = 0; count >= 0 && k < count + frame; k++) search[k] = input[first + k];
+            for (let p = 0; p <= count; p++) {
               let corr = 0;
-              for (let k = 0; k < frame; k += 4) corr += input[p + k] * target[k];
-              if (corr > best) { best = corr; bestD = d; }
+              for (let k = 0; k < frame; k += 4) corr += search[p + k] * target[k];
+              if (corr > best) { best = corr; start = first + p; }
             }
-            start = anaPos + bestD;
           }
         }
         if (start < 0) start = 0;
@@ -60460,12 +60463,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // format is a STORE (uncompressed — media is already compressed) ZIP, written entry-by-entry to a stream:
     // no giant string at any point. Read back by the existing importConteFolderZip (method 0, basename match).
     let __zipCrcTable = null;
-    function zipCrc32(bytes) {
+    function zipCrc32(bytes, previous) {
       if (!__zipCrcTable) {
         __zipCrcTable = new Uint32Array(256);
         for (let n = 0; n < 256; n += 1) { let c = n; for (let k = 0; k < 8; k += 1) { c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); } __zipCrcTable[n] = c >>> 0; }
       }
-      let c = 0xFFFFFFFF;
+      let c = previous == null ? 0xFFFFFFFF : (previous ^ 0xFFFFFFFF);
       for (let i = 0; i < bytes.length; i += 1) { c = (__zipCrcTable[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8)) >>> 0; }
       return (c ^ 0xFFFFFFFF) >>> 0;
     }
@@ -60475,22 +60478,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < list.length; i += 1) { out.set(list[i], o); o += list[i].length; }
       return out;
     }
-    function zipStoreWriter(write) { // write(Uint8Array)->Promise ; STORE (method 0) only
+    function zipStoreWriter(write) { // write(Uint8Array|Blob)->Promise; same STORE headers and CRC
       const enc = new TextEncoder();
       const entries = [];
       let offset = 0;
       const u16 = function(v) { return new Uint8Array([v & 0xFF, (v >>> 8) & 0xFF]); };
       const u32 = function(v) { v = v >>> 0; return new Uint8Array([v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF]); };
+      const addEntry = async function(name, size, crc, payload) {
+        const nameBytes = enc.encode(name);
+        await write(zipConcatBytes([u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0), u32(crc), u32(size), u32(size), u16(nameBytes.length), u16(0)]));
+        await write(nameBytes);
+        if (size) await write(payload);
+        entries.push({ nameBytes: nameBytes, crc: crc, size: size, offset: offset });
+        offset += 30 + nameBytes.length + size;
+      };
       return {
-        addFile: async function(name, bytes) {
-          const nameBytes = enc.encode(name);
-          const crc = zipCrc32(bytes);
-          const size = bytes.length >>> 0;
-          await write(zipConcatBytes([u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0), u32(crc), u32(size), u32(size), u16(nameBytes.length), u16(0)]));
-          await write(nameBytes);
-          if (size) await write(bytes);
-          entries.push({ nameBytes: nameBytes, crc: crc, size: size, offset: offset });
-          offset += 30 + nameBytes.length + size;
+        addFile: async function(name, bytes) { return addEntry(name, bytes.length >>> 0, zipCrc32(bytes), bytes); },
+        addBlob: async function(name, blob, check) {
+          let crc = 0;
+          // CRC goes before bytes in the existing ZIP contract. Read a bounded prefix at a time,
+          // then pass the immutable Blob itself to the sink without materializing a full ArrayBuffer.
+          for (let start = 0; start < blob.size; start += 1048576) {
+            if (check) check();
+            const bytes = new Uint8Array(await blob.slice(start, start + 1048576).arrayBuffer());
+            if (check) check();
+            crc = zipCrc32(bytes, crc);
+          }
+          if (check) check();
+          return addEntry(name, blob.size >>> 0, crc, blob);
         },
         finish: async function() {
           const cdStart = offset; let cdSize = 0;
@@ -60868,11 +60883,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // genga media lives in ref stores (memory + IndexedDB 'gd:'/'ga:'). Refs alone would only resolve in
         // THIS browser, so the bytes must ride along — ver1895 ships them as **separate entries** instead of
         // inlining base64 (see gengaExternalizeDrawings for why). uniqueName 은 오디오·레이어와 공유한다.
-        const drawingUrls = await gengaPortableDrawingUrls(copy, owner);
+        const drawingData = await gengaPreparePortableDrawings(copy, owner, true);
         assertProjectIoOwner(owner);
         await gengaHydrateAudioStore(copy, owner);
         assertProjectIoOwner(owner);
-        gengaExternalizeDrawings(copy.gengaTimeline, uniqueName, media, drawingUrls);
+        gengaExternalizeDrawings(copy.gengaTimeline, uniqueName, media, drawingData);
         gengaExternalizeAudio(copy.gengaTimeline, uniqueName, media);
       }
       await conteBundleCollectAudio(copy, audioUrls, media, uniqueName, owner);
@@ -61015,17 +61030,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             const zip = zipStoreWriter(async function(bytes) {
               assertProjectIoOwner(owner);
               phase = 'write';
-              if (writable) await writable.write(bytes); else chunks.push(bytes.slice());
+              if (writable) await writable.write(bytes); else chunks.push(bytes instanceof Blob ? bytes : new Blob([bytes]));
               assertProjectIoOwner(owner);
             });
             await zip.addFile('project.conte.json', new TextEncoder().encode(bundle.projectJson));
             for (const item of bundle.media) {
               assertProjectIoOwner(owner);
               currentFile = zipName + ' / ' + item.path; phase = 'read-media';
-              const bytes = item.recordingRef
-                ? new Uint8Array(await (await drawingRecordingReadAsset(item.recordingRef, bundle.recordingSource, owner.handle, item.recordingFrame)).arrayBuffer())
-                : item.bytes || new Uint8Array(await (await blobFromMediaUrl(item.url)).arrayBuffer());
-              await zip.addFile(item.path, bytes);
+              if (item.bytes) await zip.addFile(item.path, item.bytes);
+              else {
+                const blob = item.recordingRef
+                  ? await drawingRecordingReadAsset(item.recordingRef, bundle.recordingSource, owner.handle, item.recordingFrame)
+                  : item.blob || await blobFromMediaUrl(item.url);
+                await zip.addBlob(item.path, blob, function() { assertProjectIoOwner(owner); });
+              }
             }
             currentFile = zipName; phase = 'finish'; await zip.finish();
             assertProjectIoOwner(owner);
@@ -61098,7 +61116,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       await externalizeLayerDrawingsToWorkspace(owner);
       await externalizeAudioToWorkspace(owner);
       const beforeWrite = projectUnsavedSnapshot(), copy = projectForJsonStorage({ portable: false });
-      const drawingUrls = await gengaPortableDrawingUrls(copy, owner); assertProjectIoOwner(owner);
+      const drawingUrls = await gengaPreparePortableDrawings(copy, owner); assertProjectIoOwner(owner);
       if (copy.gengaTimeline) { gengaInlineDrawings(copy.gengaTimeline, drawingUrls); gengaInlineAudio(copy.gengaTimeline); }
       await drawingRecordingPrepareFile(copy, owner, 'folder');
       assertProjectIoOwner(owner);
@@ -61164,7 +61182,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       owner = owner || projectIoOwner();
       await drawingFlushPending(); assertProjectIoOwner(owner);
       const baseline = projectUnsavedSnapshot(), copy = projectForJsonStorage({ portable: false });
-      const drawingUrls = await gengaPortableDrawingUrls(copy, owner); assertProjectIoOwner(owner);
+      const drawingUrls = await gengaPreparePortableDrawings(copy, owner); assertProjectIoOwner(owner);
       if (copy.gengaTimeline) { gengaInlineDrawings(copy.gengaTimeline, drawingUrls); gengaInlineAudio(copy.gengaTimeline); }
       await drawingRecordingPrepareFile(copy, owner, 'inline'); assertProjectIoOwner(owner);
       const payload = serializedProjectJson(null, copy);
@@ -95130,7 +95148,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // put 이 아직 안 끝났거나 실패했거나, 애초에 안 적는 모드(tlTut)면 **절대 안 버린다**.
     // 버리면 그 그림은 어디에도 없다 — 이 집합이 이 판의 유일한 안전 장치다.
     // ★미저장 판정은 portable:false 로 옮겨서 **이 축출과 무관**하고,
-    // ZIP·JSON은 gengaPortableDrawingUrls가 ref별로 준비·변환한다. 전체 픽셀을 상주시킬 필요는 없다.
+    // ZIP·JSON은 gengaPreparePortableDrawings가 ref별로 준비·변환한다. 전체 픽셀을 상주시킬 필요는 없다.
     const gengaPersistedRefs = new Set();      // 디스크에 들어간 것이 확인된 ref = 축출 후보
     // ── ver2443 (저장 무결성 F2 · S-B §5-B): 쓰기 결과의 소유자를 한 곳에 둔다 ──────────────────
     // **완료 즉시 지우지 않는다.** 진행 중 목록에 없다는 이유로 「성공」이라 추정하면 실패한 그림이
@@ -95292,7 +95310,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // `{dataUrl:{...}}` 이 파일에 박힌다. 파일 형식은 이 판에서 안 바꾼다(칸은 IndexedDB 안에서만
     // 산다) — 그래서 나갈 때 통짜 한 장을 그 자리에서 굽는다(ver2195: 상주 합성본이 사라졌으므로
     // 디코드된 칸에서 동기로 합친다 — 이 함수는 동기 계약이라 여기서 디코드를 기다릴 수 없고,
-    // 파일 저장은 gengaPortableDrawingUrls의 출력 전용 디코드·PNG를 전달한다).
+    // 파일 저장은 gengaPreparePortableDrawings의 출력 전용 디코드·PNG를 전달한다).
     // 미완/인코드 실패는 빈 문자열과 로그다. portable 파일 저장 호출자는 이를 실패로
     // 처리해야 한다 — 원본 바이트 없이 ref만 남기면 다른 기기에서는 복원할 수 없다.
     function gengaStoreValueUrl(v) {
@@ -95386,9 +95404,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return job;
     }
     // Prepare portable PNGs one ref at a time; decoded export pixels never accumulate in the live store.
-    async function gengaPortableDrawingUrls(project, owner) {
-      const gt = project && project.gengaTimeline, urls = new Map();
-      if (!gt) return urls;
+    async function gengaPreparePortableDrawings(project, owner, asBlob) {
+      const gt = project && project.gengaTimeline, prepared = new Map();
+      if (!gt) return prepared;
       owner = owner || projectIoOwner(); assertProjectIoOwner(owner);
       gengaFlushPendingDrawingEncodes({ pixelsOnly: true });
       const refs = new Map();
@@ -95406,32 +95424,35 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             const values = await readWorkspaceDbValues(['gd:' + ref]); assertProjectIoOwner(owner);
             const raw = values.get('gd:' + ref);
             if (raw instanceof Blob && await gengaBlobIsTileSet(raw)) value = await gengaTileSetFromBlob(raw);
-            else if (raw != null) value = raw instanceof Blob ? await gengaBlobToDataUrl(raw) : String(raw);
+            else if (raw != null) value = raw instanceof Blob ? (asBlob ? raw : await gengaBlobToDataUrl(raw)) : String(raw);
             else {
               // Delta-chain recovery keeps its existing source ownership and persistence path.
               await gengaDrawStoreFaultIn(ref, null); value = gengaDrawStore.get(ref);
             }
             assertProjectIoOwner(owner);
           }
-          const needsDecode = gengaIsTileSet(value) && !gengaTileSetDecodedComplete(value);
-          let url = '';
-          try { url = gengaIsTileSet(value) ? await gengaPortableTileUrl(value, owner) : gengaStoreValueUrl(value); }
+          const yieldsPixels = gengaIsTileSet(value) && (asBlob || !gengaTileSetDecodedComplete(value));
+          let payload = '';
+          try {
+            payload = gengaIsTileSet(value) ? await gengaPortableTile(value, owner, asBlob)
+              : asBlob ? (value instanceof Blob ? value : gengaDataUrlToBlob(gengaStoreValueUrl(value))) : gengaStoreValueUrl(value);
+          }
           catch (error) {
             assertProjectIoOwner(owner);
             if (required) throw error;
             console.warn('[gengaPortable] preserving inline/vector fallback for ' + ref, error);
           }
-          if (url) urls.set(ref, url);
+          if (payload) prepared.set(ref, payload);
           else if (required) throw new Error(t('status.genga.drawing.unavailable') + ' (' + ref + ')');
-          // Native tile decoding already yielded. Budget ready-only batches without an extra timer per decoded image.
-          if (!needsDecode && performance.now() - yieldedAt >= 8) { await yieldToBrowser(); yieldedAt = performance.now(); }
-          yieldedAt = needsDecode ? performance.now() : yieldedAt;
+          // Native decode/Blob encoding already yielded; only ready synchronous batches need a timer.
+          if (!yieldsPixels && performance.now() - yieldedAt >= 8) { await yieldToBrowser(); yieldedAt = performance.now(); }
+          yieldedAt = yieldsPixels ? performance.now() : yieldedAt;
           assertProjectIoOwner(owner);
         }
-        return urls;
+        return prepared;
       } finally { gengaSaveLeaseRelease(leased); }
     }
-    async function gengaPortableTileUrl(ts, owner) {
+    async function gengaPortableTile(ts, owner, asBlob) {
       const canvas = document.createElement('canvas');
       canvas.width = Math.max(1, ts.w); canvas.height = Math.max(1, ts.h);
       const ctx = canvas.getContext('2d'), missing = [];
@@ -95461,7 +95482,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         await Promise.all(Array.from({ length: Math.min(GENGA_TILE_DECODE_PARALLEL, missing.length) }, worker));
         if (failure) throw failure;
         assertProjectIoOwner(owner);
-        return canvas.toDataURL('image/png');
+        if (!asBlob) return canvas.toDataURL('image/png');
+        const blob = await new Promise(function(resolve) { canvas.toBlob(resolve, 'image/png'); });
+        assertProjectIoOwner(owner);
+        if (!blob) throw new Error(t('status.genga.drawing.unavailable'));
+        return blob;
       } finally { paintReleaseCanvas(canvas); }
     }
     // ---- ver2193: 획이 닿은 칸만 다시 굽는다 (docs/genga_growth_rate_2026-08-24.md · q1=A · q2=64px · q3=A) ----
@@ -95490,7 +95515,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // (잉크 상자 안의 빈 공간까지 RGBA 로 들었다). `cells`(압축 Blob)가 정본이고 `decoded` 는
     // 칸별 디코드 캐시다. store 등록은 픽셀 준비 완료를 뜻하지 않는다. 화면 밖 복원, 압력 회수,
     // 커밋 이관 뒤에는 Blob만 남을 수 있다. 표시·획 시드는 gengaPrepareDrawing의 준비/재시도를,
-    // 파일 출력은 gengaPortableDrawingUrls가 출력 전용 픽셀을 준비·인코드하고 즉시 반납한다.
+    // 파일 출력은 gengaPreparePortableDrawings가 출력 전용 픽셀을 준비·인코드하고 즉시 반납한다.
     // 통짜 한 장이 꼭 필요한 자리(직렬화·실루엣 소스·스케일 그리기)는 gengaTileSetComposeCanvas 로
     // **그때 만들어 그때 버린다** — 상주로 캐시하는 순간 이 판이 없앤 것이 도로 생긴다.
     function gengaIsTileSet(v) { return Boolean(v && typeof v === 'object' && v.cells instanceof Map); }
@@ -98035,22 +98060,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // media 에 담을 항목을 만들고 JSON 쪽에는 기술자를 남긴다. 바이트로 못 바꾸면 **인라인으로**
     // **물러선다** — 자산이 조용히 빠지는 것보다 무거운 편이 낫다.
     function gengaExternalizeAsset(store, ref, uniqueName, media) {
-      const url = gengaStoreValueUrl(store.get(ref));   // ver2193: 칸 그림은 합성본으로(소리는 늘 문자열이라 그대로 지난다)
-      if (!url) return null;
-      const mime = gengaAssetMimeOf(url);
-      const blob = gengaDataUrlToBlob(url);
+      const value = store.get(ref);
+      const url = value instanceof Blob ? '' : gengaStoreValueUrl(value);
+      const blob = value instanceof Blob ? value : gengaDataUrlToBlob(url);
       if (!blob) return null;
+      const mime = value instanceof Blob ? (blob.type || 'application/octet-stream') : gengaAssetMimeOf(url);
       const name = uniqueName(String(ref) + '.' + gengaAssetExtFor(mime));
-      media.push({ path: GENGA_ZIP_ASSET_DIR + '/' + name, url: url });
+      media.push({ path: GENGA_ZIP_ASSET_DIR + '/' + name, blob: blob });
       return { dir: GENGA_ZIP_ASSET_DIR, fileName: name, mime: mime || blob.type || '' };
     }
-    function gengaExternalizeDrawings(gt, uniqueName, media, drawingUrls) {
+    function gengaExternalizeDrawings(gt, uniqueName, media, drawingData) {
       if (!gt) return;
       const ext = function(d) {
         if (!d || !d.ref) return d;
-        const storage = gengaExternalizeAsset(drawingUrls || gengaDrawStore, d.ref, uniqueName, media);
+        const storage = gengaExternalizeAsset(drawingData || gengaDrawStore, d.ref, uniqueName, media);
         if (!storage) {
-          const u = gengaStoreValueUrl((drawingUrls || gengaDrawStore).get(d.ref));   // 바이트로 못 바꿨다 — 종전처럼 인라인
+          const u = gengaStoreValueUrl((drawingData || gengaDrawStore).get(d.ref));   // 바이트로 못 바꿨다 — 종전처럼 인라인
           if (!u) {
             if (d.dataUrl || gengaDrawingStrokes(d)) return d;
             throw new Error(t('status.genga.drawing.unavailable') + ' (' + d.ref + ')');
@@ -120891,10 +120916,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let windowCache = gengaTimelineWindowCache.get(content);
       if (!windowCache) {
         const items = Array.from(content.querySelectorAll('[data-genga-window-start]')).map(function(el) {
-          const end = Number(el.dataset.gengaWindowEnd), total = state.gengaShownRendered;
-          // Last labels can overflow the content width. Keep their boxes so pan does not change extent.
-          const keep = el.classList.contains('genga-tick') && (end === total || end === Math.floor(total / 5) * 5);
-          return { el: el, start: Number(el.dataset.gengaWindowStart), end: end, keep: keep };
+          return { el: el, start: Number(el.dataset.gengaWindowStart), end: Number(el.dataset.gengaWindowEnd) };
         });
         windowCache = { items: items };
         gengaTimelineWindowCache.set(content, windowCache);
@@ -120908,14 +120930,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const focused = document.activeElement;
       // Frame intervals are integral. Zoom and its following scroll event often cover the same cells.
       // Revisit only when membership, edit visibility or keyboard focus can change.
-      if (windowCache.start === start && windowCache.end === end && windowCache.editing === editing && windowCache.focused === focused) return;
-      Object.assign(windowCache, { start: start, end: end, editing: editing, focused: focused });
+      if (windowCache.start === start && windowCache.end === end && windowCache.editing === editing && windowCache.focused === focused && windowCache.total === state.gengaShownRendered) return;
+      const ruler = content.querySelector('.genga-ruler'), total = state.gengaShownRendered;
+      if (ruler && (windowCache.start !== start || windowCache.end !== end || windowCache.total !== total)) {
+        // Labels own no input state. Keep the ruler node/capture, and only materialize visible labels.
+        // The final two labels retain the exact overflow extent used by the scroll/zoom rail.
+        const frames = new Set();
+        for (let f = Math.max(1, start); f <= Math.min(total, end + 1); f++) frames.add(f);
+        if (total > 0) frames.add(total);
+        if (total >= 5) frames.add(Math.floor(total / 5) * 5);
+        let html = '';
+        for (const f of Array.from(frames).sort((a, b) => a - b)) html += '<div class="genga-tick' + (f === 1 || f % 5 === 0 ? ' major' : '') + ' numbered" style="left:' + gengaTimelinePx(f - 1) + '"><span>' + f + '</span></div>';
+        ruler.innerHTML = html;
+      }
+      Object.assign(windowCache, { start: start, end: end, editing: editing, focused: focused, total: total });
       const tracker = gengaViewRowTrackers.get(stage);
       // Window membership is transient geometry, reapplied after every row patch. Drain earlier
       // edits first; only this synchronous display-only pass may preserve the generated-row cache.
       if (tracker) tracker.flush();
       windowCache.items.forEach(function(item) {
-        const hidden = !editing && !item.keep && (item.end < start || item.start > end) && !item.el.contains(focused);
+        const hidden = !editing && (item.end < start || item.start > end) && !item.el.contains(focused);
         const display = hidden ? 'none' : '';
         if (item.el.style.display !== display) item.el.style.display = display;
       });
@@ -122786,13 +122820,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const selId = state.gengaSelectedLayerId || '';
       const thumbW = 40;
       const thumbH = Math.max(16, Math.min(28, Math.round(thumbW * gt.paper.h / Math.max(1, gt.paper.w))));
-      let ruler = '';
-      if (!partialRender) {
-        for (let f = 1; f <= total; f++) {
-          const major = (f === 1 || f % 5 === 0);       // darker gridline every 5 for rhythm
-          ruler += '<div class="genga-tick' + (major ? ' major' : '') + ' numbered' + '"' + gengaTimelineWindowAttrs(f - 1, f) + ' style="left:' + gengaTimelinePx(f - 1) + '">' + ('<span>' + f + '</span>') + '</div>';
-        }
-      }
       let rowsHead = '', rowsLane = '';
       const appendRow = function(id, head, body, fx) {
         id = String(id);
@@ -123316,7 +123343,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           '</div>' +
           '<div class="genga-timeline-wrap">' +
             '<div class="genga-tl-content" style="width:' + gengaTimelinePx(total) + ';--genga-minor-label:' + (cellW < 16 ? 'none' : 'block') + ';--genga-cell-w:' + cellW + 'px">' +
-              '<div class="genga-ruler">' + ruler + '</div>' +
+              '<div class="genga-ruler"></div>' +
               camLane +
               '<div class="genga-vscroll"><div class="genga-lanes">' + rowsLane + '</div></div>' +
               '<div class="genga-audio-scroll" style="height:' + audioRegionH + 'px"><div class="genga-audio-lanes-wrap">' + audioLane + '</div></div>' +
