@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2683</title>
+  <title>MoArt ver2684</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -45654,6 +45654,109 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // video one armed on pointerdown — a still long-press fought an armed drag on touch — had no rebind guard
     // and no volume line). The flow below IS the audio one; the spec supplies the selectors, the store
     // accessors, the trim/move previews and the commit functions. Audio behaviour is unchanged.
+    // ── Timeline media clip gestures: registration, trim and move sessions ──
+    // A press owns the original clip/coordinates; liveTotalFrames still reads the current view.
+    // Session helpers retain beginDragStrand cancellation and preview-before-commit ordering.
+    function beginTimelineClipTrim(event, spec, press, trimEdge) {
+      const { root, clipEl, track, clipId, clip, startX, originalClip, liveTotalFrames } = press;
+      const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, liveTotalFrames());
+      // The kernel owns listeners and coalescing; the trim handle owns capture, the clip its class.
+      const cleanupPreview = function() { updateTimelineSnapGuide(root, 0, 1, false); spec.removePreview(previewEl); };
+      beginDragStrand(event, {
+        el: clipEl,
+        captureEl: (event.target && event.target.setPointerCapture) ? event.target : clipEl,
+        raf: true,
+        onMove: function(moveEvent) {
+          const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
+          const preview = spec.previewTrim(originalClip, trimEdge, deltaFrames);
+          updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, liveTotalFrames());
+        },
+        // Cancellation removes the preview without committing trim coordinates.
+        onCancel: cleanupPreview,
+        onCommit: function(upEvent) {
+          cleanupPreview();
+          const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
+          if (!deltaFrames) return;
+          spec.commitTrim(clipId, trimEdge, originalClip, deltaFrames, { clip: clip, track: track });
+        }
+      });
+    }
+    function beginTimelineClipMove(event, spec, press) {
+      const { root, clipEl, track, clipId, clip, startX, startY, originalClip, liveTotalFrames } = press;
+      const originalStart = originalClip.startFrame;
+      const originalTrackId = clip.trackId || track.dataset[spec.trackIdKey] || spec.defaultTrackId;
+      const maxStart = Math.max(0, liveTotalFrames() - originalClip.durationFrames);
+      const rippleMode = Boolean(event.shiftKey); // shift+drag = move this clip + everything to its right
+      // Delay capture/preview until movement crosses the threshold so a still press can open its menu.
+      const MOVE_DRAG_THRESHOLD_PX = 8;
+      let dragActive = false;
+      let movePreviewEl = null;
+      let lastPreviewFrame = originalStart;
+      let lastPreviewTrackId = originalTrackId;
+      let lastSnapped = false;
+      const pointerId = event.pointerId;
+      const activateMoveDrag = function() {
+        if (dragActive) return;
+        dragActive = true;
+        clipEl.classList.add('dragging');
+        movePreviewEl = createAudioDragPreview(track, originalStart, originalClip.durationFrames, liveTotalFrames());
+        try { clipEl.setPointerCapture(pointerId); } catch (error) {}
+      };
+      // No el: this session owns delayed capture/class/preview; the kernel owns listeners and rAF.
+      // The kernel cancels a queued preview before onCommit/onCancel can tear it down.
+      const teardownMoveDrag = function() {
+        clipEl.classList.remove('dragging');
+        updateTimelineSnapGuide(root, 0, 1, false);
+        spec.removePreview(movePreviewEl);
+        movePreviewEl = null;
+        try { clipEl.releasePointerCapture(pointerId); } catch (error) {}
+      };
+      beginDragStrand(event, {
+        raf: true,
+        onMove: function(moveEvent) {
+          if (!dragActive && Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < MOVE_DRAG_THRESHOLD_PX) return;
+          activateMoveDrag();
+          if (!movePreviewEl) return;
+          const targetTrack = spec.trackFromPointer(root, moveEvent) || track;
+          const targetTrackId = targetTrack.dataset[spec.trackIdKey] || originalTrackId;
+          const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
+          const proposedStart = clampInt(originalStart + deltaFrames, 0, maxStart, originalStart);
+          const snapped = spec.snapMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
+          const nextStart = clampInt(snapped.startFrame, 0, maxStart, originalStart);
+          if (nextStart === lastPreviewFrame && targetTrackId === lastPreviewTrackId && Boolean(snapped.snapped) === lastSnapped) return;
+          lastPreviewFrame = nextStart;
+          lastPreviewTrackId = targetTrackId;
+          lastSnapped = Boolean(snapped.snapped);
+          spec.movePreviewToTrack(movePreviewEl, targetTrack);
+          movePreviewEl.classList.toggle('snapped', lastSnapped);
+          updateTimelineSnapGuide(root, snapped.snapFrame, liveTotalFrames(), lastSnapped);
+          updateAudioDragPreview(movePreviewEl, nextStart, originalClip.durationFrames, liveTotalFrames());
+        },
+        // ver842: cancel = drop, never commit. Nothing was built unless the drag armed, so an unarmed
+        // cancel is a plain no-op; an armed one tears the preview down and commits nothing.
+        onCancel: function() { if (dragActive) teardownMoveDrag(); },
+        onCommit: function(upEvent) {
+          // Release can precede the coalesced preview rAF. Decide from the final coordinate too,
+          // so a fast valid drag commits even when it never needed a preview allocation.
+          if (!dragActive && Math.hypot(upEvent.clientX - startX, upEvent.clientY - startY) < MOVE_DRAG_THRESHOLD_PX) return;
+          if (dragActive) teardownMoveDrag();
+          const targetTrack = spec.trackFromPointer(root, upEvent) || track;
+          const targetTrackId = targetTrack.dataset[spec.trackIdKey] || originalTrackId;
+          const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
+          if (rippleMode) {
+            let rippleDelta = deltaFrames;
+            if (originalStart + rippleDelta < 0) rippleDelta = -originalStart;
+            if (rippleDelta) runCommand('右側を一括移動', function(project) { rippleShiftTimelineClipsFrom(project, originalStart, rippleDelta); }, { skipSource: true, skipMemo: true });
+            return;
+          }
+          const proposedStart = clampInt(originalStart + deltaFrames, 0, maxStart, originalStart);
+          const snapped = spec.snapMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
+          const nextStart = clampInt(snapped.startFrame, 0, maxStart, originalStart);
+          if (nextStart === originalStart && targetTrackId === originalTrackId) return;
+          spec.commitMove(clipId, nextStart, targetTrackId, { liveTotalFrames: liveTotalFrames });
+        }
+      });
+    }
     function bindTimelineClipDrag(root, totalFramesAtBind, spec) {
       // ver1527: 클립을 잡아 옮기는 좌표 는 **지금 화면 기준**으로 읽는다 — 이 bind 는 컷 편집 뒤에
       // 다시 불리지 않는데(부분 렌더는 카메라·콘티만 재바인딩) 클립의 화면 위치는
@@ -45679,116 +45782,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const startX = event.clientX, startY = event.clientY;
           const trimEdge = audioTrimEdgeFromPointer(clipEl, event);
           const originalClip = spec.snapshot(clip);
-          if (trimEdge) {
-            const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, liveTotalFrames());
-            // ver976: thin spec on beginDragStrand. raf:true replaces the makeRafThrottled wrapper (the kernel
-            // coalesces to the latest event and drops the pending tick on release, which is what .cancel() did).
-            // The capture target is whatever node the press landed on — a trim handle — while the dragging class
-            // belongs to the clip, hence el + captureEl.
-            const cleanupPreview = function() { updateTimelineSnapGuide(root, 0, 1, false); spec.removePreview(previewEl); };
-            beginDragStrand(event, {
-              el: clipEl,
-              captureEl: (event.target && event.target.setPointerCapture) ? event.target : clipEl,
-              raf: true,
-              onMove: function(moveEvent) {
-                const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
-                const preview = spec.previewTrim(originalClip, trimEdge, deltaFrames);
-                updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, liveTotalFrames());
-              },
-              // ver842: cancel = drop, never commit. The commit re-reads clientX and rewrites the clip's trim
-              // in/out, so a stolen iPad gesture used to destroy the trim at the abduction coordinate — and trim
-              // points are the one audio edit with no visual undo cue. Snap guide + ghost removal is the revert.
-              onCancel: cleanupPreview,
-              onCommit: function(upEvent) {
-                cleanupPreview();
-                const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
-                if (!deltaFrames) return;
-                spec.commitTrim(clipId, trimEdge, originalClip, deltaFrames, { clip: clip, track: track });
-              }
-            });
-            return;
-          }
-          const originalStart = originalClip.startFrame;
-          const originalTrackId = clip.trackId || track.dataset[spec.trackIdKey] || spec.defaultTrackId;
-          const maxStart = Math.max(0, liveTotalFrames() - originalClip.durationFrames);
-          const rippleMode = Boolean(event.shiftKey); // shift+drag = move this clip + everything to its right
-          // Defer the move-drag until the pointer actually travels a bit, so a still long-press (the
-          // mobile context-menu / delete gesture) isn't swallowed by an instant grab. Without this the
-          // clip grabbed on touch-down and felt unstable, and long-press rarely fired.
-          const MOVE_DRAG_THRESHOLD_PX = 8;
-          let dragActive = false;
-          let movePreviewEl = null;
-          let lastPreviewFrame = originalStart;
-          let lastPreviewTrackId = originalTrackId;
-          let lastSnapped = false;
-          const pointerId = event.pointerId;
-          const activateMoveDrag = function() {
-            if (dragActive) return;
-            dragActive = true;
-            clipEl.classList.add('dragging');
-            movePreviewEl = createAudioDragPreview(track, originalStart, originalClip.durationFrames, liveTotalFrames());
-            try { clipEl.setPointerCapture(pointerId); } catch (error) {}
-          };
-          // ver976: thin spec on beginDragStrand, but WITHOUT spec.el — this is the one clip drag that arms
-          // late: the class, the ghost and the pointer capture only appear once the finger has travelled
-          // MOVE_DRAG_THRESHOLD_PX, so a still long-press stays a long-press. The kernel therefore owns the
-          // listener lifecycle and the rAF only, and activateMoveDrag/teardown stay here.
-          // The ver845 "rAF resurrection" guard is deliberately NOT ported: it existed because a pending
-          // preview tick could re-append the ghost after finish removed it (iPad "ghost clip stays after
-          // drag", and the same thing when backgrounding mid-drag queued the callback). The kernel cancels
-          // the pending tick before it calls onCommit/onCancel, so the race is structurally gone.
-          const teardownMoveDrag = function() {
-            clipEl.classList.remove('dragging');
-            updateTimelineSnapGuide(root, 0, 1, false);
-            spec.removePreview(movePreviewEl);
-            movePreviewEl = null;
-            try { clipEl.releasePointerCapture(pointerId); } catch (error) {}
-          };
-          beginDragStrand(event, {
-            raf: true,
-            onMove: function(moveEvent) {
-              if (!dragActive && Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < MOVE_DRAG_THRESHOLD_PX) return;
-              activateMoveDrag();
-              if (!movePreviewEl) return;
-              const targetTrack = spec.trackFromPointer(root, moveEvent) || track;
-              const targetTrackId = targetTrack.dataset[spec.trackIdKey] || originalTrackId;
-              const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
-              const proposedStart = clampInt(originalStart + deltaFrames, 0, maxStart, originalStart);
-              const snapped = spec.snapMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
-              const nextStart = clampInt(snapped.startFrame, 0, maxStart, originalStart);
-              if (nextStart === lastPreviewFrame && targetTrackId === lastPreviewTrackId && Boolean(snapped.snapped) === lastSnapped) return;
-              lastPreviewFrame = nextStart;
-              lastPreviewTrackId = targetTrackId;
-              lastSnapped = Boolean(snapped.snapped);
-              spec.movePreviewToTrack(movePreviewEl, targetTrack);
-              movePreviewEl.classList.toggle('snapped', lastSnapped);
-              updateTimelineSnapGuide(root, snapped.snapFrame, liveTotalFrames(), lastSnapped);
-              updateAudioDragPreview(movePreviewEl, nextStart, originalClip.durationFrames, liveTotalFrames());
-            },
-            // ver842: cancel = drop, never commit. Nothing was built unless the drag armed, so an unarmed
-            // cancel is a plain no-op; an armed one tears the preview down and commits nothing.
-            onCancel: function() { if (dragActive) teardownMoveDrag(); },
-            onCommit: function(upEvent) {
-              // Release can precede the coalesced preview rAF. Decide from the final coordinate too,
-              // so a fast valid drag commits even when it never needed a preview allocation.
-              if (!dragActive && Math.hypot(upEvent.clientX - startX, upEvent.clientY - startY) < MOVE_DRAG_THRESHOLD_PX) return;
-              if (dragActive) teardownMoveDrag();
-              const targetTrack = spec.trackFromPointer(root, upEvent) || track;
-              const targetTrackId = targetTrack.dataset[spec.trackIdKey] || originalTrackId;
-              const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
-              if (rippleMode) {
-                let rippleDelta = deltaFrames;
-                if (originalStart + rippleDelta < 0) rippleDelta = -originalStart;
-                if (rippleDelta) runCommand('右側を一括移動', function(project) { rippleShiftTimelineClipsFrom(project, originalStart, rippleDelta); }, { skipSource: true, skipMemo: true });
-                return;
-              }
-              const proposedStart = clampInt(originalStart + deltaFrames, 0, maxStart, originalStart);
-              const snapped = spec.snapMove(state.project, clipId, proposedStart, originalClip.durationFrames, originalStart, targetTrackId, originalTrackId, liveTotalFrames());
-              const nextStart = clampInt(snapped.startFrame, 0, maxStart, originalStart);
-              if (nextStart === originalStart && targetTrackId === originalTrackId) return;
-              spec.commitMove(clipId, nextStart, targetTrackId, { liveTotalFrames: liveTotalFrames });
-            }
-          });
+          const press = { root, clipEl, track, clipId, clip, startX, startY, originalClip, liveTotalFrames };
+          if (trimEdge) beginTimelineClipTrim(event, spec, press, trimEdge);
+          else beginTimelineClipMove(event, spec, press);
         });
         bindContextMenuAndLongPress(clipEl, function(event) {
           spec.contextMenu(event, clipEl.dataset[spec.clipIdKey] || '', root);
@@ -58028,6 +58024,52 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ★트랜잭션을 연 뒤에는 외부 await 를 하지 않는다 — IndexedDB 트랜잭션은 요청 사이가 비면
     //   자동으로 완료(비활성)되므로, 준비(직렬화·인코드)는 부르는 쪽이 앞에서 끝낸다.
     //   성공은 **tx.oncomplete 하나**다.
+    // ── Project save publishing: atomic transaction and serialized queue ──
+    // One atomic publish attempt. Only oncomplete updates the in-memory published head.
+    // Return workspaceDbOp directly; the queue owns retry and adds no new await boundary here.
+    function publishProjectSaveTransaction(db, id, payload, meta, seq, head) {
+      return workspaceDbOp(db, 'publish ' + id, function(resolve, reject) {
+        const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+        const store = tx.objectStore(WORKSPACE_STORE_NAME);
+        let versionSeq = 0, conflict = false;
+        const currentReq = store.get(indexedDbProjectPayloadKey(id));
+        currentReq.onsuccess = function() {
+          const current = currentReq.result == null ? null : String(currentReq.result);
+          if (current !== head.payload) { conflict = true; tx.abort(); return; }
+          store.put(payload, indexedDbProjectPayloadKey(id));
+          // Pins and eviction share the publishing transaction: no stale preflight list.
+          const pinsReq = store.get(PINNED_PROJECT_SLOTS_KEY);
+          pinsReq.onsuccess = function() {
+            const pinned = normalizePinnedProjectSlots(pinsReq.result);
+            const idxReq = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
+            idxReq.onsuccess = function() {
+              const plan = planProjectSlotIndex(idxReq.result, id, meta, pinned);
+              store.put(normalizeIndexedDbProjectIndex(plan.index), INDEXED_DB_PROJECT_INDEX_KEY);
+              plan.evicted.forEach(function(gone) { deleteProjectStorageRecords(store, gone); });
+            };
+          };
+          const viReq = store.get(indexedDbVersionIndexKey(id));
+          viReq.onsuccess = function() {
+            const plan = planProjectVersionPush(viReq.result, payload, meta.savedAt);
+            if (!plan) return;
+            versionSeq = plan.seq;
+            store.put(payload, indexedDbVersionPayloadKey(id, plan.seq));
+            store.put(plan.index, indexedDbVersionIndexKey(id));
+            plan.drops.forEach(function(s) { store.delete(indexedDbVersionPayloadKey(id, s)); });
+          };
+        };
+        tx.oncomplete = function() {
+          head.payload = payload;
+          projectSavePublishedSeq.set(id, seq);
+          resolve({ ok: true, versionSeq: versionSeq });
+        };
+        tx.onabort = function() {
+          if (conflict) resolve({ ok: false, code: 'conflict' });
+          else reject(tx.error || new Error(t('msg.idb.txAbortedFor', indexedDbProjectPayloadKey(id))));
+        };
+        tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', indexedDbProjectPayloadKey(id)))); };
+      });
+    }
     async function publishProjectSaveTx(id, payload, meta, seq, head) {
       const previous = projectSavePublishJobs.get(id) || Promise.resolve();
       const job = previous.catch(function() {}).then(async function() {
@@ -58037,47 +58079,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         for (let attempt = 0; ; attempt += 1) {
           const db = await openWorkspaceDb();
           try {
-            return await workspaceDbOp(db, 'publish ' + id, function(resolve, reject) {
-              const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
-              const store = tx.objectStore(WORKSPACE_STORE_NAME);
-              let versionSeq = 0, conflict = false;
-              const currentReq = store.get(indexedDbProjectPayloadKey(id));
-              currentReq.onsuccess = function() {
-                const current = currentReq.result == null ? null : String(currentReq.result);
-                if (current !== head.payload) { conflict = true; tx.abort(); return; }
-                store.put(payload, indexedDbProjectPayloadKey(id));
-                // Pins and eviction share the publishing transaction: no stale preflight list.
-                const pinsReq = store.get(PINNED_PROJECT_SLOTS_KEY);
-                pinsReq.onsuccess = function() {
-                  const pinned = normalizePinnedProjectSlots(pinsReq.result);
-                  const idxReq = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
-                  idxReq.onsuccess = function() {
-                    const plan = planProjectSlotIndex(idxReq.result, id, meta, pinned);
-                    store.put(normalizeIndexedDbProjectIndex(plan.index), INDEXED_DB_PROJECT_INDEX_KEY);
-                    plan.evicted.forEach(function(gone) { deleteProjectStorageRecords(store, gone); });
-                  };
-                };
-                const viReq = store.get(indexedDbVersionIndexKey(id));
-                viReq.onsuccess = function() {
-                  const plan = planProjectVersionPush(viReq.result, payload, meta.savedAt);
-                  if (!plan) return;
-                  versionSeq = plan.seq;
-                  store.put(payload, indexedDbVersionPayloadKey(id, plan.seq));
-                  store.put(plan.index, indexedDbVersionIndexKey(id));
-                  plan.drops.forEach(function(s) { store.delete(indexedDbVersionPayloadKey(id, s)); });
-                };
-              };
-              tx.oncomplete = function() {
-                head.payload = payload;
-                projectSavePublishedSeq.set(id, seq);
-                resolve({ ok: true, versionSeq: versionSeq });
-              };
-              tx.onabort = function() {
-                if (conflict) resolve({ ok: false, code: 'conflict' });
-                else reject(tx.error || new Error(t('msg.idb.txAbortedFor', indexedDbProjectPayloadKey(id))));
-              };
-              tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', indexedDbProjectPayloadKey(id)))); };
-            });
+            return await publishProjectSaveTransaction(db, id, payload, meta, seq, head);
           } catch (error) {
             if (attempt === 0 && error && error.name === 'WorkspaceDbStallError') continue; // fresh connection, one retry
             throw error;
@@ -66710,7 +66712,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (run.current !== imageBrushRuntime.current) return;
       if (!committed) { run.current.index = run.index; run.current.holdOffset = run.holdOffset; }
       try { imageBrushPersistCurrent(run.current); } catch (error) { imageBrushReportFailure(error); }
-      imageBrushChanged();
+      imageBrushSyncActiveStamp();
     }
     function imageBrushPersistCurrent(current) {
       storageRootsChanged();
@@ -66765,7 +66767,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         imageBrushPersistCurrent(current);
         imageBrushRuntime.current = current; imageBrushRuntime.capture = false;
         imageBrushDropDecodedFrames(previous);
-        imageBrushChanged();
+        imageBrushSyncActiveStamp();
         if (activate) setActivePaintTool('lasso-stamp');
         if (previous) imageBrushReleaseAsset(previous.ref).catch(imageBrushReportFailure);
         return true;
@@ -66810,7 +66812,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         imageBrushPersistCurrent(current);
         imageBrushRuntime.current = current; imageBrushRuntime.capture = false;
         imageBrushDropDecodedFrames(previous);
-        imageBrushChanged(); setActivePaintTool('lasso-stamp');
+        imageBrushSyncActiveStamp(); setActivePaintTool('lasso-stamp');
         if (previous) imageBrushReleaseAsset(previous.ref).catch(imageBrushReportFailure);
         return true;
       } catch (error) {
@@ -66856,7 +66858,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       gengaStamp.originX = origin.x * paper.w; gengaStamp.originY = origin.y * paper.h;
       gengaStamp.spacing = current.settings.spacing;
     }
-    function imageBrushChanged() {
+    function imageBrushSyncActiveStamp() {
       if (state.paintEditTool !== 'lasso-stamp') return;
       imageBrushSyncAdapters();
       imageBrushUpdateControls();
@@ -66867,13 +66869,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const current = imageBrushRuntime.current; if (!current) return;
       current.settings = imageBrushSettings(Object.assign({}, current.settings, { [key]: value }));
       try { imageBrushPersistCurrent(current); } catch (error) { imageBrushReportFailure(error); }
-      imageBrushChanged();
+      imageBrushSyncActiveStamp();
     }
     function imageBrushCaptureNew() {
       imageBrushStopPreview(); imageBrushRuntime.generation += 1; imageBrushRuntime.capture = true;
       paintAbortGestureSession(); gengaDiscardStampDrag();
       state.paintStamp = null; gengaStamp = null; gengaStampPt = null; state.paintLassoPreview = null; gengaLasso = null;
-      clearPaintStampPreview(); imageBrushChanged();
+      clearPaintStampPreview(); imageBrushSyncActiveStamp();
     }
     // Capture mode chooses the next canvas gesture; it does not discard the retained stamp.
     // Explicit resume/in-place cancels pending replacement and reuses the same origin/settings/frame.
@@ -66881,7 +66883,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (state.paintEditTool !== 'lasso-stamp' || !imageBrushRuntime.current) return false;
       imageBrushStopPreview();
       imageBrushRuntime.generation += 1; imageBrushRuntime.capture = false;
-      imageBrushChanged();
+      imageBrushSyncActiveStamp();
       return true;
     }
     function imageBrushStopPreview() {
@@ -66894,7 +66896,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       current.index = (current.index + delta + current.frames.length) % current.frames.length;
       current.holdOffset = 0;
       try { imageBrushPersistCurrent(current); } catch (error) { imageBrushReportFailure(error); }
-      imageBrushChanged();
+      imageBrushSyncActiveStamp();
     }
     function imageBrushPlayPreview() {
       if (imageBrushRuntime.playing) { imageBrushStopPreview(); imageBrushUpdateControls(); return; }
@@ -66904,7 +66906,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (current !== imageBrushRuntime.current || state.paintEditTool !== 'lasso-stamp') { imageBrushStopPreview(); return; }
         const index = imageBrushFrameAt(current.frames, offset + (now - started) * current.fps / 1000);
         // Preview playback never changes the armed drawing frame during a pointer gesture.
-        if (index !== current.index && state.paintPointerId == null && !gengaStampDrag) { current.index = index; current.holdOffset = 0; imageBrushChanged(); }
+        if (index !== current.index && state.paintPointerId == null && !gengaStampDrag) { current.index = index; current.holdOffset = 0; imageBrushSyncActiveStamp(); }
         imageBrushRuntime.playing = requestAnimationFrame(tick);
       };
       imageBrushRuntime.playing = requestAnimationFrame(tick); imageBrushUpdateControls();
@@ -67616,7 +67618,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver2271: 등록은 **나중에** 끝난다(부팅 하이드레이트·임포트·복원 셋 다 이 자리를 지난다).
       // 그때 브러시 패널의 행 활성(`pbRowEnabled`)이 팁 유무로 갈리므로 여기서 다시 칠한다 —
       // 안 그러면 「먹는데 회색」이 사용자가 패널을 만질 때까지 남는다(부팅 직후 11 행 실측).
-      img.onload = function() { paintRegisterTip(ref, img); paintBrushPreviewRefresh(ref); paintBrushPanelUpdateValues(); if (onReady) onReady(true); };
+      img.onload = function() { paintRegisterTip(ref, img); paintBrushPreviewRefresh(ref); paintBrushSyncControlsAndStamp(); if (onReady) onReady(true); };
       img.onerror = function() { if (onReady) onReady(false); };
       img.src = dataUrl;
     }
@@ -81424,7 +81426,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       safePaintSetPointerCapture(canvas, event.pointerId);
       paintStampPathPoints(state.paintRasterOp, { x: conteNormToPlaneX(localPoint.x), y: conteNormToPlaneY(localPoint.y) }, state.paintStamp);
       drawPaintStampAtPoint(state.paintRasterOp, localPoint);
-      imageBrushChanged();
+      imageBrushSyncActiveStamp();
       return true;
     }
 
@@ -84972,7 +84974,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (op.type === 'stamp') {
         const points = paintStampPathPoints(op, { x: conteNormToPlaneX(rawPoint.x), y: conteNormToPlaneY(rawPoint.y) }, state.paintStamp);
         points.forEach(function(point) { drawPaintStampAtPoint(op, { x: point.x / CONTE_PAPER_WIDTH, y: point.y / CONTE_PAPER_HEIGHT }); });
-        if (points.length) imageBrushChanged();
+        if (points.length) imageBrushSyncActiveStamp();
       }
     }
 
@@ -87722,7 +87724,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const back = (g.__pbPrev2 != null) ? g.__pbPrev2 : g.__pbPrev1;   // before the FIRST of the two
           if (back != null) {
             def.set(def.clampVal ? def.clampVal(back) : back);
-            paintBrushPanelUpdateValues();   // ver1195: the FILL has to come back too, not just the number
+            paintBrushSyncControlsAndStamp();   // ver1195: the FILL has to come back too, not just the number
           }
           g.__pbPrev1 = null; g.__pbPrev2 = null;
           pbBeginGaugeTyping(g, def);
@@ -87853,7 +87855,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         b.setAttribute('data-i18n', c.i18n);
         b.textContent = t(c.i18n);
         if (c.titleI18n) { b.setAttribute('data-i18n-attr', 'title:' + c.titleI18n); b.title = t(c.titleI18n); }
-        b.addEventListener('click', function() { def.set(c.value); paintBrushPanelUpdateValues(); });
+        b.addEventListener('click', function() { def.set(c.value); paintBrushSyncControlsAndStamp(); });
         wrap.appendChild(b);
       });
       return wrap;
@@ -87874,7 +87876,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         o.textContent = t(c.i18n);
         sel.appendChild(o);
       });
-      sel.addEventListener('change', function() { def.set(sel.value); paintBrushPanelUpdateValues(); try { sel.blur(); } catch (e) {} });
+      sel.addEventListener('change', function() { def.set(sel.value); paintBrushSyncControlsAndStamp(); try { sel.blur(); } catch (e) {} });
       return sel;
     }
     // 筆圧カーブ: chips set the curve's hardness; the graph PLOTS it, and its floor bar is dragged
@@ -88008,7 +88010,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 획이 안 따라오는(만졌는데 안 먹는) 상태가 되므로 여기서 켠다.
         if (ax.onField) paintBrushSet(ax.onField, true);
         paintBrushSet(ax.field, paintNormCurvePts(pts));
-        paintBrushPanelUpdateValues();
+        paintBrushSyncControlsAndStamp();
       };
       cv.addEventListener('pointerdown', function(ev) {
         if (ev.button !== 0 || !pointerDragCanStart('brush-curve', ev)) return;
@@ -88280,7 +88282,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const raw = def.clampVal ? def.clampVal(v) : v;
         return (def.sStep && def.sStep < 1) ? raw : Math.round(raw);
       },
-      applyLive: function(s) { s.d.def.set(s.value); paintBrushPanelUpdateValues(); },
+      applyLive: function(s) { s.d.def.set(s.value); paintBrushSyncControlsAndStamp(); },
       commit: function() { updatePaintUI(); },
       // ver1190: a click that did not turn into a drag JUMPS the level to where you pressed — the thing a
       // gauge is expected to do, and the gesture was free once typing moved to the right-click. The
@@ -88720,11 +88722,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (pin) pin.classList.toggle('active', pbIsPinned(id));
       });
     }
-    function paintBrushPanelUpdateValues() {
+    // ── Brush controls and active stamp synchronization ──
+    function paintBrushSyncControlsAndStamp() {
       pbUpdateRowsIn(document.getElementById('paintInlineOptionsBody'));
       const pop = document.getElementById('paintModPopup');
       if (pop) pbUpdateRowsIn(pop);
-      imageBrushChanged();
+      imageBrushSyncActiveStamp();
     }
 
     // full sync: placement + labels + values. Called once per updatePaintUI.
@@ -88802,7 +88805,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           try { paintBrushPreviewRequest(cv, rec, { color: activePaintColor() }); } catch (e) { console.warn('[brush] 패널 미리보기 갱신 실패', e); }
         }
       }
-      paintBrushPanelUpdateValues();
+      paintBrushSyncControlsAndStamp();
     }
     function updatePaintUI() {
       normalizePaintColorState();
@@ -118444,7 +118447,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const layer = gengaLayerById(d.layerId); if (!layer) return;
       const points = paintStampPathPoints(d, p, { width: gengaStamp.w, height: gengaStamp.h, spacing: gengaStamp.spacing });
       points.forEach(function(point) { gengaStampPaintInto(layer, d.frame, point.x, point.y); });
-      if (points.length) imageBrushChanged();
+      if (points.length) imageBrushSyncActiveStamp();
       scheduleGengaPreviewRedraw(); // ver1445: 프레임당 1회 — 찍기 자체는 step 으로 이미 솎여 있다
     }
     function gengaStampPointerEnd(ev) {
@@ -118470,7 +118473,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaStampDrag = { layerId: String(layer.id), frame: frame, pointerId: ev.pointerId, imageBrushRun: imageBrushBeginStampRun() };
         paintStampPathPoints(gengaStampDrag, p, { width: gengaStamp.w, height: gengaStamp.h, spacing: gengaStamp.spacing });
         gengaStampPaintInto(layer, frame, p.x, p.y);
-        imageBrushChanged();
+        imageBrushSyncActiveStamp();
         drawGengaPreview();
         try { ev.target.setPointerCapture(ev.pointerId); } catch (e) {}
       } else {
