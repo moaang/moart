@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2686</title>
+  <title>MoArt ver2687</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25043,6 +25043,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2687, items: [{ ja: '音声の速度変換中も画面を操作しやすくし、動画録画前の音声準備と中止処理を改善しました。', ko: '오디오 배속 계산 중 화면 멈춤을 줄이고, 동영상 녹화 전 음성 준비와 취소 처리를 개선했습니다.', en: 'Moved audio time stretching off the UI thread and improved audio preparation and cancellation before video recording.', zh: '将音频变速计算移出界面线程，并改进视频录制前的音频准备和取消处理。' }] },
       { ver: 2686, items: [{ ja: '原画タイムラインの初回表示と音声の速度変換を軽量化し、ZIP保存時の画像文字列と大きなデータのコピーを削減しました。', ko: '원화 타임라인 첫 표시와 오디오 배속 계산을 가볍게 하고, ZIP 저장의 이미지 문자열과 대형 데이터 복사를 줄였습니다.', en: 'Reduced initial animation timeline and audio time-stretch costs, and removed image string conversions and large data copies from ZIP saves.', zh: '减轻原画时间轴首次显示和音频变速计算的负担，减少ZIP保存时的图像字符串转换与大型数据复制。' }] },
       { ver: 2685, items: [{ ja: '多数の原画を含むファイル保存・ZIP出力時の画像メモリを削減しました。タイムライン初回表示と無音区間を含む音声の速度変換も改善しました。', ko: '그림이 많은 파일 저장·ZIP 출력의 이미지 메모리 보유를 줄였습니다. 타임라인 첫 표시와 무음 구간이 포함된 오디오의 배속 변환도 개선했습니다.', en: 'Reduced drawing memory retained during file saves and ZIP exports. Improved initial timeline rendering and time stretching of audio with silent sections.', zh: '减少含有大量原画的文件保存和ZIP导出时的图像内存占用，改善时间轴首次显示和含静音段音频的变速处理。' }] },
       { ver: 2683, items: [{ ja: '大きなプロジェクトの保存・初回表示・画像読み込みの負荷を軽減し、音声と一時キャンバスのメモリ保持を改善しました。', ko: '큰 프로젝트의 저장·첫 화면·그림 로드 부담을 줄이고 오디오와 임시 캔버스의 메모리 보유를 개선했습니다.', en: 'Reduced large-project save, initial timeline and drawing-load work, and improved audio and temporary canvas memory lifetimes.', zh: '减少大型项目保存、时间轴首次显示和图像加载的负担，改善音频和临时画布的内存管理。' }] },
@@ -54749,20 +54750,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           ? await audioBufferSliceForClip(ctx, clip, audioUrl)
           : await audioBufferForClip(ctx, clip, audioUrl);
         if (!current()) return;
+        const fps = mediaFpsForProject(state.project);
+        const stretched = await getStretchedClipBuffer(ctx, clip, buffer, fps, null, function() {
+          if (!current()) throw new DOMException('Playback stopped or replaced', 'AbortError');
+        });
+        if (!current()) return;
         const sliceStartSec = Number(buffer.conteSliceStartSec) || 0;
-        const fps = mediaFpsForProject(state.project);   // ver2675: seconds
         const currentFrame = state.videoPlaybackStartFrame + Math.max(0, (performance.now() - state.videoPlaybackStartClock) / 1000 * fps);
         const delaySeconds = Math.max(0, (clip.startFrame - currentFrame) / fps);
         const offsetInClipSeconds = Math.max(0, (currentFrame - clip.startFrame) / fps);
         const trimStart = clipAudioTrimStartSeconds(clip, fps);
         const trimDuration = clipAudioTrimDurationSeconds(clip, fps) || Math.max(0.01, (sliceStartSec + buffer.duration) - trimStart);
-        // ver1528: 위의 디코드 await 가 클립 길이보다 오래 걸리면 여기서 클립이 이미 지나가 있다.
-        // 종전에는 그대로 return 해서 **소리가 통째로 사라졌는데 아무 흔적이 없었다** — 사용자가 겪은
-        // 「곧바로 재생하면 소리가 안 나고 몇 번 다시 재생해야 들린다」가 정확히 이것이다.
-        if (offsetInClipSeconds >= trimDuration) { noteAudioPlaybackMiss(clip, 'decode-too-slow'); return; }
+        // Decode/stretch preparation may outlast the clip. Report the miss; never start at a stale offset.
+        if (offsetInClipSeconds >= trimDuration) { noteAudioPlaybackMiss(clip, 'prepare-too-slow'); return; }
         const boxDuration = Math.max(0.01, trimDuration - offsetInClipSeconds); // timeline box length (may exceed source audio when slowed); resolveClipSourcePlayback clamps per path
         const source = ctx.createBufferSource();
-        const r4 = resolveClipSourcePlayback(ctx, clip, buffer, fps, offsetInClipSeconds, boxDuration);
+        const r4 = resolveClipSourcePlayback(clip, buffer, fps, offsetInClipSeconds, boxDuration, stretched);
         if (!r4.duration) return;
         source.buffer = r4.buffer;
         connectAudioSourceForClip(source, ctx, clip, ctx.currentTime + delaySeconds, boxDuration, offsetInClipSeconds);
@@ -54850,22 +54853,89 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < outLen; i++) res[i] = norm[i] > 1e-6 ? out[i] / norm[i] : 0;
       return res;
     }
-    function timeStretchTrimmedBuffer(ctx, buffer, startSample, lenSample, factor) {
+    // One buffer job at a time: queued clips keep their existing source, not copied PCM.
+    let audioStretchQueue = Promise.resolve();
+    function timeStretchTrimmedBuffer(ctx, buffer, startSample, lenSample, factor, check) {
+      const run = audioStretchQueue.then(function() { return timeStretchBufferJob(ctx, buffer, startSample, lenSample, factor, check); });
+      audioStretchQueue = run.catch(function() {}); // A canceled job cannot poison the next one.
+      return run;
+    }
+    async function timeStretchBufferJob(ctx, buffer, startSample, lenSample, factor, check) {
       const ch = Math.max(1, buffer.numberOfChannels), total = buffer.length;
       const s0 = Math.max(0, Math.min(total, startSample));
       const len = Math.max(1, Math.min(total - s0, lenSample));
-      let out = null;
-      for (let c = 0; c < ch; c++) {
-        const st = timeStretchChannelData(buffer.getChannelData(c).subarray(s0, s0 + len), factor, buffer.sampleRate);
-        // AudioBuffer channels have equal length. Release each temporary channel before the next.
-        if (!out) out = ctx.createBuffer(ch, st.length, buffer.sampleRate);
-        out.getChannelData(c).set(st);
+      let out = null, worker = null, url = null;
+      const verify = function() { if (check) check(); };
+      verify();
+      try {
+        // Serialize the actual pure kernel; there is no second algorithm to keep in sync.
+        try {
+          const code = timeStretchChannelData.toString() + ';onmessage=function(e){try{var d=e.data,o=timeStretchChannelData(d.input,d.factor,d.sampleRate);postMessage({output:o},[o.buffer]);}catch(e){postMessage({error:String(e)});}}';
+          url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
+          worker = new Worker(url);
+        } catch (error) { console.warn('[wsola] worker unavailable; using identical local kernel', error); }
+        for (let c = 0; c < ch; c++) {
+          verify();
+          const input = buffer.getChannelData(c).subarray(s0, s0 + len);
+          let st;
+          if (worker) {
+            try {
+              st = await new Promise(function(resolve, reject) {
+                let timer = null;
+                const started = performance.now();
+                const finish = function(error, value) {
+                  clearInterval(timer); worker.onmessage = worker.onerror = worker.onmessageerror = null;
+                  if (error) reject(error); else resolve(value);
+                };
+                worker.onmessage = function(event) {
+                  try {
+                    verify();
+                    if (!event.data || !(event.data.output instanceof Float32Array)) throw new Error(event.data && event.data.error || 'Invalid stretch result');
+                    finish(null, event.data.output);
+                  } catch (error) { finish(error); }
+                };
+                worker.onerror = function(event) { event.preventDefault(); finish(new Error(event.message || 'Audio stretch worker failed')); };
+                worker.onmessageerror = function() { finish(new Error('Audio stretch transfer failed')); };
+                timer = setInterval(function() {
+                  try {
+                    verify();
+                    if (performance.now() - started > 120000) throw new DOMException('Audio stretch worker timed out', 'TimeoutError');
+                  } catch (error) { finish(error); }
+                }, 25);
+                try {
+                  const copy = input.slice(); // Never transfer/detach a channel owned by AudioBuffer.
+                  worker.postMessage({input: copy, factor: factor, sampleRate: buffer.sampleRate}, [copy.buffer]);
+                } catch (error) { finish(error); }
+              });
+            } catch (error) {
+              worker.terminate(); worker = null;
+              verify(); // Cancellation must never enter the synchronous fallback.
+              if (error.name === 'AbortError' || error.name === 'TimeoutError') throw error;
+              console.warn('[wsola] worker failed; using identical local kernel', error);
+              st = timeStretchChannelData(input, factor, buffer.sampleRate);
+            }
+          } else st = timeStretchChannelData(input, factor, buffer.sampleRate);
+          verify();
+          if (!out) out = ctx.createBuffer(ch, st.length, buffer.sampleRate);
+          out.getChannelData(c).set(st);
+        }
+        return out;
+      } finally {
+        if (worker) worker.terminate();
+        if (url) URL.revokeObjectURL(url);
       }
-      return out;
     }
     const audioStretchSourceIds = new WeakMap();
     let audioStretchSourceSerial = 0;
-    function getStretchedClipBuffer(ctx, clip, buffer, fps, exportCache) {
+    async function getStretchedClipBuffer(ctx, clip, buffer, fps, exportCache, check) {
+      const owner = projectIoOwner();
+      const verify = function() {
+        if (!projectIoOwnerCurrent(owner)) throw new DOMException('Audio project replaced', 'AbortError');
+        if (check) check();
+      };
+      verify();
+      const fx = audioClipFx(clip);
+      if (fx.preservePitch === false || Math.abs((fx.speed || 1) - 1) <= 0.01) return null;
       const speed = Math.max(0.1, Math.min(4, audioClipFx(clip).speed || 1));
       const sr = buffer.sampleRate;
       // Slice buffers: the trim-in point is expressed in SOURCE time -- rebase into the buffer's own samples.
@@ -54881,10 +54951,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const hit = cache.get(key);
       if (hit) return hit;
       let out = null;
-      try { out = timeStretchTrimmedBuffer(ctx, buffer, startSample, lenSample, 1 / speed); } catch (e) { out = null; console.warn('[wsola] pitch-preserve failed, falling back to rate-change playback', e); } // ver750 (fix_design P3-B)
+      try { out = await timeStretchTrimmedBuffer(ctx, buffer, startSample, lenSample, 1 / speed, verify); }
+      catch (e) {
+        verify();
+        if (e.name === 'AbortError' || e.name === 'TimeoutError') throw e;
+        console.warn('[wsola] pitch-preserve failed, falling back to rate-change playback', e);
+      }
+      verify();
       if (out) boundedMapSet(cache, key, out, 32);
       return out;
     }
+    // Preparation is awaited before scheduling. This mapper never starts expensive work.
     // Resolve buffer/rate/offset/duration for a clip source: pitch-preserve → pre-stretched box buffer at
     // rate 1 (trim baked, 0-based offset); else original at playbackRate=speed (4a offset/duration scaling).
     // THE box->source time mapping. A clip's timeline box advances through its SOURCE audio at `speed`x
@@ -54898,11 +54975,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { offsetSec: trimStartSec + boxOffsetSec * speed, speed: speed };
     }
 
-    function resolveClipSourcePlayback(ctx, clip, buffer, fps, offsetBoxSec, durBoxSec, exportCache) {
+    function resolveClipSourcePlayback(clip, buffer, fps, offsetBoxSec, durBoxSec, stretched) {
       const fx = audioClipFx(clip);
       const speed = Math.max(0.1, Math.min(4, fx.speed || 1));
       if (fx.preservePitch !== false && Math.abs(speed - 1) > 0.01) {
-        const stretched = getStretchedClipBuffer(ctx, clip, buffer, fps, exportCache);
         if (stretched) {
           const off = Math.max(0, offsetBoxSec);
           return { buffer: stretched, rate: 1, offset: off, duration: Math.max(0, Math.min(durBoxSec, stretched.duration - off)) };
@@ -92899,7 +92975,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
               let buffer = null;
               try { buffer = await decodeAudioForExport(audioCtx, url, control); } catch (e) { checkMediaExport(control); recFailed += 1; continue; }
               checkMediaExport(control);
-              if (buffer) scheduled.push({ clip: clips[i], buffer: buffer });
+              if (buffer) {
+                const stretched = await getStretchedClipBuffer(audioCtx, clips[i], buffer, fps, new Map(), function() { checkMediaExport(control); });
+                checkMediaExport(control);
+                scheduled.push({ clip: clips[i], buffer: buffer, stretched: stretched });
+              }
               done += 1;
               if (status && done % 8 === 0) status(t('msg.export.loadingAudio', done, clips.length));
             }
@@ -92920,7 +93000,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
                 const when = t0 + span.startFrame / fps + Math.max(0, offsetSec);
                 const playDur = Math.min(trimDurSec - skip, (span.endFrame - span.startFrame) / fps - Math.max(0, offsetSec)); // box length within the span (no source-audio clamp; resolve clamps per path so slowed clips aren't cut)
                 if (playDur <= 0) return;
-                const r4 = resolveClipSourcePlayback(audioCtx, s.clip, s.buffer, fps, skip, playDur);
+                const r4 = resolveClipSourcePlayback(s.clip, s.buffer, fps, skip, playDur, s.stretched);
                 if (!r4.duration) return;
                 const src = audioCtx.createBufferSource(); src.buffer = r4.buffer;
                 wireAudioClipGraph(audioCtx, src, s.clip, when, playDur, bus, skip);
@@ -92961,7 +93041,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const playDur = Math.min(trimDurSec - skip, durationSec - when);
         if (segment && playDur <= 0) { segment.cache.delete(clip); continue; }
         let original = segment && segment.cache.get(clip);
-        let buf;
+        let buf, stretched;
         if (!original) {
           const url = await ensurePlaybackAudioUrlForClip(clip);
           checkMediaExport(control);
@@ -92969,10 +93049,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           try { buf = await decodeAudioForExport(octx, url, control); }
           catch (e) { checkMediaExport(control); failedClips += 1; continue; }
           checkMediaExport(control);
+          stretched = await getStretchedClipBuffer(octx, clip, buf, fps, new Map(), function() { checkMediaExport(control); });
+          checkMediaExport(control);
           if (segment) {
             const initialSkip = Math.max(0, -globalOffset);
-            original = resolveClipSourcePlayback(octx, clip, buf, fps, initialSkip,
-              Math.min(trimDurSec - initialSkip, (endFrame - startFrame) / fps - Math.max(0, globalOffset)), new Map());
+            original = resolveClipSourcePlayback(clip, buf, fps, initialSkip,
+              Math.min(trimDurSec - initialSkip, (endFrame - startFrame) / fps - Math.max(0, globalOffset)), stretched);
             original = await prepareMediaExportSource(original, Math.max(0, globalOffset), sampleRate, (endFrame - startFrame) / fps, control);
             segment.cache.set(clip, original);
           }
@@ -92984,7 +93066,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const advance = Math.max(0, segment.start / sampleRate - original.when);
           r4 = {buffer: original.buffer, rate: 1, offset: original.offset + advance,
             duration: Math.max(0, Math.min(original.duration - advance, playDur))};
-        } else r4 = resolveClipSourcePlayback(octx, clip, buf, fps, skip, playDur);
+        } else r4 = resolveClipSourcePlayback(clip, buf, fps, skip, playDur, stretched);
         if (!r4.duration) continue;
         const src = octx.createBufferSource(); src.buffer = r4.buffer;
         wireAudioClipGraph(octx, src, clip, when, playDur, octx.destination, skip);
