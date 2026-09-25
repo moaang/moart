@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2687</title>
+  <title>MoArt ver2688</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25043,6 +25043,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2688, items: [{ ja: '原画タイムラインのセリフ区間とレイヤーFX更新で、重複計算と不要なコマの作り直しを減らしました。', ko: '원화 타임라인의 대사 구간과 레이어 FX 갱신에서 반복 계산과 불필요한 코마 재생성을 줄였습니다.', en: 'Reduced repeated lip-sync range calculations and unnecessary cel rebuilding during genga layer FX updates.', zh: '减少原画时间轴对白区间的重复计算和图层效果更新时不必要的单元格重建。' }] },
       { ver: 2687, items: [{ ja: '音声の速度変換中も画面を操作しやすくし、動画録画前の音声準備と中止処理を改善しました。', ko: '오디오 배속 계산 중 화면 멈춤을 줄이고, 동영상 녹화 전 음성 준비와 취소 처리를 개선했습니다.', en: 'Moved audio time stretching off the UI thread and improved audio preparation and cancellation before video recording.', zh: '将音频变速计算移出界面线程，并改进视频录制前的音频准备和取消处理。' }] },
       { ver: 2686, items: [{ ja: '原画タイムラインの初回表示と音声の速度変換を軽量化し、ZIP保存時の画像文字列と大きなデータのコピーを削減しました。', ko: '원화 타임라인 첫 표시와 오디오 배속 계산을 가볍게 하고, ZIP 저장의 이미지 문자열과 대형 데이터 복사를 줄였습니다.', en: 'Reduced initial animation timeline and audio time-stretch costs, and removed image string conversions and large data copies from ZIP saves.', zh: '减轻原画时间轴首次显示和音频变速计算的负担，减少ZIP保存时的图像字符串转换与大型数据复制。' }] },
       { ver: 2685, items: [{ ja: '多数の原画を含むファイル保存・ZIP出力時の画像メモリを削減しました。タイムライン初回表示と無音区間を含む音声の速度変換も改善しました。', ko: '그림이 많은 파일 저장·ZIP 출력의 이미지 메모리 보유를 줄였습니다. 타임라인 첫 표시와 무음 구간이 포함된 오디오의 배속 변환도 개선했습니다.', en: 'Reduced drawing memory retained during file saves and ZIP exports. Improved initial timeline rendering and time stretching of audio with silent sections.', zh: '减少含有大量原画的文件保存和ZIP导出时的图像内存占用，改善时间轴首次显示和含静音段音频的变速处理。' }] },
@@ -107171,10 +107172,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ver1499: 이 코마가 セリフ 구간에 삼켜져 개별 번호를 내지 않는가. 動画マーク 로 구간이 끊긴 뒤의
     // 코마는 구간 밖이라 ふつうに 번호를 낸다(ver792) — 그 예외까지 포함한 판정 한 벌.
-    function gengaExposureInSerifu(layer, exp) {
+    function gengaExposureInSerifu(layer, exp, spans) {
       if (!exp || !exp.serifuId) return false;
       const sec = gengaSerifuSectionOf(layer, exp); if (!sec) return false;
-      const eff = gengaSerifuEffectiveSpan(layer, sec.id);
+      const eff = gengaSerifuEffectiveSpan(layer, sec.id, spans);
       return !!eff && exp.startFrame <= eff.end;
     }
     // ver1499: 화면의 하얀 번호(미지정 코마의 통번호)를 보이는 그대로 값으로 굳히는 계획을 세운다.
@@ -107186,6 +107187,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!layer || layer.locked || gengaLayerIsPaper(layer)) return null;
       if (layer.cellGroupId && layer.tagOff) return null; // セルサブレイヤー: 화면에 번호 자체가 없다(부모가 소유)
       const ranks = gengaPositionalRanks(layer);
+      const serifuSpans = new Map();
       const taken = {};
       // 「이 레이어가 이미 아는 값」의 정본 — 배치된 값 + sharedDrawings 키 + セリフ 구간의 from..to
       gengaInstanceValueCandidates(layer).forEach(function(c) {
@@ -107195,7 +107197,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let conflicts = 0;
       gengaSortedExposures(layer).forEach(function(e) {
         if (gengaValueKey(e.instanceValue) !== null) return; // 이미 값이 있다(파란 글씨)
-        if (gengaExposureInSerifu(layer, e)) return;         // 구간이 번호를 소유한다
+        if (gengaExposureInSerifu(layer, e, serifuSpans)) return;         // 구간이 번호를 소유한다
         const v = String(ranks[e.id]);
         if (taken[v]) { conflicts++; return; }
         taken[v] = true;
@@ -107608,12 +107610,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return first;
     }
     // The span the section actually GOVERNS. null when a mark sits on the very first frame (nothing left).
-    function gengaSerifuEffectiveSpan(layer, sectionId) {
-      const sp = gengaSerifuSpan(layer, sectionId); if (!sp) return null;
-      const cut = gengaSerifuFirstDougaFrame(layer, sectionId);
-      if (cut === null) return { start: sp.start, end: sp.end, cut: null };
-      const end = cut - 1;
-      return (end < sp.start) ? null : { start: sp.start, end: end, cut: cut };
+    function gengaSerifuEffectiveSpan(layer, sectionId, spans) {
+      // Optional memo belongs to one synchronous read of one layer, never to saved/editor state.
+      // Cache null too: a mark at the section start governs no exposure.
+      if (spans && spans.has(sectionId)) return spans.get(sectionId);
+      const sp = gengaSerifuSpan(layer, sectionId);
+      let result = null;
+      if (sp) {
+        const cut = gengaSerifuFirstDougaFrame(layer, sectionId);
+        const end = cut === null ? sp.end : cut - 1;
+        if (cut === null || !(end < sp.start)) result = { start: sp.start, end: end, cut: cut };
+      }
+      if (spans) spans.set(sectionId, result);
+      return result;
     }
     function gengaSerifuValues(section) { // the mouth chart alphabet: from..to
       const out = []; if (!section) return out;
@@ -122686,18 +122695,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return [placeholder, node];
       }));
       // Move retained rows directly between live children; never adopt them into the inert template document.
+      const resolveRow = function(node) {
+        const retained = reused.get(node);
+        if (!retained) return node;
+        if (node.dataset.gengaReuseFx === '1') {
+          Array.from(retained.children).forEach(function(child) {
+            if (child.classList.contains('genga-fx-strip')) child.remove();
+          });
+          retained.append(...node.childNodes);
+        }
+        return retained;
+      };
       const replaceRows = function(current, next) {
-        current.replaceChildren(...Array.from(next.childNodes).map(function(node) {
-          const retained = reused.get(node);
-          if (!retained) return node;
-          if (node.dataset.gengaReuseFx === '1') {
-            Array.from(retained.children).forEach(function(child) {
-              if (child.classList.contains('genga-fx-strip')) child.remove();
-            });
-            retained.append(...node.childNodes);
-          }
-          return retained;
-        }));
+        current.replaceChildren(...Array.from(next.childNodes).map(resolveRow));
       };
       if (renderPlan && renderPlan.scope === 'partial') {
         const layerIds = Array.isArray(renderPlan.layerIds) ? renderPlan.layerIds : [];
@@ -122744,7 +122754,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
         rowPairs.forEach(function(pair) {
           pair.currentHead.replaceWith(pair.nextHead);
-          pair.currentLane.replaceWith(pair.nextLane);
+          const lane = resolveRow(pair.nextLane);
+          if (lane !== pair.currentLane) pair.currentLane.replaceWith(lane);
         });
         if (audioNodes) {
           audioNodes.currentAHeads.style.cssText = audioNodes.nextAHeads.style.cssText;
@@ -122910,7 +122921,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const markup = { body: body, fx: fx || '' };
         if (rows) rows.markup.set(id, markup);
         rowsHead += head;
-        rowsLane += rows && !partialRender ? gengaViewRowMarkup(rows, id, markup) : body + markup.fx + '</div>';
+        rowsLane += rows ? gengaViewRowMarkup(rows, id, markup) : body + markup.fx + '</div>';
       };
       // ── ver1372: A-Z 탭은 **그 행의 자식**이다. 예전에는 패널 왼쪽 바깥에 뜬 별도 오버레이였고,
       // 행이 네이티브로 스크롤되면 JS가 scroll 이벤트를 받아 translateY 로 **뒤따라갔다**. iOS 관성
@@ -123093,7 +123104,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // value-less koma show their left-to-right position on the timeline (1,2,3…), not insertion order.
           // 이 표는 같은 배열의 **전** 원소에 1 부터 매긴다 — 조회가 비는 일이 없어
           // 읽는 자리에 폴백을 두지 않는다(종전 세 자리의 `|| …` 는 평가된 적이 없었다).
-          const expoRank = gengaPositionalRanks(l); // ver1499: 일괄 확정과 같은 번호를 써야 한다 — 커널 한 벌
+          const expoRank = gengaPositionalRanks(l); // Same numbering as positional commit.
+          const serifuSpans = new Map(); // One read of this row; discarded before any edit can run.
           // ver2362: 시트 표기의 프레임 칸/이음선 마크업 한 벌 — 전후 비헤이비어(pbCell/pbDash)·
           // 中間リピート(mCell/mDash)·セリフ 인라인이 같은 생성기를 세 벌 들고 있었다(리뷰 dup-3).
           // dash 의 `cells > 0` 가드는 mid 쪽에만 있던 것을 승계 — pb 쪽 호출은 전부 상수(1·4·5)라 동작 불변.
@@ -123102,7 +123114,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           (l.exposures || []).forEach(function(e, ei) {
             // セリフ区間のメンバーは個別の値を出さない — 区間ごとに「from ~ to セ リ フ」を1回だけ重ねて描く。
             // ただし 動画マークで区間が切れた先から始まるコマは区間外なので、ふつうに番号を出す（ver792）。
-            const inSerifu = gengaExposureInSerifu(l, e); // ver1499: 일괄 확정과 같은 판정 — 커널 한 벌
+            const inSerifu = gengaExposureInSerifu(l, e, serifuSpans); // ver1499: 일괄 확정과 같은 판정 — 커널 한 벌
             const valued = !inSerifu && (e.instanceValue !== null && e.instanceValue !== undefined && e.instanceValue !== '');
             const numText = (inSerifu || isCelSubLayer) ? '' : gengaKomaNumberText(e, expoRank);
             const eDr = gengaExposureDrawing(l, e);
@@ -123218,7 +123230,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           let serifuHtml = '';
           (l.serifuSections || []).forEach(function(sec) {
             // effective span — the blue notation and its hold line stop at the first 動画 mark (ver792)
-            const sp = gengaSerifuEffectiveSpan(l, sec.id); if (!sp) return;
+            const sp = gengaSerifuEffectiveSpan(l, sec.id, serifuSpans); if (!sp) return;
             const spanCells = sp.end - sp.start + 1;
             const glyphs = [String(sec.from), '~', String(sec.to)].concat(sec.cover ? ['×', 'セ', 'リ', 'フ'] : ['セ', 'リ', 'フ']);
             const shown = glyphs.slice(0, spanCells);
