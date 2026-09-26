@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2710</title>
+  <title>MoArt ver2711</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25049,6 +25049,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2711, items: [{ ja: '遠近変形の精度を歪みに合わせて調整し、操作中の線のずれを軽減しました。絵コンテ・原画で計算を共通化し、弱い変形の処理と重複計算を減らしました。', ko: '원근 변형의 왜곡에 맞춰 정밀도를 조절해 조작 중 선의 어긋남을 줄였습니다. 콘티·원화의 계산을 통일하고 약한 변형의 처리량과 중복 계산을 줄였습니다.', en: 'Perspective accuracy now follows distortion to reduce line displacement while dragging. Storyboard and animation share the calculation, with less work for mild warps and fewer repeated calculations.', zh: '根据透视变形程度调整精度，减少拖动时线条偏移。分镜与原画共用计算，减少轻微变形及重复计算的开销。' }] },
       { ver: 2710, items: [{ ja: '絵コンテのプロジェクト切り替え後、不要になった音声のデコードを開始しないようにしました。', ko: '콘티 프로젝트를 바꾼 뒤 필요 없어진 음원 디코드가 시작되지 않도록 수정했습니다.', en: 'Prevented obsolete audio decoding from starting after switching storyboard projects.', zh: '修复了切换分镜项目后仍启动无用音频解码的问题。' }] },
       { ver: 2709, items: [{ ja: '原画プロジェクトを切り替えた後、遅れて読み込まれた古い音声がメモリに残る問題を修正しました。', ko: '원화 프로젝트를 바꾼 뒤 늦게 읽힌 이전 음성이 메모리에 남던 문제를 수정했습니다.', en: 'Fixed old audio remaining in memory when decoding finishes after switching away from an animation project.', zh: '修复了切换原画项目后，延迟解码完成的旧音频残留在内存中的问题。' }] },
       { ver: 2708, items: [{ ja: '絵コンテの変形プレビューを確定後と同じ描画経路に統一し、確定時の線の見え方の変化を修正しました。遠近変形の一時キャンバスも再利用します。', ko: '콘티 변형 미리보기를 확정 후와 같은 표시 경로로 통일해, 확정할 때 선의 인상이 바뀌는 문제를 수정했습니다. 원근 변형의 임시 캔버스도 재사용합니다.', en: 'Unified storyboard transform previews with committed layer rendering to prevent line appearance changes on apply. Perspective transforms also reuse temporary canvas capacity.', zh: '统一分镜变形预览与确认后的图层绘制路径，修复确认时线条显示变化，并复用透视变形临时画布。' }] },
@@ -82566,7 +82567,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // 평행사변형이면 단일 ctx.transform(=아핀, 이음매 없음), 아니면 메시 워프.
     // 트랜스폼 모드의 quad는 정의상 항상 평행사변형이라 늘 fast-path를 탄다.
-    function paintDrawPatchThroughQuad(ctx, patch, iw, ih, quad, meshN) {
+    function paintDrawPatchThroughQuad(ctx, patch, iw, ih, quad, maxError) {
       if (!ctx || !patch || !Array.isArray(quad) || quad.length !== 4) return;
       const w = Math.max(1, Number(iw) || 1);
       const h = Math.max(1, Number(ih) || 1);
@@ -82578,7 +82579,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ctx.restore();
         return;
       }
-      paintWarpQuadMesh(ctx, patch, w, h, quad, meshN);
+      paintWarpQuadMesh(ctx, patch, w, h, quad, paintQuadMeshDivisions(ctx, quad, maxError));
     }
 
     function drawPaintPatchMovedExact(ctx, source, dx, dy) {
@@ -82694,7 +82695,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return true;
     }
-    // 소스 삼각형 하나를 목적지 삼각형으로 워프(삼각형 메시 바이리니어 = 기하적으로 정확).
+    // 소스 삼각형 하나를 목적지 삼각형으로 아핀 매핑. 전체 bilinear quad의 조각별 근사다.
     // ver711에 genga에서 콘티로 손복사됐다가 ver768에 다시 하나로 합쳐진 함수 — 룰5 세금의 대표 사례.
     // baseM은 호출자 ctx의 현재 변환. genga는 항등이라 baseM.multiply(M) === setTransform(M)과 비트동일이고,
     // 콘티는 레이어 오프셋 등이 걸린 ctx에 그리므로 반드시 합성해야 한다(반증: genga 커널을 base ctx에 쓰면
@@ -82736,45 +82737,31 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         ctx.clip();
         // ctx is paintWarpQuadMesh's transparent scratch: REPLACE what lies under the clip — clear it by the
         // clip's coverage c, then add this triangle at the same c. A band pixel the neighbour already holds
-        // ends at d(1-c) + s*c = s; plain source-over made it 1-(1-a)^2 (darker seams on semi-transparent ink).
+        // ends at d(1-c) + s*c; uniform ink (d=s) stays s. Different local mappings may still differ at edges.
+        // Plain source-over made uniform ink 1-(1-a)^2 (darker seams on semi-transparent ink).
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalCompositeOperation = 'destination-out';
         ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
         ctx.globalCompositeOperation = 'lighter';
-        ctx.setTransform(baseM.multiply(new DOMMatrix([a, b, c, d, e, f])));
+        ctx.setTransform(baseM.a * a + baseM.c * b, baseM.b * a + baseM.d * b,
+          baseM.a * c + baseM.c * d, baseM.b * c + baseM.d * d,
+          baseM.a * e + baseM.c * f + baseM.e, baseM.b * e + baseM.d * f + baseM.f);
         ctx.drawImage(img, 0, 0);
       } finally { ctx.restore(); }
     }
-    // 메시 분할 수. 비용은 픽셀이 아니라 삼각형 수에 비례한다(삼각형당 save+clip+setTransform+drawImage+
-    // restore ≈ 10µs 고정) — 실측: n=24는 무브당 11.9ms로 60Hz 예산의 69%, n=6은 0.78ms(15.4배).
-    // ver769: 드래그 중에는 6으로 낮춘다(genga와 같은 트레이드). 정지 프리뷰와 커밋은 24 그대로라
-    // 화면에 남는 그림과 구워지는 픽셀은 불변 — 손가락이 움직이는 동안의 미리보기만 거칠어진다.
-    const PAINT_TRANSFORM_MESH_N = 24;
-    const PAINT_TRANSFORM_MESH_N_DRAG = 6;
-    // ver1942 (판정 q3=A): 분할을 **결과 크기에 비례**시킨다. 고정 분할은 큰 변형에서 셀이 커져
-    // 원근 근사가 눈에 띄게 어긋난다(셀 안은 선형이므로 「거칠다」가 아니라 **모양이 다르다**).
-    // 실측 — 2520x1781 결과, 강한 사다리꼴, 오차는 n=128 대비 픽셀 비율:
-    //   n=6  셀 420px  3.83%  0.5ms   ← 종전 드래그 값
-    //   n=12 셀 210px  1.01%  2.3ms
-    //   n=16 셀 158px  0.25%  4.3ms   ← 드래그 상한(60Hz 예산의 26%)
-    //   n=24 셀 105px  0.03%  8.5ms   ← 정지·커밋. **큰 결과에서도 이미 수렴한다**
-    //   n=32~64        0.01~0.03%  20~68ms  ← 오차는 안 줄고 비용만 는다
-    // 그래서 **정지·커밋(24)은 그대로 둔다** — 올릴 이유가 측정에 없다. 바꾸는 것은 드래그뿐이고,
-    // 작은 결과에서는 하한(6)이 걸려 종전과 같은 값이 나온다(561px 결과 → ceil(561/160)=4 → 6).
-    const PAINT_TRANSFORM_MESH_DRAG_CELL_PX = 160;
-    const PAINT_TRANSFORM_MESH_N_DRAG_MAX = 16;
-
-    // 드래그 스코프 판정. paintRasterOp는 pointerdown에 서고 pointerup에서 해제되므로 정확히 제스처 동안만 참.
-    // 크기는 **결과(quad)** 로 잰다 — 근사 오차를 만드는 것은 소스 해상도가 아니라 그려지는 넓이다.
-    function paintTransformDragMeshN(preview) {
-      const op = state.paintRasterOp;
-      if (!(op && op.type === 'transform-edit')) return PAINT_TRANSFORM_MESH_N;
-      const quad = preview && preview.box ? paintTransformBoxQuadArray(preview.box) : null;
-      const b = (Array.isArray(quad) && quad.length === 4) ? paintBoundsFromQuad(quad) : null;
-      const span = b ? Math.max(Number(b.w) || 0, Number(b.h) || 0) : 0;
-      if (!span) return PAINT_TRANSFORM_MESH_N_DRAG;
-      const n = Math.ceil(span / PAINT_TRANSFORM_MESH_DRAG_CELL_PX);
-      return Math.max(PAINT_TRANSFORM_MESH_N_DRAG, Math.min(PAINT_TRANSFORM_MESH_N_DRAG_MAX, n));
+    // Bilinear F(u,v)=A+B*u+C*v+D*u*v. On either cell triangle, the affine
+    // approximation differs by at most |D|/(4*n*n), measured in destination pixels.
+    // This bounds geometry inside triangles, not clipping/filtering error. The cap
+    // bounds work on extreme quads; at the cap the requested error may be exceeded.
+    const PAINT_TRANSFORM_ERROR_PX = 0.125;
+    const PAINT_TRANSFORM_DRAG_ERROR_PX = 0.5;
+    function paintQuadMeshDivisions(ctx, quad, maxError) {
+      const m = ctx.getTransform();
+      const dx = quad[0][0] - quad[1][0] + quad[2][0] - quad[3][0];
+      const dy = quad[0][1] - quad[1][1] + quad[2][1] - quad[3][1];
+      const bend = Math.hypot(m.a * dx + m.c * dy, m.b * dx + m.d * dy);
+      const error = maxError > 0 ? maxError : PAINT_TRANSFORM_ERROR_PX;
+      return Math.min(32, Math.max(2, Math.ceil(Math.sqrt(bend / (4 * error)))));
     }
 
     // The triangles replace each other's overlap bands (paintWarpQuadTriangle), which needs a canvas that holds
@@ -82785,7 +82772,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     let paintWarpMeshScratch = null;
     function paintWarpQuadMesh(ctx, img, iw, ih, quad, n) {
       const baseM = ctx.getTransform();
-      const div = Math.max(1, Number(n) || PAINT_TRANSFORM_MESH_N);
+      const div = Math.max(1, Math.floor(Number(n) || paintQuadMeshDivisions(ctx, quad)));
       const pts = quad.map(function(q) { return { x: baseM.a * q[0] + baseM.c * q[1] + baseM.e, y: baseM.b * q[0] + baseM.d * q[1] + baseM.f }; });
       const xs = pts.map(function(p) { return p.x; }), ys = pts.map(function(p) { return p.y; });
       const pad = Math.ceil(PAINT_QUAD_CLIP_OUTSET * Math.max(Math.hypot(baseM.a, baseM.b), Math.hypot(baseM.c, baseM.d))) + 2;
@@ -82813,16 +82800,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         sctx.imageSmoothingQuality = ctx.imageSmoothingQuality;
         const sM = new DOMMatrix([1, 0, 0, 1, -x0, -y0]).multiply(baseM);
         sctx.setTransform(sM);
+        // Each grid vertex belongs to up to six triangles; compute it only once.
+        const stride = div + 1, source = [], target = [];
+        for (let i = 0; i <= div; i += 1) {
+          for (let j = 0; j <= div; j += 1) {
+            const u = i / div, v = j / div, p = paintQuadBilinearPoint(quad, u, v);
+            source.push([u * iw, v * ih]); target.push([p.x, p.y]);
+          }
+        }
         for (let i = 0; i < div; i += 1) {
           for (let j = 0; j < div; j += 1) {
-            const u0 = i / div, u1 = (i + 1) / div, v0 = j / div, v1 = (j + 1) / div;
-            const sx0 = u0 * iw, sx1 = u1 * iw, sy0 = v0 * ih, sy1 = v1 * ih;
-            const dTL = paintQuadBilinearPoint(quad, u0, v0);
-            const dTR = paintQuadBilinearPoint(quad, u1, v0);
-            const dBR = paintQuadBilinearPoint(quad, u1, v1);
-            const dBL = paintQuadBilinearPoint(quad, u0, v1);
-            paintWarpQuadTriangle(sctx, sM, img, [sx0, sy0], [sx1, sy0], [sx1, sy1], [dTL.x, dTL.y], [dTR.x, dTR.y], [dBR.x, dBR.y]);
-            paintWarpQuadTriangle(sctx, sM, img, [sx0, sy0], [sx1, sy1], [sx0, sy1], [dTL.x, dTL.y], [dBR.x, dBR.y], [dBL.x, dBL.y]);
+            const tl = i * stride + j, tr = tl + stride, br = tr + 1, bl = tl + 1;
+            paintWarpQuadTriangle(sctx, sM, img, source[tl], source[tr], source[br], target[tl], target[tr], target[br]);
+            paintWarpQuadTriangle(sctx, sM, img, source[tl], source[br], source[bl], target[tl], target[br], target[bl]);
           }
         }
         ctx.save();
@@ -82866,8 +82856,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         && Math.abs(q[0][1] - ((Number(sb.y) || 0) + (Number(preview.moveDy) || 0))) < 0.001;
     }
 
-    // meshN은 호출자가 명시한다(전역 판독 금지) — 커밋이 실수로 드래그용 저분할로 구워지는 걸 구조적으로 막는다.
-    function drawPaintTransformPatch(ctx, preview, meshN) {
+    // 품질 목표는 호출자가 전달한다. 생략하면 정지/확정 품질이며 전역 드래그 상태를 읽지 않는다.
+    function drawPaintTransformPatch(ctx, preview, maxError) {
       if (!ctx || !preview || !preview.source || !preview.source.patchCanvas) return;
       if (paintTransformIsPureMove(preview)) {
         drawPaintPatchMovedExact(ctx, preview.source, preview.moveDx || 0, preview.moveDy || 0);
@@ -82877,7 +82867,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 모양을 다 펴고, 드로어가 평행사변형 여부로 fast-path/메시를 고른다. 모드 분기 불필요.
       const patch = preview.source.patchCanvas;
       paintDrawPatchThroughQuad(ctx, patch, patch.width, patch.height, paintTransformBoxQuadArray(preview.box),
-        Math.max(1, Number(meshN) || PAINT_TRANSFORM_MESH_N));
+        maxError);
     }
 
     // Pending ink and committed ink use the same layer canvas/CSS sampling, opacity and FX path.
@@ -82887,15 +82877,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintTransformPreviewBitmap(preview) {
       const source = preview && preview.source;
       if (!source || !source.baseCanvas || !preview.box) return null;
-      const meshN = paintTransformDragMeshN(preview);
+      const maxError = state.paintRasterOp && state.paintRasterOp.type === 'transform-edit'
+        ? PAINT_TRANSFORM_DRAG_ERROR_PX : PAINT_TRANSFORM_ERROR_PX;
       const key = [paintTransformBoxQuadArray(preview.box).join(';'), preview.mode,
         preview.hit && preview.hit.action, preview.moveDx, preview.moveDy,
-        preview.layerCanvasOffsetX, preview.layerCanvasOffsetY, meshN].join('|');
+        preview.layerCanvasOffsetX, preview.layerCanvasOffsetY, maxError].join('|');
       let cache = paintTransformPreviewCache;
       if (cache && cache.source === source && cache.geometry === key) return cache;
       if (!cache) cache = {};
       if (cache.source !== source) cache.baseBounds = canvasAlphaBounds(source.baseCanvas);
-      const result = paintTransformResultCanvas(preview, { meshN: meshN, canvas: cache.canvas, baseBounds: cache.baseBounds });
+      const result = paintTransformResultCanvas(preview, { maxError: maxError, canvas: cache.canvas, baseBounds: cache.baseBounds });
       if (!result) return null;
       cache.source = source; cache.geometry = key; cache.canvas = result.canvas;
       cache.key = 'transform-preview:' + (++paintTransformPreviewRevision);
@@ -82961,7 +82952,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.save();
       ctx.translate(-x, -y);
       ctx.drawImage(op.source.baseCanvas, 0, 0);
-      drawPaintTransformPatch(ctx, preview, options ? options.meshN : PAINT_TRANSFORM_MESH_N); // commit has no preview options
+      drawPaintTransformPatch(ctx, preview, options && options.maxError); // commit has no preview options
       ctx.restore();
       return { canvas: canvas, bounds: { x: x, y: y, w: w, h: h } };
     }
@@ -83122,7 +83113,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       out.width = w; out.height = h;
       const octx = out.getContext('2d');
       octx.translate(-x, -y);
-      paintDrawPatchThroughQuad(octx, mask, mask.width, mask.height, corners, PAINT_TRANSFORM_MESH_N);
+      paintDrawPatchThroughQuad(octx, mask, mask.width, mask.height, corners);
       return { canvas: out, x: x, y: y };
     }
     function paintSelectionAfterTransform(preview) {
@@ -117251,25 +117242,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const b = sel.bounds;
       return [[b.x, b.y], [b.x + b.w, b.y], [b.x + b.w, b.y + b.h], [b.x, b.y + b.h]];
     }
-    // UNIFIED transform applier for BOTH tools: draws the bounds-cropped source into ctx at the quad.
-    // A parallelogram quad (move/rotate/scale — anything the transform tool makes) is an exact affine map,
-    // drawn with ONE composed matrix at the transform tool's pre-quad cost; the triangle mesh only runs for
-    // a true perspective warp. meshN coarsens the warp while dragging for perf.
-    // 드래그 중엔 6분할로 낮춰 응답성을 산다(놓으면 원래 분할로 다시 매끈하게) — 콘티 ver769와 같은
-    // 트레이드. (구주석 "콘티는 늘 24"는 ver769 이후 스테일이었다 — 콘티도 드래그 중엔 6이다.)
-    // ver844: 정지/커밋 분할 12→24 (콘티 PAINT_TRANSFORM_MESH_N 파리티). "genga 캔버스=표시 해상도"
-    // 논거는 커밋에는 성립하지 않는다 — gengaSelCompositeFrom은 용지 해상도(gt.paper.w/h, A4@300dpi급
-    // 가능)로 굽는다. 실측(verify_p1.html, 공용 ver768 커널 픽셀 diff): A4@300dpi급에서 n12 커밋은
-    // 정확한 bilinear 대비 최대 1.3~1.7px 잉크 변위(>32계조 diff 픽셀 6.0%), n24는 0.3~0.4px(1.5%).
-    // 커밋 비용 n24 ≈ 12~17ms 원샷(콘티가 매 커밋 지불하는 값과 동급). 드래그 중 6은 그대로 —
-    // 이 상수는 커밋·정지 프리뷰·내보내기 합성(gengaSelCompositeFrom 소비처)에만 걸린다.
-    const GENGA_SEL_MESH_N = PAINT_TRANSFORM_MESH_N;           // ver873 G1b: single source (was a hand-copied 24 —
-    const GENGA_SEL_MESH_N_DRAG = PAINT_TRANSFORM_MESH_N_DRAG;  // the comment above already declared it "conte parity")
-
-    // ver768: 콘티와 공용 커널(paintDrawPatchThroughQuad). 평행사변형 fast-path/메시 분기, 분할 수, 수식 전부
-    // 종전과 동일 — 픽셀 diff로 등가 증명 후 위임(scratchpad/quad_kernel_equiv.html TEST 2).
+    // Conte and genga share the affine fast path and destination-pixel mesh accuracy.
     function gengaSelApplyTransform(ctx, sel, crop, cw, ch) {
-      paintDrawPatchThroughQuad(ctx, crop, cw, ch, gengaResolveQuad(sel), gengaSelDrag ? GENGA_SEL_MESH_N_DRAG : GENGA_SEL_MESH_N);
+      paintDrawPatchThroughQuad(ctx, crop, cw, ch, gengaResolveQuad(sel), gengaSelDrag ? PAINT_TRANSFORM_DRAG_ERROR_PX : PAINT_TRANSFORM_ERROR_PX);
     }
     // map a point in selection-local (paper) coords → its transformed paper point (quad bilinear)
     function gengaSelMapPoint(sel, x, y) {
