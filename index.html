@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2707</title>
+  <title>MoArt ver2708</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25049,6 +25049,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2708, items: [{ ja: '絵コンテの変形プレビューを確定後と同じ描画経路に統一し、確定時の線の見え方の変化を修正しました。遠近変形の一時キャンバスも再利用します。', ko: '콘티 변형 미리보기를 확정 후와 같은 표시 경로로 통일해, 확정할 때 선의 인상이 바뀌는 문제를 수정했습니다. 원근 변형의 임시 캔버스도 재사용합니다.', en: 'Unified storyboard transform previews with committed layer rendering to prevent line appearance changes on apply. Perspective transforms also reuse temporary canvas capacity.', zh: '统一分镜变形预览与确认后的图层绘制路径，修复确认时线条显示变化，并复用透视变形临时画布。' }] },
       { ver: 2707, items: [
         { ja: '表示倍率を変えたときのクリップ移動、パレット、筆圧カーブの座標ずれを修正しました。再生中のシークとカメラ操作のキャンセルも整理しました。', ko: 'UI 배율 변경 시 클립 이동·팔레트·필압 곡선의 좌표 어긋남을 수정했습니다. 재생 중 시크와 카메라 조작 취소도 정리했습니다.', en: 'Fixed clip, palette and pressure-curve coordinates at different UI scales, plus seeking during playback and cancelling camera gestures.', zh: '修复不同界面缩放下片段、调色板和笔压曲线的坐标偏移，以及播放中定位和取消摄影机操作的问题。' },
         { ja: '選択範囲の変形・半透明の合成、描画のキャンセル、原画の用紙変更とロック中のFX操作を修正しました。練習レッスン間で古い操作履歴が残らないようにしました。', ko: '선택 변형·반투명 합성·그리기 취소, 원화 용지 변경과 잠긴 레이어의 FX 조작을 수정했습니다. 연습 레슨 사이에 이전 실행 취소 이력이 남지 않도록 했습니다.', en: 'Fixed selection transforms, translucent compositing, drawing cancellation, animation paper resizing and locked-layer FX editing. Practice lessons now start with fresh undo history.', zh: '修复选区变形、半透明合成、绘画取消、原画纸张调整和锁定图层的FX操作。练习课程切换时清空旧的撤销记录。' }
@@ -76085,8 +76086,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function drawLayerDrawingPreviewToCanvas(canvas, drawingRef) {
       const ref = String(drawingRef || '');
       if (!canvas || !ref) return;
-      const drawing = ensureLayerDrawingData(state.project, ref);
-      const liveBitmap = layerLiveBitmapFor(ref); // ver636: committed pixels, no dataUrl needed
+      const pending = state.paintTransformPreview;
+      const rendered = pending && String(pending.drawingRef) === ref && paintTransformUiRefValid(ref)
+        ? paintTransformPreviewBitmap(pending) : null;
+      const drawing = rendered ? rendered.drawing : ensureLayerDrawingData(state.project, ref);
+      const liveBitmap = rendered ? rendered.canvas : layerLiveBitmapFor(ref);
+      canvas.dataset.transformPreviewPainted = rendered ? '1' : '';
       if (drawing && (drawing.bitmapDataUrl || liveBitmap)) {
         const rect = layerDrawingBitmapRect(drawing);
         const cameraTarget = canvas.closest('.video-preview-camera-target');
@@ -76096,7 +76101,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // ver629: content-addressed (version-free) — the CACHE key is the raw bitmap identity; the
         // per-canvas dedup key additionally carries the bokeh radius (bokeh changes how the same
         // bitmap is painted, but not the decoded image itself).
-        const contentKey = layerDrawingContentKey(ref, drawing);
+        const contentKey = rendered ? rendered.key : layerDrawingContentKey(ref, drawing);
         const key = contentKey + ':bk' + Math.round(bokehR * 10);
         // This canvas already shows this exact bitmap → nothing to do. Skips the needless async
         // re-decode that used to re-run for every UNCHANGED previous panel on each re-render
@@ -76105,7 +76110,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         canvas.dataset.layerPreviewDrawKey = key;
         const paint = function(img) {
           if (canvas.dataset.layerPreviewDrawKey !== key) return;
-          if (paintCanvasHasActiveStroke(canvas)) return;
+          if (!rendered && paintCanvasHasActiveStroke(canvas)) return;
           if (bokehR > 0) {
             // 玉ボケ preview: grow the canvas by the disc radius (480-space) and accumulate the bitmap over a
             // filled disc, matching the export (bright points -> filled aperture circles).
@@ -79231,17 +79236,19 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       // 뒤늦은 한 프레임이 겹쳐 그려지지 않는다(호출부마다 취소를 기억할 필요가 없다).
       if (paintOverlayRedrawRaf) { cancelAnimationFrame(paintOverlayRedrawRaf); paintOverlayRedrawRaf = 0; }
       const refFilter = String(drawingRef || '');
-      // ver682: only a CONTEXT-VALID preview hides its base canvas — an orphaned preview must not leave the
-      // real layer pixels invisible (self-validating rule, same gate as the overlay draw).
+      // Pending pixels use the ordinary layer renderer, including stacking, opacity, FX and CSS sampling.
+      // The stage overlay owns only gizmos/selection; changing commit state must not change the ink renderer.
       const rawPreviewRef = state.paintTransformPreview && String(state.paintTransformPreview.drawingRef || '') || '';
       const previewRef = rawPreviewRef && paintTransformUiRefValid(rawPreviewRef) ? rawPreviewRef : '';
-      // ver714: the selection UI (marquee/lasso/box/preview/stamp) now renders on the single stage overlay
-      // (drawPaintStageOverlay). Here we only toggle the LIVE base layer's visibility while a valid transform
-      // preview stands in for it (the preview art is drawn on the stage overlay above the layers).
+      if (!previewRef && paintTransformPreviewCache) {
+        paintReleaseCanvas(paintTransformPreviewCache.canvas);
+        paintTransformPreviewCache = null;
+      }
       document.querySelectorAll('.picture-layer-canvas[data-layer-drawing-ref], .video-preview-layer-canvas[data-layer-drawing-ref]').forEach(function(canvas) {
         const ref = String(canvas.dataset.layerDrawingRef || '');
         if (refFilter && ref !== refFilter) return;
-        canvas.style.visibility = previewRef && previewRef === ref ? 'hidden' : '';
+        canvas.style.visibility = '';
+        if (previewRef === ref || canvas.dataset.transformPreviewPainted === '1') drawLayerDrawingPreviewToCanvas(canvas, ref);
       });
       document.querySelectorAll('.video-preview-layer-image[data-layer-drawing-ref]').forEach(function(image) {
         const ref = String(image.dataset.layerDrawingRef || '');
@@ -80750,7 +80757,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // transform is derived purely from the frame element's gBCR relative to the overlay's OWN gBCR (both in
     // the same CSS-zoom context, so the Chromium-vs-WebKit gBCR-under-zoom difference cancels — no pointer
     // math, no uiReadScale needed), so it stays aligned on both engines. Every inner draw (drawPaintMaskOutline
-    // / drawPaintTransformOverlay / drawPaintTransformPreviewOverlay / drawPaintStampPreviewOverlay)
+    // / drawPaintTransformOverlay / drawPaintStampPreviewOverlay)
     // already works in layer coords, so they are reused unchanged. (ver1439: drawPaintDashedPoints 는 유일한
     // 호출부였던 라쏘 프리뷰가 실선으로 바뀌면서 호출부 0 이 되어 삭제 — 묘비를 남기지 않는다.)
     // ver714: ONE stage overlay canvas, a persistent child of the PREVIEW SCREEN (.editor-stage — the whole
@@ -80892,12 +80899,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       const stampPreview = state.paintStampPreview;
       if (stampPreview) drawPaintStampPreviewOverlay(ctx, stampPreview);
-      // ver845: 변형 프리뷰는 숨겨진 레이어 캔버스의 대역(updatePaintEditOverlays) — 그 캔버스의 표시 보간
-      // 신호(.conte-crisp, ver646 크리스프 규칙)를 그대로 전달해 프리뷰와 커밋 표시가 보간에서 갈라질 수
-      // 없게 한다(갈라짐 = "변형 중 2値化가 풀려 보임" 버그). 문턱 재계산 금지 — 클래스가 단일 신호.
-      const conteStageEl = document.getElementById('conteVideoStage');
-      const stageCrisp = !!(conteStageEl && conteStageEl.classList.contains('conte-crisp'));
-      if (transformPreview) drawPaintTransformPreviewOverlay(ctx, transformPreview, stageCrisp);
       const box = state.paintTransformBox;
       if (box && paintTransformUiRefValid(box.drawingRef)) drawPaintTransformOverlay(ctx, box, mstyle);
     }
@@ -82774,7 +82775,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // The triangles replace each other's overlap bands (paintWarpQuadTriangle), which needs a canvas that holds
     // nothing else — so the mesh is assembled in a transparent DEVICE-space scratch covering the warp (the
     // caller's transform is folded in, no resample) and reaches ctx in one drawImage, under the caller's own
-    // alpha / clip / composite. One scratch is reused (the mesh never re-enters), like paintTransformPreviewScratch.
+    // alpha / clip / composite. One scratch is reused (the mesh never re-enters), like paintTransformPreviewCache.
     const PAINT_WARP_MESH_SCRATCH_BYTES = 8 * 1024 * 1024;
     let paintWarpMeshScratch = null;
     function paintWarpQuadMesh(ctx, img, iw, ih, quad, n) {
@@ -82788,8 +82789,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!(x1 > x0 && y1 > y0)) return; // the warp lies wholly off this canvas
       if (!paintWarpMeshScratch) paintWarpMeshScratch = document.createElement('canvas');
       const scratch = paintWarpMeshScratch;
-      if (scratch.width !== x1 - x0) scratch.width = x1 - x0;
-      if (scratch.height !== y1 - y0) scratch.height = y1 - y0;
+      // Retain capacity across nearby drag positions; canvas dimension writes discard the backing.
+      // Only the used rectangle is composited below. Growth and retention share the existing 8MiB cap.
+      const needW = x1 - x0, needH = y1 - y0;
+      if (scratch.width < needW || scratch.height < needH) {
+        let nextW = Math.max(scratch.width, Math.ceil(needW / 64) * 64);
+        let nextH = Math.max(scratch.height, Math.ceil(needH / 64) * 64);
+        if (nextW * nextH * 4 > PAINT_WARP_MESH_SCRATCH_BYTES) { nextW = needW; nextH = needH; }
+        if (scratch.width !== nextW) scratch.width = nextW;
+        if (scratch.height !== nextH) scratch.height = nextH;
+      }
       try {
         const sctx = scratch.getContext('2d');
         sctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -82866,42 +82875,30 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         Math.max(1, Number(meshN) || PAINT_TRANSFORM_MESH_N));
     }
 
-    // ver845: 변형 프리뷰 표시 흐림(2値化가 풀려 보임) 수정. 종전엔 base/patch를 표시 배율이 걸린 오버레이
-    // ctx에 직접 그려 레이어 픽셀이 기본 bilinear로 리샘플됐다(레이어 캔버스 본체는 pixelated CSS로 표시
-    // 되므로 변형 시작=crisp→bilinear 스왑, Enter=원복 — "드래그 중만 흐림"의 전모). 이제 커밋
-    // (paintTransformResultCanvas)과 동일하게 LAYER 해상도 스크래치에 base+patch를 합성한 뒤(순수 이동=
-    // 정수 blit, 스케일·회전·퍼스펙티브=커밋과 같은 레이어-res bilinear 워프 유지) 단일 drawImage로 올리고,
-    // 그 보간만 레이어 캔버스 표시 규칙(.conte-crisp ↔ smoothing off)에 맞춘다. 실측(patch_Q3 하네스, 하드
-    // 잉크, x3.5 표시): 종전 직접 경로 중간알파 7,515px vs 커밋 표시 0px; smoothing off 단독은 분수 스케일
-    // patch 경계 커버리지 심 1,120px 잔존; 본 경로 = 커밋 표시와 픽셀 diff 0(이동·워프·AA잉크·다운스케일 전부).
-    let paintTransformPreviewScratch = null; // 매 move 재할당 방지 — 레이어-res 1장 재사용
-    function drawPaintTransformPreviewOverlay(ctx, preview, crisp) {
-      if (!ctx || !preview || !preview.source) return;
-      const previewBase = preview.source.baseCanvas;
-      if (previewBase && previewBase.width > 0 && previewBase.height > 0) {
-        if (!paintTransformPreviewScratch) paintTransformPreviewScratch = document.createElement('canvas');
-        const scratch = paintTransformPreviewScratch;
-        if (scratch.width !== previewBase.width) scratch.width = previewBase.width;
-        if (scratch.height !== previewBase.height) scratch.height = previewBase.height;
-        const sctx = scratch.getContext('2d');
-        sctx.clearRect(0, 0, scratch.width, scratch.height);
-        sctx.drawImage(previewBase, 0, 0);
-        drawPaintTransformPatch(sctx, preview, paintTransformDragMeshN(preview)); // ver769: 드래그 중만 저분할 · ver1942: 결과 크기에 비례
-        ctx.save();
-        ctx.globalAlpha = 0.98;
-        ctx.imageSmoothingEnabled = !crisp; // 표시 보간 = 레이어 캔버스와 같은 신호(패치 1/2에서 전달)
-        ctx.translate(-Math.round(Number(preview.layerCanvasOffsetX) || 0), -Math.round(Number(preview.layerCanvasOffsetY) || 0));
-        ctx.drawImage(scratch, 0, 0);
-        ctx.restore();
-        return;
-      }
-      // baseCanvas 부재 방어(preparePaintTransformSource는 항상 채우지만) — 종전 직접 경로 그대로
-      ctx.save();
-      ctx.globalAlpha = 0.98;
-      ctx.translate(-Math.round(Number(preview.layerCanvasOffsetX) || 0), -Math.round(Number(preview.layerCanvasOffsetY) || 0));
-      if (preview.source.baseCanvas) ctx.drawImage(preview.source.baseCanvas, 0, 0);
-      drawPaintTransformPatch(ctx, preview, paintTransformDragMeshN(preview)); // ver1942
-      ctx.restore();
+    // Pending ink and committed ink use the same layer canvas/CSS sampling, opacity and FX path.
+    // Cache immutable source bounds once; rebuild the pending bitmap only for a new quad or mesh quality.
+    let paintTransformPreviewCache = null; // one pending bitmap; released when the preview ends
+    let paintTransformPreviewRevision = 0;
+    function paintTransformPreviewBitmap(preview) {
+      const source = preview && preview.source;
+      if (!source || !source.baseCanvas || !preview.box) return null;
+      const meshN = paintTransformDragMeshN(preview);
+      const key = [paintTransformBoxQuadArray(preview.box).join(';'), preview.mode,
+        preview.hit && preview.hit.action, preview.moveDx, preview.moveDy,
+        preview.layerCanvasOffsetX, preview.layerCanvasOffsetY, meshN].join('|');
+      let cache = paintTransformPreviewCache;
+      if (cache && cache.source === source && cache.geometry === key) return cache;
+      if (!cache) cache = {};
+      if (cache.source !== source) cache.baseBounds = canvasAlphaBounds(source.baseCanvas);
+      const result = paintTransformResultCanvas(preview, { meshN: meshN, canvas: cache.canvas, baseBounds: cache.baseBounds });
+      if (!result) return null;
+      cache.source = source; cache.geometry = key; cache.canvas = result.canvas;
+      cache.key = 'transform-preview:' + (++paintTransformPreviewRevision);
+      cache.drawing = { bitmapX: result.bounds.x - Math.round(Number(preview.layerCanvasOffsetX) || 0),
+        bitmapY: result.bounds.y - Math.round(Number(preview.layerCanvasOffsetY) || 0),
+        bitmapWidth: result.bounds.w, bitmapHeight: result.bounds.h };
+      paintTransformPreviewCache = cache;
+      return cache;
     }
 
     function paintUnionBounds(a, b) {
@@ -82927,7 +82924,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return paintBoundsFromQuad(paintTransformBoxQuadArray(preview.box)); // ver945 G4b: one shape for both modes (the perspective branch died with the scalar box)
     }
 
-    function paintTransformResultCanvas(op) {
+    function paintTransformResultCanvas(op, options) {
       if (!op || !op.source || !op.source.baseCanvas) return null;
       const preview = {
         drawingRef: op.drawingRef,
@@ -82942,7 +82939,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       };
       // The result REPLACES the layer bitmap, so a base scan that fails must keep the whole base (the trim
       // policy of canvasAlphaBounds), not read as "no ink" (paintCanvasInkBounds' safe stop for what to warp).
-      const baseBounds = canvasAlphaBounds(op.source.baseCanvas);
+      const baseBounds = options && Object.prototype.hasOwnProperty.call(options, 'baseBounds')
+        ? options.baseBounds : canvasAlphaBounds(op.source.baseCanvas);
       const patchBounds = paintTransformPatchBounds(preview);
       const union = paintUnionBounds(baseBounds, patchBounds);
       if (!union) return null;
@@ -82950,14 +82948,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const y = Math.floor(union.y);
       const w = Math.max(1, Math.ceil(union.x + union.w) - x);
       const h = Math.max(1, Math.ceil(union.y + union.h) - y);
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
+      const canvas = options && options.canvas || document.createElement('canvas');
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
       const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, w, h);
       ctx.save();
       ctx.translate(-x, -y);
       ctx.drawImage(op.source.baseCanvas, 0, 0);
-      drawPaintTransformPatch(ctx, preview, PAINT_TRANSFORM_MESH_N); // ver769: 커밋은 항상 최고 분할
+      drawPaintTransformPatch(ctx, preview, options ? options.meshN : PAINT_TRANSFORM_MESH_N); // commit has no preview options
       ctx.restore();
       return { canvas: canvas, bounds: { x: x, y: y, w: w, h: h } };
     }
