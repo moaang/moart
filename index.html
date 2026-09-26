@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2702</title>
+  <title>MoArt ver2703</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25043,6 +25043,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2703, items: [{ ja: 'プロジェクトを開いたときに保存したタイムライン位置が先頭へ戻る問題を修正しました。動画再生中の同じ映像の重複描画を減らしました。', ko: '프로젝트를 열 때 저장한 타임라인 위치가 맨 앞으로 돌아가던 문제를 수정했습니다. 동영상 재생 중 같은 영상의 중복 그리기를 줄였습니다.', en: 'Fixed saved timeline positions resetting when opening a project. Reduced duplicate video drawing during playback.', zh: '修复打开项目时已保存的时间轴位置回到开头的问题。减少视频播放期间同一画面的重复绘制。' }] },
       { ver: 2702, items: [{ ja: 'タイムシートの最終ページを越えると操作が止まる問題を修正しました。破損したCLIPファイルのレイヤー接続が循環している場合は、処理を停止してエラーを表示します。', ko: '타임시트 마지막 페이지를 넘으면 조작이 멈추던 문제를 수정했습니다. 손상된 CLIP 파일의 레이어 연결이 순환하면 처리를 중단하고 오류를 표시합니다.', en: 'Fixed a freeze past the final timesheet page. Damaged CLIP files with cyclic layer links now stop with an error.', zh: '修复超过时间表最后一页时操作卡住的问题。损坏的CLIP文件若图层链接形成循环，将停止处理并显示错误。' }] },
       { ver: 2701, items: [{ ja: 'JSON・ZIPを開く前に未保存の作業を確認し、読み込み中に追加した編集や別のプロジェクトを上書きしないようにしました。新規コンテが操作前から未保存になる問題も修正しました。', ko: 'JSON·ZIP을 열기 전에 미저장 작업을 확인하고, 로딩 중 추가한 편집이나 다른 프로젝트를 덮어쓰지 않도록 했습니다. 새 콘티가 조작 전부터 미저장으로 표시되는 문제도 수정했습니다.', en: 'Opening JSON or ZIP now checks unsaved work and preserves edits or another project made during loading. Fixed untouched new storyboards being marked unsaved.', zh: '打开JSON或ZIP前现会确认未保存工作，并保留加载期间新增的编辑或其他项目。修复新建分镜在操作前就被标记为未保存的问题。' }] },
       { ver: 2700, items: [{ ja: '原画FXのラスタライズで、画像の準備失敗を空の絵と扱って絵や効果を消す問題を修正しました。読み込んだプロジェクトのIDを音量・不透明度ゲージに安全に表示するよう修正しました。', ko: '원화 FX 래스터화에서 그림 준비 실패를 빈 그림으로 처리해 그림이나 효과를 지우던 문제를 수정했습니다. 불러온 프로젝트의 ID를 음량·불투명도 게이지에 안전하게 표시하도록 수정했습니다.', en: 'Fixed genga FX rasterization deleting drawings or effects when image preparation fails. Project IDs are now escaped in volume and opacity gauges.', zh: '修复原画FX栅格化时将图像准备失败当作空白并删除图画或效果的问题。音量和不透明度控件中的项目ID现已安全转义。' }] },
@@ -35703,6 +35704,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         el.addEventListener('seeked', onVideoMediaFramePainted);   // ver2576
         el.src = src;
         state.videoMediaElements.set(clip.id, el);
+        // The transport clock advances between decoded frames. Track actual presented media frames
+        // so the compositor does not copy the same video raster on every display refresh.
+        if (typeof el.requestVideoFrameCallback === 'function') {
+          const watch = { id: 0, mediaTime: null };
+          el._moartFrameWatch = watch;
+          const presented = function(now, metadata) {
+            if (el._moartFrameWatch !== watch) return;
+            watch.mediaTime = metadata.mediaTime;
+            watch.id = el.requestVideoFrameCallback(presented);
+            // A paused seek can finish decoding after seeked; refresh that same project frame too.
+            if (!state.videoPlaying) onVideoMediaFramePainted();
+          };
+          watch.id = el.requestVideoFrameCallback(presented);
+        }
       }
       return el;
     }
@@ -35719,6 +35734,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const id = String(clipId || '');
       const el = pool instanceof Map ? pool.get(id) : null;
       if (!el) return;
+      const watch = el._moartFrameWatch;
+      el._moartFrameWatch = null;
+      if (watch && typeof el.cancelVideoFrameCallback === 'function') el.cancelVideoFrameCallback(watch.id);
       try { el.pause(); } catch (e) {}
       if (el.parentNode) el.parentNode.removeChild(el);
       el.removeAttribute('src');
@@ -47211,11 +47229,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // feeds this frame changed (same frame index -> same base composite AND same overlays).
         // Rounded like the compositor's own `f` so fractional playhead values still dedupe.
         const frame = Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0));
-        // ver2576: the footage under this frame may still be seeking — its currentTime is part of the key so the
-        // `seeked` redraw (onVideoMediaFramePainted) is not deduped away at the same playhead frame
+        // Project frame still invalidates camera/FX. Video invalidation follows presented media frames,
+        // not the continuously advancing clock; seeked independently clears the key. Until a frame
+        // callback arrives (or where unavailable), retain the existing currentTime behavior.
         const footage = videoMediaClipShownAtFrame(state.project, frame, slot.cut.id);
         const footageEl = footage && footage.sourceType === 'video' ? videoMediaElementFor(footage) : null;
-        const drawKey = frame + '|' + layersSig + '|' + outWidth + (footageEl ? '|vm' + (Number(footageEl.currentTime) || 0).toFixed(3) : '');
+        const watch = footageEl && footageEl._moartFrameWatch;
+        const mediaKey = watch && watch.mediaTime != null && state.videoPlaying && !footageEl.seeking
+          ? 'p' + watch.mediaTime : (footageEl ? (Number(footageEl.currentTime) || 0).toFixed(3) : '');
+        const drawKey = frame + '|' + layersSig + '|' + outWidth + (footageEl ? '|vm' + footage.id + ':' + mediaKey : '');
         if (canvas.dataset.compositorDrawn === '1' && canvas.dataset.compositorDrawKey === drawKey) return true;
         // A complete cache avoids decode waits, but async renderer errors still reject its Promise.
         const project = state.project;
@@ -126052,7 +126074,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       // Project kind owns the stage mode; UI preferences only restore view geometry and controls.
       state.timelineFramePx = timelineZoomValue(ui.timelineFramePx, 1, 6, conteTimelineFramePx());
-      state.timelineScrollLeft = Math.max(0, Math.round(Number(ui.timelineScrollLeft) || 0));
+      // A partial app preference must not erase the project's restored viewport. Explicit zero still wins.
+      if (Object.prototype.hasOwnProperty.call(ui, 'timelineScrollLeft')) state.timelineScrollLeft = Math.max(0, Math.round(Number(ui.timelineScrollLeft) || 0));
       if (Object.prototype.hasOwnProperty.call(ui, 'videoPlayheadFrames')) state.videoPlayheadFrames = Math.max(0, Math.round(Number(ui.videoPlayheadFrames) || 0));
       if (Object.prototype.hasOwnProperty.call(ui, 'timelineLowerPanelHeight')) state.timelineLowerPanelHeight = clampTimelineLowerPanelHeight(ui.timelineLowerPanelHeight);
       // ver2179: **폰은 뷰 기하를 물려받지 않는다.** 폰은 이 상태를 저장하지 않는데(아래
