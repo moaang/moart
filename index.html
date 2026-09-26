@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2704</title>
+  <title>MoArt ver2705</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25043,6 +25043,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2705, items: [{ ja: 'タイムラインのサムネイル準備と音声波形の計算を分散し、再生開始時に処理が集中するのを抑えました。', ko: '타임라인 썸네일 준비와 음성 파형 계산을 나눠, 재생 시작 때 작업이 몰리는 현상을 줄였습니다.', en: 'Spread timeline thumbnail preparation and audio waveform work across tasks to reduce bursts during playback startup.', zh: '分批处理时间轴缩略图与音频波形，减少开始播放时的集中处理。' }] },
       { ver: 2704, items: [{ ja: 'Shift直線への切り替え後に元の線が残る問題と、自由線へ戻した際の色抜けを修正しました。Shift直線をペンアップで確定するときの太さを保持します。ブラシの一時画像を使用後に整理し、保持容量を制限しました。', ko: 'Shift 직선 전환 뒤 이전 선이 남거나 자유선으로 돌아올 때 색이 빠지는 문제를 수정했습니다. Shift 직선은 펜을 떼기 직전의 굵기로 확정합니다. 브러시 임시 이미지는 사용 후 정리하여 보유 용량을 제한했습니다.', en: 'Fixed stale lines and missing colors when switching between freehand and Shift lines. Shift lines retain their visible width on pen-up. Limited retained brush sample images after use.', zh: '修复自由线与Shift直线切换时残留线条和缺色的问题。Shift直线在抬笔时保留可见粗细。使用后清理画笔临时图像并限制保留容量。' }] },
       { ver: 2703, items: [{ ja: 'プロジェクトを開いたときに保存したタイムライン位置が先頭へ戻る問題を修正しました。動画再生中の同じ映像の重複描画を減らしました。', ko: '프로젝트를 열 때 저장한 타임라인 위치가 맨 앞으로 돌아가던 문제를 수정했습니다. 동영상 재생 중 같은 영상의 중복 그리기를 줄였습니다.', en: 'Fixed saved timeline positions resetting when opening a project. Reduced duplicate video drawing during playback.', zh: '修复打开项目时已保存的时间轴位置回到开头的问题。减少视频播放期间同一画面的重复绘制。' }] },
       { ver: 2702, items: [{ ja: 'タイムシートの最終ページを越えると操作が止まる問題を修正しました。破損したCLIPファイルのレイヤー接続が循環している場合は、処理を停止してエラーを表示します。', ko: '타임시트 마지막 페이지를 넘으면 조작이 멈추던 문제를 수정했습니다. 손상된 CLIP 파일의 레이어 연결이 순환하면 처리를 중단하고 오류를 표시합니다.', en: 'Fixed a freeze past the final timesheet page. Damaged CLIP files with cyclic layer links now stop with an error.', zh: '修复超过时间表最后一页时操作卡住的问题。损坏的CLIP文件若图层链接形成循环，将停止处理并显示错误。' }] },
@@ -50758,6 +50759,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.timelineLayerThumbnailObserver.disconnect();
       }
       state.timelineLayerThumbnailObserver = null;
+      (state.timelineLayerThumbnailQueue || []).forEach(function(canvas) { delete canvas._timelineThumbnailDecode; });
       state.timelineLayerThumbnailQueue = [];
       state.timelineLayerThumbnailPending = new Set();
     }
@@ -53993,11 +53995,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const length = Math.max(1, audioBuffer.length | 0);
       const binCount = Math.max(1, Math.ceil(length / samplesPerBin));
       const out = new Uint8Array(binCount);
+      audioPeakBinsInto(audioBuffer, samplesPerBin, out, 0, binCount);
+      return out;
+    }
+
+    // The same sample/bin boundaries serve synchronous analysis and incremental timeline waveforms.
+    function audioPeakBinsInto(audioBuffer, samplesPerBin, out, firstBin, endBin) {
+      const length = Math.max(1, audioBuffer.length | 0);
       const channels = Math.max(1, audioBuffer.numberOfChannels || 1);
       for (let channel = 0; channel < channels; channel += 1) {
         const data = audioBuffer.getChannelData(channel);
-        let cursor = 0;
-        for (let bin = 0; bin < binCount; bin += 1) {
+        let cursor = Math.min(length, Math.floor(firstBin * samplesPerBin));
+        for (let bin = firstBin; bin < endBin; bin += 1) {
           const end = Math.min(length, Math.floor((bin + 1) * samplesPerBin));
           let peak = 0;
           for (; cursor < end; cursor += 1) {
@@ -54008,6 +54017,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const scaled = peak >= 1 ? 255 : (peak * 255) | 0;
           if (scaled > out[bin]) out[bin] = scaled;
         }
+      }
+    }
+
+    async function audioPeaksFromBufferAsync(audioBuffer, binsPerSecond, current) {
+      if (!audioBuffer) return new Uint8Array(0);
+      const sampleRate = Math.max(1, Number(audioBuffer.sampleRate) || 48000);
+      const density = Math.max(1, Math.round(Number(binsPerSecond) || AUDIO_PEAK_BINS_PER_SECOND));
+      const samplesPerBin = sampleRate / density;
+      const out = new Uint8Array(Math.max(1, Math.ceil(Math.max(1, audioBuffer.length | 0) / samplesPerBin)));
+      const binsPerBatch = Math.max(1, Math.floor(262144 / (samplesPerBin * Math.max(1, audioBuffer.numberOfChannels || 1))));
+      for (let first = 0; first < out.length; first += binsPerBatch) {
+        // Let playback consume the decoded buffer before nonessential waveform work.
+        await yieldToBrowser();
+        if (current && !current()) return null;
+        audioPeakBinsInto(audioBuffer, samplesPerBin, out, first, Math.min(out.length, first + binsPerBatch));
       }
       return out;
     }
@@ -54096,8 +54120,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const decoded = await decodeBuffer();
           if (!current()) return null;
           if (!decoded) throw new Error('decode produced nothing');
-          const peaks = audioPeaksFromBuffer(decoded, AUDIO_PEAK_BINS_PER_SECOND);
-          if (!peaks.length) throw new Error('empty decode');
+          const peaks = await audioPeaksFromBufferAsync(decoded, AUDIO_PEAK_BINS_PER_SECOND, current);
+          if (!current()) return null;
+          if (!peaks || !peaks.length) throw new Error('empty decode');
           rememberAudioSourcePeaks(sourceKey, peaks);
           if (cacheKey) putWorkspaceDbValue(cacheKey, { v: 2, binsPerSecond: AUDIO_PEAK_BINS_PER_SECOND, peaks: peaks.buffer.slice(0) })
             .catch(function(error) { console.warn('[waveform] cache write failed', sourceKey, error); });
@@ -76139,7 +76164,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const ref = String(drawingRef || '');
       if (!canvas || !ref) return;
       const key = layerDrawingThumbnailKey(canvas, ref);
-      if (canvas.dataset.layerThumbnailDrawnKey === key) return;
+      if (canvas.dataset.layerThumbnailDrawnKey === key) {
+        delete canvas._timelineThumbnailDecode;
+        return;
+      }
       const thumbnail = canvas.closest ? canvas.closest('.conte-layer-thumbnail') : null;
       const restoredFromCache = restoreTimelineLayerThumbnailFromCache(canvas, key);
       const targetWidth = CONTE_FRAME_W;  // ver951: was the last live 480/270 literal pair (full-sweep P2)
@@ -76150,6 +76178,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!restoredFromCache) ctx.clearRect(0, 0, canvas.width, canvas.height);
       const drawing = ensureLayerDrawingData(state.project, ref);
       if (!layerDrawingHasInk(drawing)) {
+        delete canvas._timelineThumbnailDecode;
         canvas.dataset.layerThumbnailDrawnKey = '';
         if (thumbnail) thumbnail.classList.add('empty');
         clearTimelineLayerThumbnailBackground(canvas);
@@ -76210,27 +76239,49 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
       const live = layerLiveBitmapFor(ref);
       if (live && live.width && live.height) {
+        delete canvas._timelineThumbnailDecode;
         paintFromSource(live, live.width, live.height);
         return;
       }
       if (!drawing.bitmapDataUrl) {
+        delete canvas._timelineThumbnailDecode;
         canvas.dataset.layerThumbnailDrawnKey = '';
         return;
       }
-      const image = new Image();
-      image.onload = function() {
-        if (!canvas.isConnected || layerDrawingThumbnailKey(canvas, canvas.dataset.layerDrawingRef || '') !== key) return;
+      // Image completion only queues work. Cropping and PNG encoding must use the
+      // same idle budget as already decoded thumbnails, rather than burst in onload.
+      const pending = canvas._timelineThumbnailDecode;
+      if (pending && pending.key === key && projectIoOwnerCurrent(pending.owner)) {
+        if (!pending.ready) return;
+        delete canvas._timelineThumbnailDecode;
+        const image = pending.image;
         const iw = Math.max(1, image.naturalWidth || image.width || 1);
         const ih = Math.max(1, image.naturalHeight || image.height || 1);
         const sourceCanvas = createReadbackCanvas();
         sourceCanvas.width = iw;
         sourceCanvas.height = ih;
         const sourceCtx = sourceCanvas.getContext('2d');
-        sourceCtx.clearRect(0, 0, iw, ih);
         sourceCtx.drawImage(image, 0, 0, iw, ih);
         paintFromSource(sourceCanvas, iw, ih);
+        return;
+      }
+      const image = new Image();
+      const job = { key: key, owner: projectIoOwner(), image: image, ready: false };
+      canvas._timelineThumbnailDecode = job;
+      image.onload = function() {
+        if (canvas._timelineThumbnailDecode !== job) return;
+        if (!canvas.isConnected || !projectIoOwnerCurrent(job.owner)
+          || layerDrawingThumbnailKey(canvas, canvas.dataset.layerDrawingRef || '') !== key
+          || timelineLayerThumbnailsSuspended()) {
+          delete canvas._timelineThumbnailDecode;
+          return; // Stop/drag completion refreshes missing thumbnails; retain no decoded image while suspended.
+        }
+        job.ready = true;
+        queueTimelineLayerThumbnail(canvas);
       };
       image.onerror = function() {
+        if (canvas._timelineThumbnailDecode !== job) return;
+        delete canvas._timelineThumbnailDecode;
         canvas.dataset.layerThumbnailDrawnKey = '';
       };
       image.src = drawing.bitmapDataUrl;
