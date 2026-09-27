@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2716</title>
+  <title>MoArt ver2717</title>
 
   <!-- ============================ GoatCounter (privacy analytics) ============================
        Cookieless, aggregate-only usage counting. Loads async and fails silently — it never
@@ -25049,6 +25049,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2717, items: [{ ja: '保存済み素材の読み込みに失敗した場合も現在の作業とUndoを保ち、原画ベクター変形の重複処理を減らしました。', ko: '저장된 자산 읽기에 실패해도 현재 작업과 Undo를 유지하고, 원화 벡터 변형의 중복 처리를 줄였습니다.', en: 'Preserved current work and Undo when saved assets fail to load, and reduced redundant vector transform rendering.', zh: '保存素材读取失败时保留当前作品和撤销历史，并减少原画矢量变形的重复处理。' }] },
       { ver: 2716, items: [{ ja: '原画の再生開始でも、外部中断から音声が復帰する前に音を予約しないよう修正しました。', ko: '원화 재생 시작에서도 외부 중단에서 음성이 복귀하기 전에 소리를 예약하지 않도록 수정했습니다.', en: 'Animation playback now waits for interrupted audio to resume before scheduling sound.', zh: '原画播放现在会等待被中断的音频恢复后再安排声音播放。' }] },
       { ver: 2715, items: [{ ja: '原画ベクターの変形で位置と線方向に応じて線幅を計算し、プレビューと確定結果を一致させました。', ko: '원화 벡터 변형에서 위치·선 방향에 맞춰 굵기를 계산하고 미리보기와 확정 결과를 맞췄습니다.', en: 'Vector transforms now use local stroke direction and position for width, with matching preview and committed results.', zh: '原画矢量变形按位置和笔画方向计算线宽，使预览与确认结果一致。' }] },
       { ver: 2714, items: [{ ja: '外部中断後の音声再開を修正し、復帰時に映像の現在位置へ音声を合わせ直します。', ko: '외부 중단 후 음성 재개 누락을 고치고, 복귀한 음원을 영상의 현재 위치에 다시 맞추도록 수정했습니다.', en: 'Fixed audio resumption after external interruptions and realigned returning audio with the current video position.', zh: '修复外部中断后的音频恢复，并在返回时将音频重新对齐到当前画面位置。' }] },
@@ -58608,11 +58609,58 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
+    // Prepare only the incoming assets. A failed read must not replace the live project/Undo.
+    async function prepareIndexedDbProjectRestore(project, owner, prepared) {
+      const addUrl = function(kind, key, blob) {
+        if (!blob) return '';
+        const url = URL.createObjectURL(blob);
+        if (prepared.urls[kind][key]) URL.revokeObjectURL(prepared.urls[kind][key]);
+        prepared.urls[kind][key] = url;
+        return url;
+      };
+      await drawingRecordingHydrateInline(project, owner);
+      assertProjectIoOwner(owner);
+      const audioBlobs = new Map();
+      for (const clip of project.audio && project.audio.clips || []) {
+        if (!clip || clip.audioDataUrl || !audioClipIndexedDbStorageKey(clip)) continue;
+        const key = audioClipIndexedDbStorageKey(clip);
+        if (!audioBlobs.has(key)) audioBlobs.set(key, await readAudioBlobFromIndexedDb(clip));
+        const blob = audioBlobs.get(key);
+        assertProjectIoOwner(owner); addUrl('audio', clip.id, blob);
+      }
+      for (const ref of Object.keys(project.layerDrawings || {})) {
+        const drawing = project.layerDrawings[ref];
+        if (!drawing || drawing.bitmapDataUrl || !layerDrawingHasIndexedDbStorage(drawing)) continue;
+        const blob = await readLayerDrawingBlobFromIndexedDb(ref, drawing);
+        assertProjectIoOwner(owner);
+        if (blob) drawing.bitmapDataUrl = addUrl('layers', ref, blob);
+      }
+      for (const clip of project.video && project.video.clips || []) {
+        if (!clip || clip.mediaDataUrl || !videoClipIndexedDbStorageKey(clip)) continue;
+        const blob = await readVideoMediaBlobFromIndexedDb(clip);
+        assertProjectIoOwner(owner); addUrl('pictures', videoClipPlaybackKey(clip), blob);
+      }
+      await gengaHydrateDrawStore(project, owner, prepared);
+      assertProjectIoOwner(owner);
+      await gengaHydrateAudioStore(project, owner, prepared.audio);
+      assertProjectIoOwner(owner);
+    }
+    function releasePreparedProjectRestore(prepared) {
+      for (const store of Object.values(prepared.urls)) Object.values(store).forEach(function(url) { URL.revokeObjectURL(url); });
+      prepared.drawings.forEach(function(value) { if (gengaIsTileSet(value)) gengaReleaseTileDecodes(value); });
+      prepared.drawings.clear();
+      prepared.tiles.forEach(gengaReleaseTileDecodes);
+      prepared.audio.clear();
+    }
+
     async function restoreIndexedDbProjectById(id, options) {
       options = options || {};
       const request = options.request || beginProjectFileLoad();
       let owner = request.owner;
       const versionRestore = options.versionSeq != null;
+      const prepared = { urls: { audio: {}, layers: {}, pictures: {} }, drawings: new Map(), thumbs: new Map(),
+        persisted: new Set(), deltas: new Set(), missing: new Set(), audio: new Map(), tiles: new Set() };
+      let adopted = false;
       showLoadingOverlay(t('msg.loading.loadingProject'), null, request);
       try {
         assertProjectIoOwner(owner);
@@ -58624,6 +58672,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return false;
         }
         const project = JSON.parse(payload);
+        await prepareIndexedDbProjectRestore(project, owner, prepared);
+        assertProjectIoOwner(owner);
         // Finish fallible activation before replacing the live project or releasing its Undo/media.
         if (!versionRestore) {
           const db = await openWorkspaceDb();
@@ -58643,6 +58693,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           assertProjectIoOwner(owner);
         }
         applyRestoredIndexedDbProject(project, payload, versionRestore);
+        state.workspaceObjectUrls = prepared.urls;
+        Object.values(prepared.urls.layers).forEach(registerLayerBlobUrl);
+        prepared.drawings.forEach(function(value, ref) {
+          gengaDrawStorePut(ref, value);
+          if (prepared.deltas.has(ref)) gengaScheduleTileEncode(ref, value);
+          else if (!gengaIsTileSet(value)) gengaScheduleWholeRasterConvert(ref);
+        });
+        prepared.audio.forEach(function(url, ref) { gengaAudioStore.set(ref, url); });
+        prepared.persisted.forEach(function(ref) { gengaPersistedRefs.add(ref); });
+        prepared.thumbs.forEach(function(url, ref) { gengaThumbCache.set(ref, url); });
+        prepared.missing.forEach(function(ref) { gengaDrawingFailures.set(ref, null); });
+        adopted = true;
         owner = request.owner = projectIoOwner(request);
         await hydrateWorkspaceMediaRefs(owner);
         assertProjectIoOwner(owner);
@@ -58650,11 +58712,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!versionRestore) markProjectSavedBaseline();
         setProjectActive(true);
         owner = request.owner = projectIoOwner(request);
-        await gengaHydrateDrawStore(state.project, owner);
-        assertProjectIoOwner(owner);
+        gengaTrimDrawStore(null);
         hideLoadingOverlay(request); // Media is ready; mount once outside the modal inert subtree.
         refresh();
         warnMissingProjectAssets(collectMissingProjectAssets(state.project));
+        warnMissingProjectAssets(collectMissingGengaDrawings(state.project, prepared.missing));
         if (versionRestore) renderProjectVersions();
         return true;
       } catch (error) {
@@ -58662,6 +58724,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         else console.warn('[project-load] Previous IndexedDB request discarded', error);
         return false;
       } finally {
+        if (!adopted) releasePreparedProjectRestore(prepared);
         hideLoadingOverlay(request);
       }
     }
@@ -97990,7 +98053,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const fc = field.getContext('2d'), rc = result.getContext('2d');
       try {
         fc.globalCompositeOperation = 'source-over'; fc.fillStyle = '#000'; fc.fillRect(0, 0, w, h);
-        for (let at = 0; at < pts.length - 1; at += 128) paintRoundBatch(s, fc, pts, radii, at, Math.min(pts.length, at + 129));
+        // A single block can fill the opaque field directly. Keep luminance-to-alpha
+        // conversion: direct colored filling changes antialiased edge pixels.
+        if (pts.length > 1 && pts.length <= 129) {
+          fc.save();
+          try {
+            const t = s.roundTransform;
+            fc.setTransform(t.a, t.b, t.c, t.d, t.e, t.f);
+            fc.beginPath(); paintTraceVariableWidthPath(fc, pts, radii, 0, pts.length); fc.fillStyle = '#fff'; fc.fill();
+          } finally { fc.restore(); }
+        } else for (let at = 0; at < pts.length - 1; at += 128) paintRoundBatch(s, fc, pts, radii, at, Math.min(pts.length, at + 129));
         if (pts.length === 1) paintRoundBatch(s, fc, pts, radii, 0, 1);
         s.box = { x0: 0, y0: 0, x1: w, y1: h };
         rc.globalCompositeOperation = 'source-over'; rc.clearRect(0, 0, w, h);
@@ -98316,14 +98388,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1541: 저장된 값 여러 개를 **묶어서 병렬로** 읽는다. 종전에는 참조 하나당 트랜잭션 하나를
     // 순차로 열었다 — 코마가 수백 장인 원화 프로젝트에서 그 왕복이 그대로 쌓여 「불러오기가 엄청
     // 렉」이 됐다(사용자 제보). 한 번에 다 던지지 않고 청크로 끊는 이유는, 수백 개를 동시에 열면
-    // IndexedDB 쪽이 되레 밀리기 때문이다. 실패는 null 로 떨어뜨려 호출부가 결측으로 센다.
+    // IndexedDB 쪽이 되레 밀리기 때문이다. 일반 조회 실패는 null, 복원 준비(strict)는 reject를 보존한다.
     const DB_READ_CHUNK = 24;
-    async function readWorkspaceDbValues(keys, onProgress) {
+    async function readWorkspaceDbValues(keys, onProgress, strict) {
       const out = new Map();
       for (let i = 0; i < keys.length; i += DB_READ_CHUNK) {
         const part = keys.slice(i, i + DB_READ_CHUNK);
         const vals = await Promise.all(part.map(function(key) {
           return getWorkspaceDbValue(key).catch(function(error) {
+            if (strict) throw error;
             console.error('[db] read failed for ' + key, error);
             return null;
           });
@@ -98344,14 +98417,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return Math.max(1, Number(drawing && drawing.w) || 1) * Math.max(1, Number(drawing && drawing.h) || 1) * 4;
     }
-    function gengaHydrateDrawStore(project, owner) {
+    function gengaHydrateDrawStore(project, owner, prepared) {
       const gt = project && project.gengaTimeline; if (!gt) return;
       const running = gengaHydrateJobs.get(project);
-      if (running && projectIoOwnerCurrent(running.owner)) return running.promise;
+      if (!prepared && running && projectIoOwnerCurrent(running.owner)) return running.promise;
       const refs = new Set();
       // Known durable refs can have been intentionally evicted. Their pixel consumer
       // faults them in; a full view render must not reload the entire project again.
-      const add = function(d, required) { if (d && d.ref && !gengaDrawingStrokes(d) && !gengaDrawStore.has(d.ref) && !gengaDrawingFailures.has(d.ref) && (required === true || !gengaPersistedRefs.has(d.ref))) refs.add(d.ref); };
+      const add = function(d, required) { if (d && d.ref && !gengaDrawingStrokes(d) && (prepared || (!gengaDrawStore.has(d.ref) && !gengaDrawingFailures.has(d.ref) && (required === true || !gengaPersistedRefs.has(d.ref))))) refs.add(d.ref); };
       const currentTiles = new Set();
       (gt.layers || []).forEach(function(layer) {
         const drawing = gengaExposureDrawing(layer, gengaExposureAt(layer, gengaCurrentFrame()));
@@ -98363,13 +98436,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!refs.size && !currentTiles.size) return;
       owner = owner || projectIoOwner();
       const hydration = { owner: owner, refs: refs, promise: null, reservedBytes: 0 };
-      gengaHydrateInFlight = hydration;
-      gengaHydrateJobs.set(project, hydration);
+      if (!prepared) { gengaHydrateInFlight = hydration; gengaHydrateJobs.set(project, hydration); }
       hydration.promise = (async function() {
         let loaded = 0;
         const missingRefs = new Set(), list = Array.from(refs);
         try {
           for (const tiles of currentTiles) {
+            if (prepared) prepared.tiles.add(tiles);
             assertProjectIoOwner(owner);
             await gengaTileSetDecode(tiles);
             assertProjectIoOwner(owner); loaded++;
@@ -98379,46 +98452,56 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           for (let i = 0; i < list.length; i += DB_READ_CHUNK) {
             assertProjectIoOwner(owner);
             const part = list.slice(i, i + DB_READ_CHUNK);
-            const values = await readWorkspaceDbValues(part.flatMap(function(ref) { return ['gd:' + ref, 'gt:' + ref]; }));
+            const values = await readWorkspaceDbValues(part.flatMap(function(ref) { return ['gd:' + ref, 'gt:' + ref]; }), null, !!prepared);
             for (const ref of part) {
               assertProjectIoOwner(owner);
               let value = null, published = false, delta = false;
               try {
                 const raw = values.get('gd:' + ref);
                 if (!raw) {
-                  value = await gengaRestoreDeltaChain(ref).catch(function(error) { console.error('[gengaDelta] restore threw for ' + ref, error); return null; });
+                  value = await (prepared ? gengaRestoreDeltaChainRun(ref) : gengaRestoreDeltaChain(ref)).catch(function(error) { if (prepared) throw error; console.error('[gengaDelta] restore threw for ' + ref, error); return null; });
                   delta = true;
                 }
                 else if (await gengaBlobIsTileSet(raw)) value = await gengaTileSetFromBlob(raw);
                 else value = raw instanceof Blob ? await gengaBlobToDataUrl(raw) : String(raw);
                 assertProjectIoOwner(owner);
-                if (!value) { gengaDrawingFailures.set(ref, null); missingRefs.add(ref); continue; }
+                if (!value) { if (prepared) prepared.missing.add(ref); else gengaDrawingFailures.set(ref, null); missingRefs.add(ref); continue; }
                 if (gengaIsTileSet(value) && (requiredRefs.has(ref) || !values.get('gt:' + ref))) {
                   hydration.reservedBytes = gengaDrawingPixelEstimate({ tileSet: value });
-                  gengaTrimDrawStore(null, hydration.reservedBytes);
+                  if (!prepared) gengaTrimDrawStore(null, hydration.reservedBytes);
                   await gengaTileSetDecode(value);
                   assertProjectIoOwner(owner);
                 }
-                gengaDrawStorePut(ref, value); published = true;
-                if (delta) gengaScheduleTileEncode(ref, value);
-                else gengaPersistedRefs.add(ref);
+                if (prepared) {
+                  prepared.drawings.set(ref, value);
+                  if (delta) prepared.deltas.add(ref); else prepared.persisted.add(ref);
+                } else {
+                  gengaDrawStorePut(ref, value);
+                  if (delta) gengaScheduleTileEncode(ref, value); else gengaPersistedRefs.add(ref);
+                }
+                published = true;
                 const thumb = values.get('gt:' + ref);
                 const thumbUrl = thumb instanceof Blob ? await gengaBlobToDataUrl(thumb) : (typeof thumb === 'string' ? thumb : '');
                 assertProjectIoOwner(owner);
-                if (thumbUrl) gengaThumbCache.set(ref, thumbUrl);
-                else if (gengaIsTileSet(value)) gengaThumbUrlFor({ ref: ref });
-                if (!gengaIsTileSet(value)) gengaScheduleWholeRasterConvert(ref);
+                if (thumbUrl) (prepared ? prepared.thumbs : gengaThumbCache).set(ref, thumbUrl);
+                else if (!prepared && gengaIsTileSet(value)) gengaThumbUrlFor({ ref: ref });
+                if (!prepared && !gengaIsTileSet(value)) gengaScheduleWholeRasterConvert(ref);
+                // Durable off-screen drawings are faulted in after adoption, not held twice.
+                if (prepared && !requiredRefs.has(ref) && !delta) {
+                  if (gengaIsTileSet(value)) gengaReleaseTileDecodes(value);
+                  prepared.drawings.delete(ref);
+                }
                 loaded++;
               } finally {
                 hydration.reservedBytes = 0;
                 if (!published && gengaIsTileSet(value)) gengaReleaseTileDecodes(value);
                 values.delete('gd:' + ref); values.delete('gt:' + ref);
               }
-              gengaTrimDrawStore(null);
+              if (!prepared) gengaTrimDrawStore(null);
             }
             if (!loadingOverlayOwner || loadingOverlayOwner === owner || loadingOverlayOwner === owner.request) updateLoadingOverlayProgress(Math.min(list.length, i + part.length), list.length);
           }
-          if (missingRefs.size) {
+          if (!prepared && missingRefs.size) {
             console.error('[gengaHydrate] Stored raster data unavailable for ' + missingRefs.size + ' of ' + refs.size + ' drawing ref(s)');
             warnMissingProjectAssets(collectMissingGengaDrawings(owner.project, missingRefs), owner.project, owner);
           }
@@ -98429,7 +98512,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           if (gengaHydrateInFlight === hydration) gengaHydrateInFlight = false;
           if (gengaHydrateJobs.get(project) === hydration) gengaHydrateJobs.delete(project);
         }
-        if (loaded && projectIoOwnerCurrent(owner) && state.project.kind === 'genga') { gengaFrameStackInvalidate(); renderGengaView(); }
+        if (!prepared && loaded && projectIoOwnerCurrent(owner) && state.project.kind === 'genga') { gengaFrameStackInvalidate(); renderGengaView(); }
       })();
       return hydration.promise;
     }
@@ -98478,23 +98561,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       delete c.dataUrl;
       return c;
     }
-    async function gengaHydrateAudioStore(project, owner) {
+    async function gengaHydrateAudioStore(project, owner, prepared) {
       const gt = project && project.gengaTimeline; if (!gt) return;
       const refs = new Set();
-      (gt.audioClips || []).forEach(function(c) { if (c.ref && !gengaAudioStore.has(c.ref)) refs.add(c.ref); });
+      (gt.audioClips || []).forEach(function(c) { if (c.ref && (prepared || !gengaAudioStore.has(c.ref))) refs.add(c.ref); });
       if (!refs.size) return;
       owner = owner || projectIoOwner();
       const list = Array.from(refs); // ver1541: 순차 → 청크 병렬(그림 쪽과 같은 커널)
       try {
       assertProjectIoOwner(owner);
-      const values = await readWorkspaceDbValues(list.map(function(ref) { return 'ga:' + ref; }));
+      const values = await readWorkspaceDbValues(list.map(function(ref) { return 'ga:' + ref; }), null, !!prepared);
       assertProjectIoOwner(owner);
       for (const ref of list) {
         const value = values.get('ga:' + ref);
         if (!audioRecordValid('ga:' + ref, value)) continue;
         const url = value instanceof Blob ? await gengaBlobToDataUrl(value) : value;
         assertProjectIoOwner(owner);
-        if (url) gengaAudioStore.set(ref, url);
+        if (url) (prepared || gengaAudioStore).set(ref, url);
       }
       } catch (error) {
         if (projectIoOwnerCurrent(owner)) throw error;
