@@ -5,6 +5,10 @@
 // served on the NEXT launch. One release behind for one launch is the deliberate trade.
 const CACHE = 'conte-shell-v1'; // FIXED on purpose: bumping it per release would force a full re-download every time.
 const SHELL = ['./', './index.html'];
+// CacheStorage is shared by every app under this origin, not scoped to this worker: only MoArt's own
+// old shell names may be deleted, never another app's named cache.
+const CACHE_PREFIX = 'conte-shell-';
+function isOldMoArtCache(name) { return name !== CACHE && name.indexOf(CACHE_PREFIX) === 0; }
 
 // ONE-TIME shell replacement, for clients already stuck on an old cached shell. The cache NAME stays
 // fixed (bumping it per release would force a full re-download every time — see CACHE above); instead a
@@ -25,8 +29,8 @@ function shellStamp(res) {
   if (!res || !res.headers) return '';
   return res.headers.get('etag') || res.headers.get('last-modified') || '';
 }
-function isShellRequest(request, url) {
-  if (request.mode === 'navigate') return true;
+function isShellRequest(url) {
+  // Only these document aliases may populate the shared shell or announce its readiness.
   return SHELL.some(function (path) { return new URL(path, self.location.href).href === url.href; });
 }
 function notifyShellUpdated() {
@@ -35,14 +39,33 @@ function notifyShellUpdated() {
   });
 }
 
+// Cache.put commits only after the whole body is read, so two refreshes of one key can finish in the
+// reverse order they started: a slow OLD body would overwrite the NEW one already stored and announced.
+// Every writer of a key (install, one-time purge, fetch refresh) therefore runs as one queued task, from
+// its network response to its last put, in the order the tasks were started. A failed task never blocks
+// the next one. Both shell aliases share one key.
+const cacheWriteQueues = new Map();
+function cacheWriteKey(url) { return isShellRequest(url) ? 'shell' : url.href; }
+function queueCacheWrite(key, task) {
+  const run = (cacheWriteQueues.get(key) || Promise.resolve()).then(task);
+  const tail = run.catch(function () {});
+  cacheWriteQueues.set(key, tail);
+  tail.then(function () { if (cacheWriteQueues.get(key) === tail) cacheWriteQueues.delete(key); });
+  return run;
+}
+
+function putShellResponse(c, res) {
+  return Promise.all(SHELL.map(function (p) {
+    return c.put(new URL(p, self.location.href).href, res.clone());
+  }));
+}
+
 function replaceShellFromNetwork(c) {
   const first = new URL(SHELL[0], self.location.href).href;
   return fetch(first, { cache: 'reload' }).then(function (res) {   // cache:reload — bypass the HTTP cache
     if (!res || !res.ok) throw new Error('shell fetch failed: ' + (res && res.status));
     // both SHELL entries are the same document; clone once per entry rather than downloading twice.
-    return Promise.all(SHELL.map(function (p) {
-      return c.put(new URL(p, self.location.href).href, res.clone());
-    }));
+    return putShellResponse(c, res);
   });
 }
 
@@ -52,7 +75,7 @@ function runOneTimeShellPurge() {
     return c.match(tokenUrl).then(function (rec) {
       return (rec ? rec.text() : Promise.resolve('')).then(function (seen) {
         if (seen === PURGE_TOKEN) return;                       // this client already did it
-        return replaceShellFromNetwork(c)
+        return queueCacheWrite('shell', function () { return replaceShellFromNetwork(c); })
           .then(function () { return c.put(tokenUrl, new Response(PURGE_TOKEN)); })
           .then(notifyShellUpdated);   // a pre-ver1459 shell cannot hear this — its NEXT launch is fresh anyway
       });
@@ -64,13 +87,13 @@ function runOneTimeShellPurge() {
 
 self.addEventListener('install', function (e) {
   self.skipWaiting();
-  e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }));
+  e.waitUntil(queueCacheWrite('shell', function () { return caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }); }));
 });
 
 self.addEventListener('activate', function (e) {
   e.waitUntil(
     caches.keys()
-      .then(function (keys) { return Promise.all(keys.filter(function (k) { return k !== CACHE; }).map(function (k) { return caches.delete(k); })); })
+      .then(function (keys) { return Promise.all(keys.filter(isOldMoArtCache).map(function (k) { return caches.delete(k); })); })
       .then(function () { return self.clients.claim(); })
       .then(runOneTimeShellPurge)   // after claim: a slow shell refetch must not delay taking control
   );
@@ -89,25 +112,32 @@ self.addEventListener('fetch', function (e) {
   // build 707 releases old, on a shell too old to even receive the ver1459 update message.
   // Two things changed: the put is INSIDE this chain (it used to dangle off caches.open with nothing
   // awaiting it), and waitUntil keeps the worker alive until that chain settles.
-  const net = fetch(e.request);
-  const stored = net.then(function (res) {
-    if (!res || !res.ok) return;
-    const copy = res.clone();
-    const fresh = shellStamp(res);
-    const shell = isShellRequest(e.request, url);
+  // The store copy is split off the moment the response arrives, BEFORE a cache miss hands the original
+  // to the page: the queued writer may run only after the page has read that body, and cloning a consumed
+  // Response throws. Shell aliases are cloned from this copy too, so the page's body is never touched.
+  const net = fetch(e.request).then(function (res) {
+    return { res: res, copy: res && res.ok ? res.clone() : null };
+  });
+  // queued synchronously, so writes for one key commit in request-start order (see queueCacheWrite)
+  const stored = queueCacheWrite(cacheWriteKey(url), function () { return net.then(function (got) {
+    const copy = got.copy;
+    if (!copy) return;
+    const fresh = shellStamp(copy);
+    const shell = isShellRequest(url);
     return caches.open(CACHE).then(function (c) {
       // read the OLD entry before overwriting it — that is the copy the user is looking at right now
       return c.match(e.request).then(function (old) {
         const stale = shellStamp(old);
-        return c.put(e.request, copy).then(function () {
-          // notify only AFTER the put, so a reload is guaranteed to get the new shell.
+        const storedAliases = shell ? putShellResponse(c, copy) : c.put(e.request, copy);
+        return storedAliases.then(function () {
+          // Both aliases must finish before any window is told the shell is ready.
           // no old entry = first visit, missing stamp = no grounds to judge -> stay quiet either way
           // (a false "new version" banner would be worse than the delay it is fixing).
           if (shell && old && fresh && stale && fresh !== stale) return notifyShellUpdated();
         });
       });
     });
-  }).catch(function (err) {
+  }); }).catch(function (err) {
     // never silent: a failed cache write means the NEXT launch is still stale and nobody would know
     console.error('[sw] shell cache update failed', err);
   });
@@ -118,7 +148,7 @@ self.addEventListener('fetch', function (e) {
       // A cache MISS that also fails the network must still resolve to a Response — respondWith(undefined)
       // throws a TypeError and takes the whole request down with it. Hits the first-ever visit made offline,
       // and any same-origin asset outside SHELL requested while offline.
-      return net.catch(function () { return Response.error(); });
+      return net.then(function (got) { return got.res; }, function () { return Response.error(); });
     })
   );
 });
