@@ -85,6 +85,17 @@ function runOneTimeShellPurge() {
   });
 }
 
+// rest-K3 #013: the purge must NOT sit in activate's waitUntil. claim() there does not help: the browser holds
+// navigations until the worker is ACTIVATED (measured in Chrome: reopening the app waited the whole shell
+// download, 3.9s for a 4s refetch). So activate only starts it, and every shell request keeps the one run alive
+// with its own waitUntil — which also retries a run cut short by worker shutdown (the token is still missing).
+// One run at a time; once it settles the next shell request just re-reads the token (one cache read).
+let shellPurgeRun = null;
+function ensureShellPurge() {
+  if (!shellPurgeRun) shellPurgeRun = runOneTimeShellPurge().then(function () { shellPurgeRun = null; });
+  return shellPurgeRun;
+}
+
 self.addEventListener('install', function (e) {
   self.skipWaiting();
   e.waitUntil(queueCacheWrite('shell', function () { return caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }); }));
@@ -95,7 +106,7 @@ self.addEventListener('activate', function (e) {
     caches.keys()
       .then(function (keys) { return Promise.all(keys.filter(isOldMoArtCache).map(function (k) { return caches.delete(k); })); })
       .then(function () { return self.clients.claim(); })
-      .then(runOneTimeShellPurge)   // after claim: a slow shell refetch must not delay taking control
+      .then(function () { ensureShellPurge(); })   // started, not awaited: see ensureShellPurge
   );
 });
 
@@ -115,15 +126,21 @@ self.addEventListener('fetch', function (e) {
   // The store copy is split off the moment the response arrives, BEFORE a cache miss hands the original
   // to the page: the queued writer may run only after the page has read that body, and cloning a consumed
   // Response throws. Shell aliases are cloned from this copy too, so the page's body is never touched.
-  const net = fetch(e.request).then(function (res) {
+  // A shell request waits for a pending one-time purge before it fetches AND before it joins the write queue
+  // (rest-K3 #013). Fetching first could race an old body over the purged one; queueing first deadlocks,
+  // because the purge enters the same queue only after its async token read. The cached copy still answers
+  // at once below — only a shell cache MISS waits. Shell requests waiting on one purge enter the queue in
+  // the order they arrived; every other request is queued synchronously as before.
+  const shell = isShellRequest(url);
+  const purge = shell ? ensureShellPurge() : null;
+  const net = (purge ? purge.then(function () { return fetch(e.request); }) : fetch(e.request)).then(function (res) {
     return { res: res, copy: res && res.ok ? res.clone() : null };
   });
-  // queued synchronously, so writes for one key commit in request-start order (see queueCacheWrite)
-  const stored = queueCacheWrite(cacheWriteKey(url), function () { return net.then(function (got) {
+  // queued in request-start order, so writes for one key commit in that order (see queueCacheWrite)
+  const write = function () { return net.then(function (got) {
     const copy = got.copy;
     if (!copy) return;
     const fresh = shellStamp(copy);
-    const shell = isShellRequest(url);
     return caches.open(CACHE).then(function (c) {
       // read the OLD entry before overwriting it — that is the copy the user is looking at right now
       return c.match(e.request).then(function (old) {
@@ -137,7 +154,9 @@ self.addEventListener('fetch', function (e) {
         });
       });
     });
-  }); }).catch(function (err) {
+  }); };
+  const key = cacheWriteKey(url);
+  const stored = (purge ? purge.then(function () { return queueCacheWrite(key, write); }) : queueCacheWrite(key, write)).catch(function (err) {
     // never silent: a failed cache write means the NEXT launch is still stale and nobody would know
     console.error('[sw] shell cache update failed', err);
   });
