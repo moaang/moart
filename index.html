@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2822</title>
+  <title>MoArt ver2823</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -7488,14 +7488,7 @@
       -webkit-user-drag: none;
     }
 
-    .conte-paper-stage.memo-active .picture-frame {
-      overflow: visible;
-    }
-
-    .conte-paper-stage.memo-active .picture-cell {
-      overflow: visible;
-      z-index: 8;
-    }
+    /* Memo ink uses the separate page-wide overlay. Picture clipping and stacking stay unchanged. */
 
     .picture-frame .picture-base-image {
       position: absolute;
@@ -7541,11 +7534,8 @@
       pointer-events: none;
     }
 
-    /* ver1652: 카메라 궤도 밝힘. 프레임의 회색은 「팬이 훑는 범위 중 **한 번도 안 보이는** 곳」이라
-       궤도가 지나는 자리는 그보다 밝아야 한다. 밝힘을 오버레이(z 4)에 두면 그림 위에 흰 덧칠이
-       얹혀 선화가 흐려지므로, 아트보드(z 1)보다 **아래**(z 0)에 깐다 — 그림은 그대로고 아트보드
-       밖에서만 밝아진다. 투명도는 **컨테이너**에 준다: 개별 사각형에 주면 겹칠 때마다 누적돼
-       키프레임이 많은 팬에서 가운데만 허옇게 뜬다. */
+    /* The swept camera union brightens the gray background below the artwork.
+       A single filled path prevents overlap from accumulating opacity; z 0 keeps ink unchanged. */
     .picture-camera-work-fill {
       position: absolute;
       inset: 0;
@@ -21653,13 +21643,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ver702: camera edits only need the paper reflow when a cut's camera-work ROW SPAN actually changes
     // (rowSpan 2~3 = the 用紙 cell height). relayoutProject on a big project costs ~450ms (a full episode, 730
     // cuts), and paying it on EVERY keyframe add / drag release made camera editing feel frozen. The
-    // signature is cheap (per-cut keyframe extents only), so compare before/after and skip the reflow
-    // when nothing changed height.
+    // Compare swept-bound row spans before/after to skip reflow when height is unchanged.
+    // This bounds-only pass does not build the shaded path.
     function cameraRowSpanSignature(project) {
-      // Self-contained single pass over the keyframes (76 kfs → μs). Going through
-      // cameraWorkPaperRowSpan(project, cut) per cut re-derives slot maps each call — 325ms on 730 cuts,
-      // which would defeat the gate. Mirrors cameraWorkPaperBounds/RowSpan exactly (seed bounds at the
-      // base frame, pad 1.8%, thresholds 1.58 extent / 2.45–1.18 aspect → span 3 else 2).
+      // Group once without normalizing/rebuilding slot maps per cut. Use the same swept bounds as
+      // paper layout; endpoint-only bounds miss rotation extrema and can leave stale row spans.
       try {
         const byCut = new Map();
         (((project || {}).camera || {}).keyframes || []).forEach(function(k) {
@@ -21672,15 +21660,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const parts = [];
         byCut.forEach(function(kfs, cutId) {
           if (!cameraKeyframesHaveWork(kfs)) return;
-          let minX = 0, minY = 0, maxX = baseW, maxY = baseH;
-          kfs.forEach(function(k) {
-            cameraFrameCorners(k).forEach(function(p) {
-              if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
-              if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
-            });
-          });
-          const w = Math.max(1, (maxX + pad) - (minX - pad));
-          const h = Math.max(1, (maxY + pad) - (minY - pad));
+          const sweep = cameraPaperSweep(kfs.slice().sort(function(a, b) { return a.frame - b.frame || String(a.id).localeCompare(String(b.id)); }));
+          const w = Math.max(1, sweep.maxX - sweep.minX + 2 * pad);
+          const h = Math.max(1, sweep.maxY - sweep.minY + 2 * pad);
           parts.push(cutId + ':' + cameraPaperRowSpanForBounds({ w: w, h: h, aspect: w / h }));
         });
         return parts.sort().join('|');
@@ -24102,7 +24084,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ver1652: 키프레임 사각형의 기하를 **정규화(0~1, bounds 기준)** 로 한 번만 계산한다.
     // 프리뷰는 % 로, 출력은 px 로 바꿔 쓴다 — 좌표계는 호출 전에 맞춘다(커널에 분기를 두지 않는다).
-    // 테두리 오버레이와 궤도 밝힘이 같은 사각형을 그리므로 **반드시 같은 커널**을 봐야 한다.
+    // Endpoint outlines/labels and active-key fill only. The continuous union uses cameraSweepPath.
     function cameraKeyframeUnitRects(bounds) {
       const keyframes = bounds && Array.isArray(bounds.keyframes) ? bounds.keyframes : [];
       if (!keyframes.length) return [];
@@ -24327,39 +24309,109 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return cameraRectCorners(cameraFrameTransformToFrameRect(transform));
     }
 
+    // Paper presentation only: linear rect interpolation + shortest-angle rotation, exactly the
+    // lerpCameraRect kernel used by playback. Time spacing changes speed, not the continuous sweep.
+    // Conte has no hold/easing switch in that kernel; equal transforms are a stationary hold.
+    // Bounds need only a curvature-bounded sampling pass. The heavier union path is lazy and lives
+    // on this bounds object, never in a permanent cache or in saved project data.
+    function cameraPaperSweep(keyframes) {
+      const rects = keyframes.map(cameraFrameTransformToFrameRect);
+      const radius = rects.reduce(function(value, r) { return Math.max(value, Math.hypot(r.w, r.h) / 2); }, 1);
+      const tolerance = radius / 1024;
+      let minX = 0, minY = 0, maxX = cameraCoordinateWidth(), maxY = cameraCoordinateHeight();
+      const segments = [];
+      rects.forEach(function(b, index) {
+        const a = rects[Math.max(0, index - 1)];
+        const angle = Math.abs(lerpAngleRad(a.rotation, b.rotation, 1) - a.rotation);
+        const r = Math.max(Math.hypot(a.w, a.h), Math.hypot(b.w, b.h)) / 2;
+        const dr = Math.hypot(b.w - a.w, b.h - a.h) / 2;
+        // |corner''| <= r*angle^2 + 2*dr*angle. Linear chord error <= |corner''|/8n^2.
+        const curvature = r * angle * angle + 2 * dr * angle;
+        const count = Math.max(1, Math.ceil(Math.sqrt(curvature / (8 * tolerance))));
+        const error = curvature / (8 * count * count);
+        for (let i = 0; i <= count; i++) {
+          cameraRectCorners(lerpCameraRect(a, b, i / count)).forEach(function(p) {
+            minX = Math.min(minX, p.x - error); minY = Math.min(minY, p.y - error);
+            maxX = Math.max(maxX, p.x + error); maxY = Math.max(maxY, p.y + error);
+          });
+        }
+        // Exact ruled edge patches below need only the corner chord error, not a first-order hull bound.
+        const pieces = count;
+        segments.push({ a: a, b: b, pieces: pieces });
+      });
+      return { minX: minX, minY: minY, maxX: maxX, maxY: maxY, segments: segments, tolerance: tolerance };
+    }
+
+    // Exact swept area of an edge with linearly moving endpoints. P(t,u)=a+t*v+u*(edge+t*delta)
+    // is bilinear. Its Jacobian is affine; splitting the parameter square at J=0 makes each mapped
+    // patch injective with constant winding. The fold boundary maps to a quadratic Bezier, not a hull.
+    // Reversing the negative-J patch gives one positive-winding union even where a rotating edge folds.
+    function cameraSweepEdgePath(a, b, c, d) {
+      const vx = c.x - a.x, vy = c.y - a.y, ex = b.x - a.x, ey = b.y - a.y;
+      const dx = d.x - c.x - ex, dy = d.y - c.y - ey;
+      const j0 = vx * ey - vy * ex, jt = vx * dy - vy * dx, ju = dx * ey - dy * ex;
+      if (j0 === 0 && jt === 0 && ju === 0) return '';
+      const point = function(p) { return { x: a.x + p.t * vx + p.u * (ex + p.t * dx), y: a.y + p.t * vy + p.u * (ey + p.t * dy) }; };
+      const coord = function(p) { return p.x.toFixed(5) + ' ' + p.y.toFixed(5); };
+      let path = '';
+      [1, -1].forEach(function(sign) {
+        const square = [{ t: 0, u: 0 }, { t: 1, u: 0 }, { t: 1, u: 1 }, { t: 0, u: 1 }], polygon = [];
+        square.forEach(function(p, index) {
+          const q = square[(index + 1) % 4];
+          const jp = sign * (j0 + jt * p.t + ju * p.u), jq = sign * (j0 + jt * q.t + ju * q.u);
+          if (jp >= 0) polygon.push(p);
+          if ((jp < 0 && jq > 0) || (jp > 0 && jq < 0)) {
+            const f = jp / (jp - jq);
+            polygon.push({ t: p.t + (q.t - p.t) * f, u: p.u + (q.u - p.u) * f });
+          }
+        });
+        if (polygon.length < 3) return;
+        if (sign < 0) polygon.reverse();
+        path += 'M' + coord(point(polygon[0]));
+        polygon.forEach(function(p, index) {
+          const q = polygon[(index + 1) % polygon.length], start = point(p), end = point(q);
+          if (p.t === q.t || p.u === q.u) path += 'L' + coord(end);
+          else {
+            const mid = point({ t: (p.t + q.t) / 2, u: (p.u + q.u) / 2 });
+            path += 'Q' + coord({ x: 2 * mid.x - (start.x + end.x) / 2, y: 2 * mid.y - (start.y + end.y) / 2 }) + ' ' + coord(end);
+          }
+        });
+        path += 'Z';
+      });
+      return path;
+    }
+
+    // Identical positive-winding SVG/Path2D union for DOM/output, with no alpha accumulation.
+    // The first rectangle plus all swept edges covers the piecewise-linear rectangle motion exactly.
+    // At most 46 subdivisions/segment (angle <= pi, dr <= radius), independent of frame duration.
+    // Corner chord error <= radius/1024 frame units (+ decimal rounding), < 0.72px at a 1024px long side.
+    function cameraSweepPath(sweep) {
+      if (sweep.path !== undefined) return sweep.path;
+      const paths = [];
+      sweep.segments.forEach(function(segment) {
+        let previous = cameraRectCorners(segment.a);
+        paths.push(previous.map(function(p, index) { return (index ? 'L' : 'M') + p.x.toFixed(5) + ' ' + p.y.toFixed(5); }).join('') + 'Z');
+        for (let i = 1; i <= segment.pieces; i++) {
+          const next = cameraRectCorners(lerpCameraRect(segment.a, segment.b, i / segment.pieces));
+          for (let edge = 0; edge < 4; edge++) paths.push(cameraSweepEdgePath(previous[edge], previous[(edge + 1) % 4], next[edge], next[(edge + 1) % 4]));
+          previous = next;
+        }
+      });
+      sweep.path = paths.join('');
+      return sweep.path;
+    }
+
     function cameraWorkPaperBounds(project, cut) {
       const keyframes = cameraWorkKeyframesForPaper(project, cut);
       if (!keyframes.length) return null;
-      const baseW = cameraCoordinateWidth();
-      const baseH = cameraCoordinateHeight();
-      let minX = 0;
-      let minY = 0;
-      let maxX = baseW;
-      let maxY = baseH;
-      keyframes.forEach(function(transform) {
-        cameraFrameCorners(transform).forEach(function(point) {
-          minX = Math.min(minX, point.x);
-          minY = Math.min(minY, point.y);
-          maxX = Math.max(maxX, point.x);
-          maxY = Math.max(maxY, point.y);
-        });
-      });
-      const pad = Math.max(baseW, baseH) * 0.018;
-      minX -= pad;
-      minY -= pad;
-      maxX += pad;
-      maxY += pad;
-      const w = Math.max(1, maxX - minX);
-      const h = Math.max(1, maxY - minY);
+      const sweep = cameraPaperSweep(keyframes);
+      const pad = Math.max(cameraCoordinateWidth(), cameraCoordinateHeight()) * 0.018;
+      const minX = sweep.minX - pad, minY = sweep.minY - pad;
+      const maxX = sweep.maxX + pad, maxY = sweep.maxY + pad;
+      const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
       return {
-        minX: minX,
-        minY: minY,
-        maxX: maxX,
-        maxY: maxY,
-        w: w,
-        h: h,
-        aspect: w / h,
-        keyframes: keyframes,
+        minX: minX, minY: minY, maxX: maxX, maxY: maxY, w: w, h: h, aspect: w / h,
+        sweep: sweep, keyframes: keyframes,
         activeIndex: cameraWorkActiveKeyframeIndexForCut(project, cut, keyframes)
       };
     }
@@ -24377,24 +24429,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return 2;
     }
 
-    function paperPictureAspectRatioForCut(project, cut) {
-      const bounds = cameraWorkPaperBounds(project, cut);
-      return bounds ? bounds.aspect : 16 / 9;
-    }
-
-    function paperPictureFrameRectForCut(metrics, cut) {
-      const bounds = cameraWorkPaperBounds(state.project, cut);
-      return pictureFrameRect(metrics, cut.startRow - 1, cut.rowSpan, paperPictureAspectRatioForCut(state.project, cut), {
+    function paperPictureFrameRectForCut(metrics, cut, bounds = cameraWorkPaperBounds(state.project, cut)) {
+      return pictureFrameRect(metrics, cut.startRow - 1, cut.rowSpan, bounds ? bounds.aspect : 16 / 9, {
         cameraWork: Boolean(bounds)
       });
     }
 
-    function paperCameraWorkDomLayout(project, cut) {
-      const bounds = cameraWorkPaperBounds(project, cut);
+    function paperCameraWorkDomLayout(cut, bounds) {
       if (!bounds) return null;
       const paper = defaultPaperSpec();
       const metrics = pageMetrics(paper.width, paper.height);
-      const frame = paperPictureFrameRectForCut(metrics, cut);
+      const frame = paperPictureFrameRectForCut(metrics, cut, bounds);
       const row = paperRowRect(metrics, cut.startRow - 1, cut.rowSpan);
       const spanX = metrics.cols[1].x;
       const spanW = metrics.cols[4].x - metrics.cols[1].x;
@@ -25406,6 +25451,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2823, items: [{"ja":"用紙のメモをオンにしたとき、絵が枠の外へはみ出して見出しや隣の欄を覆う問題を修正しました。カメラ移動の途中で映る範囲も明るく表示し、回転途中の広がりまで用紙に収めます。","ko":"용지 메모를 켰을 때 그림이 프레임 밖으로 새어 머리글과 이웃 칸을 덮는 문제를 고쳤습니다. 카메라가 이동 중에 비추는 영역도 밝히고, 회전 중 넓어지는 범위까지 용지에 담습니다.","en":"Fixed artwork spilling over headers and neighboring cells in paper memo mode. Paper shading now includes the area visible throughout camera motion, with bounds that include intermediate rotations.","zh":"修复纸张备忘模式下图片溢出画框并遮盖表头和相邻栏目的问题。现在会点亮摄像机移动途中可见的区域，并将旋转过程中的范围完整纳入纸张。"}]},
       { ver: 2822, items: [{"ja": "用紙を開いたままコマや音声を選ぶと、ページ・選択表示・メモが一緒に切り替わるように直しました。", "ko": "용지를 연 상태에서 그림이나 오디오를 선택하면 페이지·선택 표시·메모가 함께 바뀌도록 고쳤습니다.", "en": "Fixed paper pages, selection highlights and memo ink updating together when selecting panels or audio with the paper window open.", "zh": "修复了打开纸张窗口时，选择画格或音频后页面、选中标记和备忘笔迹未同步切换的问题。"}]},
       { ver: 2821, items: [{"ja": "セリフシートに配置の出所を表示し、説明を短くしました。文字位置の調整中はShift＋ドラッグで、その文字以降を間隔を保って区間内で動かせます。", "ko": "대사 시트에 배치 출처를 표시하고 설명을 줄였습니다. 글자 조정 중 Shift+드래그로 그 글자부터 뒤쪽을 간격 그대로 구간 안에서 이동합니다.", "en": "Dialogue sheets now show the placement source with shorter help. In character adjustment mode, Shift-drag moves that character and the following characters together within the entry.", "zh": "台词表现在显示排列来源，并简化说明。调整文字时按住 Shift 拖动，可保持间距将该字及后续文字一起移动，且不超出台词区间。"}]},
       { ver: 2820, items: [{"ja": "原画の画像・動画レイヤーを、取り込み画面を開いたときに選択していたレイヤーのすぐ上に追加するようにしました。", "ko": "원화 이미지·영상 레이어를 가져오기 창을 열었을 때 선택한 레이어 바로 위에 추가합니다.", "en": "Imported animation image/video layers now appear directly above the layer selected when the import dialog opened.", "zh": "原画图片和视频图层现在添加到打开导入窗口时所选图层的正上方。"}]},
@@ -52034,7 +52080,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const row = cut.startRow;
       const rowSpan = clampInt(cut.rowSpan, 1, ROWS_PER_PAGE, 1);
       const gridRow = rowSpan > 1 ? row + ' / span ' + rowSpan : String(row);
-      const cameraWorkLayout = paperCameraWorkDomLayout(state.project, cut);
+      const cameraBounds = cameraWorkPaperBounds(state.project, cut);
+      const cameraWorkLayout = paperCameraWorkDomLayout(cut, cameraBounds);
       const isLastRow = row + rowSpan - 1 >= ROWS_PER_PAGE;
       const cutIndex = cutIndexById(state.project, cut.id);
       const inheritedDisplay = isInheritedCutNoDisplay(state.project, cutIndex);
@@ -52073,7 +52120,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       pictureCell.dataset.cutId = cut.id;
       if (cameraWorkLayout) pictureCell.classList.add('camera-work-cell');
       if (isLastRow) pictureCell.classList.add('last-row');
-      pictureCell.appendChild(createPictureFrame(cut));
+      pictureCell.appendChild(createPictureFrame(cut, cameraBounds, cameraWorkLayout));
       // ver1532: 시트 그림칸의 이미지 드롭은 없앴다(사용자: 필요 없는 기능). 그림칸은 보여 주기만 한다.
       bodyEl.appendChild(pictureCell);
 
@@ -52239,11 +52286,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // 用紙 카메라워크 그림칸: 칸 비율(카메라 궤적 bounds)과 칸 안 프레임 위치·원래 화면 위치를 CSS 변수로 싣는다.
     // (키 색은 여기서 다루지 않는다 — cameraKeyframeUnitRects 가 cameraKeyColor(index, count) 로 정한다.)
-    function applyCameraWorkPictureFrameStyle(frame, bounds, cut) {
+    function applyCameraWorkPictureFrameStyle(frame, bounds, layout) {
       if (!frame || !bounds) return;
       const baseW = cameraCoordinateWidth();
       const baseH = cameraCoordinateHeight();
-      const layout = paperCameraWorkDomLayout(state.project, cut);
       frame.classList.add('camera-work');
       if (bounds.aspect < 16 / 9) frame.classList.add('tall');
       frame.style.aspectRatio = bounds.w.toFixed(3) + ' / ' + bounds.h.toFixed(3);
@@ -52268,28 +52314,29 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       el.style.transform = 'rotate(' + rect.rotation.toFixed(2) + 'deg)';
     }
 
-    // ver1652: 궤도가 지나는 자리를 회색보다 밝게. 투명도는 **컨테이너**에 준다 — 사각형마다 주면
-    // 겹칠 때마다 누적돼 키프레임이 많은 팬에서 가운데만 허옇게 뜬다.
+    // One swept union beneath artwork; endpoint labels/outlines and active-key brightness stay separate.
     function createCameraWorkTrailFill(bounds) {
       const rects = cameraKeyframeUnitRects(bounds);
       if (!rects.length) return null;
       const host = document.createElement('div');
       host.className = 'picture-camera-work-fill';
-      const layer = function(list, alpha) {
-        if (!list.length) return;
-        const box = document.createElement('div');
-        box.style.position = 'absolute';
-        box.style.inset = '0';
-        box.style.opacity = String(alpha);
-        list.forEach(function(rect) {
-          const cell = document.createElement('span');
-          applyCameraUnitRectStyle(cell, rect);
-          box.appendChild(cell);
-        });
-        host.appendChild(box);
-      };
-      layer(rects, CAMERA_TRAIL_FILL);
-      layer(rects.filter(function(rect) { return rect.active; }), CAMERA_TRAIL_FILL_ACTIVE);
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', [bounds.minX, bounds.minY, bounds.w, bounds.h].join(' '));
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.style.cssText = 'position:absolute;width:100%;height:100%;inset:0';
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', cameraSweepPath(bounds.sweep));
+      path.setAttribute('fill', '#fff');
+      path.setAttribute('fill-opacity', String(CAMERA_TRAIL_FILL));
+      svg.appendChild(path);
+      host.appendChild(svg);
+      const active = rects.find(function(rect) { return rect.active; });
+      if (active) {
+        const cell = document.createElement('span');
+        applyCameraUnitRectStyle(cell, active);
+        cell.style.opacity = String(CAMERA_TRAIL_FILL_ACTIVE);
+        host.appendChild(cell);
+      }
       return host;
     }
 
@@ -52310,12 +52357,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return overlay;
     }
 
-    function createPictureFrame(cut) {
+    function createPictureFrame(cut, cameraBounds, cameraWorkLayout) {
       const frame = document.createElement('div');
       const layerEntries = layerDrawingEntriesForCut(state.project, cut && cut.id);
-      const cameraBounds = cameraWorkPaperBounds(state.project, cut);
       frame.className = 'picture-frame' + (layerEntries.length ? '' : ' empty');
-      if (cameraBounds) applyCameraWorkPictureFrameStyle(frame, cameraBounds, cut);
+      if (cameraBounds) applyCameraWorkPictureFrameStyle(frame, cameraBounds, cameraWorkLayout);
       if (layerEntries.length) {
         const stack = document.createElement('div');
         stack.className = 'picture-layer-stack';
@@ -97151,7 +97197,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const layerEntries = layerDrawingEntriesForCut(state.project, cut && cut.id);
         const cameraBounds = cameraWorkPaperBounds(state.project, cut);
         if (!layerEntries.length && !cameraBounds) continue;
-        const frame = paperPictureFrameRectForCut(metrics, cut);
+        const frame = paperPictureFrameRectForCut(metrics, cut, cameraBounds);
         const inset = Math.max(1, Math.round(metrics.table.w / 2200));
         let contentFrame = frame;
         // ver1648: 프리뷰의 .picture-frame 은 overflow:hidden 으로 잘린다 — ver718 이 적어 둔 대로
@@ -97228,8 +97274,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.restore();
     }
 
-    // ver1652: 출력에서의 궤도 밝힘. 프리뷰가 컨테이너 opacity 로 하는 것을 여기서는 오프스크린에
-    // union 을 그린 뒤 한 번에 합성해서 한다 — 사각형마다 globalAlpha 로 칠하면 겹칠 때 누적된다.
+    // Same swept path as the DOM, filled once at trail alpha. Active-key fill is a separate pass.
     function drawCameraTrailFill(ctx, frame, inset, bounds) {
       const rects = cameraKeyframeUnitRects(bounds);
       if (!rects.length) return;
@@ -97237,27 +97282,25 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const drawY = frame.y + inset;
       const drawW = frame.w - inset * 2;
       const drawH = frame.h - inset * 2;
-      const paint = function(list, alpha) {
-        if (!list.length) return;
-        const off = createOutputCanvas(Math.max(1, Math.ceil(drawW)), Math.max(1, Math.ceil(drawH)));
-        const octx = off.getContext('2d');
-        octx.fillStyle = '#fff';
-        list.forEach(function(rect) {
-          const w = rect.w * drawW;
-          const h = rect.h * drawH;
-          octx.save();
-          octx.translate((rect.left + rect.w / 2) * drawW, (rect.top + rect.h / 2) * drawH);
-          octx.rotate(rect.rotation * Math.PI / 180);
-          octx.fillRect(-w / 2, -h / 2, w, h);
-          octx.restore();
-        });
+      ctx.save();
+      ctx.translate(drawX, drawY);
+      ctx.scale(drawW / bounds.w, drawH / bounds.h);
+      ctx.translate(-bounds.minX, -bounds.minY);
+      ctx.fillStyle = '#fff';
+      ctx.globalAlpha = CAMERA_TRAIL_FILL;
+      ctx.fill(new Path2D(cameraSweepPath(bounds.sweep)));
+      ctx.restore();
+      const active = rects.find(function(rect) { return rect.active; });
+      if (active) {
+        const w = active.w * drawW, h = active.h * drawH;
         ctx.save();
-        ctx.globalAlpha = alpha;
-        ctx.drawImage(off, drawX, drawY);
+        ctx.translate(drawX + (active.left + active.w / 2) * drawW, drawY + (active.top + active.h / 2) * drawH);
+        ctx.rotate(active.rotation * Math.PI / 180);
+        ctx.fillStyle = '#fff';
+        ctx.globalAlpha = CAMERA_TRAIL_FILL_ACTIVE;
+        ctx.fillRect(-w / 2, -h / 2, w, h);
         ctx.restore();
-      };
-      paint(rects, CAMERA_TRAIL_FILL);
-      paint(rects.filter(function(rect) { return rect.active; }), CAMERA_TRAIL_FILL_ACTIVE);
+      }
     }
 
     function drawTextLayer(ctx, width, height, metrics, cuts) {
@@ -97277,7 +97320,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const rowIndex = cut.startRow - 1;
         const row = paperRowRect(metrics, rowIndex, cut.rowSpan);
         const cameraBounds = cameraWorkPaperBounds(state.project, cut);
-        const cameraFrame = cameraBounds ? paperPictureFrameRectForCut(metrics, cut) : null;
+        const cameraFrame = cameraBounds ? paperPictureFrameRectForCut(metrics, cut, cameraBounds) : null;
         const textTop = cameraFrame ? Math.min(row.y + row.h * 0.92, Math.max(row.y + row.h * 0.035, cameraFrame.y + cameraFrame.h + row.h * 0.025)) : row.y + row.h * 0.035;
         const textHeight = Math.max(row.h * 0.08, row.y + row.h * 0.955 - textTop);
         const cutCol = metrics.cols[0];
