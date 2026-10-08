@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2833</title>
+  <title>MoArt ver2834</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -21414,7 +21414,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ver1542: 파일에서 여는 경로(zip / json)는 여기서 그린 뒤에도 그림 참조 정리·미디어 복원을
       // 더 하고 **끝에서 다시 그린다** — 즉 이 렌더는 통째로 버려진다. 원화 프로젝트에서 그 한 번이
       // 155ms 였다(실측). 부른 쪽이 skipRefresh 로 「내가 뒤에 그린다」고 말하면 건너뛴다.
-      // 탭 전환처럼 뒤에 렌더가 없는 호출부는 이 옵션을 주지 않으므로 종전대로 여기서 그린다.
+      // 파일·슬롯 복원은 자산 준비 후 한 번 그리고, 일반 호출은 여기서 그린다.
       if (!options.skipRefresh) refresh(options.refreshOptions);
       restoreTimelineViewportForHistory(historyViewport);
       if (options.sameProject) refreshPlayingAudio();
@@ -25080,7 +25080,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const run = function(event) {
           event.preventDefault();
           event.stopPropagation(); // never let the tab's own click switch/settings fire underneath
-          trackPersistFailure('close-slot', closeProjectSlot(slot.id, active));
+          trackPersistFailure('close-slot', closeProjectSlot(slot.id));
         };
         close.addEventListener('click', run);
         close.addEventListener('keydown', function(event) {
@@ -25131,7 +25131,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // whatever project is live on the next render, which would put it straight back in the slot it just left.
     // An inactive slot holds no in-memory state (its content is the saved backup entry it stays listed as),
     // so releasing it needs no prompt and loses nothing.
-    async function closeProjectSlot(id, isCurrent) {
+    async function closeProjectSlot(id) {
+      // The old tab DOM can remain visible while a new project is loading its slot list.
+      const isCurrent = state.projectActive && state.project && state.project.projectId === id;
       if (!isCurrent) { await unpinProjectSlot(id); return; }
       const request = beginProjectFileLoad();
       if (!(await confirmDiscardUnsaved('msg.project.unsavedClose', request.owner))) return;
@@ -25462,6 +25464,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+        { ver: 2834, items: [{ ja: '自動保存が無効なファイルを開いたときに作業スロットが表示されない問題と、変形枠がタイムラインのコマ削除を妨げる問題を修正しました。', ko: '자동저장이 꺼진 파일을 열 때 작업 슬롯이 표시되지 않는 문제와 변형 테두리가 타임라인 코마 삭제를 막는 문제를 수정했습니다.', en: 'Fixed missing work slots when opening files with autosave disabled, and automatic transform bounds blocking timeline cel deletion.', zh: '修复打开关闭自动保存的文件时工作槽位不显示，以及自动变形框阻止时间线删除曝光帧的问题。' }] },
       { ver: 2833, items: [
         { ja: '長い音声の波形計算とカメラ更新の重複処理を減らし、再生中は次の映像を先読みするようにしました。', ko: '긴 음원의 파형 계산과 카메라 갱신의 중복 처리를 줄이고, 재생 중 다음 영상을 미리 읽도록 했습니다.', en: 'Reduced repeated waveform and camera work, and preload the next video during playback.', zh: '减少长音频波形计算和摄像机更新中的重复处理，并在播放时预载下一个视频。' }
       ] },
@@ -58334,6 +58337,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (source) markProjectSavedBaseline();
         setProjectActive(true);
+        owner = request.owner = projectIoOwner(request);
+        if (source) await snapshotLoadedProject(owner);
         hideLoadingOverlay(request); // Media is ready; mount once outside the modal inert subtree.
         refresh();
         if (source) warnMissingProjectAssets(collectMissingProjectAssets(state.project));
@@ -59484,7 +59489,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       catch (error) { return { ok: false, code: 'drawing-input', error: error }; }
       try { await drawingRecordingDrain({ capture: false }); }
       catch (error) { if (drawingRecordingRuntime) drawingRecordingFail(drawingRecordingRuntime, error); }
-      if (state.project !== recordingProject) return { ok: false, code: 'owner-changed' };
+      if (state.project !== recordingProject || (opts && opts.owner && !projectIoOwnerCurrent(opts.owner))) return { ok: false, code: 'owner-changed' };
       const id = ensureCurrentProjectId();
       const seq = ++projectSaveSeqNext;
       projectSaveLatestSeq.set(id, seq);
@@ -59586,6 +59591,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       catch (error) {
         console.error('[persist] 탭 전환 전 저장이 실패했다 — 현재 프로젝트를 유지한다', error);
         return { ok: false, code: 'publish', error: error };
+      }
+    }
+    // Opening a file earns a durable slot independently of its passive-autosave preference.
+    // A failed slot snapshot leaves the loaded editor available and reports the save failure.
+    async function snapshotLoadedProject(owner) {
+      assertProjectIoOwner(owner);
+      if (!indexedDbAvailable()) return;
+      const result = await writeProjectToIndexedDbSlot({ owner: owner });
+      assertProjectIoOwner(owner);
+      if (!result.ok) {
+        const message = t('msg.workspace.saveFailed', result.error && result.error.message || result.code || 'save');
+        state.indexedDbAutosaveStatus = message;
+        updatePrefsUI();
+        if (!projectSaveFailureNotices.has(String(state.project.projectId))) showToast(message, { warn: true });
       }
     }
     // ver2443 (F7): 명시적 전환은 완료를 기다릴 수 있으므로 **실패하면 떠나지 않는다.**
@@ -63317,12 +63336,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // A ZIP bundle is self-contained, NOT linked to a working folder. FORGET any remembered conte working
         // folder (same as the .json load path) — a remembered folder belongs to a different project than the
         // one just loaded.
-        // ver2048: 여기 「boot falls through to restoreLastIndexedDbProject, which reopens THIS project」가
-        // 붙어 있었는데 **ver1683 부터 거짓**이다. 그 판이 부팅 자동 복원을 일부러 걷어냈다(여는 도중
-        // 멈추는 프로젝트면 켤 때마다 같은 자리에서 멈춰 앱이 영영 못 뜬다). 지금 부팅은 **아무
-        // 프로젝트도 열지 않고** 시작 화면을 보여 주며, 이 번들은 그 화면의 최근 목록에서 열린다
-        // (아래 ZIP 자동저장이 indexedDbAutosaveEnabled:true 로 그 목록에 올려 둔다).
-        // 이 문장이 실제로 조사를 오도했다 — 읽고서 부팅 복원이 깨진 줄 알았다.
+        // Boot shows the start screen. The completed load publishes its recent/work slot below;
+        // the file's passive-autosave preference is preserved.
         clearWorkspaceConnection({ forgetSavedHandle: true });
         // ver2197: 원화 자산(storage 기술자)의 수집은 **restoreProject 전에** 한다. restoreProject 는
         // 인자 객체를 제자리 정규화하며(gengaIngestDrawing 화이트리스트) storage 필드를 떨어뜨린다 —
@@ -63535,13 +63550,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         normalizeProject(state.project);
         await hydrateWorkspaceMediaRefs(owner);
         assertProjectIoOwner(owner);
+        await snapshotLoadedProject(owner);
         markProjectSavedBaseline();
         // Close the modal before mounting the new DOM: closing it afterwards restyles every new node.
         // No await separates close and refresh, so input cannot observe an unfinished editor.
         hideLoadingOverlay(request);
         setProjectActive(true);
         refresh();
-        scheduleIndexedDbAutosave(0);
         if (entries.incomplete) missing.push({ kind: 'zip', name: t('msg.project.zipIncomplete', entries.incomplete.read, entries.incomplete.expected) });
         if (missing.length) warnMissingProjectAssets(missing);
       } catch (error) {
@@ -63595,6 +63610,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         showLoadingOverlay(t('msg.loading.loadingProject'), null, request);
         await hydrateWorkspaceMediaRefs(owner);
         assertProjectIoOwner(owner);
+        await snapshotLoadedProject(owner);
         markProjectSavedBaseline();
         hideLoadingOverlay(request); // Media is ready; mount once outside the modal inert subtree.
         refresh();
@@ -93132,7 +93148,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function handleGengaDeleteKey(event) {
       const gt = state.project && state.project.kind === 'genga' && state.project.gengaTimeline;
       if (!gt) return false;
-      if (isTypingTarget(event.target) || gengaSel) return false;
+      // Automatic transform bounds do not own Delete; explicit masks and pending transforms still do.
+      if (isTypingTarget(event.target) || (gengaSel && (!gengaSel.auto || !gengaSelIsPristine(gengaSel)))) return false;
       if (!isDeleteKeyEvent(event)) return false;
       // 0a) an explicitly selected AUDIO clip → delete it
       if (state.gengaSelectedAudioId) {
