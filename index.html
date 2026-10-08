@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2831</title>
+  <title>MoArt ver2832</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25462,6 +25462,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2832, items: [
+        { ja: 'デスクトップで長いAAC音声を再生する際の、一括読み込みによる停止とメモリ使用量を減らしました。', ko: '데스크톱에서 긴 AAC 음원을 재생할 때 전체 해독으로 생기는 멈춤과 메모리 사용량을 줄였습니다.', en: 'Reduced full-decode stalls and memory use when playing long AAC audio on desktop.', zh: '减少桌面端播放较长AAC音频时由整体解码造成的停顿和内存占用。' }
+      ] },
       { ver: 2831, items: [
         { ja: '非表示のBG・BOOKと、セルより下にあるBOOKのタイムシート表示を修正しました。', ko: '숨긴 BG·BOOK과 셀보다 아래에 있는 BOOK의 타임시트 표시를 고쳤습니다.', en: 'Fixed timesheet handling of hidden BG/BOOK layers and BOOK layers below cels.', zh: '修复了隐藏的BG、BOOK以及位于赛璐璐层下方的BOOK在摄影表中的显示。' },
         { ja: '原画の描画確定と再生中の不要な処理を減らしました。', ko: '원화의 그림 확정과 재생 중 불필요한 처리를 줄였습니다.', en: 'Reduced unnecessary work when committing drawings and playing genga projects.', zh: '减少了原画绘制确认及播放时的不必要处理。' },
@@ -47110,10 +47113,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!ctx || (current && !current())) return null;
       const pcm = await audioClipPcmSource(clip, url);
       if (current && !current()) return null;
-      if (pcm) return pcmAudioWindow(ctx, pcm, audioClipPcmTime(clip, frame == null ? state.videoPlayheadFrames : frame));
+      if (pcm) {
+        const time = audioClipPcmTime(clip, frame == null ? state.videoPlayheadFrames : frame);
+        const buffer = await pcmAudioWindow(ctx, pcm, time);
+        // Muted clips share this warm-up: keep the next AAC block ready before crossing its boundary.
+        // Scrub without a playback guard only needs its requested block.
+        const next = (Math.floor(time / PCM_AUDIO_WINDOW_SEC) + 1) * PCM_AUDIO_WINDOW_SEC;
+        if (pcm.info.kind === 'aac-mp4' && current && current() && next < pcm.info.durationSec) await pcmAudioWindow(ctx, pcm, next);
+        return buffer;
+      }
       const plan = await audioClipDecodePlan(clip, url);
       if (plan === 'html' || (current && !current())) return null;
       return plan === 'slice' ? audioBufferSliceForClip(ctx, clip, url) : audioBufferForClip(ctx, clip, url);
+    }
+    // Active sources come before upcoming sources, including mute/zero gain so turning sound on stays ready.
+    function playbackAudioWarmCandidates(project, frame, endFrame, limit) {
+      const active = [], upcoming = [];
+      for (const clip of (project.audio && project.audio.clips || [])) {
+        if (!clip || clip.startFrame + clip.durationFrames <= frame || clip.startFrame > endFrame || !audioClipHasSource(project, clip)) continue;
+        (clip.startFrame <= frame ? active : upcoming).push(clip);
+      }
+      return active.concat(upcoming).slice(0, limit);
     }
     // 재생 시작 직후의 클립은 프리캐시(primePlaybackCachesForRange)가 120ms 뒤에나 도는 데다 await 도
     // 안 되므로 **첫 클립이 늘 미준비**였다. 시작 시점에 겹치거나 곧 시작할 클립만 짧게 기다린다.
@@ -47121,9 +47141,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 상한을 넘기면 그대로 시작하고, 못 낸 소리는 위 카운터가 잡아 보고한다.
     async function warmPlaybackAudioForStart(project, startFrame, fps) {
       const current = playbackCacheWarmGuard(project);
-      const clips = (state.playbackClipQueue || []).filter(function(clip) {
+      const audible = (state.playbackClipQueue || []).filter(function(clip) {
         return clip && clip.startFrame <= startFrame + fps && audioClipHasSource(project, clip);
       }).slice(0, 4);
+      const muted = playbackAudioWarmCandidates(project, startFrame, startFrame, 4).filter(function(clip) { return !audible.includes(clip); });
+      const clips = audible.concat(muted).slice(0, 4);
       if (!clips.length) return;
       const work = Promise.all(clips.map(function(clip) {
         return ensurePlaybackAudioUrlForClip(clip).then(function(url) {
@@ -47143,9 +47165,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         warmVideoCachesAroundFrame(project, startFrame);
         const fps = fpsForProject(project);
         const preloadEnd = Math.min(totalFrames, startFrame + fps * 10);
-        (project.audio && project.audio.clips || []).filter(function(clip) {
-          return clip.startFrame + clip.durationFrames >= startFrame && clip.startFrame <= preloadEnd && audioClipHasSource(project, clip);
-        }).slice(0, 12).forEach(function(clip) {
+        playbackAudioWarmCandidates(project, startFrame, preloadEnd, 12).forEach(function(clip) {
           ensurePlaybackAudioUrlForClip(clip).then(function(url) {
             if (url && current()) preloadAudioBufferForClip(clip, current);
           });
@@ -55063,8 +55083,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const cached = cacheKey ? await getWorkspaceDbValue(cacheKey).catch(function() { return null; }) : null;
           if (!current()) return null;
           if (cached && cached.peaks && cached.peaks.byteLength) return rememberAudioSourcePeaks(sourceKey, new Uint8Array(cached.peaks));
+          const windowed = sizePolicy && !sizePolicy.resident() ? await pcmAudioSource(sourceKey, function() { return sourceBlob; }) : null;
+          if (!current()) return null;
           let peaks = null;
-          if (sizePolicy && !sizePolicy.resident() && !await audioBlobFullDecodeAllowed(sourceBlob)) {
+          if (sizePolicy && !sizePolicy.resident() && ((windowed && windowed.info.kind === 'aac-mp4' && !audioSourceHasMultipleClips(sourceKey)) || !await audioBlobFullDecodeAllowed(sourceBlob))) {
             if (!current()) return null;
             peaks = await audioStreamPeaksFromBlob(sourceBlob, AUDIO_PEAK_BINS_PER_SECOND, current);
             if (!current()) return null;
@@ -55220,7 +55242,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // playback/scrub offset math (which thinks in absolute source seconds) can subtract it.
     const AUDIO_SLICE_PAD_SEC = 0.4;
 
-    // Long PCM WAV sources share bounded sample windows across waveform, scrub and playback.
+    // Long PCM WAV and supported desktop AAC-LC sources share bounded sample windows.
     // Source bytes and stored projects stay unchanged; other codecs retain their existing decoder.
     const PCM_AUDIO_WINDOW_SEC = 4;
     const PCM_AUDIO_FULL_LIMIT = 32 * 1024 * 1024;
@@ -55262,6 +55284,85 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return peaks;
     }
+    // Runtime-only AAC-LC reader: metadata and bounded decoded windows, never a retained demuxer.
+    async function pcmAacInfo(blob) {
+      if (!(blob instanceof Blob) || mobileOrTabletRuntime() || typeof AudioDecoder === 'undefined') return null;
+      // Filesystem/OPFS blobs can omit MIME; validate MP4 bytes before loading the demuxer.
+      const head = await blob.slice(0, 12).arrayBuffer();
+      if (head.byteLength < 12 || readAscii(new DataView(head), 4, 4) !== 'ftyp') return null;
+      let input = null;
+      try {
+        const B = await loadMediaExportModule();
+        input = new B.Input({ source: new B.BlobSource(blob), formats: B.ALL_FORMATS });
+        const audioTracks = await input.getAudioTracks(), videoTracks = await input.getVideoTracks();
+        if (audioTracks.length !== 1 || videoTracks.length) return null;
+        const track = audioTracks[0], config = await track.getDecoderConfig();
+        if (!config || config.codec !== 'mp4a.40.2' || ![1, 2].includes(config.numberOfChannels) || !Number.isInteger(config.sampleRate) || config.sampleRate <= 0 || !await track.canDecode()) return null;
+        const rate = config.sampleRate, firstTimestamp = await track.getFirstTimestamp();
+        if (!Number.isFinite(firstTimestamp) || firstTimestamp > 0 || firstTimestamp < -1024 / rate - 1e-8) return null;
+        const firstSample = await new B.AudioSampleSink(track).getSample(0);
+        if (!firstSample) return null;
+        try { if (Math.abs(firstSample.timestamp) > 1e-8 || firstSample.sampleRate !== rate || firstSample.numberOfChannels !== config.numberOfChannels) return null; }
+        finally { firstSample.close(); }
+        const el = document.createElement('audio'), url = URL.createObjectURL(blob);
+        let duration;
+        try {
+          el.preload = 'metadata';
+          const ready = videoMediaWaitEvent(el, ['loadedmetadata', 'error'], 8000);
+          el.src = url; el.load();
+          if (await ready !== 'loadedmetadata') return null;
+          duration = el.duration;
+        } finally { el.removeAttribute('src'); el.load(); URL.revokeObjectURL(url); }
+        if (!Number.isFinite(duration) || duration <= 0) return null;
+        const durationIndexed = await track.computeDuration();
+        if (!Number.isFinite(durationIndexed) || Math.abs(durationIndexed - duration) > 1024 / rate) return null;
+        const frames = Math.round(duration * rate), blockAlign = config.numberOfChannels * 4;
+        if (!Number.isSafeInteger(frames) || frames <= 0) return null;
+        return { kind: 'aac-mp4', format: { audioFormat: 3, channels: config.numberOfChannels, sampleRate: rate, bitsPerSample: 32, blockAlign: blockAlign }, dataOffset: 0, dataSize: frames * blockAlign, durationSec: frames / rate, decodedBytes: frames * blockAlign };
+      } catch (error) { console.warn('[audio] AAC window source unavailable', error); return null; }
+      finally { if (input) input.dispose(); }
+    }
+    async function pcmAacRange(blob, info, first, last) {
+      const B = await loadMediaExportModule(), input = new B.Input({ source: new B.BlobSource(blob), formats: B.ALL_FORMATS });
+      try {
+        const track = await input.getPrimaryAudioTrack(), f = info.format, frames = last - first;
+        if (!track) throw new Error('AAC window has no audio track');
+        const bytes = new ArrayBuffer(frames * f.blockAlign), view = new DataView(bytes);
+        let covered = first, plane = null;
+        // Decode the priming packet too; crop its negative samples instead of discarding decoder history.
+        const decodeStart = first === 0 ? await track.getFirstTimestamp() : first / f.sampleRate;
+        for await (const sample of new B.AudioSampleSink(track).samples(decodeStart, last / f.sampleRate)) {
+          try {
+            const exact = sample.timestamp * f.sampleRate, start = Math.round(exact);
+            if (sample.sampleRate !== f.sampleRate || sample.numberOfChannels !== f.channels || Math.abs(exact - start) > 0.001) throw new Error('AAC window sample layout changed');
+            const from = Math.max(first, start), to = Math.min(last, start + sample.numberOfFrames);
+            if (to <= from) continue;
+            if (from > covered) throw new Error('AAC window contains a sample gap');
+            if (!plane || plane.length < sample.numberOfFrames) plane = new Float32Array(sample.numberOfFrames);
+            for (let c = 0; c < f.channels; c++) {
+              sample.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+              for (let frame = from; frame < to; frame++) view.setFloat32((frame - first) * f.blockAlign + c * 4, plane[frame - start], true);
+            }
+            covered = Math.max(covered, to);
+          } finally { sample.close(); }
+        }
+        if (covered !== last) throw new Error('AAC window ended before its requested samples');
+        return pcmWavRange(new Blob([bytes]), info, 0, frames);
+      } finally { input.dispose(); }
+    }
+    // Separate trims of one compressed source need independently ready windows for instant unmute.
+    // Keep their established full-buffer path until the window cache can retain all active demands.
+    function audioSourceHasMultipleClips(key) {
+      const project = state.project;
+      let count = 0;
+      for (const clip of (project && project.audio && project.audio.clips || [])) {
+        if (audioClipSourceKey(clip) === key && ++count > 1) return true;
+      }
+      for (const clip of (project && project.gengaTimeline && project.gengaTimeline.audioClips || [])) {
+        if (gengaAudioSourceKey(clip.ref) === key && ++count > 1) return true;
+      }
+      return false;
+    }
     async function pcmAudioSource(key, loadBlob, prepared) {
       const owner = projectIoOwner(), hit = pcmAudioSources.get(key);
       if (hit && hit.project === owner.project) { pcmAudioSources.delete(key); pcmAudioSources.set(key, hit); return hit.promise; }
@@ -55272,7 +55373,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Import already validated/decoded the first window before storing the new immutable ref.
       if (prepared) { entry.loading = false; entry.source = prepared; entry.promise = Promise.resolve(prepared); return entry.promise; }
       entry.promise = (async function() {
-        const blob = await loadBlob(), info = await pcmWavInfo(blob);
+        const blob = await loadBlob(), info = await pcmWavInfo(blob) || await pcmAacInfo(blob);
         if (!projectIoOwnerCurrent(owner) || pcmAudioSources.get(key) !== entry) throw new DOMException('Audio source changed', 'AbortError');
         if (!info || info.decodedBytes <= PCM_AUDIO_FULL_LIMIT) return null;
         return (entry.source = { blob: blob, info: info, windows: new Map(), pending: new Map() });
@@ -55288,10 +55389,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function pcmAudioReadyWindow(key, time, ctx) {
       const entry = pcmAudioSources.get(key), source = entry && entry.source;
-      return source && ctx && source.windows.get(ctx.sampleRate + ':' + Math.floor(Math.max(0, time) / PCM_AUDIO_WINDOW_SEC));
+      return source && ctx && source.windows.get(ctx.sampleRate + ':' + (source.fullDecode ? 'full' : Math.floor(Math.max(0, time) / PCM_AUDIO_WINDOW_SEC)));
     }
     async function pcmAudioWindow(ctx, source, time) {
-      const block = Math.floor(Math.max(0, time) / PCM_AUDIO_WINDOW_SEC), index = ctx.sampleRate + ':' + block;
+      const block = Math.floor(Math.max(0, time) / PCM_AUDIO_WINDOW_SEC), index = ctx.sampleRate + ':' + (source.fullDecode ? 'full' : block);
       if (source.windows.has(index)) return source.windows.get(index);
       if (source.pending.has(index)) return source.pending.get(index);
       const job = (async function() {
@@ -55301,9 +55402,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const first = Math.max(0, (block * PCM_AUDIO_WINDOW_SEC - 1) * f.sampleRate);
         const last = Math.min(total, ((block + 1) * PCM_AUDIO_WINDOW_SEC + 1) * f.sampleRate);
         if (last <= first) throw new Error('PCM window is outside its source');
-        const bytes = await pcmWavRange(source.blob, source.info, first, last);
-        const buffer = await ctx.decodeAudioData(bytes);
-        buffer.conteSliceStartSec = first / f.sampleRate;
+        let buffer;
+        if (source.fullDecode) buffer = await ctx.decodeAudioData(await source.blob.arrayBuffer());
+        else {
+          try {
+            const bytes = source.info.kind === 'aac-mp4' ? await pcmAacRange(source.blob, source.info, first, last) : await pcmWavRange(source.blob, source.info, first, last);
+            buffer = await ctx.decodeAudioData(bytes);
+          } catch (error) {
+            if (source.info.kind !== 'aac-mp4') throw error;
+            // A later packet can fail after metadata/first-window validation. Restore the existing native
+            // decoder once, in the same registry/cache; the scheduler keeps its clock and cancellation guard.
+            if (!source.fullDecode) {
+              console.warn('[audio] AAC window decode failed; using full native decoder', error);
+              source.fullDecode = true;
+              source.windows.clear();
+            }
+            return pcmAudioWindow(ctx, source, time);
+          }
+          // Another request may have retired the window path while this decode was pending.
+          if (source.fullDecode) return pcmAudioWindow(ctx, source, time);
+        }
+        buffer.conteSliceStartSec = source.fullDecode ? 0 : first / f.sampleRate;
         buffer.conteSourceDurationSec = source.info.durationSec;
         source.windows.set(index, buffer);
         while (source.windows.size > 3) source.windows.delete(source.windows.keys().next().value);
@@ -55742,7 +55861,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const fx = audioClipFx(clip);
       // Whole-window WSOLA retains its established phase/quality. Do not replace it with per-chunk stretching.
       if (fx.preservePitch !== false && Math.abs(fx.speed - 1) > 0.01) return null;
-      return pcmAudioSource(audioClipSourceKey(clip) || url, function() { return audioSourceCompressedBlobForClip(clip, url); });
+      const key = audioClipSourceKey(clip) || url;
+      if (state.audioBufferCache[key]) return null;
+      const source = await pcmAudioSource(key, function() { return audioSourceCompressedBlobForClip(clip, url); });
+      return source && source.info.kind === 'aac-mp4' && audioSourceHasMultipleClips(key) ? null : source;
     }
     function playAudioClipPcm(ctx, clip, pcm, current) {
       const fps = mediaFpsForProject(state.project);
@@ -101609,11 +101731,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       try { src.start(0, window.sourceOffset - (Number(buf.conteSliceStartSec) || 0), dur); gengaScrubAudioState.sources = [src]; } catch (e) {}
     }
     // schedule every clip via WebAudio relative to the playhead start frame (frame-accurate, survives rAF jitter)
-    function gengaPcmAudioSource(ref) {
-      return pcmAudioSource(gengaAudioSourceKey(ref), function() {
+    async function gengaPcmAudioSource(ref) {
+      if (gengaAudioBuf.has(ref)) return null;
+      const key = gengaAudioSourceKey(ref);
+      const source = await pcmAudioSource(key, function() {
         const url = gengaAudioUrl(ref);
         return url ? fetch(url).then(function(r) { if (!r.ok) throw new Error('Audio source HTTP ' + r.status); return r.blob(); }) : null;
       });
+      return source && source.info.kind === 'aac-mp4' && audioSourceHasMultipleClips(key) ? null : source;
     }
     function playGengaPcmAudio(ctx, gt, clip, pcm, fps, startFrame, startedAt, generation) {
       const now = (startFrame - 1) / fps + Math.max(0, (performance.now() - startedAt) / 1000);
