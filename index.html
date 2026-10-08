@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2835</title>
+  <title>MoArt ver2836</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25158,6 +25158,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       gengaStopRecording(gengaRecSession, true);
       clearProjectHistory();
       setProjectActive(false);
+      // The last tab is closed, not parked: release its runtime through the normal project reset.
+      if (!nextId) {
+        resetProjectForNewProject();
+        // Rebuildable display ownership only; shared pixels remain valid for other consumers.
+        gengaImageCache.clear();
+        gengaPreviewRender.composite = null;
+      }
       request.owner = projectIoOwner(request);
       renderProjectTabBar();
       // switchToProjectTab 은 쓰지 않는다 — 그건 먼저 **현재 프로젝트를 스냅샷**하는데, 방금 닫기로 버린
@@ -25250,8 +25257,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let projectTabBarRenderSeq = 0; // ver1256: renderProjectTabBar has ~11 independent trigger sites
     // (setProjectActive + every updateWorkspaceUI callsite) that can legitimately fire close together
     // during one restore — without this, two overlapping calls each clear+rebuild the same live <div>
-    // and both sets of appendChild calls land, duplicating every tab. A stale call bails right after the
-    // one real await instead of appending on top of a newer call's content.
+    // and both sets of appendChild calls land, duplicating every tab. Superseded reads stop before
+    // auto-pinning or publishing DOM; automatic pin writes also validate this generation.
     let projectTabBarSig = '';       // ver1276: what the bar currently SHOWS
     // ver1276: this used to clear the live bar and then await IndexedDB before refilling it, so every
     // caller flashed an empty tab bar for the length of two DB reads. Conte hit it on every undo/redo
@@ -25276,11 +25283,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (indexedDbAvailable()) {
         try {
           pinnedIds = await loadPinnedProjectSlots();
+          // A superseded render must not re-pin a closed slot or continue reading its metadata.
+          if (seq !== projectTabBarRenderSeq) return;
           // Restore/backup selection may pin only an already-published project.
           // New projects gain their pin atomically in the first successful save.
           if (pinnedProjectSlotsEnabled() && pinnedIds.indexOf(currentId) === -1 && pinnedIds.length < PINNED_PROJECT_MAX) {
-            await pinProjectToSlot(currentId);
+            await pinProjectToSlot(currentId, function() { return seq === projectTabBarRenderSeq; });
+            if (seq !== projectTabBarRenderSeq) return;
             pinnedIds = await loadPinnedProjectSlots();
+            if (seq !== projectTabBarRenderSeq) return;
           }
           const index = await loadIndexedDbProjectIndex();
           indexSlots = index.slots;
@@ -25464,6 +25475,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+        { ver: 2836, items: [{ ja: '閉じた作業スロットが戻る問題を修正し、最後のスロットを閉じた後の画像・音声の作業データを解放します。メモリ使用量の集計も修正しました。', ko: '닫은 작업 슬롯이 되살아나는 문제를 수정하고 마지막 슬롯을 닫은 뒤 그림·음원 작업 데이터를 해제합니다. 메모리 사용량 집계도 수정했습니다.', en: 'Fixed closed work slots reappearing, released image and audio runtime data after closing the last slot, and corrected memory accounting.', zh: '修复已关闭工作槽位再次出现的问题，关闭最后一个槽位后释放图像和音频运行数据，并修正内存用量统计。' }] },
         { ver: 2835, items: [{ ja: '番号付きBG・BOOK名をシートと移動指示でも保持し、レイヤー順による番号の食い違いを修正しました。', ko: '번호가 있는 BG·BOOK 이름을 시트와 이동 지시에서도 유지해 레이어 순서에 따른 번호 불일치를 수정했습니다.', en: 'Numbered BG and BOOK names now stay consistent in timesheets and movement instructions.', zh: '带编号的BG和BOOK名称现与时间表及移动指示保持一致。' }] },
         { ver: 2834, items: [{ ja: '自動保存が無効なファイルを開いたときに作業スロットが表示されない問題と、変形枠がタイムラインのコマ削除を妨げる問題を修正しました。', ko: '자동저장이 꺼진 파일을 열 때 작업 슬롯이 표시되지 않는 문제와 변형 테두리가 타임라인 코마 삭제를 막는 문제를 수정했습니다.', en: 'Fixed missing work slots when opening files with autosave disabled, and automatic transform bounds blocking timeline cel deletion.', zh: '修复打开关闭自动保存的文件时工作槽位不显示，以及自动变形框阻止时间线删除曝光帧的问题。' }] },
       { ver: 2833, items: [
@@ -59251,9 +59263,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // A missing key is empty; a failed read must reject, never authorize unpinning/eviction.
       return normalizePinnedProjectSlots(await getWorkspaceDbValue(PINNED_PROJECT_SLOTS_KEY));
     }
-    async function pinProjectToSlot(id) {
+    async function pinProjectToSlot(id, shouldPin) {
       if (!id || !pinnedProjectSlotsEnabled() || String(id).indexOf('tltut-') === 0) return false;
       const db = await openWorkspaceDb();
+      if (shouldPin && !shouldPin()) return false;
       return workspaceDbOp(db, 'pin project ' + id, function(resolve, reject) {
         const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
         const store = tx.objectStore(WORKSPACE_STORE_NAME);
@@ -59268,7 +59281,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (!normalizeIndexedDbProjectIndex(indexRequest.result).slots.some(function(slot) { return slot.id === id; })) return;
             const payloadRequest = store.get(indexedDbProjectPayloadKey(id));
             payloadRequest.onsuccess = function() {
-              if (!payloadRequest.result) return;
+              // Auto-pin belongs to its render until publication; explicit pins have no guard.
+              if (!payloadRequest.result || (shouldPin && !shouldPin())) return;
               ids.push(id);
               store.put(ids, PINNED_PROJECT_SLOTS_KEY);
               pinned = true;
@@ -60492,6 +60506,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (typeof AudioBuffer !== 'undefined' && value instanceof AudioBuffer) { bytes += audioBufferByteSize(value); continue; }
         if (value instanceof Blob) { bytes += value.size; continue; }
+        // ImageData owns a typed-array backing store, not enumerable pixel fields.
+        if (typeof ImageData !== 'undefined' && value instanceof ImageData) { queue.push(value.data); continue; }
         if (ArrayBuffer.isView(value)) { queue.push(value.buffer); continue; }
         if (value instanceof ArrayBuffer) { bytes += value.byteLength; continue; }
         if (value instanceof Map || value instanceof Set) {
@@ -101580,6 +101596,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaDrawStoreDrop(ref);
       });
       const freedBytes = Math.max(0, totalBefore - gengaDrawStoreTotal);
+      gengaDrawnBoundsCache.forEach(function(_v, key) { if (!drawRefs.has(key)) gengaDrawnBoundsCache.delete(key); });
       gengaThumbCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbCache.delete(ref); });   // ver2197: 썸 캐시도 같은 경계에서 회수 — 안 하면 ref 당 ~15KB 가 세션 내내 쌓인다
       gengaThumbImageCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbImageCache.delete(ref); });   // ver2239: 헤드 썸 Image 도 같은 경계에서
       audioSaveLeaseKeys.forEach(function(_n, key) { if (key.indexOf('ga:') === 0) audioRefs.add(key.slice(3)); });
@@ -104054,8 +104071,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // ver1036: the drawn box of one drawing, in paper px, memoised on the decode cache's own key. The scan is a
     // full-canvas alpha pass, so it must never run per repaint — a drawing is immutable under its dataUrl, so one
     // scan per drawing is enough and a stroke that edits it produces a new url and therefore a new entry.
-    // ver2187: 그 「decode cache's own key」가 이제 gengaRasterCacheKey 다. 여기만 base64 를 키로
-    // 남기면 그 문자열을 이 맵이 계속 붙잡아(delete 도 clear 도 없는 맵이다) 저쪽의 회수가 무효가 된다.
+    // Use compact raster keys so metadata does not retain inline image strings.
+    // Runtime pruning keeps entries owned by the project, history, clipboard or an active save.
     const gengaDrawnBoundsCache = new Map();
     // ver2193: 픽셀을 **이미 든** 그림(칸 그림 · 인코드 대기)은 디코드를 기다릴 것이 없다.
     // 종전 키(래스터 전용)로는 빈 키가 나와 여기서 null 이 됐고, 그러면 FX 기즈모와 目盛り 원점이
