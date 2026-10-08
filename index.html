@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2832</title>
+  <title>MoArt ver2833</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25462,6 +25462,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2833, items: [
+        { ja: '長い音声の波形計算とカメラ更新の重複処理を減らし、再生中は次の映像を先読みするようにしました。', ko: '긴 음원의 파형 계산과 카메라 갱신의 중복 처리를 줄이고, 재생 중 다음 영상을 미리 읽도록 했습니다.', en: 'Reduced repeated waveform and camera work, and preload the next video during playback.', zh: '减少长音频波形计算和摄像机更新中的重复处理，并在播放时预载下一个视频。' }
+      ] },
       { ver: 2832, items: [
         { ja: 'デスクトップで長いAAC音声を再生する際の、一括読み込みによる停止とメモリ使用量を減らしました。', ko: '데스크톱에서 긴 AAC 음원을 재생할 때 전체 해독으로 생기는 멈춤과 메모리 사용량을 줄였습니다.', en: 'Reduced full-decode stalls and memory use when playing long AAC audio on desktop.', zh: '减少桌面端播放较长AAC音频时由整体解码造成的停顿和内存占用。' }
       ] },
@@ -45837,8 +45840,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!options || !options.lightweight || options.updateTimecode) updateTimelineTimecodeDom(root, totalFrames);
       updateCameraTrackSelectionDom(root);
       const previewStage = document.getElementById('conteVideoStage');
-      applyCameraPreviewTransform(previewStage);
-      renderCameraFrameOverlay(previewStage);
+      renderCameraFrameOverlay(previewStage); // Also applies camera and layer FX once.
       updateActiveAudioClipDom(root);
       if ((!options || !options.lightweight) && !(options && options.skipAutoScroll)) {
         const activeScroll = root.querySelector('.timeline-scroll');
@@ -47156,6 +47158,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       await Promise.race([work, cap]);
     }
 
+    // Warm only the next displayed video, at most two seconds ahead. Transport remains the sole
+    // seek/play owner: loading a source does not claim that a trimmed or resumed frame is ready.
+    function warmNextVideoMedia(project, frame) {
+      if (!state.videoPlaying || !state.videoEditMode || state.project !== project) return;
+      const target = Math.max(0, Math.round(Number(frame) || 0));
+      const end = Math.min(videoTimelineContentFrames(project) - 1, target + Math.ceil(2 * mediaFpsForProject(project)));
+      if (end <= target) return;
+      const boundaries = new Set();
+      const add = function(value) { if (value > target && value <= end) boundaries.add(value); };
+      for (const clip of (project.video && project.video.clips || [])) {
+        const start = Math.max(0, Math.round(Number(clip.startFrame) || 0));
+        add(start); add(start + Math.max(1, Math.round(Number(clip.durationFrames) || 1)));
+      }
+      const timeline = buildVideoTimelineCached(project);
+      for (const span of (timeline.primarySegments || timeline.slots || [])) { add(span.startFrame); add(span.endFrame); }
+      const slot = videoSlotAtFrame(project, target);
+      const current = videoMediaClipAtFrame(project, target, slot && slot.cut.id);
+      for (const nextFrame of Array.from(boundaries).sort(function(a, b) { return a - b; })) {
+        const nextSlot = videoSlotAtFrame(project, nextFrame);
+        const next = videoMediaClipAtFrame(project, nextFrame, nextSlot && nextSlot.cut.id);
+        if (next && next !== current && next.sourceType === 'video') {
+          videoMediaElementFor(next);
+          return;
+        }
+      }
+    }
+
     function primePlaybackCachesForRange(project, startFrame, totalFrames) {
       if (state.videoCachePrimeTimer || !state.videoPlaying || state.project !== project) return;
       const current = playbackCacheWarmGuard(project);
@@ -47163,6 +47192,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.videoCachePrimeTimer = null;
         if (!current()) return;
         warmVideoCachesAroundFrame(project, startFrame);
+        warmNextVideoMedia(project, state.videoPlayheadFrames);
         const fps = fpsForProject(project);
         const preloadEnd = Math.min(totalFrames, startFrame + fps * 10);
         playbackAudioWarmCandidates(project, startFrame, preloadEnd, 12).forEach(function(clip) {
@@ -55000,10 +55030,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return peaks;
     }
 
-    // fix2744 #044: a cold waveform obeys the same decode-size policy as playback (audioClipDecodePlan). Above
-    // audioFullDecodeByteLimit a compressed source is streamed packet by packet (the export's Mediabunny demuxer +
-    // WebCodecs AudioDecoder) and only peak bins are kept; without that decoder the waveform is left out instead of
-    // decoding the whole file to PCM.
+    // Cold waveforms use streaming for windowed AAC or sources above the full-decode budget.
+    // Only peak bins are retained; decoder availability and owner lifetime are checked before publishing.
     function audioDecodedBytesEstimate(info, compressedBytes) {
       return info ? info.decodedBytes : compressedBytes * 16; // unknown container: assume strong compression (~128-192kbps)
     }
@@ -55035,10 +55063,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (!plane || plane.length < frames) plane = new Float32Array(frames);
             for (let c = 0; c < sample.numberOfChannels; c += 1) {
               sample.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
-              for (let i = 0; i < frames; i += 1) {
+              // Scan each timestamp bin once; do not recalculate/quantize the same bin for every sample.
+              for (let i = 0; i < frames;) {
                 const bin = Math.floor(origin + i * step);
-                if (bin < 0 || bin >= peaks.length) continue;
-                const value = plane[i] < 0 ? -plane[i] : plane[i], scaled = value >= 1 ? 255 : (value * 255) | 0;
+                let end = Math.min(frames, Math.max(i + 1, Math.ceil((bin + 1 - origin) / step)));
+                // Division may round across an exact boundary; preserve the original timestamp predicate.
+                while (end > i + 1 && Math.floor(origin + (end - 1) * step) !== bin) end--;
+                while (end < frames && Math.floor(origin + end * step) === bin) end++;
+                if (bin < 0 || bin >= peaks.length) { i = end; continue; }
+                let peak = 0;
+                for (; i < end; i++) {
+                  const value = plane[i], magnitude = value < 0 ? -value : value;
+                  if (magnitude > peak) peak = magnitude;
+                }
+                const scaled = peak >= 1 ? 255 : (peak * 255) | 0;
                 if (scaled > peaks[bin]) peaks[bin] = scaled;
               }
             }
