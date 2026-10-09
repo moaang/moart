@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2868</title>
+  <title>MoArt ver2869</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -21465,6 +21465,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!options.sameProject) resetProjectTransientRuntime();
       else { cancelPointerDrags(); if (longPressContacts) longPressContacts.cancelPending(); }
       state.project = normalizeProjectSnapshot(project);
+      if (previousProject) {
+        retirePcmAudioSources(previousProject);
+        const audioCache = audioStorageOptimizations.get(previousProject);
+        if (audioCache) {
+          audioStorageOptimizations.set(state.project, audioCache);
+          audioStorageOptimizations.delete(previousProject);
+        }
+        const savedAudio = audioStorageSavedZips.get(previousProject);
+        if (savedAudio) {
+          audioStorageSavedZips.set(state.project, savedAudio);
+          audioStorageSavedZips.delete(previousProject);
+        }
+      }
       if (fileSource) setProjectFileSource(state.project, fileSource);
       if (previousProject && typeof inheritLocalProjectRecovery === 'function') inheritLocalProjectRecovery(previousProject, state.project);
       if (previousProject && gengaWorkspaceAssets.has(previousProject)) gengaWorkspaceAssets.set(state.project, gengaWorkspaceAssets.get(previousProject));
@@ -25595,6 +25608,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2869, items: [{"ja": "ZIPの画像・音源登録をまとめ、元に戻した後に残る音声キャッシュを整理しました。", "ko": "ZIP의 그림·음원 등록을 묶고, 실행 취소 뒤 남는 음원 캐시를 정리했습니다.", "en": "Batch ZIP image and audio registration and release retired audio caches after undo.", "zh": "批量登记ZIP图像与音频，并清理撤销后失效的音频缓存。"}]},
       { ver: 2868, items: [{"ja":"ZIP書き込みをまとめ、大きな音源の圧縮結果を再利用して繰り返し保存の無駄を減らしました。","ko":"ZIP 쓰기를 묶고 큰 음원의 압축 결과를 재사용해 반복 저장의 낭비를 줄였습니다.","en":"Batch ZIP writes and reuse large audio compression results to reduce repeated save work.","zh":"合并ZIP写入并复用大型音频压缩结果，减少重复保存的开销。"}] },
       { ver: 2867, items: [{"ja": "ZIP保存で保持中の音声・動画データも再利用し、同じ素材の読み直しを減らしました。", "ko": "ZIP 저장에서 보유 중인 음원·영상 데이터도 재사용해 같은 소재를 다시 읽는 낭비를 줄였습니다.", "en": "ZIP saving also reuses retained audio and video bytes, avoiding repeated source reads.", "zh": "ZIP保存也复用已保留的音视频数据，减少重复读取素材。"}] },
       { ver: 2866, items: [{"ja": "コンテZIPの画像登録をまとめ、画像が多いプロジェクトの読み込み待ちを減らしました。", "ko": "콘티 ZIP의 그림 등록을 묶어 그림이 많은 프로젝트의 불러오기 대기를 줄였습니다.", "en": "Batched image registration reduces loading waits for large conte ZIP projects.", "zh": "批量登记分镜ZIP图像，减少大型项目加载等待。"}] },
@@ -30581,10 +30595,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           try { releaseWorkspaceMediaUrl('audio', state.workspaceObjectUrls.audio[id]); } catch (error) {}
         });
         state.workspaceObjectUrls.audio = {};
-        pcmAudioSources.forEach(function(entry) {
-          if (entry.source) { entry.source.retired = true; entry.source.windows.clear(); }
-        });
-        pcmAudioSources.clear();
+        retirePcmAudioSources();
         state.audioBufferCache = {};
         state.audioBufferPendingCache = {};
         state.audioBufferCacheOrder = [];
@@ -56147,6 +56158,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }).catch(function(error) { if (pcmAudioSources.get(key) === entry) pcmAudioSources.delete(key); throw error; });
       return entry.promise;
     }
+    // Project replacement invalidates pending consumers too; do not reassign their source owner.
+    function retirePcmAudioSources(project) {
+      for (const [key, entry] of pcmAudioSources) {
+        if (project && entry.project !== project) continue;
+        if (entry.source) { entry.source.retired = true; entry.source.windows.clear(); }
+        pcmAudioSources.delete(key);
+      }
+    }
     function pcmAudioReadyWindow(key, time, ctx) {
       const entry = pcmAudioSources.get(key), source = entry && entry.source;
       return source && ctx && source.windows.get(ctx.sampleRate + ':' + (source.fullDecode ? 'full' : Math.floor(Math.max(0, time) / PCM_AUDIO_WINDOW_SEC)));
@@ -59637,6 +59656,69 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } finally { storageLeaseChange(storedAssetSaveLeases, held, -1); }
     }
 
+    // Import-scoped writes: bounded transactions, normal per-record failure results, no new disk format.
+    function createWorkspaceDbWriteBatch(owner) {
+      let pending = [], bytes = 0, scheduled = false, tail = Promise.resolve();
+      const flush = function() {
+        if (!pending.length) return tail;
+        const records = pending; pending = []; bytes = 0;
+        tail = tail.then(async function() {
+          let committed = false;
+          try {
+            assertProjectIoOwner(owner);
+            if (records.length > 1 && indexedDbAvailable()) {
+              for (let attempt = 0; ; attempt++) {
+                let tx = null;
+                try {
+                  const db = await openWorkspaceDb(); assertProjectIoOwner(owner);
+                  await workspaceDbOp(db, 'import asset batch ' + records.length, function(resolve, reject) {
+                    tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+                    tx.oncomplete = function() { resolve(); };
+                    tx.onabort = function() { reject(tx.error || new Error('Asset batch aborted')); };
+                    const store = tx.objectStore(WORKSPACE_STORE_NAME);
+                    records.forEach(function(record) { store.put(record.value, record.key); });
+                  });
+                  committed = true; break;
+                } catch (error) {
+                  if (tx) { try { tx.abort(); } catch (_) {} }
+                  assertProjectIoOwner(owner);
+                  if (attempt === 0 && workspaceDbRetryOnce(error)) continue;
+                  console.warn('[zip-import] asset batch failed; retrying individual assets', error);
+                  break;
+                }
+              }
+            }
+            for (const record of records) {
+              try {
+                assertProjectIoOwner(owner);
+                const ok = committed || await putWorkspaceDbValue(record.key, record.value);
+                assertProjectIoOwner(owner);
+                record.resolve(ok === true);
+              } catch (error) { record.reject(error); }
+            }
+          } catch (error) { records.forEach(function(record) { record.reject(error); }); }
+          finally { storageLeaseChange(storedAssetSaveLeases, records.map(function(record) { return record.key; }), -1); }
+        });
+        return tail;
+      };
+      const write = function(key, value) {
+        assertProjectIoOwner(owner);
+        const blob = value instanceof Blob ? value : value && value.blob;
+        const size = blob ? blob.size : typeof value === 'string' ? value.length * 2 : 0;
+        if (pending.length && bytes + size > 8 * 1024 * 1024) flush();
+        storageLeaseChange(storedAssetSaveLeases, [key], 1);
+        const done = new Promise(function(resolve, reject) { pending.push({ key: key, value: value, resolve: resolve, reject: reject }); });
+        bytes += size;
+        if (pending.length >= 32 || bytes >= 8 * 1024 * 1024) flush();
+        if (!scheduled) {
+          scheduled = true;
+          Promise.resolve().then(function() { scheduled = false; flush(); });
+        }
+        return done;
+      };
+      return { write: write, flush: flush };
+    }
+
     // ver2444: 자동/수동 정리의 공통 진입부. 요청 목록은 후보일 뿐이며 최신 root로 다시 판정한다.
     // 두 정리가 겹쳐 같은 행의 삭제 수를 두 번 세지 않도록 이 실행기만 직렬화한다.
     function deleteWorkspaceDbValues(keys, onProgress, canContinue) {
@@ -59749,7 +59831,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // iPad / no-folder: store the audio blob as a separate IndexedDB record and keep only a REF on the clip
     // (audioDataUrl=''), so the base64 never rides in state.project → editing stays light. The file/export
-    // pulls it back to inline (self-contained). Each successful write publishes a fresh audioStorage.key.
+    // uses binary ZIP assets or standalone JSON inline data. Each successful write publishes a fresh audioStorage.key.
     // 공용 음원 쓰기: 양 엔진과 ZIP import가 완료 결과/진행 원본을 함께 소유한다.
     const audioPersistJobs = new Map();
     const audioSaveLeaseKeys = new Map();
@@ -59758,13 +59840,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         || (value instanceof Blob && value.size > 0);
       return !!(value && value.blob instanceof Blob && value.blob.size > 0);
     }
-    function persistAudioRecord(key, value) {
+    function persistAudioRecord(key, value, write) {
       if (!audioRecordValid(key, value)) return Promise.resolve(false);
       const existing = audioPersistJobs.get(key);
       if (existing) return existing.done;
       storageRootsChanged();
       const job = { value: value, done: null };
-      job.done = Promise.resolve().then(function() { return putWorkspaceDbValue(key, value); }).then(function(ok) {
+      job.done = Promise.resolve().then(function() { return (write || putWorkspaceDbValue)(key, value); }).then(function(ok) {
         if (ok !== true) console.error('[audio] write refused: ' + key);
         return ok === true;
       }, function(error) { console.error('[audio] write failed: ' + key, error); return false; });
@@ -63114,11 +63196,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         await write(new Blob(size ? [header, nameBytes, payload] : [header, nameBytes]));
         entries.push({ nameBytes: nameBytes, crc: crc, size: size, offset: offset });
         offset += 30 + nameBytes.length + size;
+        return { offset: offset - size, size: size, crc: crc };
       };
       return {
         addFile: async function(name, bytes) { return addEntry(name, bytes.length, zipCrc32(bytes), bytes); },
         addBlob: async function(name, blob, check) {
-          const cacheable = !(typeof File !== 'undefined' && blob instanceof File);
+          const cacheable = !(typeof File !== 'undefined' && blob instanceof File) && !savedAudioZipSlices.has(blob);
           let crc = cacheable ? zipBlobCrc.get(blob) : undefined;
           if (crc === undefined) {
             crc = 0;
@@ -63214,11 +63297,50 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // Verified results are bounded per project, keyed by immutable source bytes, never filenames.
     const audioStorageOptimizations = new WeakMap();
+    // Successful ZIPs hold oversized results on disk. Weak source keys retain only locations, not result bytes.
+    const audioStorageSavedZips = new WeakMap();
+    const savedAudioZipSlices = new WeakSet();
+    async function readSavedAudioOptimization(blob, owner) {
+      const memo = audioStorageSavedZips.get(owner.project), saved = memo && memo.get(blob);
+      if (!saved) return null;
+      try {
+        const file = await saved.handle.getFile(); assertProjectIoOwner(owner);
+        if (!projectFileVersionMatches(file, saved.version) || !Number.isSafeInteger(saved.offset) || !Number.isSafeInteger(saved.size)
+            || saved.offset < 0 || saved.size <= 0 || saved.offset + saved.size > file.size) throw new Error('Saved audio ZIP changed');
+        const result = file.slice(saved.offset, saved.offset + saved.size, 'audio/flac');
+        let crc = 0;
+        for (let start = 0; start < result.size; start += 1048576) {
+          assertProjectIoOwner(owner);
+          crc = zipCrc32(new Uint8Array(await result.slice(start, start + 1048576).arrayBuffer()), crc);
+        }
+        assertProjectIoOwner(owner);
+        if (crc !== saved.crc || !projectFileVersionMatches(await saved.handle.getFile(), saved.version)) throw new Error('Saved audio ZIP bytes changed');
+        assertProjectIoOwner(owner);
+        // File-backed slices must never enter the immutable CRC/result caches across saves.
+        savedAudioZipSlices.add(result);
+        return result;
+      } catch (error) {
+        assertProjectIoOwner(owner);
+        memo.delete(blob);
+        console.warn('[audio] Saved ZIP result unavailable; encoding original source', error);
+        return null;
+      }
+    }
+    function rememberSavedAudioOptimizations(project, handle, file, items) {
+      if (!items.length) return;
+      let memo = audioStorageSavedZips.get(project);
+      if (!memo) { memo = new WeakMap(); audioStorageSavedZips.set(project, memo); }
+      const version = projectFileVersionOf(file);
+      for (const item of items) memo.set(item.source, { handle: handle, version: version, offset: item.range.offset, size: item.range.size, crc: item.range.crc });
+    }
     async function optimizeAudioForStorage(blob, owner, explicit) {
       assertProjectIoOwner(owner);
       let cache = audioStorageOptimizations.get(owner.project);
       let key = cache && cache.sources.get(blob);
       if (key && cache.entries.has(key)) return cache.entries.get(key);
+      const saved = await readSavedAudioOptimization(blob, owner);
+      assertProjectIoOwner(owner);
+      if (saved) return saved;
       const result = await encodeAudioForStorage(blob, owner, explicit);
       assertProjectIoOwner(owner);
       if (result !== blob && result.size <= 64 * 1024 * 1024) {
@@ -63524,6 +63646,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           result = {changed: false};
           if (encoded !== item.blob) {
             result = {changed: true, fileName: uniqueName(st.fileName.replace(/\.[^.]+$/, '') + '.flac'), mime: 'audio/flac'};
+            if (encoded.size > 64 * 1024 * 1024) item.audioOriginal = item.blob;
             item.blob = encoded; item.path = st.dir + '/' + result.fileName;
           }
           done.set(path, result);
@@ -63758,7 +63881,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (handle) await assertProjectFileVersion(handle, expectedVersion, owner);
         return await runWorkspaceWrite(owner, async function() {
           try {
-            const chunks = [];
+            const chunks = [], savedAudio = [];
             let zipBytes = 0;
             if (handle) {
               await assertProjectFileVersion(handle, expectedVersion, owner);
@@ -63784,7 +63907,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 const blob = item.recordingRef
                   ? await drawingRecordingReadAsset(item.recordingRef, bundle.recordingSource, owner.handle, item.recordingFrame)
                   : item.blob || await blobFromMediaUrl(item.url);
-                await zip.addBlob(item.path, blob, function() { assertProjectIoOwner(owner); });
+                const range = await zip.addBlob(item.path, blob, function() { assertProjectIoOwner(owner); });
+                if (item.audioOriginal) savedAudio.push({ source: item.audioOriginal, range: range });
               }
             }
             currentFile = zipName; phase = 'finish'; await zip.finish();
@@ -63798,6 +63922,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               phase = 'verify-save'; const savedFile = await handle.getFile();
               assertProjectIoOwner(owner);
               if (savedFile.size !== zipBytes) throw new Error(t('project.source.changed'));
+              rememberSavedAudioOptimizations(owner.project, handle, savedFile, savedAudio);
               savedSource = { kind: 'zip', fileName: handle.name || zipName, fileHandle: handle,
                 fileVersion: { size: savedFile.size, lastModified: savedFile.lastModified } };
             }
@@ -64847,6 +64972,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (state.project.kind === 'genga' && gengaZipAssets.length) {
           // Shared placements reuse a successful import. Different files for the same ref keep their input order.
           const importedDrawings = new Map(), importedAudio = new Map();
+          const batch = createWorkspaceDbWriteBatch(owner);
+          let pendingAssets = [];
+          const flushAssets = async function() {
+            const jobs = pendingAssets; pendingAssets = [];
+            await Promise.all(jobs); assertProjectIoOwner(owner);
+          };
           for (let ai = 0; ai < gengaZipAssets.length; ai += 1) {
             const item = gengaZipAssets[ai];
             const isDraw = item.isDraw;
@@ -64857,32 +64988,50 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             try {
               const mime = item.storage.mime || bundleMimeFromFileName(fileName) || (isDraw ? 'image/png' : 'audio/mpeg');
               const imported = isDraw ? importedDrawings : importedAudio, previous = imported.get(item.ref);
-              if (previous && previous.entry === entry && previous.mime === mime) continue;
+              if (previous && isDraw && !previous.settled && previous.entry === entry && previous.mime === mime) {
+                previous.repeats++; continue; // Share the pending write, retaining each later placement's retry.
+              }
+              if (previous) {
+                await flushAssets(); // Different bytes for one ref keep input order; failed imports may retry.
+                if (imported.get(item.ref) === previous && previous.entry === entry && previous.mime === mime) continue;
+              }
               showLoadingOverlay(t(isDraw ? 'msg.loading.extractingZipImages' : 'msg.loading.extractingZipAudio', ai + 1, gengaZipAssets.length), null, request);
               const blob = entry.blob.slice(0, entry.blob.size, mime);
               // Keep encoded bytes; only visible/warmed images are decoded, without a base64 copy.
               const url = blob;
               let storedRef = item.ref;
-              if (isDraw) { gengaDrawStorePut(item.ref, url); }
+              if (isDraw) { gengaPersistedRefs.delete(item.ref); gengaDrawStorePut(item.ref, url); }
               else {
-                storedRef = gengaPutAudioData(url);
+                storedRef = gengaPutAudioData(url, preferIndexedDb ? batch.write : undefined);
                 (state.project.gengaTimeline.audioClips || []).forEach(function(c) { if (c.ref === item.ref) c.ref = storedRef; });
               }
               // ver2197: gengaMarkPersisted 로 감싼다 — 안 감싸면 디스크에 있는데도 축출 후보가 못 되어
               // ver2192 의 예산 회수가 임포트 그림에는 영영 안 듣는다.
+              const importedItem = { entry: entry, mime: mime, repeats: 0, settled: !preferIndexedDb };
+              imported.set(item.ref, importedItem);
               if (preferIndexedDb) {
-                const ok = isDraw ? await gengaMarkPersisted(item.ref, putWorkspaceDbValue('gd:' + item.ref, blob), owner)
-                  : await persistAudioRecord('ga:' + storedRef, blob);
-                assertProjectIoOwner(owner);
-                if (ok !== true) throw new Error('Asset write refused');
+                const done = isDraw ? gengaMarkPersisted(item.ref, gengaPersistJobRegister(item.ref, batch.write('gd:' + item.ref, blob)), owner)
+                  : persistAudioRecord('ga:' + storedRef, blob, batch.write);
+                pendingAssets.push(done.then(async function(ok) {
+                  while (projectIoOwnerCurrent(owner) && ok !== true) {
+                    console.error('[zip-import] genga asset store failed:', fileName);
+                    missing.push({ kind: isDraw ? 'genga-drawing' : 'genga-audio', ref: item.ref, name: fileName });
+                    if (!isDraw || importedItem.repeats <= 0) break;
+                    importedItem.repeats--;
+                    ok = await gengaMarkPersisted(item.ref, gengaPersistJobRegister(item.ref, batch.write('gd:' + item.ref, blob)), owner);
+                  }
+                  importedItem.settled = true;
+                  if (ok !== true && imported.get(item.ref) === importedItem) imported.delete(item.ref);
+                }));
+                if (pendingAssets.length >= 32) await flushAssets();
               }
-              imported.set(item.ref, { entry: entry, mime: mime });
             } catch (error) {
               if (!projectIoOwnerCurrent(owner)) throw error;
               console.error('[zip-import] genga asset store failed:', fileName, error);
               missing.push({ kind: isDraw ? 'genga-drawing' : 'genga-audio', ref: item.ref, name: fileName });
             }
           }
+          await flushAssets();
         }
         const clips = state.project.audio && Array.isArray(state.project.audio.clips) ? state.project.audio.clips : [];
         // Clips share source files heavily (real data: one 20MB BGM recording referenced by 295 of 476
@@ -64894,16 +65043,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // audioStorage.key, so sharing needs no read-side changes. clip.audioFileName is kept so a future
         // ZIP re-export still dedupes by name instead of re-duplicating per clip.
         const sharedAudioByBase = {};
-        for (let index = 0; index < clips.length; index += 1) {
-          const clip = clips[index];
-          if (clip.audioDataUrl) continue;
-          const fileName = clip.audioFileName || (clip.audioStorage && clip.audioStorage.fileName) || '';
-          if (!fileName) continue;
-          const base = String(fileName).toLowerCase();
-          const entry = byBase[base];
-          if (!entry) { missing.push({ kind: 'audio', name: fileName }); continue; }
-          assertProjectIoOwner(owner);
-          showLoadingOverlay(t('msg.loading.extractingZipAudio', index + 1, clips.length), null, request);
+        const audioBatch = createWorkspaceDbWriteBatch(owner);
+        let pendingAudio = [];
+        const importAudio = async function(clip, fileName, base, entry) {
           try {
             const mime = clip.audioMime || bundleMimeFromFileName(fileName) || 'audio/mpeg';
             if (preferIndexedDb) {
@@ -64912,10 +65054,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 const blob = entry.blob.slice(0, entry.blob.size, mime);
                 const key = indexedDbAudioStorageKey(newPrefixedId('audio')); // 한 import 안 공유, 다른 판본의 바이트는 불변
                 const savedAt = new Date().toISOString();
-                if (!await persistAudioRecord(key, { blob: blob, mime: mime, size: blob.size, fileName: fileName, savedAt: savedAt })) throw new Error('Audio write refused');
-                assertProjectIoOwner(owner);
-                shared = sharedAudioByBase[base] = { key: key, blob: blob, mime: mime, size: blob.size, savedAt: savedAt };
+                const done = persistAudioRecord(key, { blob: blob, mime: mime, size: blob.size, fileName: fileName, savedAt: savedAt }, audioBatch.write);
+                shared = sharedAudioByBase[base] = { key: key, blob: blob, mime: mime, size: blob.size, savedAt: savedAt, done: done };
               }
+              if (!await shared.done) {
+                if (sharedAudioByBase[base] === shared) delete sharedAudioByBase[base];
+                throw new Error('Audio write refused');
+              }
+              assertProjectIoOwner(owner);
               clip.audioMime = shared.mime;
               clip.audioDataUrl = '';
               clip.audioStorage = { kind: 'indexeddb', key: shared.key, fileName: fileName, mime: shared.mime, size: shared.size, savedAt: shared.savedAt };
@@ -64931,7 +65077,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             await saveAudioBlobInline(clip, entry.blob.slice(0, entry.blob.size, clip.audioMime || 'audio/mpeg'), clip.audioMime, owner);
             missing.push({ kind: 'audio', name: fileName });
           }
+        };
+        for (let index = 0; index < clips.length; index += 1) {
+          const clip = clips[index];
+          if (clip.audioDataUrl) continue;
+          const fileName = clip.audioFileName || (clip.audioStorage && clip.audioStorage.fileName) || '';
+          if (!fileName) continue;
+          const base = String(fileName).toLowerCase(), entry = byBase[base];
+          if (!entry) { missing.push({ kind: 'audio', name: fileName }); continue; }
+          assertProjectIoOwner(owner);
+          showLoadingOverlay(t('msg.loading.extractingZipAudio', index + 1, clips.length), null, request);
+          pendingAudio.push(importAudio(clip, fileName, base, entry));
+          if (pendingAudio.length >= 32) { await Promise.all(pendingAudio); pendingAudio = []; }
         }
+        await Promise.all(pendingAudio); assertProjectIoOwner(owner);
         // ver2577 (q1=A): V1 footage entries (assets/video) — an IndexedDB record when IndexedDB is there, else
         // inline (externalizeVideoMediaToWorkspace moves it into a folder on save); one record per file, shared by
         // split pieces the way audio shares a BGM file
@@ -103022,7 +103181,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       };
       gengaForEachProjectDrawingAsset(gt, function(d, put) { put(inl(d)); });
     }
-    // ---- genga audio (mirrors the drawing store): clip holds {ref,...}; bytes (dataURL) live in gengaAudioStore +
+    // ---- Genga audio: clip holds {ref,...}; original Blob or legacy dataURL lives in gengaAudioStore +
     // WORKSPACE_DB 'ga:<ref>'; decoded AudioBuffers cached in gengaAudioBuf for WebAudio playback. ----
     let gengaAudioStore = new Map();   // immutable ref → original Blob or legacy dataURL
     let gengaAudioBuf = new Map();     // ref → AudioBuffer (decoded, lazy)
@@ -103035,11 +103194,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const value = ref && gengaAudioStore.get(ref);
       return value instanceof Blob ? gengaBlobUrl('audio:' + ref, value) : value || null;
     }
-    function gengaPutAudioData(dataUrl) {
+    function gengaPutAudioData(dataUrl, write) {
       const ref = newPrefixedId('ga'); // 別タブで同時に取り込んだ音源も別の不変キーになる。
       const value = gengaDataUrlToBlob(dataUrl) || String(dataUrl || '');
       gengaAudioStore.set(ref, value);
-      persistAudioRecord('ga:' + ref, value); // 실패 원본은 RAM에 남고 저장 배리어가 재시도한다.
+      persistAudioRecord('ga:' + ref, value, write); // 실패 원본은 RAM에 남고 저장 배리어가 재시도한다.
       return ref;
     }
     function gengaIngestAudioClip(c, imported) {
