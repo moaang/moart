@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2854</title>
+  <title>MoArt ver2853</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -63182,35 +63182,55 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // Project JSON with media as REFS (small → no string-length limit) + the media blobs to write alongside
-    // (audio, video and layer bitmaps). Existing importConteFolderZip resolves the separate media entries.
+    // (audio + layer bitmaps; video not bundled). Names match what importConteFolderZip re-inlines by basename.
     async function conteBundleCollectAudio(copy, audioUrls, media, uniqueName, owner) {
-      // Ordinary project saves preserve source bytes. Lossy size reduction belongs to explicit compression.
-      // Names are presentation metadata: distinct sources with the same filename must remain distinct.
-      const audioMap = new Map();
+      // Audio: big WAV sources (BGM, >0.8MB) get re-encoded to AAC/Opus (~10x smaller); small ones (voice) are
+      // copied as-is. De-duped by source so a shared BGM is encoded once. Trim/speed/peaks stay valid (same content).
+      const AUDIO_COMPRESS_MIN = 800 * 1024;
+      const audioMap = {};
       const audioClips = (copy.audio && Array.isArray(copy.audio.clips)) ? copy.audio.clips : [];
       for (let i = 0; i < audioClips.length; i += 1) {
         const c = audioClips[i];
         assertProjectIoOwner(owner);
-        const url = c.audioDataUrl || audioUrls[c.id] || '';
-        if (!url) {
-          if (c.audioFileName || audioClipHasIndexedDbStorage(c)) throw new Error('Audio source unavailable: ' + (c.audioFileName || c.id));
-          continue;
-        }
-        let entry = audioMap.get(url);
-        if (!entry) {
+        const key = c.audioFileName || ('id:' + c.id);
+        if (!audioMap[key]) {
+          const url = audioUrls[c.id] || c.audioDataUrl || '';
+          if (!url) {
+            if (c.audioFileName || audioClipHasIndexedDbStorage(c)) throw new Error('Audio source unavailable: ' + (c.audioFileName || c.id));
+            continue;
+          }
           let blob;
           try { blob = await blobFromMediaUrl(url); }
           catch (error) { throw projectFileOperationError(error, 'read-media', c.audioFileName || c.id); }
           assertProjectIoOwner(owner);
-          if (!blob.size) throw new Error('Audio source unavailable: ' + (c.audioFileName || c.id));
-          const mime = blob.type || c.audioMime;
-          const name = uniqueName(c.audioFileName || (c.id + audioExtFromMime(mime)));
-          media.push({ path: 'assets/audio/' + name, blob: blob });
-          entry = { name: name, mime: mime };
-          audioMap.set(url, entry);
+          let entry = null;
+          // WAV is always uncompressed PCM, so even a SMALL wav (a single short voice line) still shrinks
+          // ~8-10x from re-encoding -- worth the encode time regardless of size, unlike an already-compressed
+          // format (mp3/m4a/etc) under the size threshold, which has little left to gain.
+          const isWav = /\.wav$/i.test(String(c.audioFileName || ''));
+          // Already compressed (by compressWorkspaceMedia ahead of time, or a prior export) -- ship as-is,
+          // skip the decode/encode round-trip entirely so a pre-compressed project exports fast.
+          const alreadyCompressed = /\.(m4a|aac|opus|mp3|ogg|webm)$/i.test(String(c.audioFileName || ''));
+          if (!alreadyCompressed && (blob.size > AUDIO_COMPRESS_MIN || isWav) && typeof AudioEncoder !== 'undefined') {
+            try {
+              showLoadingOverlay(t('msg.loading.compressingAudio'), null, owner);
+              const full = await audioExportDecodeCtx().decodeAudioData(await blob.arrayBuffer());
+              const enc = await encodeAudioBufferToFileBlob(full, 160000);
+              const nm = uniqueName(String(c.audioFileName || c.id).replace(/\.[^.]+$/, '') + enc.ext);
+              media.push({ path: 'assets/audio/' + nm, blob: enc.blob });
+              entry = { name: nm, mime: enc.mime };
+            } catch (e) { console.warn('[zip-export] Audio compression failed; preserving source', c.id, e); entry = null; }
+          }
+          if (!entry) {
+            const nm = uniqueName(c.audioFileName || (c.id + audioExtFromMime(c.audioMime)));
+            media.push({ path: 'assets/audio/' + nm, blob: blob });
+            entry = { name: nm, mime: c.audioMime };
+          }
+          audioMap[key] = entry;
         }
-        c.audioFileName = entry.name; if (entry.mime) c.audioMime = entry.mime; c.audioDataUrl = '';
-        c.audioStorage = { kind: 'workspace', dir: 'assets/audio', fileName: entry.name };
+        const am = audioMap[key];
+        c.audioFileName = am.name; if (am.mime) c.audioMime = am.mime; c.audioDataUrl = '';
+        c.audioStorage = { kind: 'workspace', dir: 'assets/audio', fileName: am.name };
       }
     }
 
@@ -63244,28 +63264,70 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     async function conteBundleCollectDrawings(copy, media, uniqueName, owner) {
-      if (!copy.layerDrawings || typeof copy.layerDrawings !== 'object') return;
-      const usedRefs = referencedConteLayerDrawingRefs(copy);
-      for (const ref of Object.keys(copy.layerDrawings)) {
-        if (/^drawing-conte-layer-/i.test(ref) && !usedRefs.has(ref)) { delete copy.layerDrawings[ref]; continue; }
-        const d = normalizeLayerDrawingData(copy.layerDrawings[ref]);
-        d.strokes = [];
-        const url = String(d.bitmapDataUrl || '');
-        assertProjectIoOwner(owner);
-        if (!url && (layerDrawingHasIndexedDbStorage(d) || d.bitmapStorage && d.bitmapStorage.fileName)) throw new Error('Drawing source unavailable: ' + (d.bitmapStorage.fileName || ref));
-        if (url) {
-          const blob = await blobFromMediaUrl(url);
+      if (copy.layerDrawings && typeof copy.layerDrawings === 'object') {
+        const usedRefs = referencedConteLayerDrawingRefs(copy);
+        const refs = Object.keys(copy.layerDrawings);
+        for (let i = 0; i < refs.length; i += 1) {
+          const ref = refs[i];
+          if (/^drawing-conte-layer-/i.test(ref) && !usedRefs.has(ref)) { delete copy.layerDrawings[ref]; continue; } // used assets only: drop orphan layer drawings
+          const d = normalizeLayerDrawingData(copy.layerDrawings[ref]);
+          d.strokes = [];
+          const live = copy.layerDrawings[ref];
+          const url = live ? String(live.bitmapDataUrl || '') : '';
           assertProjectIoOwner(owner);
-          if (!blob.size) throw new Error('Drawing source unavailable: ' + ref);
-          // The source may have been edited since its old filename was assigned. Match the current bytes.
-          const mime = blob.type || d.bitmapStorage && d.bitmapStorage.mime || 'image/png';
-          const baseName = d.bitmapStorage && d.bitmapStorage.fileName || ref;
-          const name = uniqueName(baseName.replace(/\.[^.]+$/, '') + '.' + extensionForMime(mime));
-          media.push({ path: 'assets/layers/' + name, blob: blob });
-          d.bitmapStorage = { dir: 'assets/layers', fileName: name, mime: mime };
-          d.bitmapDataUrl = '';
+          if (!url && (layerDrawingHasIndexedDbStorage(d) || d.bitmapStorage && d.bitmapStorage.fileName)) throw new Error('Drawing source unavailable: ' + (d.bitmapStorage.fileName || ref));
+          if (url && (d.fillSource || d.fillModel)) {
+            const name = uniqueName(ref + '.png');
+            const blob = await fetch(url).then(function(response) { if (!response.ok) throw new Error('Fill source export failed'); return response.blob(); });
+            // The ZIP writer reads bounded CRC slices and passes this immutable Blob on; no full-size array copy.
+            media.push({ path: 'assets/layers/' + name, blob: blob });
+            d.bitmapStorage = { dir: 'assets/layers', fileName: name, mime: blob.type || 'image/png' };
+            d.bitmapDataUrl = '';
+            continue;
+          }
+          if (url) {
+            const baseName = (d.bitmapStorage && d.bitmapStorage.fileName) || ref;
+            // Already compressed (by compressWorkspaceMedia ahead of time, or a prior export) -- ship the
+            // bytes as-is, skip the decode/canvas/re-encode round-trip so a pre-compressed project exports fast.
+            const alreadyWebp = Boolean(d.bitmapStorage && (/image\/webp/i.test(String(d.bitmapStorage.mime || '')) || /\.webp$/i.test(String(d.bitmapStorage.fileName || ''))));
+            if (alreadyWebp) {
+              const name = uniqueName(baseName.match(/\.[^.]+$/) ? baseName : baseName + '.webp');
+              d.bitmapStorage = { dir: 'assets/layers', fileName: name, mime: 'image/webp' };
+              d.bitmapDataUrl = '';
+              media.push({ path: 'assets/layers/' + name, url: url });
+            } else {
+            // Re-encode to WebP (same 0.82 quality preparePictureBlobForStorage already uses for normal
+            // image imports) rather than shipping whatever format/size the source bitmap happens to be in.
+            // Measured ~90% smaller on real storyboard panel PNGs with no visible quality loss (line art:
+            // large flat white regions + thin strokes compress extremely well under lossy WebP). Audio
+            // already gets equivalent size-based re-encoding above; images previously had none at all.
+            let encoded = null, ext = 'webp', mime = 'image/webp', canvas = null;
+            try {
+              const img = await loadImage(url);
+              canvas = document.createElement('canvas');
+              canvas.width = Math.max(1, img.naturalWidth || img.width || 1);
+              canvas.height = Math.max(1, img.naturalHeight || img.height || 1);
+              const cctx = canvas.getContext('2d');
+              cctx.drawImage(img, 0, 0);
+              encoded = await canvasToBlob(canvas, 'image/webp', 0.82);
+            } catch (error) { console.warn('[zip-export] Drawing compression failed; preserving source', ref, error); encoded = null; }
+            finally { if (canvas) paintReleaseCanvas(canvas); }
+            if (encoded) {
+              const name = uniqueName(baseName.replace(/\.[^.]+$/, '') + '.' + ext);
+              d.bitmapStorage = { dir: 'assets/layers', fileName: name, mime: mime };
+              d.bitmapDataUrl = '';
+              media.push({ path: 'assets/layers/' + name, blob: encoded });
+            } else {
+              // WebP re-encode failed (e.g. canvas tainted) -- fall back to shipping the source as-is.
+              const name = uniqueName(baseName.match(/\.[^.]+$/) ? baseName : baseName + '.png');
+              d.bitmapStorage = { dir: 'assets/layers', fileName: name };
+              d.bitmapDataUrl = '';
+              media.push({ path: 'assets/layers/' + name, url: url });
+            }
+            }
+          }
+          copy.layerDrawings[ref] = d;
         }
-        copy.layerDrawings[ref] = d;
       }
     }
 
