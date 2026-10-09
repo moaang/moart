@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2867</title>
+  <title>MoArt ver2868</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25595,6 +25595,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2868, items: [{"ja":"ZIP書き込みをまとめ、大きな音源の圧縮結果を再利用して繰り返し保存の無駄を減らしました。","ko":"ZIP 쓰기를 묶고 큰 음원의 압축 결과를 재사용해 반복 저장의 낭비를 줄였습니다.","en":"Batch ZIP writes and reuse large audio compression results to reduce repeated save work.","zh":"合并ZIP写入并复用大型音频压缩结果，减少重复保存的开销。"}] },
       { ver: 2867, items: [{"ja": "ZIP保存で保持中の音声・動画データも再利用し、同じ素材の読み直しを減らしました。", "ko": "ZIP 저장에서 보유 중인 음원·영상 데이터도 재사용해 같은 소재를 다시 읽는 낭비를 줄였습니다.", "en": "ZIP saving also reuses retained audio and video bytes, avoiding repeated source reads.", "zh": "ZIP保存也复用已保留的音视频数据，减少重复读取素材。"}] },
       { ver: 2866, items: [{"ja": "コンテZIPの画像登録をまとめ、画像が多いプロジェクトの読み込み待ちを減らしました。", "ko": "콘티 ZIP의 그림 등록을 묶어 그림이 많은 프로젝트의 불러오기 대기를 줄였습니다.", "en": "Batched image registration reduces loading waits for large conte ZIP projects.", "zh": "批量登记分镜ZIP图像，减少大型项目加载等待。"}] },
       { ver: 2865, items: [{"ja": "コンテZIP保存で保持中の画像データを再利用し、繰り返し保存の待ち時間を減らしました。", "ko": "콘티 ZIP 저장에서 보유 중인 그림 데이터를 재사용해 반복 저장의 대기 시간을 줄였습니다.", "en": "Conte ZIP saving reuses retained image bytes to reduce repeated save preparation.", "zh": "分镜ZIP保存复用已保留的图像数据，减少重复保存的准备时间。"}] },
@@ -60794,7 +60795,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const addUrl = function(kind, key, blob) {
         if (!blob) return '';
         const url = URL.createObjectURL(blob);
-        if (prepared.urls[kind][key]) URL.revokeObjectURL(prepared.urls[kind][key]);
+        if (prepared.urls[kind][key]) {
+          prepared.layerBlobs.delete(prepared.urls[kind][key]);
+          releaseWorkspaceMediaUrl(kind, prepared.urls[kind][key], prepared.urls);
+        }
+        if (kind === 'layers') prepared.layerBlobs.set(url, blob);
+        registerWorkspaceMediaBlob(kind, prepared.urls[kind], url, blob);
         prepared.urls[kind][key] = url;
         return url;
       };
@@ -60826,9 +60832,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       assertProjectIoOwner(owner);
     }
     function releasePreparedProjectRestore(prepared) {
-      for (const store of Object.values(prepared.urls)) Object.values(store).forEach(function(url) { URL.revokeObjectURL(url); });
+      for (const kind of Object.keys(prepared.urls)) Object.values(prepared.urls[kind]).forEach(function(url) { releaseWorkspaceMediaUrl(kind, url, prepared.urls); });
       prepared.drawings.forEach(function(value) { if (gengaIsTileSet(value)) gengaReleaseTileDecodes(value); });
       prepared.drawings.clear();
+      prepared.layerBlobs.clear();
       prepared.tiles.forEach(gengaReleaseTileDecodes);
       prepared.audio.clear();
     }
@@ -60838,7 +60845,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const request = options.request || beginProjectFileLoad();
       let owner = request.owner;
       const versionRestore = options.versionSeq != null;
-      const prepared = { urls: { audio: {}, layers: {}, pictures: {} }, drawings: new Map(), thumbs: new Map(),
+      const prepared = { urls: { audio: {}, layers: {}, pictures: {} }, layerBlobs: new Map(), drawings: new Map(), thumbs: new Map(),
         persisted: new Set(), deltas: new Set(), missing: new Set(), retry: new Set(), audio: new Map(), tiles: new Set() };
       let adopted = false;
       showLoadingOverlay(t('msg.loading.loadingProject'), null, request);
@@ -60880,7 +60887,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (gengaAssets && gengaAssets.handle === state.workspaceHandle) gengaWorkspaceAssets.set(state.project, gengaAssets);
         state.workspaceName = options.connection && options.connection.handle ? options.connection.handle.name || '' : '';
         state.workspaceObjectUrls = prepared.urls;
-        Object.values(prepared.urls.layers).forEach(registerLayerBlobUrl);
+        Object.values(prepared.urls.layers).forEach(function(url) { registerLayerBlobUrl(url, prepared.layerBlobs.get(url)); });
+        prepared.layerBlobs.clear();
         prepared.drawings.forEach(function(value, ref) {
           gengaDrawStorePut(ref, value);
           if (prepared.deltas.has(ref)) gengaScheduleTileEncode(ref, value);
@@ -62313,8 +62321,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // Original immutable media bytes live exactly as long as their workspace URL, not an extra cache tier.
     const workspaceMediaBlobSources = new WeakMap();
-    function releaseWorkspaceMediaUrl(kind, url) {
-      const sources = workspaceMediaBlobSources.get(state.workspaceObjectUrls[kind]);
+    function registerWorkspaceMediaBlob(kind, store, url, blob) {
+      if ((kind === 'audio' || kind === 'pictures') && blob instanceof Blob && !(typeof File !== 'undefined' && blob instanceof File)) {
+        let sources = workspaceMediaBlobSources.get(store);
+        if (!sources) { sources = new Map(); workspaceMediaBlobSources.set(store, sources); }
+        sources.set(url, blob);
+      }
+    }
+    function releaseWorkspaceMediaUrl(kind, url, stores) {
+      const sources = workspaceMediaBlobSources.get((stores || state.workspaceObjectUrls)[kind]);
       if (sources) sources.delete(url);
       URL.revokeObjectURL(url);
     }
@@ -62349,11 +62364,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           state.layerBlobWorkspaceSources.set(url, { handle: source.handle, dir: String(source.dir || ''), fileName: String(source.fileName) });
         }
       }
-      if ((kind === 'audio' || kind === 'pictures') && blob instanceof Blob && !(typeof File !== 'undefined' && blob instanceof File)) {
-        let sources = workspaceMediaBlobSources.get(store);
-        if (!sources) { sources = new Map(); workspaceMediaBlobSources.set(store, sources); }
-        sources.set(url, blob);
-      }
+      registerWorkspaceMediaBlob(kind, store, url, blob);
       if (store) store[key] = url;
       return url;
     }
@@ -63099,9 +63110,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const nameBytes = enc.encode(name);
         if (!(size >= 0) || size > 0xFFFFFFFF || nameBytes.length > 0xFFFF || entries.length >= 0xFFFF
           || offset + 30 + nameBytes.length + size > 0xFFFFFFFF) throw tooLarge();
-        await write(zipConcatBytes([u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0), u32(crc), u32(size), u32(size), u16(nameBytes.length), u16(0)]));
-        await write(nameBytes);
-        if (size) await write(payload);
+        const header = zipConcatBytes([u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0), u32(crc), u32(size), u32(size), u16(nameBytes.length), u16(0)]);
+        await write(new Blob(size ? [header, nameBytes, payload] : [header, nameBytes]));
         entries.push({ nameBytes: nameBytes, crc: crc, size: size, offset: offset });
         offset += 30 + nameBytes.length + size;
       };
@@ -63126,17 +63136,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return addEntry(name, blob.size, crc, blob);
         },
         finish: async function() {
-          const cdStart = offset; let cdSize = 0;
+          const cdStart = offset; let cdSize = 0, buffered = 0; const directory = [];
           let cdBytes = 0;
           for (let i = 0; i < entries.length; i += 1) cdBytes += 46 + entries[i].nameBytes.length;
           if (cdStart + cdBytes + 22 > 0xFFFFFFFF) throw tooLarge();
           for (let i = 0; i < entries.length; i += 1) {
             const e = entries[i];
             const ch = zipConcatBytes([u32(0x02014b50), u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0), u32(e.crc), u32(e.size), u32(e.size), u16(e.nameBytes.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(e.offset)]);
-            await write(ch); await write(e.nameBytes);
+            directory.push(ch, e.nameBytes);
             cdSize += ch.length + e.nameBytes.length;
+            buffered += ch.length + e.nameBytes.length;
+            if (buffered >= 1048576) { await write(new Blob(directory)); directory.length = 0; buffered = 0; }
           }
-          await write(zipConcatBytes([u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length), u32(cdSize), u32(cdStart), u16(0)]));
+          directory.push(zipConcatBytes([u32(0x06054b50), u16(0), u16(0), u16(entries.length), u16(entries.length), u32(cdSize), u32(cdStart), u16(0)]));
+          await write(new Blob(directory));
         }
       };
     }
@@ -63204,16 +63217,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function optimizeAudioForStorage(blob, owner, explicit) {
       assertProjectIoOwner(owner);
       let cache = audioStorageOptimizations.get(owner.project);
-      if (cache && cache.entries.has(blob)) return cache.entries.get(blob);
+      let key = cache && cache.sources.get(blob);
+      if (key && cache.entries.has(key)) return cache.entries.get(key);
       const result = await encodeAudioForStorage(blob, owner, explicit);
       assertProjectIoOwner(owner);
-      if (result !== blob && blob.size + result.size <= 64 * 1024 * 1024) {
-        if (!cache) { cache = { entries: new Map(), bytes: 0 }; audioStorageOptimizations.set(owner.project, cache); }
-        while (cache.bytes + blob.size + result.size > 64 * 1024 * 1024 && cache.entries.size) {
-          const key = cache.entries.keys().next().value;
-          cache.bytes -= key.size + cache.entries.get(key).size; cache.entries.delete(key);
+      if (result !== blob && result.size <= 64 * 1024 * 1024) {
+        // A source may already be large; retain only its verified result, not another strong source reference.
+        cache = audioStorageOptimizations.get(owner.project);
+        if (!cache) { cache = { sources: new WeakMap(), entries: new Map(), bytes: 0 }; audioStorageOptimizations.set(owner.project, cache); }
+        key = cache.sources.get(blob);
+        if (key && cache.entries.has(key)) return cache.entries.get(key);
+        while (cache.bytes + result.size > 64 * 1024 * 1024 && cache.entries.size) {
+          const oldest = cache.entries.keys().next().value;
+          cache.bytes -= cache.entries.get(oldest).size; cache.entries.delete(oldest);
         }
-        if (!cache.entries.has(blob)) { cache.entries.set(blob, result); cache.bytes += blob.size + result.size; }
+        key = {}; cache.sources.set(blob, key);
+        cache.entries.set(key, result); cache.bytes += result.size;
       }
       return result;
     }
