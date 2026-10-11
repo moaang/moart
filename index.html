@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2880</title>
+  <title>MoArt ver2882</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -59712,6 +59712,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
+    // Bounded, presence-only batch. Callers must not treat failure as absence.
+    async function workspaceDbExistingKeys(keys) {
+      if (!keys.length) return new Set();
+      if (keys.length > 256) throw new RangeError('Asset presence batch exceeds 256 keys');
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const db = await openWorkspaceDb();
+          return await workspaceDbOp(db, 'presence batch', function(resolve, reject) {
+            const found = new Set();
+            const tx = db.transaction(WORKSPACE_STORE_NAME, 'readonly');
+            const store = tx.objectStore(WORKSPACE_STORE_NAME);
+            tx.oncomplete = function() { resolve(found); };
+            tx.onabort = function() { reject(tx.error || new Error('Asset presence batch aborted')); };
+            tx.onerror = function() { reject(tx.error || new Error('Asset presence batch failed')); };
+            for (const key of keys) {
+              const req = store.getKey(key);
+              req.onsuccess = function() { if (req.result !== undefined) found.add(key); };
+              req.onerror = function() { reject(req.error || new Error('Asset presence check failed')); };
+            }
+          });
+        } catch (error) {
+          if (attempt === 0 && workspaceDbRetryOnce(error)) continue;
+          throw error;
+        }
+      }
+    }
+
     async function putWorkspaceDbValue(key, value, options) {
       if (!indexedDbAvailable()) return false;
       const held = String(key).indexOf('bt:') === 0 ? [key] : [];
@@ -64682,7 +64709,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gt = project && project.gengaTimeline;
       if (!gt || !gengaCollectExternalAssets(gt).length) return null;
       // Read all required files before publishing; ordinary drawings keep their encoded Blob bytes.
-      await gengaRemapCollidingZipRefs(gt);
+      await gengaRemapCollidingZipRefs(gt, owner);
       assertProjectIoOwner(owner);
       const prepared = { handle: handle, drawings: new Map(), audio: new Map(), audioById: new Map(), audioBlobs: new Map(), blobs: new Map() };
       const files = new Map(), sources = new Map(), conflicts = new Set();
@@ -65222,13 +65249,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // live store entry) gets a fresh ref before import — the import used to overwrite that row. One new ref
     // per old ref, applied to every asset (exposures, shared pool values, fill bases/sources) and to a fill
     // model's resultRef, so the result does not turn stale.
-    async function gengaRemapCollidingZipRefs(gt) {
+    async function gengaRemapCollidingZipRefs(gt, owner) {
       const refs = new Set(), remap = new Map();
       gengaForEachProjectDrawingAsset(gt, function(d) { if (d && d.ref && d.storage) refs.add(String(d.ref)); });
-      for (const ref of refs) {
-        let taken = gengaDrawStore.has(ref);
-        if (!taken && indexedDbAvailable()) taken = (await workspaceDbHasValue('gd:' + ref)) || (await workspaceDbHasValue('gdd:' + ref));
-        if (taken) remap.set(ref, gengaNewDrawRef());
+      const list = Array.from(refs);
+      for (let offset = 0; offset < list.length; offset += 128) {
+        if (owner) assertProjectIoOwner(owner);
+        const chunk = list.slice(offset, offset + 128), ramTaken = new Set(), keys = [];
+        for (const ref of chunk) {
+          if (gengaDrawStore.has(ref)) ramTaken.add(ref);
+          else { keys.push('gd:' + ref); keys.push('gdd:' + ref); }
+        }
+        const found = keys.length && indexedDbAvailable() ? await workspaceDbExistingKeys(keys) : new Set();
+        if (owner) assertProjectIoOwner(owner);
+        for (const ref of chunk) {
+          if (ramTaken.has(ref) || gengaDrawStore.has(ref) || found.has('gd:' + ref) || found.has('gdd:' + ref)) {
+            remap.set(ref, gengaNewDrawRef());
+          }
+        }
       }
       if (!remap.size) return remap;
       gengaForEachProjectDrawing(gt, function(drawing, put) {
@@ -65271,7 +65309,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // gd:/ga: 행이 같은 ref 로 남아 있어 hydrate 가 메꿔 주므로 오래 안 드러났다).
         const gengaZipAssets = [];
         if (project && project.kind === 'genga' && project.gengaTimeline) {
-          await gengaRemapCollidingZipRefs(project.gengaTimeline);
+          await gengaRemapCollidingZipRefs(project.gengaTimeline, owner);
           assertProjectIoOwner(owner);
           gengaZipAssets.push.apply(gengaZipAssets, gengaCollectExternalAssets(project.gengaTimeline).map(function(item) {
             return { ref: item.ref, storage: item.storage, isDraw: item.isDraw };
@@ -99328,9 +99366,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // ver: a cut can span more than one printed timesheet page (conteCutGroupTimesheetPageCount) —
           // render+write one PNG per page, or the tail of any cut ≥144(or 72) frames silently vanished.
           const pageCount = conteCutGroupTimesheetPageCount(project, g.cut);
-          const sheetCanvases = [];
+          const sheetOutputs = [];
           for (let p = 0; p < pageCount; p += 1) {
-            sheetCanvases.push(await conteRasterizeSvgToCanvas(conteRenderTimesheetSvg(project, g.cut, p)));
+            const canvas = await conteRasterizeSvgToCanvas(conteRenderTimesheetSvg(project, g.cut, p));
+            try {
+              sheetOutputs.push(dirHandle ? await canvasToBlob(canvas, 'image/png') : canvas.toDataURL('image/png'));
+            } finally {
+              // This is a detached export-only canvas. No live/history owner uses it.
+              paintReleaseCanvas(canvas);
+            }
           }
           const json = buildConteShootSheetSettingsJson(project, g.cut);
           const komas = await conteRenderKomaImages(project, g.cut);
@@ -99339,9 +99383,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const camCanvas = await conteRenderCameraInstructionCanvas(project, g.cut);
           if (dirHandle) {
             const sub = await dirHandle.getDirectoryHandle(base, { create: true });
-            for (let p = 0; p < sheetCanvases.length; p += 1) {
+            for (let p = 0; p < sheetOutputs.length; p += 1) {
               const sheetName = p === 0 ? (base + '.png') : (base + '_' + (p + 1) + '.png');
-              await writeBlobToDirectory(sub, sheetName, await canvasToBlob(sheetCanvases[p], 'image/png'));
+              await writeBlobToDirectory(sub, sheetName, sheetOutputs[p]);
             }
             await writeBlobToDirectory(sub, base + '.json', JSON.stringify(json, null, 2));
             for (const koma of komas) await writeBlobToDirectory(sub, koma.label + '.png', await canvasToBlob(koma.canvas, 'image/png'));
@@ -99349,11 +99393,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
               const camDir = await sub.getDirectoryHandle('_camera', { create: true });
               await writeBlobToDirectory(camDir, base + '_CAM.png', await canvasToBlob(camCanvas, 'image/png'));
             }
-            results.push({ cutNo: g.cutNo, base: base, written: true, pageCount: sheetCanvases.length, komaCount: komas.length, hasCamera: !!camCanvas });
+            results.push({ cutNo: g.cutNo, base: base, written: true, pageCount: sheetOutputs.length, komaCount: komas.length, hasCamera: !!camCanvas });
           } else {
             results.push({
               cutNo: g.cutNo, base: base, json: json,
-              sheetPngDataUrls: sheetCanvases.map(function(c) { return c.toDataURL('image/png'); }),
+              sheetPngDataUrls: sheetOutputs,
               camPngDataUrl: camCanvas ? camCanvas.toDataURL('image/png') : null,
               komas: komas.map(function(k) { return { label: k.label, pngDataUrl: k.canvas.toDataURL('image/png') }; })
             });
@@ -104832,15 +104876,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, outW, outH);
       const cam = gengaCameraWorkAt(gt, frame);
       const comp = gengaCompositeFrame(frame);
-      if (options && options.strict && (!comp || comp._complete === false)) throw new Error(t('msg.export.requiredImageUnavailable'));
-      if (comp) {
-        ctx.save();
-        ctx.translate(outW / 2, outH / 2);
-        ctx.scale(outW / Math.max(1, cam.w), outH / Math.max(1, cam.h));
-        ctx.rotate(-(Number(cam.rotation) || 0));
-        ctx.translate(-(cam.x + cam.w / 2), -(cam.y + cam.h / 2));
-        ctx.drawImage(comp, 0, 0, gt.paper.w, gt.paper.h);
-        ctx.restore();
+      try {
+        if (options && options.strict && (!comp || comp._complete === false)) throw new Error(t('msg.export.requiredImageUnavailable'));
+        if (comp) {
+          ctx.save();
+          try {
+            ctx.translate(outW / 2, outH / 2);
+            ctx.scale(outW / Math.max(1, cam.w), outH / Math.max(1, cam.h));
+            ctx.rotate(-(Number(cam.rotation) || 0));
+            ctx.translate(-(cam.x + cam.w / 2), -(cam.y + cam.h / 2));
+            ctx.drawImage(comp, 0, 0, gt.paper.w, gt.paper.h);
+          } finally { ctx.restore(); }
+        }
+      } finally {
+        // The export call requests a fresh composite. Preserve exceptional preview ownership.
+        if (comp && comp !== gengaPreviewRender.composite
+            && (!gengaPreviewRender.clip || gengaPreviewRender.clip.cv !== comp)) paintReleaseCanvas(comp);
       }
       if (gengaLipsyncExport) {
         // ver2801: 분석 준비는 같은 프로젝트 상태(gt 객체)에 한 번 — 종전에는 출력 프레임마다 모든 클립의 키·대기를 다시 돌았다.
@@ -105066,10 +105117,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const samp = []; let idx = 0;
       for (let f = 0; f < frames.length; f++) {
         const d = frames[f];
-        for (let p = 0; p < d.length; p += 4) {
-          if ((idx++ % step) !== 0) continue;
+        const pixelCount = Math.ceil(d.length / 4);
+        const first = (step - (idx % step)) % step;
+        for (let pixel = first; pixel < pixelCount; pixel += step) {
+          const p = pixel * 4;
           if (d[p + 3] < 8) samp.push(255, 255, 255); else samp.push(d[p], d[p + 1], d[p + 2]);
         }
+        idx += pixelCount;
       }
       const n = samp.length / 3; if (n === 0) return [[255, 255, 255]];
       const order = new Uint32Array(n); for (let i = 0; i < n; i++) order[i] = i;
@@ -105725,10 +105779,29 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const cached = gengaImageCache.get(key);
         if (cached && cached.complete) { res(Boolean(cached.naturalWidth)); return; }
         const owner = state.project;
+        if (cached) {
+          // Reuse a pending decode without replacing the creator's handlers.
+          let settled = false;
+          const finish = function(ok) {
+            if (settled) return;
+            settled = true;
+            cached.removeEventListener('load', loaded);
+            cached.removeEventListener('error', failed);
+            if (!ok && state.project === owner && gengaImageCache.get(key) === cached) gengaImageCache.delete(key);
+            res(Boolean(ok && state.project === owner && cached.naturalWidth));
+          };
+          const loaded = function() { finish(true); };
+          const failed = function() { finish(false); };
+          cached.addEventListener('load', loaded, { once: true });
+          cached.addEventListener('error', failed, { once: true });
+          if (cached.complete) finish(Boolean(cached.naturalWidth));
+          return;
+        }
         const img = new Image();
         img.onload = function() { res(state.project === owner); };
         img.onerror = function() {
           if (state.project !== owner) { res(false); return; }
+          if (gengaImageCache.get(key) === img) gengaImageCache.delete(key);
           console.error('[gengaDecode] image decode failed - anything composited from it will be missing this layer');
           res(false);
         };
@@ -111671,8 +111744,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaLipsyncVowelTrack(mono, clip, fps) {
       const P = GENGA_LIPSYNC_MFCC, fb = gengaEnsureLipsyncMelBank(), start = Math.max(0, Math.floor((Number(clip.sourceOffsetSec) || 0) * P.rate));
       const end = Math.min(mono.length, Number(clip.durationSec) > 0 ? start + Math.floor(Number(clip.durationSec) * P.rate) : mono.length);
-      const x = new Float64Array(Math.max(0, end - start));
-      for (let i = 0; i < x.length; i++) x[i] = mono[start + i] - (i > 0 ? 0.97 * mono[start + i - 1] : 0);
+      const sampleCount = Math.max(0, end - start);
       const ham = new Float64Array(P.win); for (let i = 0; i < P.win; i++) ham[i] = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (P.win - 1));
       // Same coefficient expression and accumulation order; one table per analysis.
       const dct = Array.from({ length: P.ceps }, function(_, index) {
@@ -111681,9 +111753,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return row;
       });
       const re = new Float64Array(P.nfft), im = new Float64Array(P.nfft), logm = new Float64Array(P.mel), feats = [], ens = [];
-      for (let s = 0; s < x.length - P.win; s += P.hop) {
+      for (let s = 0; s < sampleCount - P.win; s += P.hop) {
         re.fill(0); im.fill(0); let e = 0;
-        for (let i = 0; i < P.win; i++) { const v = x[s + i] * ham[i]; re[i] = v; e += v * v; }
+        for (let i = 0; i < P.win; i++) { const at = s + i; const v = (mono[start + at] - (at > 0 ? 0.97 * mono[start + at - 1] : 0)) * ham[i]; re[i] = v; e += v * v; }
         gengaLipsyncFft(re, im);
         for (let j = 0; j < P.mel; j++) { let sum = 0; const row = fb[j]; for (let k = 0; k <= P.nfft / 2; k++) if (row[k]) sum += row[k] * (re[k] * re[k] + im[k] * im[k]); logm[j] = Math.log(sum + 1e-10); }
         const c = new Float64Array(P.ceps);
@@ -111694,7 +111766,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const voiced = ens.map(function(e) { return e > emax * 0.05; }), norm = new Float64Array(P.ceps); let nv = 0;
       feats.forEach(function(f, i) { if (voiced[i]) { nv++; for (let d = 0; d < P.ceps; d++) norm[d] += f[d]; } });
       if (nv) for (let d = 0; d < P.ceps; d++) norm[d] /= nv;
-      const frames = Math.max(1, Math.round((Number(clip.durationSec) || x.length / P.rate) * fps)), out = new Array(frames).fill(null);
+      const frames = Math.max(1, Math.round((Number(clip.durationSec) || sampleCount / P.rate) * fps)), out = new Array(frames).fill(null);
       const acc = []; for (let k = 0; k < frames; k++) acc.push({ n: 0, f: new Float64Array(P.ceps) });
       feats.forEach(function(f, i) {
         if (!voiced[i]) return;
