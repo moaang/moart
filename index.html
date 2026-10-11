@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2878</title>
+  <title>MoArt ver2880</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -40182,6 +40182,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // a bar count fixed per clip is what made long clips read as a few fat bars with gaps between them.
     // Drawn as one path of hairline vertical strokes; at 1 column per pixel they abut into a solid
     // envelope, which is exactly what every editor's waveform is.
+    // Preserve peak object identity without retaining peak bytes in CSS records.
+    const waveformPeakTokens = new WeakMap();
+    function waveformPeakToken(peaks) {
+      let token = waveformPeakTokens.get(peaks);
+      if (!token) { token = {}; waveformPeakTokens.set(peaks, token); }
+      return token;
+    }
     function waveformSvgUrl(peaks, fromBin, toBin, columns) {
       const total = peaks && peaks.length ? peaks.length : 0;
       if (!total) return '';
@@ -40224,10 +40231,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const toBin = clipBoxOffsetToSourceSeconds(clip, fps, Math.max(1, Number(clip.durationFrames) || 1) / fps).offsetSec * AUDIO_PEAK_BINS_PER_SECOND;
       const columns = audioClipDisplayColumns(clip);
       const key = [sourceKey, peaks.length, fromBin.toFixed(1), toBin.toFixed(1), columns].join(':');
+      const peakToken = waveformPeakToken(peaks);
       const cached = state.audioWaveformCssCache && state.audioWaveformCssCache[clip.id || key];
-      if (cached && cached.key === key && cached.peaks === peaks) return cached.css;
+      if (cached && cached.key === key && cached.peakToken === peakToken) return cached.css;
       const css = waveformSvgUrl(peaks, fromBin, toBin, columns);
-      if (clip.id) state.audioWaveformCssCache[clip.id] = { key: key, peaks: peaks, css: css };
+      if (clip.id) state.audioWaveformCssCache[clip.id] = { key: key, peakToken: peakToken, css: css };
       return css;
     }
 
@@ -40315,9 +40323,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const window = gengaAudioWindow(clip, { duration: peaks.length / AUDIO_PEAK_BINS_PER_SECOND }, fps, 0);
         const from = window.sourceStart * AUDIO_PEAK_BINS_PER_SECOND, to = (window.sourceStart + Math.max(0, Number(clip.durationSec) || 0)) * AUDIO_PEAK_BINS_PER_SECOND;
         const key = [clip.ref, peaks.length, columns, from, to].join(':');
+        const peakToken = waveformPeakToken(peaks);
         const hit = cache[id];
-        const css = (hit && hit.key === key && hit.peaks === peaks) ? hit.css : waveformSvgUrl(peaks, from, to, columns);
-        if (!hit || hit.key !== key || hit.peaks !== peaks) cache[id] = { key: key, peaks: peaks, css: css };
+        const css = (hit && hit.key === key && hit.peakToken === peakToken) ? hit.css : waveformSvgUrl(peaks, from, to, columns);
+        if (!hit || hit.key !== key || hit.peakToken !== peakToken) cache[id] = { key: key, peakToken: peakToken, css: css };
         if (css) node.style.setProperty('--waveform', css);
       });
     }
@@ -55935,15 +55944,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (state.audioBufferPendingCache[key]) return state.audioBufferPendingCache[key];
       const current = function() { return projectIoOwnerCurrent(owner) && state.audioBufferPendingCache === pending && pending[key] === job; };
-      const job = fetch(audioUrl).then(function(response) {
+      const job = fetch(audioUrl).then(async function(response) {
         if (!current()) throw new DOMException('Audio source changed', 'AbortError');
         if (!response.ok) throw new Error('Audio cache HTTP ' + response.status);
-        return response.arrayBuffer();
-      }).then(async function(buffer) {
-        // A replaced project's native decode still allocates PCM. Do not overlap its full allocation
-        // with a new project's request; same-owner source-key sharing remains in pending above.
+        // Wait before materializing compressed JS bytes: the outgoing native decoder cannot be cancelled.
+        // Its PCM allocation still needs the existing replacement barrier; queued input need not coexist.
         await Promise.all(Array.from(audioNativeDecodePending).filter(function(entry) { return entry.project !== owner.project; })
           .map(function(entry) { return entry.promise.then(function() {}, function() {}); }));
+        if (!current()) throw new DOMException('Audio source changed', 'AbortError');
+        return response.arrayBuffer();
+      }).then(async function(buffer) {
         if (!current()) throw new DOMException('Audio source changed', 'AbortError');
         const entry = { project: owner.project, promise: ctx.decodeAudioData(buffer) };
         audioNativeDecodePending.add(entry);
@@ -59163,6 +59173,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             // Prepared file bytes become runtime-owned only after replacement commits.
             for (const [ref, blob] of gengaAssets.blobs) gengaDrawStorePut(ref, blob);
             delete gengaAssets.blobs;
+            for (const [ref, blob] of gengaAssets.audioBlobs) {
+              gengaAudioStore.set(ref, blob);
+              persistAudioRecord('ga:' + ref, blob);
+            }
+            gengaAssets.audioBlobs.clear();
+            delete gengaAssets.audioBlobs;
             for (const clip of project.gengaTimeline.audioClips || []) {
               const entry = gengaAssets.audioById.get(clip.id);
               if (entry) gengaAssets.audio.set(clip.ref, entry);
@@ -63921,6 +63937,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     async function optimizeBundleAudio(copy, media, uniqueName, owner) {
       const byPath = new Map(media.map(function(item) { return [item.path, item]; })), done = new Map();
+      // Only this save's successful immutable results; output identities stay distinct.
+      const successfulSources = new WeakMap();
       const targets = [];
       for (const c of copy.audio && copy.audio.clips || []) if (c.audioStorage) targets.push({clip: c, storage: c.audioStorage, conte: true});
       for (const c of copy.gengaTimeline && copy.gengaTimeline.audioClips || []) if (c.storage) targets.push({clip: c, storage: c.storage, conte: false});
@@ -63929,8 +63947,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!item || !item.blob) continue; // Reused folder assets have no newly prepared media entry.
         let result = done.get(path);
         if (!result) {
-          const encoded = await optimizeAudioForStorage(item.blob, owner);
+          const original = item.blob;
+          const immutableSource = original instanceof Blob
+            && !(typeof File !== 'undefined' && original instanceof File)
+            && !savedAudioZipSlices.has(original);
+          let encoded = immutableSource ? successfulSources.get(original) : null;
+          if (!encoded) encoded = await optimizeAudioForStorage(original, owner);
           assertProjectIoOwner(owner);
+          if (immutableSource && encoded !== original && encoded instanceof Blob
+              && !(typeof File !== 'undefined' && encoded instanceof File)
+              && !savedAudioZipSlices.has(encoded)) successfulSources.set(original, encoded);
           result = {changed: false};
           if (encoded !== item.blob) {
             result = {changed: true, fileName: uniqueName(st.fileName.replace(/\.[^.]+$/, '') + '.flac'), mime: 'audio/flac'};
@@ -64658,7 +64684,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Read all required files before publishing; ordinary drawings keep their encoded Blob bytes.
       await gengaRemapCollidingZipRefs(gt);
       assertProjectIoOwner(owner);
-      const prepared = { handle: handle, drawings: new Map(), audio: new Map(), audioById: new Map(), blobs: new Map() };
+      const prepared = { handle: handle, drawings: new Map(), audio: new Map(), audioById: new Map(), audioBlobs: new Map(), blobs: new Map() };
       const files = new Map(), sources = new Map(), conflicts = new Set();
       const assets = gengaCollectExternalAssets(gt);
       for (const item of assets) {
@@ -64673,14 +64699,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const mime = st.mime || file.type || bundleMimeFromFileName(name) || (item.isDraw ? 'image/png' : 'audio/mpeg');
           // Snapshot file-backed rasters before publication: later external edits must not change Undo/source bytes.
           let blob = file.slice(0, file.size, mime);
-          if (item.isDraw) {
+          {
             const stream = file.stream().pipeThrough(new TransformStream({
               transform(chunk, controller) { assertProjectIoOwner(owner); controller.enqueue(chunk); }
             }));
             try { blob = await new Response(stream, { headers: { 'Content-Type': mime } }).blob(); }
             catch (error) { assertProjectIoOwner(owner); throw error; }
             assertProjectIoOwner(owner);
-            if (blob.size !== file.size) throw new Error('Drawing source snapshot changed: ' + name);
+            // Response serializes MIME parameters; retain the legacy audio data-URL spelling.
+            if (!item.isDraw) blob = blob.slice(0, blob.size, mime);
+            if (blob.size !== file.size) throw new Error('Drawing/audio source snapshot changed: ' + name);
           }
           assertProjectIoOwner(owner);
           value = { blob: blob, entry: { storage: { dir: dir, fileName: name, mime: mime }, size: file.size, lastModified: file.lastModified } };
@@ -64697,14 +64725,52 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (const item of assets) {
         // Conflicting refs retain the normalizer's existing per-placement split semantics.
         if (item.isDraw && item.ref && !conflicts.has(item.ref)) { delete item.asset.dataUrl; continue; }
-        if (item.isDraw) prepared.blobs.delete(item.ref);
+        if (!item.isDraw) continue; // Audio is compared as immutable bytes below, before normalization.
+        prepared.blobs.delete(item.ref);
         const value = sources.get(item);
         if (!value.url) value.url = await gengaBlobToDataUrl(value.blob);
         assertProjectIoOwner(owner);
         if (!value.url) throw new Error('Drawing/audio source unavailable: ' + value.entry.storage.fileName);
         item.asset.dataUrl = value.url;
       }
+      // Preserve gengaIngestAudioClip's last-source-per-ref sharing, including mixed legacy inline clips.
+      // Only a mixed inline collision needs a canonical data URL; ordinary folder audio never does.
+      const audioSources = new Map(assets.filter(function(item) { return !item.isDraw; })
+        .map(function(item) { return [item.asset, sources.get(item).blob]; }));
+      const imported = new Map();
+      for (const clip of gt.audioClips || []) {
+        const blob = audioSources.get(clip);
+        const url = !blob && typeof clip.dataUrl === 'string' ? clip.dataUrl : '';
+        if (!blob && !url) continue;
+        const previous = clip.ref && imported.get(clip.ref);
+        let shared = false;
+        if (previous) {
+          if (blob && previous.blob) shared = await gengaAudioBlobsEqual(blob, previous.blob, owner);
+          else {
+            const left = blob ? await gengaBlobToDataUrl(blob) : url;
+            const right = previous.blob ? await gengaBlobToDataUrl(previous.blob) : previous.url;
+            shared = left === right;
+          }
+        }
+        assertProjectIoOwner(owner);
+        const ref = shared ? previous.ref : newPrefixedId('ga');
+        if (!shared) prepared.audioBlobs.set(ref, blob || gengaDataUrlToBlob(url) || url);
+        if (clip.ref) imported.set(clip.ref, { ref: ref, blob: blob, url: url });
+        clip.ref = ref;
+        delete clip.dataUrl;
+      }
       return prepared;
+    }
+    // Canonical FileReader data URLs compare MIME plus bytes. Bound comparison scratch memory.
+    async function gengaAudioBlobsEqual(left, right, owner) {
+      if (left.type !== right.type || left.size !== right.size) return false;
+      if (left === right) return true;
+      for (let offset = 0; offset < left.size; offset += 262144) {
+        const a = await readZipBlobRange(left, offset, offset + 262144, owner);
+        const b = await readZipBlobRange(right, offset, offset + 262144, owner);
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      }
+      return true;
     }
     async function gengaPrepareWorkspaceSave(copy, owner, prepared, optimizeAudio) {
       const gt = copy.gengaTimeline;
@@ -111608,6 +111674,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const x = new Float64Array(Math.max(0, end - start));
       for (let i = 0; i < x.length; i++) x[i] = mono[start + i] - (i > 0 ? 0.97 * mono[start + i - 1] : 0);
       const ham = new Float64Array(P.win); for (let i = 0; i < P.win; i++) ham[i] = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (P.win - 1));
+      // Same coefficient expression and accumulation order; one table per analysis.
+      const dct = Array.from({ length: P.ceps }, function(_, index) {
+        const row = new Float64Array(P.mel), k = index + 1;
+        for (let n = 0; n < P.mel; n++) row[n] = Math.cos(Math.PI * k * (2 * n + 1) / (2 * P.mel));
+        return row;
+      });
       const re = new Float64Array(P.nfft), im = new Float64Array(P.nfft), logm = new Float64Array(P.mel), feats = [], ens = [];
       for (let s = 0; s < x.length - P.win; s += P.hop) {
         re.fill(0); im.fill(0); let e = 0;
@@ -111615,7 +111687,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaLipsyncFft(re, im);
         for (let j = 0; j < P.mel; j++) { let sum = 0; const row = fb[j]; for (let k = 0; k <= P.nfft / 2; k++) if (row[k]) sum += row[k] * (re[k] * re[k] + im[k] * im[k]); logm[j] = Math.log(sum + 1e-10); }
         const c = new Float64Array(P.ceps);
-        for (let k = 1; k <= P.ceps; k++) { let sum = 0; for (let n = 0; n < P.mel; n++) sum += logm[n] * Math.cos(Math.PI * k * (2 * n + 1) / (2 * P.mel)); c[k - 1] = sum * Math.sqrt(2 / P.mel); }
+        for (let k = 1; k <= P.ceps; k++) { let sum = 0; for (let n = 0; n < P.mel; n++) sum += logm[n] * dct[k - 1][n]; c[k - 1] = sum * Math.sqrt(2 / P.mel); }
         feats.push(c); ens.push(Math.sqrt(e / P.win));
       }
       let emax = 0; ens.forEach(function(e) { if (e > emax) emax = e; });
