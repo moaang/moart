@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2882</title>
+  <title>MoArt ver2883</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -63409,6 +63409,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // Verified results are bounded per project, keyed by immutable source bytes, never filenames.
     const audioStorageOptimizations = new WeakMap();
+    function audioStorageCacheFor(project) {
+      let cache = audioStorageOptimizations.get(project);
+      if (!cache) {
+        cache = { sources: new WeakMap(), entries: new Map(), bytes: 0, noGain: new WeakMap() };
+        audioStorageOptimizations.set(project, cache);
+      }
+      return cache;
+    }
     // Successful ZIPs hold oversized results on disk. Weak source keys retain only locations, not result bytes.
     const audioStorageSavedZips = new WeakMap();
     const savedAudioZipSlices = new WeakSet();
@@ -63672,12 +63680,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const temp = await readTempAudioCache(blob, owner);
       assertProjectIoOwner(owner);
       if (temp) return temp;
+      cache = audioStorageOptimizations.get(owner.project);
+      // Only completed no-gain attempts for this immutable source and the current pinned encoder.
+      if (!explicit && blob instanceof Blob && !(typeof File !== 'undefined' && blob instanceof File)
+          && !savedAudioZipSlices.has(blob) && audioFlacEncoderPromise && cache
+          && cache.noGain.get(blob) === audioFlacEncoderPromise) return blob;
       const result = await encodeAudioForStorage(blob, owner, explicit);
       assertProjectIoOwner(owner);
+      if (result !== blob) {
+        cache = audioStorageOptimizations.get(owner.project);
+        if (cache) cache.noGain.delete(blob);
+      }
       if (result !== blob && result.size <= 64 * 1024 * 1024) {
         // A source may already be large; retain only its verified result, not another strong source reference.
-        cache = audioStorageOptimizations.get(owner.project);
-        if (!cache) { cache = { sources: new WeakMap(), entries: new Map(), bytes: 0 }; audioStorageOptimizations.set(owner.project, cache); }
+        cache = audioStorageCacheFor(owner.project);
         key = cache.sources.get(blob);
         if (key && cache.entries.has(key)) return cache.entries.get(key);
         while (cache.bytes + result.size > 64 * 1024 * 1024 && cache.entries.size) {
@@ -63699,6 +63715,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!info || info.format.audioFormat !== 1 || ![16, 24].includes(info.format.bitsPerSample)
           || ![1, 2].includes(info.format.channels) || info.dataSize % info.format.blockAlign) return blob;
         const B = await loadAudioFlacEncoder(), f = info.format, frames = info.dataSize / f.blockAlign;
+        const encoderPolicy = audioFlacEncoderPromise;
         current();
         sink = createMediaExportBlobTarget();
         output = new B.Output({format: new B.FlacOutputFormat(), target: new B.StreamTarget(sink.stream)});
@@ -63719,7 +63736,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         await output.finalize();
         const encoded = sink.finish('audio/flac');
-        if (encoded.size > blob.size * 0.9) return blob;
+        current();
+        if (encoded.size > blob.size * 0.9) {
+          if (encoderPolicy && encoderPolicy === audioFlacEncoderPromise
+              && !(typeof File !== 'undefined' && blob instanceof File) && !savedAudioZipSlices.has(blob)) {
+            audioStorageCacheFor(owner.project).noGain.set(blob, encoderPolicy);
+          }
+          return blob;
+        }
         await verifyAudioFlac(encoded, blob, info, current);
         current(); return encoded;
       } catch (error) {
