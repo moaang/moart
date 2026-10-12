@@ -1,8 +1,8 @@
-// ver1053: offline shell for the Add-to-Home-Screen app. iOS Safari cannot open a local HTML file at all
-// (file:// is blocked; the Files-app Quick Look preview does not run JS), so a cached PWA is the only way this
-// runs offline on iPad. Stale-while-revalidate: the cached copy launches instantly — it is ~4MB, and a
-// network-first fetch would stall every cold start — while a fresh copy downloads in the background and is
-// served on the NEXT launch. One release behind for one launch is the deliberate trade.
+// ver1053: cached offline shell for the Add-to-Home-Screen app. The cached document lets the
+// installed app launch without waiting for a fresh network copy of the large shell.
+// Stale-while-revalidate downloads a fresh copy in the background for a later launch or reload.
+// Offline use and failed refreshes can leave the cached copy older than one release; no maximum
+// version lag is guaranteed.
 const CACHE = 'conte-shell-v1'; // FIXED on purpose: bumping it per release would force a full re-download every time.
 const SHELL = ['./', './index.html'];
 // CacheStorage is shared by every app under this origin, not scoped to this worker: only MoArt's own
@@ -19,12 +19,11 @@ function isOldMoArtCache(name) { return name !== CACHE && name.indexOf(CACHE_PRE
 const PURGE_TOKEN = '2026-08-15-waituntil';
 const PURGE_KEY = './__shell-purge-token';   // not a real path — nothing ever fetches it
 
-// ver1459: the stale-while-revalidate trade above says "one release behind for one launch". That was fine
-// when releases were rare, but during a run of frequent deploys every launch stays one behind and the app
-// looks like it never updated (reported as "you don't seem to be deploying"). So once the fresh shell is IN
-// THE CACHE, tell the open page — it shows a "new version / reload" bar, and reloading serves the copy we
-// just stored. The offline-instant launch is unchanged; only the not-knowing is fixed.
-// Version is judged from HEADERS, never the 5.7MB body: GitHub Pages sends a strong ETag.
+// ver1459 history: frequent deployments made the cached launch appear persistently out of date
+// (reported as "you don't seem to be deploying"). After a changed, stamped shell is stored,
+// notify open windows so the page can offer a "new version / reload" bar. A later reload can
+// use the stored copy without waiting for the background refresh.
+// Change detection compares ETag or Last-Modified headers, without reading the large body.
 function shellStamp(res) {
   if (!res || !res.headers) return '';
   return res.headers.get('etag') || res.headers.get('last-modified') || '';
