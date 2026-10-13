@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2891</title>
+  <title>MoArt ver2895</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -84751,7 +84751,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 연습에서 그은 몇 장에 즉시 회수의 실익이 없다. 예산 축출·고아 회수(엔진 내부)는 부른다.
         // ver2215: delete 는 총량 추적 헬퍼(gengaDrawStoreDrop)로 — 직접 delete 는 증분 총량을
         // 조용히 드리프트시킨다. 이 한 호출은 modules.json exempt 에 사유와 함께 등록돼 있다.
-        drop.forEach(function(k) { gengaDrawStoreDrop(k); gengaThumbCache.delete(k); gengaThumbImageCache.delete(k); });   // ver2197: 썸 캐시도 그 짝 — 연습 그림은 디스크에 없어 캐시만 거두면 끝이다 // ver2239: 헤드 썸 Image 도 같은 짝
+        drop.forEach(function(k) { gengaDrawStoreDrop(k); gengaThumbCache.delete(k); gengaThumbImageCache.delete(k); gengaThumbBakeFailed.delete(k); });   // ver2197: 썸 캐시도 그 짝 — 연습 그림은 디스크에 없어 캐시만 거두면 끝이다 // ver2239: 헤드 썸 Image 도 같은 짝
       }
       const s = tlTut.saved; tlTut = null;
       audioTempCacheNoteProjectClosed(state.project);
@@ -100493,6 +100493,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaDrawingFailures.delete(ref);
       const old = gengaDrawStore.get(ref);
       if (old === v) { gengaDrawStoreReweighValue(v); return; }
+      if (gengaThumbBakeFailed.delete(ref)) {
+        gengaThumbCache.delete(ref); gengaThumbImageCache.delete(ref);
+      }
       if (old !== undefined) gengaDrawStoreUntrackValue(old);
       gengaReleaseBlobUrl('drawing:' + ref);
       gengaDrawStore.set(ref, v);
@@ -101658,6 +101661,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     const GENGA_THUMB_PX = 200;
     const gengaThumbCache = new Map();        // ref → 200px PNG dataURL (회수: gengaPruneRuntimeStoresToProject)
     const gengaThumbBakePending = new Set();  // 통짜 base64 에서 굽는 중인 ref — 중복 디코드 방지
+    const gengaThumbBakeFailed = new Set();   // final failure: original fallback until reset, ref GC or new source
     let gengaThumbBakeEpoch = 0;              // 프로젝트 교체마다 오른다(gengaResetEngineTransients) — 늦은 워커 답을 거른다
     // 200px 축소 한 벌 — 칸 썸 · 벡터 썸 · 커밋 썸이 같은 산수를 쓴다(sx,sy 는 크롭 원점, 기본 0).
     function gengaThumbCanvasFrom(src, sw, sh, sx, sy, createCanvas) {
@@ -101671,6 +101675,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 캐시 + 디스크 한 벌. 디스크 실패해도 본체 저장과 무관하다 — 썸은 다음 로드의 fault-in 이 다시 굽는다.
     function gengaThumbPersist(ref, thumbUrl) {
       if (!ref || !thumbUrl) return;
+      gengaThumbBakeFailed.delete(ref);
+      if (gengaThumbCache.get(ref) !== thumbUrl) gengaThumbImageCache.delete(ref);
       gengaThumbCache.set(ref, thumbUrl);
       if (!gengaDrawingShouldPersist()) return;   // 도장(タイムライン練習)은 gd: 와 같은 가드로 디스크에 안 적는다
       const blob = gengaDataUrlToBlob(thumbUrl);
@@ -101682,14 +101688,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
       } catch (e) { console.warn('[gengaThumb] IndexedDB write threw for gt:' + ref, e); }
     }
-    // ver2202: 칸 커밋의 코마 썸 — 손에 든 통짜 캔버스에서 절단(동기, 0.2ms급)하고 PNG 인코드는
-    // toBlob 로 화면 밖. cv 의 (ts.x, ts.y, ts.w, ts.h) 절단은 gengaTileSetComposeCanvas(ts) 와
-    // 같은 픽셀이다(칸 조각이 방금 그 cv 에서 잘려 나왔다 — 픽셀 diff 0 실측). 대기 동안의
-    // gengaUpdateExpDom 은 이 Set 을 보고 스킵하고(옛 썸 유지 — 빈 칸이 아니다), 완료가 반드시
-    // 재호출한다. 그래서 통짜 bake 의 gengaThumbBakePending 과 Set 을 **가르지 않으면 안 된다** —
-    // 그쪽은 완료가 재호출하지 않는 계약이라, 한 Set 이면 통짜 미스의 패치가 영영 안 온다.
-    // 실패는 warn + 재호출 — 미스 경로(gengaTileThumbDataUrl)가 그 자리에서 동기로 받는다.
-    let gengaThumbCommitBakePending = new Set();
+    // Commit thumbnails retain the previous cell while encoding; cold raster consumers wait without a src.
+    const gengaThumbCommitBakePending = new Set();
+    function gengaThumbBakeSettled(ref, url) {
+      gengaThumbBakePending.delete(ref); gengaThumbCommitBakePending.delete(ref);
+      if (url) gengaThumbPersist(ref, url);
+      else gengaThumbBakeFailed.add(ref);
+      scheduleGengaLayerThumbsRedraw();
+    }
     // ver2207 (q2=B): 굽는 자리를 커밋의 동기 구간 **밖으로**, 그리고 연타 중에는 마지막 획의 것만.
     // ★ver2202 가 인코드를 toBlob 으로 옮겼는데도 **그 호출 자체가** 커밋 안에 남아 있었다 —
     //   Chrome 은 toBlob 시점에 캔버스를 동기로 스냅샷하므로, 그 한 줄이 방금 커밋 캔버스에 쌓인
@@ -101710,15 +101716,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const fr = new FileReader();
           fr.onload = function() { done(String(fr.result || '')); };
           fr.onerror = function() { done(''); };
-          fr.readAsDataURL(blob);
+          try { fr.readAsDataURL(blob); } catch (e) { done(''); }
         }, 'image/png');
       } catch (e) { done(''); }
     }
     function gengaThumbBakeFromCommitCanvas(ref, cv, ts, layerId, frame) {
-      if (!ref || gengaThumbCache.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
+      if (!ref || gengaThumbCache.has(ref) || gengaThumbBakePending.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
       let tcv = null;
       try { tcv = gengaThumbCanvasFrom(cv, ts.w, ts.h, ts.x, ts.y); }
-      catch (e) { console.warn('[gengaThumb] commit-canvas thumb crop failed - miss path rebuilds on render', e); return; }
+      catch (e) { gengaThumbBakeSettled(ref, ''); return; }
+      const epoch = gengaThumbBakeEpoch;
       const key = String(layerId) + ':' + frame;
       const prev = gengaThumbBakeQueue.get(key);
       if (prev) {                                  // 같은 자리에 또 그었다 — 앞선 획의 썸은 굽지 않는다
@@ -101735,10 +101742,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (strokeInProgress()) { entry.timer = setTimeout(fire, GENGA_BG_STROKE_DEFER_MS); return; }
         gengaThumbBakeQueue.delete(key);
         gengaThumbEncodeAsync(tcv, function(url) {
-          gengaThumbCommitBakePending.delete(ref);
           paintReleaseCanvas(tcv);
-          if (url) gengaThumbPersist(ref, url);
-          else console.warn('[gengaThumb] commit-canvas thumb encode failed for ' + ref + ' - miss path rebuilds on render');
+          if (epoch !== gengaThumbBakeEpoch) return;
+          gengaThumbBakeSettled(ref, url);
           gengaUpdateExpDom(layerId, frame);
         });
       };
@@ -101809,9 +101815,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (gengaThumbWorkerPool) { tvppWorkerPoolClose(gengaThumbWorkerPool); gengaThumbWorkerPool = undefined; }
       gengaThumbWorkerJobQueue.splice(0).forEach(function(job) { job.done(null); });
     }
-    // 통짜 base64 그림의 썸을 화면 밖에서 굽는다(그동안의 표시는 원본 그대로 — 현행과 같아 퇴행이 없다).
-    // ver2204 (q3=A): 인코드도 커널(toBlob)로 — onload 에 남던 동기 toDataURL 이 로드 직후 러시의
-    // 잼이었다. 완료 재패치는 종전대로 없다(<img> 는 원본 dataUrl 을 이미 물고 있어 옳은 그림이다).
+    // Patch current connected consumers in the header rAF; preserve their placement and active editors.
+    function gengaPatchBakedThumbs() {
+      document.querySelectorAll('#gengaStage .genga-exp-thumb-img[data-genga-thumb-ref], #gengaCelPickPop img[data-genga-thumb-ref]').forEach(function(img) {
+        const ref = img.dataset.gengaThumbRef;
+        if (!ref) return;
+        const expEl = img.closest('.genga-exp');
+        const layer = gengaLayerById(expEl ? expEl.dataset.gengaLayer : img.dataset.gengaLayer);
+        if (!layer) return;
+        const row = img.closest('.genga-celpick-item');
+        const dr = expEl
+          ? gengaExposureDrawing(layer, gengaFindExposure(state.project, layer.id, expEl.dataset.gengaExp))
+          : row && gengaResolveDrawing((layer.sharedDrawings || {})[gengaValueKey(row.dataset.value)]);
+        if (!dr || String(dr.ref) !== ref) return;
+        const url = gengaThumbUrlFor(dr);
+        if (url && img.getAttribute('src') !== url) img.src = url;
+      });
+    }
     // commitBakePending 가드: 통짜 폴백 커밋의 bake 대기 중 렌더가 이 예약을 겹치면 같은 썸을
     // 두 번 인코드하고 gt: 를 두 번 쓴다 — 커밋 쪽 완료가 어차피 persist 한다.
     // ver2870: 이 함수의 메인 캔버스 toBlob 이 CPU 프로파일 자기시간의 다수를 차지했다(근거는
@@ -101826,14 +101846,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 있었다(장부 없이 ref 만 보는 가드라 신원이 안 갈린다). 지금은 stale 이면 pending 을 **건드리지
     // 않는다** — 그 Set 은 reset 이 통째로 비우므로(아래), 새 작업의 표식을 지울 일이 없다.
     function gengaThumbBakeFromDataUrl(ref, dataUrl) {
-      if (!ref || !dataUrl || gengaThumbCache.has(ref) || gengaThumbBakePending.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
+      if (!ref || !dataUrl || gengaThumbCache.has(ref) || gengaThumbBakeFailed.has(ref) || gengaThumbBakePending.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
       gengaThumbBakePending.add(ref);
       const epoch = gengaThumbBakeEpoch;
       const stale = function() { return epoch !== gengaThumbBakeEpoch; };
-      const settle = function(url) {   // epoch 가 안 바뀌었을 때만 부른다 — pending 삭제의 유일한 자리
-        gengaThumbBakePending.delete(ref);
-        if (url) { gengaThumbPersist(ref, url); scheduleGengaLayerThumbsRedraw(); }   // ver2870: 헤드가 이제 이 썸을 먼저 본다
-        else console.warn('[gengaThumb] bake encode failed for ' + ref + ' - full-res dataUrl stays in use');
+      const settle = function(url) {
+        if (!stale()) gengaThumbBakeSettled(ref, url);
       };
       const bakeOnMain = function() {
         if (stale()) return;   // 비싼 메인 디코드를 버려진 project 몫으로 돌리지 않는다
@@ -101850,9 +101868,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             tcv = gengaThumbCanvasFrom(sourceCanvas, sourceCanvas.width, sourceCanvas.height);
           }
           catch (e) {
-            gengaThumbBakePending.delete(ref);
-            console.warn('[gengaThumb] bake shrink failed for ' + ref + ' - full-res dataUrl stays in use', e);
-            return;
+            settle(''); return;
           } finally { if (sourceCanvas) paintReleaseCanvas(sourceCanvas); }
           gengaThumbEncodeAsync(tcv, function(url) {
             paintReleaseCanvas(tcv);
@@ -101862,8 +101878,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         };
         img.onerror = function() {
           if (stale()) return;
-          gengaThumbBakePending.delete(ref);
-          console.warn('[gengaThumb] bake decode failed for ' + ref + ' - full-res dataUrl stays in use');
+          settle('');
         };
         img.src = dataUrl;
       };
@@ -101880,17 +101895,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             settle(String(fr.result || ''));
           };
           fr.onerror = function() { bakeOnMain(); };
-          fr.readAsDataURL(thumbBlob);
+          try { fr.readAsDataURL(thumbBlob); } catch (e) { bakeOnMain(); }
         });
       }).catch(function() { bakeOnMain(); });
     }
-    // 그림의 썸 URL 정본 — ① 영속 캐시 ② 원본 dataUrl(+백그라운드 굽기 예약) ③ 칸 굽기(+영속화).
+    // Thumbnail URL authority: cached small image, pending bake (no src), then original only on final failure.
     // 벡터 폴백은 호출부 소관 — 코마 썸만 벡터를 안다(셀 픽커는 현행대로 벡터 미리보기가 없다).
     function gengaThumbUrlFor(dr) {
       if (!dr) return '';
       const cached = dr.ref ? gengaThumbCache.get(dr.ref) : '';
-      if (cached) return cached;
-      if (dr.dataUrl) { gengaThumbBakeFromDataUrl(dr.ref, dr.dataUrl); return dr.dataUrl; }
+      if (cached && !gengaThumbBakeFailed.has(dr.ref)) {
+        gengaThumbImageFor(dr, scheduleGengaLayerThumbsRedraw);
+        return cached;
+      }
+      if (dr.dataUrl) {
+        if (!dr.ref || gengaThumbBakeFailed.has(dr.ref)) return dr.dataUrl;
+        gengaThumbBakeFromDataUrl(dr.ref, dr.dataUrl);
+        return '';
+      }
       const ts = gengaDrawingTiles(dr);
       if (ts) {
         const url = gengaTileThumbDataUrl(ts);
@@ -104013,6 +104035,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaDrawnBoundsCache.forEach(function(_v, key) { if (!drawRefs.has(key)) gengaDrawnBoundsCache.delete(key); });
       gengaThumbCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbCache.delete(ref); });   // ver2197: 썸 캐시도 같은 경계에서 회수 — 안 하면 ref 당 ~15KB 가 세션 내내 쌓인다
       gengaThumbImageCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbImageCache.delete(ref); });   // ver2239: 헤드 썸 Image 도 같은 경계에서
+      gengaThumbBakeFailed.forEach(function(ref) { if (!drawRefs.has(ref)) gengaThumbBakeFailed.delete(ref); });
       audioSaveLeaseKeys.forEach(function(_n, key) { if (key.indexOf('ga:') === 0) audioRefs.add(key.slice(3)); });
       audioPersistJobs.forEach(function(_job, key) { if (key.indexOf('ga:') === 0) audioRefs.add(key.slice(3)); });
       gengaAudioStore.forEach(function(_v, ref) { if (!audioRefs.has(ref)) { gengaAudioStore.delete(ref); gengaReleaseBlobUrl('audio:' + ref); } });
@@ -123100,47 +123123,44 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       return best;
     }
-    // ★ver2239: 레이어 헤드 썸의 **그릴 소스** 판정. 78808 주석이 「레이어 헤드(canvas drawImage)와
-    // 코마 <img> 가 같은 것을 본다」고 선언하는데, 헤드에는 **영속 썸(`gt:<ref>`) 갈래가 없었다** —
-    // 그래서 본체가 축출된(ver2192) 그림에서 코마 칸은 썸을 그리는데 **헤드만 빈칸**이었다
-    // (ver2197 이 코마 쪽만 고쳤다). 판정을 이름 붙여 뽑고 그 갈래를 더한다.
-    // ver1324: 인코드 대기 중인 그림은 자기 canvas 에서 그린다(같은 placement 법).
-    // ver2195: 칸 그림은 200px 썸 캐시로 — 매 렌더 잉크 상자 합성은 상주를 되살린다.
-    // ver2870: 영속 썸(`gengaThumbImageFor`)을 통짜(`dr.dataUrl`) 보다 **먼저** 시도한다. 헤드는
-    // 어차피 이 작은 캔버스로 전부 스케일(아래 drawImage 의 4-arg 호출)돼 destination rect 가
-    // 소스 해상도와 무관하다 — 200px 로 그려도 결과가 같다. 통짜 bake(`gengaThumbBakeFromDataUrl`)가
-    // 워커로 끝낸 썸이 이미 있는데도 헤드가 매번 풀해상도를 `gengaImageCache` 에 디코드·상주시키던
-    // 낭비를 줄인다. 썸이 아직 안 구워졌으면(최초 접근) 여전히 통짜로 떨어진다 — 빈 헤드로
-    // 퇴행하지 않는다. 축출된 그림(`dr.dataUrl` 없음)의 마지막 답도 그대로다(이제 순서만 앞당김).
-    // 실제 프리뷰 합성(102887의 `gengaImageFor` 직접 호출)이 같은 그림을 필요로 하면 그쪽이 어차피
-    // 풀해상도를 깐다 — 이 순서는 헤드만의 추가 디코드를 줄일 뿐, 그 그림의 디코드 자체를 없애지 않는다.
+    // Canvas/tile pixels win. A cached thumbnail may be decoding: wait without decoding the original.
+    // A cold header shares the same bake as cells/picker; only final failure or a ref-less source uses the original.
     function gengaLayerThumbSource(dr, onReady) {
       if (!dr) return null;
-      return dr.canvas
-          || (dr.tileSet ? gengaTileThumbCanvas(dr.tileSet) : null)
-          || gengaThumbImageFor(dr, onReady)
-          || (dr.dataUrl ? gengaImageFor(dr, onReady) : null);
+      const pixels = dr.canvas || (dr.tileSet ? gengaTileThumbCanvas(dr.tileSet) : null);
+      if (pixels) return pixels;
+      const thumb = gengaThumbImageFor(dr, onReady);
+      if (thumb && !thumb.complete) return null;
+      if (thumb && thumb.naturalWidth) return thumb;
+      gengaThumbUrlFor(dr);
+      return dr.dataUrl && (!dr.ref || gengaThumbBakeFailed.has(dr.ref)) ? gengaImageFor(dr, onReady) : null;
     }
-    // 영속 썸(문자열)의 Image. 헤드는 canvas 에 drawImage 하므로 `<img src>` 인 코마 칸과 달리
-    // 디코드된 객체가 필요하다. **여기서 굽지 않는다** — 없으면 null 을 내고 물러선다(굽기는 본체를
-    // 다시 읽어야 해서 축출의 목적을 깬다). 코마 칸이 fault-in 하면 다음 렌더에 여기도 답이 생긴다.
-    const gengaThumbImageCache = new Map();   // ref → Image (회수: gengaPruneRuntimeStoresToProject)
+    // Share one small Image per ref, including pending decodes. Final failure is tracked separately.
+    // Only the current epoch/cache entry may notify consumers or enable the original fallback.
+    const gengaThumbImageCache = new Map();   // ref -> Image; pruned by gengaPruneRuntimeStoresToProject
     function gengaThumbImageFor(dr, onReady) {
       const ref = dr && dr.ref;
-      if (!ref) return null;
+      if (!ref || gengaThumbBakeFailed.has(ref)) return null;
       let img = gengaThumbImageCache.get(ref);
       if (!img) {
         const url = gengaThumbCache.get(ref);
         if (!url) return null;
         img = new Image();
-        if (onReady) img.addEventListener('load', function() { onReady(); }, { once: true });
+        const epoch = gengaThumbBakeEpoch;
+        const ready = function() {
+          if (epoch === gengaThumbBakeEpoch && gengaThumbImageCache.get(ref) === img && onReady) onReady();
+        };
+        img.addEventListener('load', ready, { once: true });
         img.addEventListener('error', function() {
-          console.warn('[gengaThumb] layer-head thumb decode failed for ' + ref + ' - head stays blank');
+          if (epoch !== gengaThumbBakeEpoch || gengaThumbImageCache.get(ref) !== img) return;
+          gengaThumbBakeFailed.add(ref);
+          scheduleGengaLayerThumbsRedraw();
+          ready();
         }, { once: true });
-        img.src = url;
         gengaThumbImageCache.set(ref, img);
+        img.src = url;
       }
-      return (img.complete && img.naturalWidth) ? img : null;
+      return img;
     }
     // sheet-tool style layer-header thumbnail: each layer's drawing at the current (or nearest) frame.
     let gengaLayerThumbsRedrawRaf = 0;
@@ -123149,6 +123169,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (gengaLayerThumbsRedrawRaf) return;
       gengaLayerThumbsRedrawRaf = requestAnimationFrame(function() {
         gengaLayerThumbsRedrawRaf = 0;
+        gengaPatchBakedThumbs();
         drawGengaLayerThumbs();
       });
     }
@@ -125829,7 +125850,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // ver2193: 칸 그림은 dataUrl 이 없다 — 합성본을 작게 구운 것을 쓴다(벡터와 같은 자리, 같은 이유).
       // ver2197: 영속 썸 우선(gengaThumbUrlFor) — 통짜도 200px 로 그리고, 본체가 축출된 그림도 이 칸이 그려진다.
       const thumbUrl = gengaThumbUrlFor(dr) || (thumbStrokes ? gengaVectorThumbDataUrl(thumbStrokes, pw, ph) : '');
-      if (!thumbUrl) return '';
+      if (!thumbUrl && !(dr.ref && dr.dataUrl)) return '';
       // ver1470: 같은 커널 — 여기서는 % 로 옮긴다.
       const place = gengaDrawingPlacement(dr, pw, ph);
       // Scale = min(card width / paper width, thumbnail height / paper height). Image-relative
@@ -125838,7 +125859,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const tx = (place.x - pw / 2) / place.w * 100, ty = (place.y - ph / 2) / place.h * 100;
       const clip = [Math.max(0, -place.y) / place.h, Math.max(0, place.x + place.w - pw) / place.w,
         Math.max(0, place.y + place.h - ph) / place.h, Math.max(0, -place.x) / place.w];
-      return '<img class="genga-exp-thumb-img" src="' + thumbUrl + '" style="width:' + width + ';aspect-ratio:' + place.w + '/' + place.h +
+      return '<img class="genga-exp-thumb-img" data-genga-thumb-ref="' + escapeAttr(dr.ref || '') + '"' + (thumbUrl ? ' src="' + escapeAttr(thumbUrl) + '"' : '') + ' style="width:' + width + ';aspect-ratio:' + place.w + '/' + place.h +
         ';transform:translate(' + tx + '%,' + ty + '%)' + (clip.some(function(v) { return v > 0; }) ? ';clip-path:inset(' + clip.map(function(v) { return (v * 100) + '%'; }).join(' ') + ')' : '') + '" alt="">';
     }
     // paper-sized working canvas seeded with the current exposure art (sync, from cache).
@@ -126121,6 +126142,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaThumbBakeEpoch += 1;   // ver2870: 늦게 끝난 통짜 썸 워커 답은 옛 프로젝트 몫 — gengaThumbBakeFromDataUrl 이 버린다
       gengaThumbWorkerPoolReset();   // ver2870-b: 옛 프로젝트의 워커·대기열을 끝낸다 — 세션 내내 들고 있지 않는다
       gengaThumbBakePending.clear();   // 옛 ref 표식을 비워 같은 ref 의 새 bake 가 막히지 않게 한다(위 stale() 와 짝)
+      gengaThumbBakeFailed.clear();
+      gengaThumbImageCache.clear();
+      gengaThumbBakeQueue.forEach(function(entry) { clearTimeout(entry.timer); paintReleaseCanvas(entry.tcv); });
+      gengaThumbBakeQueue.clear(); gengaThumbCommitBakePending.clear();
       gengaPlaybackWarm = null; // A late predecode completion cannot restart the previous project.
       gengaImageCache.clear(); // Decoded rasters belong to the outgoing project, independently of encoded stores.
       gengaClearOtherSelections('');
@@ -131609,8 +131634,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ver2193: 칸 그림은 dataUrl 이 없다 — 여기서 빈 칸으로 떨어뜨리면 그림이 있는 번호가
         // 미리보기 없이 뜬다(위 주석이 적은 「白紙」 오표시와 같은 종류의 어긋남이다).
         const artUrl = gengaThumbUrlFor(art);   // ver2197: 코마 썸과 같은 정본 — 영속 썸 우선, 통짜도 200px 로
-        const thumb = artUrl
-          ? '<img src="' + escapeAttr(artUrl) + '" alt="">'
+        const thumb = artUrl || (art && art.ref && art.dataUrl)
+          ? '<img data-genga-thumb-ref="' + escapeAttr(art.ref || '') + '" data-genga-layer="' + escapeAttr(String(layerId)) + '"' + (artUrl ? ' src="' + escapeAttr(artUrl) + '"' : '') + ' alt="">'
           : '<span class="genga-celpick-blank"></span>';
         return '<button type="button" class="genga-celpick-item' + (gengaValueKey(c.value) === cur ? ' current' : '') +
                '" data-value="' + escapeAttr(c.value) + '">' + thumb +
