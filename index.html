@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2896</title>
+  <title>MoArt ver2897</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -103017,8 +103017,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           return fresh;
         }
         if (!gengaDrawStore.has(d.ref) && typeof d.dataUrl === 'string' && d.dataUrl) gengaDrawStorePut(d.ref, d.dataUrl);
-        const out = { ref: String(d.ref), w: Math.max(1, Math.round(Number(d.w) || 1)), h: Math.max(1, Math.round(Number(d.h) || 1)) };
-        if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = Math.round(Number(d.x)); out.y = Math.round(Number(d.y)); }
+        // Active pixels cover the paper; their ref still owns the stored ink footprint.
+        const bounds = d.active && d.inkBounds ? d.inkBounds : d;
+        const out = { ref: String(d.ref), w: Math.max(1, Math.round(Number(bounds.w) || 1)), h: Math.max(1, Math.round(Number(bounds.h) || 1)) };
+        if ((bounds === d || bounds.placed) && Number.isFinite(Number(bounds.x)) && Number.isFinite(Number(bounds.y))) { out.x = Math.round(Number(bounds.x)); out.y = Math.round(Number(bounds.y)); }
         if (strokes) out.strokes = strokes;
         return out;
       }
@@ -128179,7 +128181,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 가지 않고 새 외부 복사를 만들 수는 없으므로, 창을 안 떠났다면 우리 복사가 최신이 확실하다.
     let osClipMirror = { marker: '', settled: false, leftWindow: false };
     function osClipMirrorNoteWindowLeft() { osClipMirror.leftWindow = true; }
-    function gengaWriteKomaToClipboard(dataUrl, marker) { // ver844: optional marker param; omitted = ver843-identical (sole prior caller passes one arg)
+    // Mirror the internal copy; delayed preparation may only publish the latest generation.
+    function gengaWriteKomaToClipboard(source, marker) {
       const mk = marker || GENGA_KOMA_CLIP_MARKER;
       const mine = { marker: mk, settled: false, leftWindow: false };
       osClipMirror = mine;
@@ -128194,8 +128197,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           return;
         }
         const markerBlob = new Blob([mk], { type: 'text/plain' });
-        if (dataUrl) {
-          fetch(dataUrl).then(function(r) { return r.blob(); }).then(function(blob) {
+        if (source) {
+          const image = source instanceof Blob ? Promise.resolve(source) : fetch(source).then(function(r) { return r.blob(); });
+          image.then(function(blob) {
+            if (osClipMirror !== mine) return;
             return navigator.clipboard.write([new ClipboardItem({ 'text/plain': markerBlob, 'image/png': blob })]);
           }).then(settled).catch(mirrorFailed);
         } else {
@@ -130231,14 +130236,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const firstTiles = (firstDrawn && !firstDrawn.dataUrl) ? gengaDrawingTiles(firstDrawn) : null;
       if (firstTiles && !gengaTileSetDecodedComplete(firstTiles)) {
         gengaWriteKomaToClipboard(null);
-        const myClip = gengaKomaClipboard;
+        const myClip = gengaKomaClipboard, myMirror = osClipMirror;
         gengaTileSetDecode(firstTiles).then(function() {
-          if (gengaKomaClipboard !== myClip) return;
+          if (gengaKomaClipboard !== myClip || osClipMirror !== myMirror) return;
           gengaWriteKomaToClipboard(gengaStoreValueUrl(firstTiles) || null);
         });
       } else {
-        const firstUrl = firstDrawn ? (firstDrawn.dataUrl || gengaStoreValueUrl(gengaDrawStore.get(firstDrawn.ref))) : '';
-        gengaWriteKomaToClipboard(firstUrl || null);
+        const firstValue = firstDrawn && firstDrawn.ref && gengaDrawStore.get(firstDrawn.ref);
+        const firstSource = firstValue instanceof Blob && firstValue.type === 'image/png' ? firstValue
+          : firstDrawn ? (firstDrawn.dataUrl || gengaStoreValueUrl(firstValue)) : null;
+        gengaWriteKomaToClipboard(firstSource || null);
       }
       if (cut) {
         if (layer.locked) return true; // locked layer: copy allowed, CUT blocked
