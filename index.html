@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2899</title>
+  <title>MoArt ver2900</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -36541,6 +36541,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         el.muted = true; el.playsInline = true; el.preload = 'auto'; el.draggable = false;
         el.setAttribute('muted', ''); el.setAttribute('playsinline', ''); el.setAttribute('draggable', 'false');
         el.dataset.videoMediaSrc = src;
+        el.addEventListener('seeking', onVideoMediaSeekVisibility);
+        el.addEventListener('seeked', onVideoMediaSeekVisibility);
         el.addEventListener('seeked', onVideoMediaFramePainted);   // ver2576
         el.src = src;
         state.videoMediaElements.set(clip.id, el);
@@ -36564,8 +36566,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       trimVideoMediaElements(el);
       return el;
     }
-    // ver2576: a seek that lands while the compositor covers the screen must repaint — the canvas drew whatever
-    // frame the element had, and the next tick would dedupe on the same playhead frame without the time stamp.
+    // Seeking retains the previous raster even at HAVE_CURRENT_DATA. Hide only the footage
+    // until its native seek completes; conte artwork and the transport clock remain live.
+    function onVideoMediaSeekVisibility(event) {
+      const el = event.currentTarget;
+      el.style.visibility = el.seeking ? 'hidden' : '';
+    }
+    // A newly decoded native frame invalidates the compositor independently of the transport tick.
     function onVideoMediaFramePainted() {
       if (!state.videoEditMode || !playbackCompositorEligible()) return;
       const canvas = playbackCompositorCanvasEl();
@@ -36579,6 +36586,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!el) return;
       const watch = el._moartFrameWatch;
       el._moartFrameWatch = null;
+      el.removeEventListener('seeking', onVideoMediaSeekVisibility);
+      el.removeEventListener('seeked', onVideoMediaSeekVisibility);
       el.removeEventListener('seeked', onVideoMediaFramePainted);
       if (watch && typeof el.cancelVideoFrameCallback === 'function') el.cancelVideoFrameCallback(watch.id);
       try { el.pause(); } catch (e) {}
@@ -36653,49 +36662,54 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (pool instanceof Map) pool.forEach(function(other) { if (other !== el && !other.paused) { try { other.pause(); } catch (e) {} } });
       if (!el) return;
       el.muted = true;   // ver2675: footage never plays its own sound — an imported video's audio becomes a linked audio clip (import dialog), so preview and export hear the same thing
-      const fps = mediaFpsForProject(project);   // ver2675: <video>.currentTime is real time
-      const rate = videoMediaClipSourceRate(clip, fps);   // ver2675: source seconds per project frame = 1/rate
-      const speed = rate === fps ? 1 : fps / rate;        // 'frame' clips run at project rate ÷ source rate (24 in 23.976 → 1000/1001)
-      const playing = Boolean(state.videoPlaying && !state.videoPlaybackStarting);
-      const clockFrame = state.videoPlaybackStartFrame + Math.max(0, (performance.now() - state.videoPlaybackStartClock) / 1000) * fps;
-      const rawTarget = playing ? Math.max(0, (Number(clip.sourceOffsetSec) || 0) + (clockFrame - clip.startFrame) / rate)
-        : videoMediaClipMediaTime(clip, f, fps);
-      // Match the native file end without changing the existing in-source frame mapping.
-      // A cut fallback may extend beyond a clip box; the export seek uses that same mapping.
-      const duration = Number(el.duration);
-      const sourceEndSec = Number.isFinite(duration) && duration > 0 ? duration : Math.max(0, Number(clip.sourceDurationSec) || 0);
-      const target = sourceEndSec > 0 ? Math.min(sourceEndSec, rawTarget) : rawTarget;
-      const error = target - (Number(el.currentTime) || 0);
-      const drift = Math.abs(error);
-      // No repeated seek while a previous seek is still decoding. Playback stays within ±3% of the
-      // interpreted source speed. Hysteresis avoids restarting the media rate pipeline on clock jitter.
-      // The audio clock, stored interpretation and offline export are unchanged.
-      const correcting = error * ((Number(el.playbackRate) || speed) - speed) > 0;
-      const correction = playing && !el.paused && !el.seeking && drift > (correcting ? 0.1 : 0.35) / rate && drift <= 2 / rate ? (error > 0 ? 0.03 : -0.03) : 0;
-      const playbackRate = speed * (1 + correction);
-      if (Math.abs((Number(el.playbackRate) || 1) - playbackRate) > (playing ? 0.0001 : 1e-6)) { try { el.playbackRate = playbackRate; } catch (e) {} }
-      if (playing) {
-        // An ended element restarts from zero on play(). Park at the actual file end,
-        // including when the transport reaches it before the native element does.
-        const atSourceEnd = sourceEndSec > 0 && (rawTarget >= sourceEndSec || (el.ended && target >= sourceEndSec - 0.5 / rate));
-        if (atSourceEnd) {
-          if (!el.paused) el.pause();
-          if (!el.seeking && Math.abs((Number(el.currentTime) || 0) - sourceEndSec) > 1e-6) el.currentTime = sourceEndSec;
+      try {
+        const fps = mediaFpsForProject(project);   // ver2675: <video>.currentTime is real time
+        const rate = videoMediaClipSourceRate(clip, fps);   // ver2675: source seconds per project frame = 1/rate
+        const speed = rate === fps ? 1 : fps / rate;        // 'frame' clips run at project rate ÷ source rate (24 in 23.976 → 1000/1001)
+        const playing = Boolean(state.videoPlaying && !state.videoPlaybackStarting);
+        const clockFrame = state.videoPlaybackStartFrame + Math.max(0, (performance.now() - state.videoPlaybackStartClock) / 1000) * fps;
+        const rawTarget = playing ? Math.max(0, (Number(clip.sourceOffsetSec) || 0) + (clockFrame - clip.startFrame) / rate)
+          : videoMediaClipMediaTime(clip, f, fps);
+        // Match the native file end without changing the existing in-source frame mapping.
+        // A cut fallback may extend beyond a clip box; the export seek uses that same mapping.
+        const duration = Number(el.duration);
+        const sourceEndSec = Number.isFinite(duration) && duration > 0 ? duration : Math.max(0, Number(clip.sourceDurationSec) || 0);
+        const target = sourceEndSec > 0 ? Math.min(sourceEndSec, rawTarget) : rawTarget;
+        const error = target - (Number(el.currentTime) || 0);
+        const drift = Math.abs(error);
+        // No repeated seek while a previous seek is still decoding. Playback stays within ±3% of the
+        // interpreted source speed. Hysteresis avoids restarting the media rate pipeline on clock jitter.
+        // The audio clock, stored interpretation and offline export are unchanged.
+        const correcting = error * ((Number(el.playbackRate) || speed) - speed) > 0;
+        const correction = playing && !el.paused && !el.seeking && drift > (correcting ? 0.1 : 0.35) / rate && drift <= 2 / rate ? (error > 0 ? 0.03 : -0.03) : 0;
+        const playbackRate = speed * (1 + correction);
+        if (Math.abs((Number(el.playbackRate) || 1) - playbackRate) > (playing ? 0.0001 : 1e-6)) { try { el.playbackRate = playbackRate; } catch (e) {} }
+        if (playing) {
+          // An ended element restarts from zero on play(). Park at the actual file end,
+          // including when the transport reaches it before the native element does.
+          const atSourceEnd = sourceEndSec > 0 && (rawTarget >= sourceEndSec || (el.ended && target >= sourceEndSec - 0.5 / rate));
+          if (atSourceEnd) {
+            if (!el.paused) el.pause();
+            if (!el.seeking && Math.abs((Number(el.currentTime) || 0) - sourceEndSec) > 1e-6) el.currentTime = sourceEndSec;
+            return;
+          }
+          if (el.paused) {
+            if (!el.seeking && drift > 0.5 / rate) el.currentTime = target;
+            const started = el.play();
+            if (started && typeof started.catch === 'function') started.catch(function(error) {
+              if (error && error.name !== 'AbortError') warnOnce('videoPlaybackStart', '[video] Playback start failed', error);
+            });
+          } else if (!el.seeking && drift > 2 / rate) {
+            el.currentTime = target;
+          }
           return;
         }
-        if (el.paused) {
-          if (!el.seeking && drift > 0.5 / rate) el.currentTime = target;
-          const started = el.play();
-          if (started && typeof started.catch === 'function') started.catch(function(error) {
-            if (error && error.name !== 'AbortError') warnOnce('videoPlaybackStart', '[video] Playback start failed', error);
-          });
-        } else if (!el.seeking && drift > 2 / rate) {
-          el.currentTime = target;
-        }
-        return;
+        if (!el.paused) { try { el.pause(); } catch (e) {} }
+        if (drift > 0.5 / rate) el.currentTime = target;
+      } finally {
+        // Every currentTime write, including the native tail, invalidates footage in this input task.
+        el.style.visibility = el.seeking ? 'hidden' : '';
       }
-      if (!el.paused) { try { el.pause(); } catch (e) {} }
-      if (drift > 0.5 / rate) el.currentTime = target;
     }
 
     function cutHasVideoMedia(project, cutId) {
@@ -36736,19 +36750,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // pictureSrcForCut and had been orphaned onto this function.
     function videoMediaClipAtFrame(project, frame, fallbackCutId) {
       const target = Math.max(0, Math.round(Number(frame) || 0));
-      const clips = (project && project.video && Array.isArray(project.video.clips) ? project.video.clips : []).filter(function(clip) {
-        if (!clip || clip.hidden || !videoClipHasMedia(clip)) return false;
+      let best = null, bestPriority = -1, bestStart = -1;
+      const clips = project && project.video && Array.isArray(project.video.clips) ? project.video.clips : [];
+      for (const clip of clips) {
+        if (!clip || clip.hidden || !videoClipHasMedia(clip)) continue;
         const start = Math.max(0, Math.round(Number(clip.startFrame) || 0));
         const end = start + Math.max(1, Math.round(Number(clip.durationFrames) || 1));
-        // Only covering clips need a track lookup; the rest cannot be displayed at this frame.
-        return target >= start && target < end && !videoMediaTrackIsHidden(project, clip.trackId || 'video-media-main');
-      }).sort(function(left, right) {
-        const leftStart = Math.max(0, Math.round(Number(left.startFrame) || 0));
-        const rightStart = Math.max(0, Math.round(Number(right.startFrame) || 0));
-        return videoMediaTrackPriority(right.trackId) - videoMediaTrackPriority(left.trackId)
-          || rightStart - leftStart || String(right.id || '').localeCompare(String(left.id || ''));
-      });
-      if (clips.length) return clips[0];
+        if (target < start || target >= end || videoMediaTrackIsHidden(project, clip.trackId || 'video-media-main')) continue;
+        const priority = videoMediaTrackPriority(clip.trackId);
+        if (!best || priority > bestPriority || (priority === bestPriority && (start > bestStart
+            || (start === bestStart && String(clip.id || '').localeCompare(String(best.id || '')) > 0)))) {
+          best = clip; bestPriority = priority; bestStart = start;
+        }
+      }
+      if (best) return best;
       return fallbackCutId ? videoMediaClipForCut(project, fallbackCutId, target) : null;
     }
     // ver2574: 「이 프레임에 보이는 V1 클립」 — 렌더·조작 자리의 정본. 한 rAF 틱에 세 자리(컴포지터 판정 ·
@@ -48100,23 +48115,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       else renderTimingDashboard();
       startTimelineVisualLoop(totalFrames, mediaFps, playbackEnd);
       advancePlaybackAudioQueue(startFrame - 1, startFrame, fps);
+      // The visual rAF owns the visible playhead. Audio uses its own clock sample; publishing
+      // it between visual ticks made cut labels/media selection run ahead of the painted frame.
+      let audioFrame = startFrame;
       state.videoPlaybackTimer = setInterval(function() {
-        const previousFrame = state.videoPlayheadFrames;
+        const previousFrame = audioFrame;
         const now = performance.now();
         const elapsedFrames = playbackElapsedFrames(mediaFps, now);
-        state.videoPlayheadFrames = Math.min(playbackEnd, startFrame + elapsedFrames); // ver1023: stop the audio-driven advance at content end too
-        const active = activeAudioClipsFromList(audioTimelineAudibleClips(state.project), state.project, state.videoPlayheadFrames);
+        audioFrame = Math.min(playbackEnd, startFrame + elapsedFrames);
+        const active = activeAudioClipsFromList(audioTimelineAudibleClips(state.project), state.project, audioFrame);
         state.activeSpeechClipId = active[0] ? active[0].id : '';
-        advancePlaybackAudioQueue(previousFrame, state.videoPlayheadFrames, fps);
+        advancePlaybackAudioQueue(previousFrame, audioFrame, fps);
         if (now - state.videoPlaybackLastUiUpdate >= 500) {
           state.videoPlaybackLastUiUpdate = now;
-          primePlaybackCachesForRange(state.project, state.videoPlayheadFrames, totalFrames);
-          if (state.videoEditMode) updateTimelineRuntimeDom(totalFrames, { lightweight: true, updateTimecode: true });
-          if (state.videoEditMode) renderVideoPreviewIfChanged(totalFrames);
+          primePlaybackCachesForRange(state.project, audioFrame, totalFrames);
+          // A hidden tab may suspend rAF. Its bounded interval fallback still follows the clock.
+          if (state.videoEditMode && document.hidden) {
+            state.videoPlayheadFrames = audioFrame;
+            updateTimelineRuntimeDom(totalFrames, { lightweight: true, updateTimecode: true });
+            renderVideoPreviewIfChanged(totalFrames);
+          }
         } else {
           updateActiveAudioClipDom(document.getElementById('timingDashboard'));
         }
-        if (state.videoPlayheadFrames >= playbackEnd) { // ver1023: stop/repeat at CONTENT end (playhead is capped at playbackEnd above; comparing padded totalFrames would be unreachable in a backgrounded tab where only this interval runs)
+        if (audioFrame >= playbackEnd) { // Content end remains reachable without rAF.
+          state.videoPlayheadFrames = playbackEnd;
           if (state.timelineRepeat) restartTimelinePlaybackFromFrame(timelineStartFrameIndex());
           else stopTimelinePlayback(true);
         }
@@ -48779,7 +48802,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (footage) {
         if (footage.sourceType !== 'video') return false;
         const footageEl = videoMediaElementFor(footage);
-        if (!footageEl || footageEl.readyState < 2) return false;
+        if (!footageEl || footageEl.readyState < 2 || footageEl.seeking) return false;
       }
       if (!footage && !layerDrawingEntriesForCut(state.project, slot.cut.id).length) return false; // no-drawing cuts keep the DOM look (unless footage fills them)
       return true;
@@ -48793,6 +48816,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function queueHidePlaybackCompositorCanvas() {
       const canvas = playbackCompositorCanvasEl();
       if (!canvas || !canvas.classList.contains('active')) return;
+      const stage = document.getElementById('conteVideoStage');
+      const slot = videoSlotAtFrame(state.project, state.videoPlayheadFrames);
+      if (stage && stage.dataset.previewSeekUnitKey === videoPreviewSeekUnitKeyFor(slot)) {
+        canvas.classList.remove('active'); canvas.dataset.compositorDrawn = '';
+        return;
+      }
       if (state.playbackCompositorHideRaf) return;
       // Deferred (setTimeout, NOT rAF — rAF stalls in throttled/background tabs) so the DOM render
       // fired in the same tick (stop / per-frame fallback) fully lands underneath before the canvas
@@ -48836,10 +48865,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           canvas.className = 'video-playback-compositor-canvas';
           screen.appendChild(canvas);
         }
-        // The pending draw owns this canvas until completion; never overlap renderers on it.
+        const footage = videoMediaClipShownAtFrame(state.project, state.videoPlayheadFrames, slot.cut.id);
+        const sceneKey = slot.cut.id + '|' + (footage && footage.id || '');
+        // A previous cut/clip is never a valid fallback for the new scene while it decodes.
+        // Keep the front surface; one white fill at the boundary removes unrelated footage.
+        if (canvas.dataset.compositorSceneKey !== sceneKey) {
+          const front = canvas.getContext('2d');
+          front.fillStyle = '#ffffff'; front.fillRect(0, 0, canvas.width, canvas.height);
+          canvas.dataset.compositorSceneKey = sceneKey;
+          canvas.dataset.compositorDrawn = ''; canvas.dataset.compositorDrawKey = '';
+        }
+        // The pending draw owns its scratch until completion; never overlap renderers on it.
         if (canvas._compositorPending) return true;
-        // Genga rule: draw only when every bitmap of the current cut is DECODED — never a blank.
-        // Missing ones start loading now; meanwhile the canvas keeps showing its previous frame.
+        // Start missing bitmaps now. Hold a complete frame only within its own cut/clip;
+        // a new scene keeps the neutral surface prepared above until its artwork is decoded.
         const entries = layerDrawingEntriesForCut(state.project, slot.cut.id);
         const cache = new Map();
         const sigParts = [slot.cut.id];
@@ -48889,7 +48928,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Project frame still invalidates camera/FX. Video invalidation follows presented media frames,
         // not the continuously advancing clock; seeked independently clears the key. Until a frame
         // callback arrives (or where unavailable), retain the existing currentTime behavior.
-        const footage = videoMediaClipShownAtFrame(state.project, frame, slot.cut.id);
         const footageEl = footage && footage.sourceType === 'video' ? videoMediaElementFor(footage) : null;
         const watch = footageEl && footageEl._moartFrameWatch;
         const mediaKey = watch && watch.mediaTime != null && state.videoPlaying && !footageEl.seeking
@@ -48898,8 +48936,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (canvas.dataset.compositorDrawn === '1' && canvas.dataset.compositorDrawKey === drawKey) return true;
         // A complete cache avoids decode waits, but async renderer errors still reject its Promise.
         const project = state.project;
+        const revision = videoTimelineSignature(project), clipCycle = state.videoClipCycleId;
         canvas._compositorPending = true;
-        const rendering = renderConteVideoFrameToCanvas(canvas, state.videoPlayheadFrames, {
+        const scratch = paintScratchCanvas(canvas, 'preview', outWidth, Math.round(outWidth * CONTE_FRAME_H / CONTE_FRAME_W));
+        const rendering = renderConteVideoFrameToCanvas(scratch, frame, {
           outWidth: outWidth,
           cache: cache,
           videoMedia: true,   // ver2576: composite the V1 footage under the layers (export does not pass this — q2)
@@ -48912,10 +48952,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         Promise.resolve(rendering).then(function() {
           canvas._compositorPending = false;
           if (state.project !== project || !canvas.isConnected || !playbackCompositorEligible()) return;
-          if (frame !== Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0))) {
+          if (frame !== Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0))
+              || canvas.dataset.compositorSceneKey !== sceneKey
+              || revision !== videoTimelineSignature(project) || clipCycle !== state.videoClipCycleId) {
             renderVideoPreview(totalFrames);
             return;
           }
+          if (canvas.width !== scratch.width) canvas.width = scratch.width;
+          if (canvas.height !== scratch.height) canvas.height = scratch.height;
+          paintPresentCanvas(canvas, scratch);
           canvas.dataset.compositorDrawn = '1';
           canvas.dataset.compositorDrawKey = drawKey;
           canvas.classList.add('active');
@@ -50289,16 +50334,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // being drawn on it — the rebuild detaches/clears the canvas and the in-progress stroke
       // vanishes. Defer; endVideoPaintStroke reconciles after the stroke commits.
       if (state.paintRasterOp) { state.videoPreviewRebuildDeferred = true; return; }
-      const videoClip = videoMediaClipShownAtFrame(state.project, state.videoPlayheadFrames, slot && slot.cut && slot.cut.id);   // ver2574: gated + per-frame memo
-      const videoClipSrc = videoClipMediaSrc(videoClip);
-      const layerEntries = !videoTrackIsHidden(state.project) && slot && slot.cut ? layerDrawingEntriesForCut(state.project, slot.cut.id) : [];
-      const onionHtml = onionSkinPreviewHtml(state.project, slot);
       if (stageEl.dataset.previewKey === previewKey) { // Artwork can stay while dialogue time changes.
         updateVideoOverlaysAtFrame(stageEl);
         if (cameraFrameOverlayNeedsRefresh()) renderCameraFrameOverlay(stageEl);
         else applyCameraPreviewTransform(stageEl);
         return;
       }
+      const videoClip = videoMediaClipShownAtFrame(state.project, state.videoPlayheadFrames, slot && slot.cut && slot.cut.id);
+      const videoClipSrc = videoClipMediaSrc(videoClip);
+      const layerEntries = !videoTrackIsHidden(state.project) && slot && slot.cut ? layerDrawingEntriesForCut(state.project, slot.cut.id) : [];
+      const onionHtml = onionSkinPreviewHtml(state.project, slot);
       let mediaHtml = '<div class="video-preview-layered video-empty-preview video-preview-camera-target" data-camera-cut-id="' + escapeAttr(slot && slot.cut && slot.cut.id || '') + '"></div>';
       if (videoClipSrc || layerEntries.length || onionHtml) {
         const parts = [];
@@ -50402,7 +50447,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // cache key instead of spawning duplicate off-screen builds. The old screen stays visible until the
       // swap; the generation guard + timeout below guarantee exactly one swap (or clean supersession) runs.
       stageEl.dataset.previewKey = previewKey;
-      stageEl.dataset.previewSeekUnitKey = seekUnitKey;
 
       const holder = document.createElement('div');
       holder.innerHTML = screenHtml;
@@ -97939,7 +97983,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const clip = videoMediaClipShownAtFrame(project, f, slot && slot.cut ? slot.cut.id : '');   // ver2675: box lookup past the last cut (preview parity)
       if (!clip || clip.sourceType !== 'video') return false;
       const source = videoMediaElementFor(clip);
-      if (!source || source.readyState < 2) return false;   // HAVE_CURRENT_DATA
+      if (!source || source.readyState < 2 || source.seeking) return false;   // HAVE_CURRENT_DATA may still hold the old seek raster
       const vw = source.videoWidth || 0, vh = source.videoHeight || 0;
       if (!vw || !vh) return false;
       ctx.save();
