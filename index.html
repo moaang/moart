@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2897</title>
+  <title>MoArt ver2898</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -123039,11 +123039,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       finally { ctx.globalAlpha = 1; paintReleaseCanvas(t); }
       return true;
     }
-    // A single view-sized surface replaces (layers × neighbours) retained tinted surfaces.
-    // Compose after view transformation so zoom/rotation do not resample a pre-composited paper.
-    // 用紙 lives only at the top or bottom of the stack, takes no FX, and the preview composite leaves it out.
-    // Drawn here with its own blend, a bottom paper sits under the onion ghosts and a top (e.g. multiply) paper
-    // over the ghosts and layers. In the composite an opaque paper hid every ghost drawn beneath it.
+    // 用紙 lives at either stack edge and stays outside the artwork composite.
+    // Its own blend applies before onion guides, which overlay both paper and artwork.
     // → { layer, dr } for the paper on that side when it draws, else null.
     function gengaPreviewPaper(gt, frame, side) {
       const layers = gt.layers || [];
@@ -123064,28 +123061,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return gengaDrawDrawingInto(ctx, paper.dr, pw, ph, scheduleGengaPreviewRedraw);
       } finally { ctx.restore(); }
     }
-    // White, then a bottom paper: the opaque base the ghosts are composed on. Composing ghosts on a transparent
-    // surface instead would quantize their faint premultiplied colours.
+    // Paint the artwork base separately; onion guides overlay the completed artwork and paper.
     function gengaPaintPreviewBase(ctx, view) {
       ctx.fillStyle = '#ffffff'; ctx.fillRect(view.ox, view.oy, view.dw, view.dh);
       return gengaDrawPreviewPaper(ctx, view.gt, view.frame, 'bottom', view.ox, view.oy, view.dw, view.dh);
     }
+    // One transparent view-sized surface replaces retained (layers × neighbours) ghost surfaces.
+    // Compose after the view transform so zoom/rotation do not resample a composed paper.
     function gengaDrawOnionView(ctx, view, ghosts) {
       const { W, H, pw, ph, ox, oy, dw, dh, vrot, vfl } = view;
       if (!ghosts.length) {
         const unused = onionGhostCache.get('genga-composite');
         if (unused) paintReleaseCanvas(unused);
         onionGhostCache.delete('genga-composite'); onionSetVisibleGhostCount(0);
-        gengaPaintPreviewBase(ctx, view);
         return;
       }
-      const base = gengaPreviewPaper(view.gt, view.frame, 'bottom');
-      const baseKey = base ? [gengaDrawingCacheKey(base.dr), base.layer.blend, base.layer.opacity] : null;
       const keys = ghosts.map(function(entry) {
         const dr = gengaExposureDrawing(entry.layer, gengaResolveExposure(entry.layer, entry.ghost.item));
         return [gengaDrawingCacheKey(dr), dr && dr.x, dr && dr.y, dr && dr.w, dr && dr.h, entry.ghost.opacity, entry.ghost.tint];
       });
-      const key = JSON.stringify([W, H, pw, ph, ox, oy, dw, dh, vrot, vfl, ctx.imageSmoothingEnabled, baseKey, keys]);
+      const key = JSON.stringify([W, H, pw, ph, ox, oy, dw, dh, vrot, vfl, ctx.imageSmoothingEnabled, keys]);
       let composed = onionGhostCache.get('genga-composite');
       if (!composed || composed._onionViewKey !== key) {
         if (composed) paintReleaseCanvas(composed);
@@ -123093,7 +123088,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         composed = document.createElement('canvas'); composed.width = W; composed.height = H;
         const cx = composed.getContext('2d'); cx.setTransform(ctx.getTransform());
         cx.imageSmoothingEnabled = ctx.imageSmoothingEnabled;
-        const baseReady = gengaPaintPreviewBase(cx, view);
         let drawn = 0;
         ghosts.forEach(function(entry) {
           const ghost = entry.ghost;
@@ -123101,7 +123095,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
         composed._onionCount = drawn;
         // A pending decode must retry on its ready callback, never cache an incomplete view as ready.
-        composed._onionViewKey = baseReady && drawn === ghosts.length ? key : null;
+        composed._onionViewKey = drawn === ghosts.length ? key : null;
         onionGhostCache.set('genga-composite', composed);
       }
       onionSetVisibleGhostCount(composed._onionCount);
@@ -123769,9 +123763,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             });
           }
         }
-        gengaDrawOnionView(ctx, view, ghosts);
+        gengaPaintPreviewBase(ctx, view);
         if (composite) { const p = composite._pad || 0; ctx.drawImage(composite, ox - p * scale, oy - p * scale, composite.width * scale, composite.height * scale); }
         gengaDrawPreviewPaper(ctx, gt, frame, 'top', ox, oy, dw, dh);
+        gengaDrawOnionView(ctx, view, ghosts);
         // ver1326: ver1324의 예측 꼬리(getPredictedEvents 오버레이)가 여기 있었다 — 제거됨. 이유는 이 파일이
         // 아니라 드로잉 앱의 규칙에 있다: 예측은 방향이 바뀔 때마다 오버슈트하고 다음 move가 그걸 되돌리므로,
         // 선 끝이 매 프레임 앞뒤로 튄다("선이 요동친다"). 지연을 몇 ms 감추자고 실제 잉크가 아닌 획을 화면에
@@ -128229,7 +128224,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           gengaOpenImageImportDialog(files, { kind: 'current' });
           return;
         }
-        if (gengaKomaClipboard) { ev.preventDefault(); gengaPasteCels(); return; } // our own koma copy (or no image)
+        if (gengaKomaClipboard) { ev.preventDefault(); gengaPasteCels(gengaPasteRangeAtPlayhead()); return; } // our own koma copy (or no image)
         return;
       }
       // ver844 (GENGAKOMA discipline → conte): the native paste decides. Our own CONTE marker on the OS
@@ -130255,9 +130250,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return true;
     }
-    function gengaPasteCels() {
+    // Keyboard/native clipboard input follows the playhead; navigation still preserves transform ranges.
+    function gengaPasteRangeAtPlayhead() {
+      const range = state.gengaCelSel, frame = gengaCurrentFrame();
+      return range && frame >= range.start && frame <= range.end ? range : null;
+    }
+    function gengaPasteCels(targetRange) {
       const clip = gengaKomaClipboard; if (!clip || !clip.komas.length) return false;
-      const cs = state.gengaCelSel;
+      // Undefined keeps the owned-range command contract; explicit null targets the current frame.
+      const cs = targetRange === undefined ? state.gengaCelSel : targetRange;
       const targetLayerId = cs ? cs.layerId : state.gengaSelectedLayerId;
       const targetLayer = gengaLayerById(targetLayerId);
       if (!targetLayer || gengaLayerEffLocked(targetLayer) || gengaLayerIsFolder(targetLayer) || gengaLayerIsPaper(targetLayer)) return false; // locked layer: no paste
@@ -130282,6 +130283,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // ripple-close it — picking a 5-frame gap and pasting 3 komas would otherwise drag everything after it
         // 2 frames left. An empty pick means plain insert-at-gap-start (the make-room shift below still applies).
         const replace = !!(cs && gengaKomasInRange(L, cellSelStart, cellSelEnd));
+        // Consume existing empty space across the group before making room; replacement keeps its range contract.
+        let gap = clip.span;
+        if (!replace) members.forEach(function(M) {
+          (M.exposures || []).forEach(function(e) {
+            if (e.startFrame <= atFrame && gengaExposureLastFrame(e) >= atFrame) gap = 0;
+            else if (e.startFrame > atFrame) gap = Math.min(gap, e.startFrame - atFrame);
+          });
+        });
+        const shift = replace ? clip.span : clip.span - gap;
         members.forEach(function(M) {
           M.exposures = M.exposures || [];
           if (replace) { // replace the selected range: clear exactly those cells (frame-accurate) + close the gap
@@ -130292,7 +130302,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           // Inserting inside a held instance retains both sides around the inserted span.
           const tails = [];
           M.exposures.forEach(function(e) {
-            if (e.startFrame >= atFrame) e.startFrame += clip.span;
+            if (e.startFrame >= atFrame) { if (shift) e.startFrame += shift; }
             else if (gengaExposureLastFrame(e) >= atFrame) {
               const leftHold = atFrame - e.startFrame;
               const marks = Array.isArray(e.dougaOffsets) ? e.dougaOffsets : [];
@@ -130362,7 +130372,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // arrives (nothing on the OS clipboard), this fallback pastes the internal cells.
         event.stopImmediatePropagation();
         gengaPendingKeydownPaste = true;
-        setTimeout(function() { if (gengaPendingKeydownPaste) { gengaPendingKeydownPaste = false; gengaPasteCels(); } }, 0);
+        setTimeout(function() { if (gengaPendingKeydownPaste) { gengaPendingKeydownPaste = false; gengaPasteCels(gengaPasteRangeAtPlayhead()); } }, 0);
         return true;
       }
       return false;
@@ -132045,7 +132055,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const f = Math.max(1, Math.round(frame || 1));
       return { label: t('menu.genga.exp.pasteAt', clip.span, f), action: function() {
         gengaSetCelSel(layerId, f, f);
-        gengaPasteCels();
+        gengaPasteCels(state.gengaCelSel);
       } };
     }
     function gengaExpContextMenu(ev) {
@@ -132137,7 +132147,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           added = true;
         }
         if (!lyr.locked && clip && clip.komas && clip.komas.length) { // paste targets a gap just as well
-          if (useSel) items.push({ label: t('menu.genga.exp.pasteSpan', clip.span), action: function() { gengaPasteCels(); } });
+          if (useSel) items.push({ label: t('menu.genga.exp.pasteSpan', clip.span), action: function() { gengaPasteCels(state.gengaCelSel); } });
           else { // no selection → paste AT the clicked frame, the ver810 empty-cell contract (label names the frame)
             const contentEl = document.querySelector('#gengaStage .genga-tl-content');
             const clickedFrame = contentEl ? Math.max(1, gengaFrameAtClientX(ev.clientX, contentEl.getBoundingClientRect().left)) : exp.startFrame;
