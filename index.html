@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2904</title>
+  <title>MoArt ver2906</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25580,6 +25580,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2906, items: [{ja: '原画の自動選択が持つ画素の重複と、一括変形後の不要なデコードを減らしました。', ko: '원화 자동선택의 중복 픽셀 보유와 일괄 변형 뒤 불필요한 디코드를 줄였습니다.', en: 'Reduced duplicate pixels held by automatic genga selections and unnecessary decoding after batch transforms.', zh: '减少了原画自动选择持有的重复像素和批量变形后不必要的解码。'}] },
+      { ver: 2905, items: [{ja: '原画の一括移動を確定するときの重複した画素処理を減らしました。', ko: '원화 일괄 이동을 확정할 때 중복되던 픽셀 처리를 줄였습니다.', en: 'Reduced redundant pixel processing when applying a batch move in genga.', zh: '减少了确认原画批量移动时重复的像素处理。'}] },
       { ver: 2904, items: [{ja: '原画の一括変形が準備中に失敗したとき、未適用の画像を保存しないようにしました。同じ画像を異なる位置で使う際の読み込み前の表示位置を修正しました。', ko: '원화 일괄 변형 준비가 실패하면 적용되지 않은 그림을 저장하지 않도록 고쳤습니다. 같은 그림을 서로 다른 위치에서 쓸 때 디코드 전 표시 위치를 바로잡았습니다.', en: 'Prevented unpublished images from being stored when genga batch transform preparation fails. Fixed pre-decode placement when identical images are used at different positions.', zh: '修正原画批量变形准备失败后仍保存未应用图像的问题，并修正相同图像位于不同位置时解码前的显示位置。'}] },
       { ver: 2903, items: [{ja: '原画でレイヤーを切り替えた後の禁止カーソルを修正しました。変形後の自動選択と取り消し履歴のメモリ使用量、コマ移動時の選択計算を減らしました。', ko: '원화에서 레이어를 바꾼 뒤 금지 커서가 남던 문제를 고쳤습니다. 변형 후 자동 선택과 실행 취소의 메모리 사용량, 코마 이동 때의 선택 계산을 줄였습니다.', en: 'Fixed a stale blocked cursor after switching genga layers. Reduced automatic selection memory, undo memory and selection work when navigating after transforms.', zh: '修正了原画切换图层后残留的禁止光标。减少了变形后自动选区、撤销记录的内存占用及切换格时的选区计算。'}] },
       { ver: 2890, items: [{ja: 'ブラウザーの履歴を読み込めなかったとき、再試行できるようにしました。', ko: '브라우저 기록을 불러오지 못했을 때 다시 시도할 수 있도록 고쳤습니다.', en: 'You can retry when browser history fails to load.', zh: '浏览器历史记录加载失败时，现在可以重试。'}] },
@@ -103091,7 +103093,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaThumbBakeFromCommitCanvas(ref, entry.canvas,
         { x: 0, y: 0, w: entry.canvas.width, h: entry.canvas.height }, entry.layerId, entry.frame);
       gengaLastStrokeCanvas = { dataUrl: url, canvas: entry.canvas };
-      gengaImageFor({ ref: ref, dataUrl: url }, scheduleGengaPreviewRedraw); // Batch decode completions share one presentation frame.
+      // Decode on pixel demand. Off-frame batch outputs already have a commit thumbnail; predecoding
+      // every PNG here duplicates the prepared crops and evicts sources still used by the visible frame.
       if (entry.layerId != null && state.project && state.project.kind === 'genga') {
         gengaUpdateExpDom(entry.layerId, entry.frame);
         drawGengaLayerThumbs([entry.layerId]);
@@ -103720,9 +103723,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       paintCanvasRetainers.delete(cv);
       try { cv.width = 0; cv.height = 0; } catch (err) {}
     }
-    function gengaTrimCanvasToDrawing(cv, scanRect, deferEncode, mime, quality) {
+    function gengaTrimCanvasToDrawing(cv, scanRect, deferEncode, mime, quality, readback) {
       const b = gengaCanvasInkBounds(cv, scanRect); if (!b) return null;
-      const t = document.createElement('canvas'); t.width = b.w; t.height = b.h;
+      const t = readback ? createReadbackCanvas() : document.createElement('canvas'); t.width = b.w; t.height = b.h;
       const tx = t.getContext('2d');
       tx.drawImage(cv, b.x, b.y, b.w, b.h, 0, 0, b.w, b.h);
       if (deferEncode) return { canvas: t, w: b.w, h: b.h, x: b.x, y: b.y }; // ver1324 (F2): the stroke path encodes later; every non-session caller keeps the sync string
@@ -126103,6 +126106,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // art leaked into the selection). onePxShiftThroughMask() clips the shift source to the mask, so only
         // the selection's own pixels move; the trailing 1px strip keeps its old value → the boundary line
         // replicates across presses. See its comment for the exact semantics.
+        // A 1px masked edit changes the patch independently. Materialize that split only for this consumer.
+        if (sel.auto && sel.patchCrop && !sel.base) {
+          const crop = sel.patchCrop;
+          const base = document.createElement('canvas'); base.width = crop.pw; base.height = crop.ph;
+          const patch = document.createElement('canvas'); patch.width = crop.pw; patch.height = crop.ph;
+          patch.getContext('2d').drawImage(crop.canvas, Math.round(sel.bounds.x), Math.round(sel.bounds.y));
+          sel.base = base; sel.patch = patch; sel.patchCrop = null;
+        }
         gengaEnsureSelMask(sel);
         if (!sel._onePxMaskBin) {
           const mb = document.createElement('canvas'); mb.width = sel.mask.width; mb.height = sel.mask.height;
@@ -126238,8 +126249,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const exp = gengaExposureAt(layer, gengaSel.frame), value = exp && gengaValueKey(exp.instanceValue);
         const key = exp && (value === null ? '|e:' + exp.id : '|v:' + value);
         if (targets.some(function(target) { return target.key === key; })) {
-          const before = gengaSelSnapshot();
-          if (before) { before.base = null; before.patch = null; before.box = null; }
+          const before = gengaSelPristineSnapshot();
           gengaUnliftSelection(gengaSel, true); gengaSel = null; gengaSelDrag = null; gengaTransformKeepsake = null;
           rider = { engineId: 'gengaSelection', before: before, after: null };
         }
@@ -126264,7 +126274,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // ---- P2a: lasso selection + move (genga single-bitmap) ----
     let gengaSelectionRequest = null; // Only the latest unfinished lasso may publish a selection.
-    let gengaSel = null; // User stencil or source-derived auto bounds; base/patch exist only while pixels float. Quad lives in gengaTransformBox.
+    let gengaSel = null; // User stencil or source-derived auto bounds; floating auto pixels use one compact crop. Quad lives in gengaTransformBox.
     let gengaTransformApplyEpoch = 0; // transient navigation/mode generation for delayed Apply
     let gengaLasso = null;   // { pts:[[x,y],...], stamp } while drawing the lasso polygon
     let gengaSelDrag = null; // { mode, ... } while dragging the selection / a handle
@@ -126623,10 +126633,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         return entry.canvas;
       }
-      const pw = sel.base.width, ph = sel.base.height;
+      const pw = sel.base ? sel.base.width : sel.patchCrop.pw, ph = sel.base ? sel.base.height : sel.patchCrop.ph;
       const c = readback ? createReadbackCanvas() : document.createElement('canvas'); c.width = pw; c.height = ph;
       const cc = c.getContext('2d');
-      cc.drawImage(sel.base, 0, 0);
+      if (sel.base) cc.drawImage(sel.base, 0, 0);
       const crop = gengaSelPatchCrop(sel, readback);
       gengaSelApplyTransform(cc, sel, crop.canvas, crop.w, crop.h);
       return c;
@@ -126792,8 +126802,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 콘티의 selectionBefore 도 성격이 같다(콘티는 float 가 선택 밖에 있어 자연히 이 모양이 된다).
       // after 는 굽고 나서야 만들 수 있으므로(새 bounds 를 굽힌 그림에서 잰다) 아래에서 채운다 —
       // 라이더는 살아 있는 객체로 커맨드에 실린다.
-      const rider = { engineId: 'gengaSelection', before: gengaSelSnapshot(sel), after: null };
-      if (rider.before) { rider.before.base = null; rider.before.patch = null; rider.before.box = null; }
+      const rider = { engineId: 'gengaSelection', before: gengaSelPristineSnapshot(sel), after: null };
       // ver2039: 벡터 레이어면 픽셀을 굽지 않고 **스트로크를 옮긴다**. quad 를 읽어야 하므로
       // gengaTransformBox 를 비우기 **전에** 한다(비우면 항등이 된다 — 아래 픽셀 경로와 같은 이유).
       const selLayer0 = gengaLayerById(sel.layerId);
@@ -127026,11 +127035,46 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const gt = state.project.gengaTimeline, pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       let fullMask = null;
       const quad = gengaTransformBox.quad, base = gengaSelIdentityQuad(sel), bakes = [];
+      const dx = quad[0][0] - base[0][0], dy = quad[0][1] - base[0][1];
+      // Whole-drawing integer translation needs neither a target ink bbox nor a floating mask/patch.
+      // Other transforms retain their existing crop/resampling and perspective extrapolation contracts.
+      const moveWhole = sel.auto && Number.isInteger(dx) && Number.isInteger(dy)
+        && quad.every(function(pt, i) { return pt[0] - base[i][0] === dx && pt[1] - base[i][1] === dy; });
       try {
         targets.forEach(function(target) {
           let bounds = sel.bounds, carried = null, wk = null, tsel = null;
           const vector = gengaLayerDrawsVector(target.layer);
           try {
+            if (moveWhole && !vector) {
+              const dr = gengaExposureDrawing(target.layer, gengaExposureAt(target.layer, target.frame));
+              const seed = gengaDrawingSeedRect(dr, pw, ph) || { x: 0, y: 0, w: pw, h: ph };
+              // Only the intersection of source paper, moved art and destination paper can survive.
+              // Rasterize that window directly instead of allocating and copying a full paper per target.
+              const x = Math.max(0, Math.min(pw, Math.max(0, seed.x) + dx));
+              const y = Math.max(0, Math.min(ph, Math.max(0, seed.y) + dy));
+              const w = Math.max(0, Math.min(pw, Math.min(pw, seed.x + seed.w) + dx) - x);
+              const h = Math.max(0, Math.min(ph, Math.min(ph, seed.y + seed.h) + dy) - y);
+              let canvas = createReadbackCanvas(); canvas.width = Math.max(1, w); canvas.height = Math.max(1, h);
+              try {
+                const ctx = canvas.getContext('2d');
+                ctx.beginPath(); ctx.rect(0, 0, w, h); ctx.clip();
+                ctx.translate(dx - x, dy - y);
+                // Clip the source before translation, including art originally outside the paper.
+                ctx.beginPath(); ctx.rect(0, 0, pw, ph); ctx.clip();
+                if (!gengaDrawDrawingInto(ctx, dr, pw, ph, scheduleGengaPreviewRedraw)) return;
+                const drawing = gengaDrawingFromCommitCanvas(canvas, target.layer.id, target.frame, null, preparedEncodes);
+                canvas = null; // The commit factory consumed this owned composite.
+                if (drawing) { drawing.x += x; drawing.y += y; }
+                if (!drawing) {
+                  // Empty output may mean clipped ink or an already transparent source. The latter was never edited.
+                  const original = gengaPlainDrawingCanvasFor(target.layer, target.frame, true);
+                  try { if (!original.hasContent || !gengaCanvasInkBounds(original.cv, seed)) return; }
+                  finally { paintReleaseCanvas(original.cv); }
+                }
+                bakes.push({ layerId: target.layer.id, frame: target.frame, drawing: drawing });
+              } finally { paintReleaseCanvas(canvas); }
+              return;
+            }
             if (sel.auto) {
               wk = gengaPlainDrawingCanvasFor(target.layer, target.frame, true);
               const sourceRect = vector ? null : gengaDrawingSeedRect(wk.drawing, pw, ph);
@@ -127069,7 +127113,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function gengaDrawingFromCommitCanvas(canvas, layerId, frame, scanRect, preparedEncodes) {
       let trimmed;
-      try { trimmed = gengaTrimCanvasToDrawing(canvas, scanRect, true); }
+      try { trimmed = gengaTrimCanvasToDrawing(canvas, scanRect, true, null, null, true); }
       finally { paintReleaseCanvas(canvas); }
       // A prepared batch owns each independent crop until all targets succeed, then transfers it to the encoder.
       return trimmed ? gengaPutDrawingCanvas(trimmed.canvas, trimmed.w, trimmed.h, trimmed.x, trimmed.y,
@@ -129815,7 +129859,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Now a selection is a MASK ONLY (conte's model) — the drawing is untouched and rendered as-is, so a
     // lossless op is impossible to get wrong. The base/patch split happens only when something actually
     // MOVES the pixels (a transform/perspective drag), where separating them is the whole point.
-    function gengaSelLifted(sel) { return !!(sel && sel.patch && sel.base); }
+    function gengaSelLifted(sel) { return !!(sel && ((sel.patch && sel.base) || (sel.auto && sel.patchCrop))); }
     // Release lifted pixels without changing the stored drawing or user stencil.
     // Transform coordinates remain unless dropQuad is explicitly true.
     // ver1313: quad 는 기본적으로 **남는다**. 리프트를 푸는 것과 좌표를 버리는 것은 다른 조작이고,
@@ -129843,13 +129887,27 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!sel) return false;
       if (gengaSelLifted(sel)) return true;
       const layer = gengaLayerById(sel.layerId); if (!layer) return false;
+      if (sel.auto && !gengaLayerDrawsVector(layer)) {
+        // Whole-art transforms own one compact crop, not an empty base plus two copies of its pixels.
+        const paper = state.project.gengaTimeline.paper, b = sel.bounds;
+        const pw = Math.max(1, paper.w), ph = Math.max(1, paper.h);
+        const w = Math.max(1, Math.round(b.w)), h = Math.max(1, Math.round(b.h));
+        const crop = document.createElement('canvas'); crop.width = w; crop.height = h;
+        let ready = false;
+        try {
+          const ctx = crop.getContext('2d'); ctx.translate(-Math.round(b.x), -Math.round(b.y));
+          ctx.beginPath(); ctx.rect(0, 0, pw, ph); ctx.clip();
+          if (working) { ready = working.hasContent; if (ready) ctx.drawImage(working.cv, 0, 0); }
+          else ready = gengaDrawDrawingInto(ctx, gengaExposureDrawing(layer, gengaExposureAt(layer, sel.frame)), pw, ph, drawGengaPreview);
+          if (ready) sel.patchCrop = { canvas: crop, w: w, h: h, pw: pw, ph: ph };
+          return ready;
+        } finally {
+          if (working) paintReleaseCanvas(working.cv);
+          if (!ready) paintReleaseCanvas(crop);
+        }
+      }
       const wk = working || gengaPlainDrawingCanvasFor(layer, sel.frame);
       if (!wk.hasContent) { paintReleaseCanvas(wk.cv); return false; }
-      if (sel.auto && !gengaLayerDrawsVector(layer)) {
-        const base = document.createElement('canvas'); base.width = wk.pw; base.height = wk.ph;
-        sel.base = base; sel.patch = wk.cv; sel.patchCrop = null;
-        return true;
-      }
       gengaEnsureSelMask(sel);
       const pw = wk.pw, ph = wk.ph;
       const patch = document.createElement('canvas'); patch.width = pw; patch.height = ph; const px = patch.getContext('2d');
@@ -129915,6 +129973,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         patchCrop: null };
       if (src.auto) {
         out.auto = true;
+        // Compact lifted pixels are source state; split-selection crops remain a rebuildable cache.
+        if (!src.base) out.patchCrop = src.patchCrop || null;
         out._autoSource = src._autoSource; out._autoGeometry = src._autoGeometry;
       }
       return out;
@@ -129924,6 +129984,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const snap = gengaSelShape(s);
       if (snap.auto) { snap.mask = null; snap.edge = null; } // Derived rectangles need no paper-sized history bitmap.
       snap.box = gengaSelBoxSnapshot();
+      return snap;
+    }
+    // A drawing command restores the selection stencil, never its old floating pixels or pending transform.
+    function gengaSelPristineSnapshot(sel) {
+      const snap = gengaSelSnapshot(sel);
+      if (snap) { snap.base = null; snap.patch = null; snap.patchCrop = null; snap.box = null; }
       return snap;
     }
     function gengaRestoreSelSnapshot(snap) {
@@ -129938,6 +130004,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaSelSnapEq(a, b) {
       if (!a && !b) return true; if (!a || !b) return false;
       if (a.base !== b.base || a.patch !== b.patch || a.mask !== b.mask) return false;
+      if (a.auto && !a.base && a.patchCrop !== b.patchCrop) return false;
       if (!a.box !== !b.box) return false;
       if (a.box) { for (let i = 0; i < 4; i++) { if (a.box.quad[i][0] !== b.box.quad[i][0] || a.box.quad[i][1] !== b.box.quad[i][1]) return false; } }
       return String(a.layerId) === String(b.layerId) && a.frame === b.frame;
