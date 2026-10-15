@@ -1,4 +1,4 @@
-// ver1053: cached offline shell for the Add-to-Home-Screen app. The cached document lets the
+// Cached offline shell for the Add-to-Home-Screen app. The cached document lets the
 // installed app launch without waiting for a fresh network copy of the large shell.
 // Stale-while-revalidate downloads a fresh copy in the background for a later launch or reload.
 // Offline use and failed refreshes can leave the cached copy older than one release; no maximum
@@ -19,11 +19,10 @@ function isOldMoArtCache(name) { return name !== CACHE && name.indexOf(CACHE_PRE
 const PURGE_TOKEN = '2026-08-15-waituntil';
 const PURGE_KEY = './__shell-purge-token';   // not a real path — nothing ever fetches it
 
-// ver1459 history: frequent deployments made the cached launch appear persistently out of date
-// (reported as "you don't seem to be deploying"). After a changed, stamped shell is stored,
-// notify open windows so the page can offer a "new version / reload" bar. A later reload can
-// use the stored copy without waiting for the background refresh.
-// Change detection compares ETag or Last-Modified headers, without reading the large body.
+// After a changed, stamped shell is stored, notify open windows so the page can offer a "new version / reload"
+// bar; a later reload uses the stored copy without waiting for the background refresh. Without this, frequent
+// deployments make the cached launch look persistently out of date. Change detection compares ETag or
+// Last-Modified headers, without reading the large body.
 function shellStamp(res) {
   if (!res || !res.headers) return '';
   return res.headers.get('etag') || res.headers.get('last-modified') || '';
@@ -76,7 +75,7 @@ function runOneTimeShellPurge() {
         if (seen === PURGE_TOKEN) return;                       // this client already did it
         return queueCacheWrite('shell', function () { return replaceShellFromNetwork(c); })
           .then(function () { return c.put(tokenUrl, new Response(PURGE_TOKEN)); })
-          .then(notifyShellUpdated);   // a pre-ver1459 shell cannot hear this — its NEXT launch is fresh anyway
+          .then(notifyShellUpdated);   // an old shell without the update listener cannot hear this — its NEXT launch is fresh anyway
       });
     });
   }).catch(function (err) {
@@ -84,7 +83,7 @@ function runOneTimeShellPurge() {
   });
 }
 
-// rest-K3 #013: the purge must NOT sit in activate's waitUntil. claim() there does not help: the browser holds
+// The purge must NOT sit in activate's waitUntil. claim() there does not help: the browser holds
 // navigations until the worker is ACTIVATED (measured in Chrome: reopening the app waited the whole shell
 // download, 3.9s for a 4s refetch). So activate only starts it, and every shell request keeps the one run alive
 // with its own waitUntil — which also retries a run cut short by worker shutdown (the token is still missing).
@@ -115,21 +114,18 @@ self.addEventListener('fetch', function (e) {
   // same-origin only — GoatCounter (gc.zgo.at) and any other third party must pass straight through, so it
   // simply fails silently offline instead of being cached or retried.
   if (url.origin !== self.location.origin) return;
-  // **The background half of stale-while-revalidate is now HELD OPEN.** Nothing used to hold it: the
-  // cached copy answered respondWith, the worker went idle, and the browser was free to kill it
-  // mid-download — with a ~5.7MB shell that window is wide. The put never landed, so the next launch was
-  // stale too, and the next, forever; the slower the line, the more certain. A report arrived from a
-  // build 707 releases old, on a shell too old to even receive the ver1459 update message.
-  // Two things changed: the put is INSIDE this chain (it used to dangle off caches.open with nothing
-  // awaiting it), and waitUntil keeps the worker alive until that chain settles.
-  // The store copy is split off the moment the response arrives, BEFORE a cache miss hands the original
-  // to the page: the queued writer may run only after the page has read that body, and cloning a consumed
-  // Response throws. Shell aliases are cloned from this copy too, so the page's body is never touched.
-  // A shell request waits for a pending one-time purge before it fetches AND before it joins the write queue
-  // (rest-K3 #013). Fetching first could race an old body over the purged one; queueing first deadlocks,
-  // because the purge enters the same queue only after its async token read. The cached copy still answers
-  // at once below — only a shell cache MISS waits. Shell requests waiting on one purge enter the queue in
-  // the order they arrived; every other request is queued synchronously as before.
+  // **The background half of stale-while-revalidate is HELD OPEN.** The put is inside this chain and waitUntil
+  // keeps the worker alive until the chain settles. Otherwise the cached copy answers respondWith, the worker
+  // goes idle and the browser may kill it mid-download of the large shell: the put never lands, so every later
+  // launch stays stale, more certainly on a slow line.
+  // The store copy is split off the moment the response arrives, BEFORE a cache miss hands the original to the
+  // page: the queued writer may run only after the page has read that body, and cloning a consumed Response
+  // throws. Shell aliases are cloned from this copy too, so the page's body is never touched.
+  // A shell request waits for a pending one-time purge before it fetches AND before it joins the write queue.
+  // Fetching first could race an old body over the purged one; queueing first deadlocks, because the purge
+  // enters the same queue only after its async token read. The cached copy still answers at once below — only a
+  // shell cache MISS waits. Shell requests waiting on one purge enter the queue in the order they arrived;
+  // every other request is queued synchronously.
   const shell = isShellRequest(url);
   const purge = shell ? ensureShellPurge() : null;
   const net = (purge ? purge.then(function () { return fetch(e.request); }) : fetch(e.request)).then(function (res) {
