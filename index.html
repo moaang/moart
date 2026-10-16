@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2921</title>
+  <title>MoArt ver2922</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24368,6 +24368,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2922, items: [{ja: 'ZIPを開くときの動画の保存処理をまとめました。', ko: 'ZIP을 열 때 영상 자산의 저장 처리를 묶었습니다.', en: 'Batched video asset writes when opening ZIP projects.', zh: '合并了打开ZIP项目时的视频素材写入。'}] },
       { ver: 2921, items: [{ja: 'ZIPを開くときの細かな読み取りをまとめました。', ko: 'ZIP을 열 때 작은 데이터의 반복 읽기를 줄였습니다.', en: 'Batched small reads when opening ZIP projects.', zh: '合并了打开ZIP项目时的小数据读取。'}] },
       { ver: 2920, items: [{ja: 'コンテを開くときのカメラキー処理と、フォルダー内のメディアの重複読み込みを減らしました。', ko: '콘티를 열 때 카메라 키 처리와 폴더 미디어의 반복 읽기를 줄였습니다.', en: 'Reduced repeated camera-key processing and folder media reads when opening Conte projects.', zh: '减少打开分镜项目时摄影机关键帧处理及文件夹媒体的重复读取。'}] },
       { ver: 2919, items: [{ja: 'コンテFXの操作枠・回転と拡大縮小の中心を描画の基準点に揃えました。', ko: '콘티 FX 조작 테두리와 회전·확대축소 중심을 그림의 실제 기준점에 맞췄습니다.', en: 'Aligned Conte FX handles and rotation/scaling with the artwork pivot.', zh: '将分镜FX操作框及旋转、缩放中心与图画实际基准点对齐。'}] },
@@ -35599,13 +35600,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const storage = clip && clip.mediaStorage && typeof clip.mediaStorage === 'object' ? clip.mediaStorage : null;
       return storage && storage.kind === 'indexeddb' ? String(storage.key || '') : '';
     }
-    async function storeVideoMediaRecordInIndexedDb(blob, mime) {
+    async function storeVideoMediaRecordInIndexedDb(blob, mime, write) {
       const key = INDEXED_DB_VIDEO_KEY_PREFIX + newPrefixedId('video');
       const mediaMime = mime || blob.type || 'video/mp4';
       const size = Math.round(Number(blob.size) || 0);
       const savedAt = new Date().toISOString();
       // the record persister is shared with conte audio (same validity rule: a non-empty blob, same write jobs)
-      if (!await persistAudioRecord(key, { blob: blob, mime: mediaMime, size: size, savedAt: savedAt })) return null;
+      if (!await persistAudioRecord(key, { blob: blob, mime: mediaMime, size: size, savedAt: savedAt }, write)) return null;
       return { kind: 'indexeddb', key: key, mime: mediaMime, size: size, savedAt: savedAt };
     }
     async function readVideoMediaBlobFromIndexedDb(clip) {
@@ -64604,44 +64605,67 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // inline (externalizeVideoMediaToWorkspace moves it into a folder on save); one record per file, shared by
         // split pieces the way audio shares a BGM file
         const videoClipsIn = state.project.video && Array.isArray(state.project.video.clips) ? state.project.video.clips : [];
-        const sharedVideoByBase = {};
+        const sharedVideoByBase = {}, videoBatch = preferIndexedDb ? createWorkspaceDbWriteBatch(owner) : null;
+        let pendingVideo = [], pendingVideoBytes = 0;
+        const videoRecord = function(row) {
+          return sharedVideoByBase[row.base] || (sharedVideoByBase[row.base] = storeVideoMediaRecordInIndexedDb(row.blob, row.mime, videoBatch.write));
+        };
+        const flushVideo = async function() {
+          const rows = pendingVideo; pendingVideo = []; pendingVideoBytes = 0;
+          // Prepare bounded writes together, but publish clips in source order. A failed shared file
+          // is retried at its next placement, as in the sequential importer. Owner changes stop publication.
+          for (const row of rows) {
+            const clip = row.clip;
+            assertProjectIoOwner(owner);
+            try {
+              if (preferIndexedDb) {
+                let shared;
+                try {
+                  shared = await videoRecord(row);
+                  assertProjectIoOwner(owner);
+                  if (!shared) throw new Error('Video write refused');
+                } catch (error) { delete sharedVideoByBase[row.base]; throw error; }
+                clip.mediaMime = shared.mime;
+                clip.mediaDataUrl = '';
+                clip.mediaFileName = '';
+                clip.mediaStorage = Object.assign({}, shared, { fileName: row.fileName });
+                replaceWorkspaceObjectUrl('pictures', videoClipPlaybackKey(clip), row.blob);
+              } else {
+                clip.mediaDataUrl = await blobToDataUrl(row.blob);
+                assertProjectIoOwner(owner);
+                clip.mediaFileName = '';
+                clip.mediaStorage = { kind: 'inline', mime: row.mime, fileName: row.fileName };
+              }
+            } catch (error) {
+              if (!projectIoOwnerCurrent(owner)) throw error;
+              console.error('[zip-import] video store failed:', row.fileName, error);
+              missing.push({ kind: 'video', name: row.fileName });
+            }
+          }
+        };
         for (let index = 0; index < videoClipsIn.length; index += 1) {
           const clip = videoClipsIn[index];
           if (!clip || clip.mediaDataUrl) continue;
           const fileName = clip.mediaFileName || (clip.mediaStorage && clip.mediaStorage.fileName) || '';
           if (!fileName) continue;
-          const base = String(fileName).toLowerCase();
-          const entry = byBase[base];
-          if (!entry) { missing.push({ kind: 'video', name: fileName }); continue; }
+          const base = String(fileName).toLowerCase(), entry = byBase[base];
+          if (!entry) { await flushVideo(); missing.push({ kind: 'video', name: fileName }); continue; }
+          if (pendingVideo.length && pendingVideoBytes + entry.blob.size > 8 * 1024 * 1024) await flushVideo();
           assertProjectIoOwner(owner);
           try {
             const mime = clip.mediaMime || (/\.(mp4|m4v|mov)$/i.test(fileName) ? 'video/mp4' : (/\.webm$/i.test(fileName) ? 'video/webm' : (bundleMimeFromFileName(fileName) || 'video/mp4')));
-            const blob = entry.blob.slice(0, entry.blob.size, mime);
-            if (preferIndexedDb) {
-              let shared = sharedVideoByBase[base];
-              if (!shared) {
-                shared = await storeVideoMediaRecordInIndexedDb(blob, mime);
-                assertProjectIoOwner(owner);
-                if (!shared) throw new Error('Video write refused');
-                sharedVideoByBase[base] = shared;
-              }
-              clip.mediaMime = shared.mime;
-              clip.mediaDataUrl = '';
-              clip.mediaFileName = '';
-              clip.mediaStorage = Object.assign({}, shared, { fileName: fileName });
-              replaceWorkspaceObjectUrl('pictures', videoClipPlaybackKey(clip), blob);
-            } else {
-              clip.mediaDataUrl = await blobToDataUrl(blob);
-              assertProjectIoOwner(owner);
-              clip.mediaFileName = '';
-              clip.mediaStorage = { kind: 'inline', mime: mime, fileName: fileName };
-            }
+            const row = { clip: clip, fileName: fileName, base: base, mime: mime, blob: entry.blob.slice(0, entry.blob.size, mime) };
+            if (preferIndexedDb) videoRecord(row);
+            pendingVideo.push(row); pendingVideoBytes += row.blob.size;
           } catch (error) {
+            await flushVideo();
             if (!projectIoOwnerCurrent(owner)) throw error;
             console.error('[zip-import] video store failed:', fileName, error);
             missing.push({ kind: 'video', name: fileName });
           }
+          if (!preferIndexedDb || pendingVideo.length >= 32 || pendingVideoBytes >= 8 * 1024 * 1024) await flushVideo();
         }
+        await flushVideo();
         assertProjectIoOwner(owner);
         showLoadingOverlay(t('msg.loading.preparingMedia'), null, request);
         normalizeProject(state.project);
