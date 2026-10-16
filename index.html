@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2922</title>
+  <title>MoArt ver2923</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24368,6 +24368,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2923, items: [{ja: '原画タイムラインで再生バーやセル範囲をドラッグして画面の端まで行くと、マウスを止めていても一定の速さでスクロールが続くようにしました。端から外へ離すほど速くなります。', ko: '원화 타임라인에서 재생바나 셀 범위를 드래그해 화면 끝에 닿으면 마우스를 멈춰도 일정한 속도로 계속 스크롤됩니다. 끝에서 바깥으로 멀어질수록 빨라집니다.', en: 'In the genga timeline, dragging the playhead or a cell range to the edge now keeps scrolling at a steady speed even when the mouse stops; the farther past the edge, the faster.', zh: '在原画时间轴拖动播放头或单元格范围到画面边缘时，即使鼠标停下也会以稳定速度持续滚动；越往边缘外越快。'}] },
       { ver: 2922, items: [{ja: 'ZIPを開くときの動画の保存処理をまとめました。', ko: 'ZIP을 열 때 영상 자산의 저장 처리를 묶었습니다.', en: 'Batched video asset writes when opening ZIP projects.', zh: '合并了打开ZIP项目时的视频素材写入。'}] },
       { ver: 2921, items: [{ja: 'ZIPを開くときの細かな読み取りをまとめました。', ko: 'ZIP을 열 때 작은 데이터의 반복 읽기를 줄였습니다.', en: 'Batched small reads when opening ZIP projects.', zh: '合并了打开ZIP项目时的小数据读取。'}] },
       { ver: 2920, items: [{ja: 'コンテを開くときのカメラキー処理と、フォルダー内のメディアの重複読み込みを減らしました。', ko: '콘티를 열 때 카메라 키 처리와 폴더 미디어의 반복 읽기를 줄였습니다.', en: 'Reduced repeated camera-key processing and folder media reads when opening Conte projects.', zh: '减少打开分镜项目时摄影机关键帧处理及文件夹媒体的重复读取。'}] },
@@ -116451,7 +116452,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // reads are hoisted here, ahead of the first write, and their results are handed to the writers. Measure
       // after guardedRender so the current generated geometry is settled; ordinary chunk updates preserve the
       // viewport shell.
-      const scrollPlan = gengaMeasurePlayheadScroll();
+      // 스크럽 중에는 따라가기 스크롤을 하지 않는다 — 프레임은 늘 보이는 영역 안의 포인터에서 오고, 화면 끝의
+      // 스크롤은 가장자리 자동 스크롤(gengaTimelineEdgePan)이 시간 기준으로 맡는다. 둘이 같이 밀면 포인터를
+      // 움직일 때만 여백만큼 튀는 톱니 스크롤이 된다.
+      const scrollPlan = gengaScrubInFlight ? null : gengaMeasurePlayheadScroll();
       const previewBox = gengaMeasurePreviewBox();
       const ph = document.querySelector('#gengaStage .genga-playhead');
       if (ph) ph.style.left = gengaTimelinePx(n - 1);
@@ -116638,6 +116642,67 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       onionClearGhostCache();
       drawGengaPreview();
     }
+    // 원화 타임라인 드래그(재생바 스크럽 · 셀 범위 선택)의 가장자리 자동 스크롤. 스크롤은 포인터 이벤트가 아니라
+    // 시간(rAF)이 민다 — 마우스를 가장자리에 세워 두기만 해도 일정한 속도로 계속 간다(OS 의 드래그 자동
+    // 스크롤 · Blender edge pan 과 같은 규약). 속도는 가장자리 안쪽 띠에서 시작해 깊이에 비례해 오르고, 화면
+    // 밖으로 나가면 나간 거리만큼 더 빨라진다(최대 창에서도 바깥 여백 없이 쓸 수 있게 안쪽 띠를 둔다). 누른 자리는
+    // 띠 안이어도 움직이기 전에는 스크롤하지 않는다. frameAt() 은 포인터를 보이는 영역 안에 묶어, 화면 밖
+    // 포인터는 가장자리 칸을 가리킨다. onPan(clientX) 은 매 틱 마지막 포인터로 불리며, false 를 돌려주면 루프를
+    // 접는다(소유 드래그가 사라진 경우).
+    const GENGA_EDGE_PAN = { zone: 32, minSpeed: 80, rampSpeed: 640, outsideGain: 10, maxSpeed: 3200 }; // LOCAL px · px/s
+    function gengaTimelineEdgePan(content, onPan) {
+      const wrap0 = document.querySelector('#gengaStage .genga-timeline-wrap');
+      // 드래그 동안 뷰포트 상자 자체는 움직이지 않는다(scrollLeft 만 바뀐다) — 한 번만 읽는다. 콘텐츠의 왼쪽은
+      // 콘텐츠 기준으로 잡아 두고 살아 있는 scrollLeft 로 뷰포트 좌표를 다시 낸다(현재 wrap 을 다시 찾는다 —
+      // 보통의 청크 갱신은 껍데기를 보존한다). scrollLeft 는 LOCAL px, gengaFrameAtClientX 는 RAW gBCR left 를
+      // 받으므로 uiReadScale() 을 곱한다.
+      const box = wrap0 ? localRect(wrap0) : null;
+      const viewW = wrap0 ? wrap0.clientWidth : 0;
+      const anchorRawLeft = content.getBoundingClientRect().left + (wrap0 ? wrap0.scrollLeft : 0) * uiReadScale();
+      let rawX = null, pointerX = null, raf = 0, last = 0, pos = null, stopped = !box;
+      const velocity = function() {
+        if (stopped || pointerX == null) return 0;
+        const k = GENGA_EDGE_PAN, left = box.left, right = box.left + viewW;
+        const zone = Math.min(k.zone, viewW / 4);
+        let depth = 0, dir = 0;
+        if (pointerX < left + zone) { depth = left + zone - pointerX; dir = -1; }
+        else if (pointerX > right - zone) { depth = pointerX - (right - zone); dir = 1; }
+        if (!dir) return 0;
+        const inside = Math.min(depth, zone), outside = Math.max(0, depth - zone);
+        return dir * Math.min(k.maxSpeed, k.minSpeed + k.rampSpeed * (inside / zone) + k.outsideGain * outside);
+      };
+      const tick = function(now) {
+        raf = 0;
+        const v = velocity();
+        if (!v) { last = 0; pos = null; return; }
+        const wrap = document.querySelector('#gengaStage .genga-timeline-wrap');
+        if (!wrap) return;
+        const dt = last ? Math.min(0.05, (now - last) / 1000) : 1 / 60;
+        last = now;
+        // 소수 이동을 잃지 않도록 위치는 자체 누산한다. 남이 스크롤을 바꿨으면(스크럽의 렌더 확장 등) 그 값에서 잇는다.
+        if (pos == null || Math.abs(pos - wrap.scrollLeft) > 1) pos = wrap.scrollLeft;
+        const max = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+        pos = Math.max(0, Math.min(max, pos + v * dt));
+        if (Math.round(pos) !== Math.round(wrap.scrollLeft)) wrap.scrollLeft = pos; // scroll 리스너가 상태 · 창 · 스크롤바를 맞춘다
+        raf = requestAnimationFrame(tick); // onPan 안의 update() 가 두 번째 루프를 열지 않도록 먼저 건다
+        if (onPan(rawX) === false) stop();
+      };
+      const stop = function() { stopped = true; if (raf) { cancelAnimationFrame(raf); raf = 0; } };
+      return {
+        update: function(clientX) {
+          rawX = clientX;
+          pointerX = uiPointerLocalX(clientX);
+          if (!raf && velocity()) { last = 0; raf = requestAnimationFrame(tick); }
+        },
+        frameAt: function(clientX) {
+          const z = uiScaleValue();
+          const x = box ? Math.max(box.left * z, Math.min((box.left + viewW - 1) * z, clientX)) : clientX;
+          const wrap = document.querySelector('#gengaStage .genga-timeline-wrap');
+          return gengaFrameAtClientX(x, anchorRawLeft - (wrap ? wrap.scrollLeft : 0) * uiReadScale());
+        },
+        stop: stop
+      };
+    }
     // drag-scrub: pointerdown on the ruler / lane background / playhead handle → jump + follow the pointer.
     let gengaScrubSession = null;   // { pid, end } — 스크럽은 한 번에 하나다
     function gengaScrubStart(ev) {
@@ -116657,20 +116722,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 축이다(헤드 캔버스 N 개가 스텝마다 dirty).
       gengaScrubInFlight = true;
       gengaEnsureAudioCtx(); // warm up ahead of the first scrub-audio tick (fire-and-forget)
-      // Cache the content-space anchor for this gesture and derive viewport left from live scrollLeft. Re-query
-      // the current wrap when applying it; ordinary chunk updates preserve the shell. scrollLeft is LOCAL px
-      // while gengaFrameAtClientX wants a RAW gBCR left, hence the uiReadScale() factor.
-      const anchorRawLeft = content0.getBoundingClientRect().left + wrap0.scrollLeft * uiReadScale();
-      const scrubRectLeft = function() {
-        const wrap = document.querySelector('#gengaStage .genga-timeline-wrap');
-        return anchorRawLeft - (wrap ? wrap.scrollLeft : 0) * uiReadScale();
-      };
+      // 화면 끝에서는 가장자리 자동 스크롤이 뷰를 밀고, 매 틱 포인터 아래 프레임으로 다시 맞춘다.
+      const edgePan = gengaTimelineEdgePan(content0, function(x) { if (!lpFired) scrub({ clientX: x }); });
       // iPad has no right-click: a long-press (touch/pen held for LONG_PRESS.delay within LONG_PRESS.movePx) opens the In/Out menu at that frame.
       const sx = ev.clientX, sy = ev.clientY; let lpFired = false, lpTimer = 0, lpStartFrame = 0;
       let scrubRaf = 0, latestScrubEvent = null;
       const scrub = function(e) {
-        // (clientX - rect.left) is VIEWPORT px (×uiScale) while cellW is LOCAL — normalize
-        const f = gengaFrameAtClientX(e.clientX, scrubRectLeft());
+        const f = edgePan.frameAt(e.clientX);
         // Same display-rate guard as the playback tick — a slow drag rests on one cell for many
         // display frames, and each of those re-ran the whole seek. The scrub audio ping and the long-press
         // cancel below still run every tick, so their behaviour is unchanged.
@@ -116695,15 +116753,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       };
       // Pre-decode the sources nearest the grab point so first-pass scrub blips are audible
       // instead of silent-until-decoded — conte's warmScrubAudioBuffers, on genga's own cache.
-      warmGengaScrubAudioBuffers(gengaFrameAtClientX(ev.clientX, scrubRectLeft()));
+      warmGengaScrubAudioBuffers(edgePan.frameAt(ev.clientX));
       scrub(ev);
       lpStartFrame = state.gengaFrame; // Frame after the initial down-scrub
-      const cleanup = function(flush) { if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; } if (scrubRaf) { cancelAnimationFrame(scrubRaf); scrubRaf = 0; if (flush) tickScrub(); } pointerSession.dispose();   stopGengaScrubAudio(); gengaScrubInFlight = false; gengaScrubSession = null; longPressContacts.unwatch(scrubMenuSub); drawGengaLayerThumbs(); }; // 세션 동안 건너뛴 헤드 썸을 여기서 1회(flush 뒤라 최종 프레임 기준) · 세션 해제
+      const cleanup = function(flush) { edgePan.stop(); if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; } if (scrubRaf) { cancelAnimationFrame(scrubRaf); scrubRaf = 0; if (flush) tickScrub(); } pointerSession.dispose();   stopGengaScrubAudio(); gengaScrubInFlight = false; gengaScrubSession = null; longPressContacts.unwatch(scrubMenuSub); drawGengaLayerThumbs(); }; // 세션 동안 건너뛴 헤드 썸을 여기서 1회(flush 뒤라 최종 프레임 기준) · 세션 해제
       const move = function(e) {
         if (!scrubOwns(e)) return;   // 다른 손가락은 이 스크럽을 못 민다
         if (lpTimer && (Math.abs(e.clientX - sx) > LONG_PRESS.movePx || Math.abs(e.clientY - sy) > LONG_PRESS.movePx)) { clearTimeout(lpTimer); lpTimer = 0; }
         if (lpFired) return;
         latestScrubEvent = e;
+        edgePan.update(e.clientX);
         if (!scrubRaf) scrubRaf = requestAnimationFrame(tickScrub);
       };
       // 이 제스처를 시작한 포인터만 재생헤드를 밀고 끝낼 수 있다.
@@ -127792,7 +127851,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // drag the body to move (startFrame); right-click → 複製 (independent copy) / 削除. 1-frame snap.
     let gengaExpDrag = null;
     // ---- cell (koma slot) selection on the timeline + koma clipboard (copy / cut / paste) ----
-    let gengaCelDrag = null;     // { layerId, anchor, rect } while drag-selecting cells
+    let gengaCelDrag = null;     // { layerId, anchor, edgePan } while drag-selecting cells
     // The click that TRAILS a cell-select gesture must not reach lanesClickHandler — that handler clears the
     // selection the gesture just made. The shared kernel guards it; see `trailingClickGuard` for why a
     // timer-bounded guard is dead on touch.
@@ -127891,8 +127950,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       ev.stopPropagation(); ev.preventDefault();
       const content = document.querySelector('#gengaStage .genga-tl-content'); if (!content) return;
-      const rect = content.getBoundingClientRect(), cw = gengaCelW();
-      const anchor = Math.max(1, gengaFrameAtClientX(ev.clientX, rect.left));
+      const anchor = Math.max(1, gengaFrameAtClientX(ev.clientX, content.getBoundingClientRect().left));
       state.gengaCelSelAnchor = { layerId: layerId, frame: anchor }; // remembered for a later Shift+click range-extend
       // Pressing INSIDE the current selection must not collapse it to one cell — a touch that begins a
       // long-press would wipe a multi-cell selection before the menu could act on it (選択セルを削除 would
@@ -127904,7 +127962,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // what lets 貼り付け insert at that point instead of overwriting the cell the touch had just selected.
       // Mouse, touch and pen taps select on unconsumed release; a long-press still owns its menu.
       const byTouch = (ev.pointerType === 'touch' || ev.pointerType === 'pen');
-      gengaCelDrag = { layerId: layerId, anchor: anchor, lastFrame: anchor, rect: rect, deferReset: inside, byTouch: byTouch, moved: false };
+      // 가장자리 자동 스크롤로 뷰가 움직여도 포인터 아래 칸은 edgePan.frameAt 이 맞춘다(스크럽과 한 벌).
+      const drag = { layerId: layerId, anchor: anchor, lastFrame: anchor, deferReset: inside, byTouch: byTouch, moved: false };
+      drag.edgePan = gengaTimelineEdgePan(content, function(x) {
+        if (gengaCelDrag !== drag) return false;
+        gengaCelSelMove({ clientX: x });
+      });
+      gengaCelDrag = drag;
       gengaCelSelLongPressed = false;
       // thin spec on beginDragStrand (capture:true — this trio listens on document in the capture phase). The
       // move/finish bodies stay put: gengaCelSelUp carries the click-vs-drag rules and the cancel guard, and
@@ -127923,7 +127987,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function gengaCelSelMove(ev) {
       if (!gengaCelDrag) return;
-      const f = Math.max(1, gengaFrameAtClientX(ev.clientX, gengaCelDrag.rect.left));
+      gengaCelDrag.edgePan.update(ev.clientX);
+      const f = Math.max(1, gengaCelDrag.edgePan.frameAt(ev.clientX));
       gengaCelDrag.lastFrame = f;
       // A deferred reset (press began inside the selection) only fires once the pointer actually moves —
       // a wobble on the same cell still counts as "did not move", so a long-press keeps the selection.
@@ -127941,12 +128006,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaCelSelUp(ev) {
       const d = gengaCelDrag;
       gengaCelDrag = null;
+      if (d) d.edgePan.stop();
       const canceled = !!(ev && ev.type === 'pointercancel');
       const consumed = gengaCelSelLongPressed;
       let endpoint = d && d.lastFrame;
       if (!canceled && !consumed && d) {
         // Owned release coordinates win even when no final pointermove was delivered.
-        if (ev && Number.isFinite(ev.clientX)) endpoint = Math.max(1, gengaFrameAtClientX(ev.clientX, d.rect.left));
+        if (ev && Number.isFinite(ev.clientX)) endpoint = Math.max(1, d.edgePan.frameAt(ev.clientX));
         if (endpoint !== d.anchor || d.moved) {
           gengaSetCelSel(d.layerId, d.anchor, endpoint);
           gengaJumpToCelSel(endpoint);
