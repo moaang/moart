@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2920</title>
+  <title>MoArt ver2921</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24368,6 +24368,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2921, items: [{ja: 'ZIPを開くときの細かな読み取りをまとめました。', ko: 'ZIP을 열 때 작은 데이터의 반복 읽기를 줄였습니다.', en: 'Batched small reads when opening ZIP projects.', zh: '合并了打开ZIP项目时的小数据读取。'}] },
       { ver: 2920, items: [{ja: 'コンテを開くときのカメラキー処理と、フォルダー内のメディアの重複読み込みを減らしました。', ko: '콘티를 열 때 카메라 키 처리와 폴더 미디어의 반복 읽기를 줄였습니다.', en: 'Reduced repeated camera-key processing and folder media reads when opening Conte projects.', zh: '减少打开分镜项目时摄影机关键帧处理及文件夹媒体的重复读取。'}] },
       { ver: 2919, items: [{ja: 'コンテFXの操作枠・回転と拡大縮小の中心を描画の基準点に揃えました。', ko: '콘티 FX 조작 테두리와 회전·확대축소 중심을 그림의 실제 기준점에 맞췄습니다.', en: 'Aligned Conte FX handles and rotation/scaling with the artwork pivot.', zh: '将分镜FX操作框及旋转、缩放中心与图画实际基准点对齐。'}] },
       { ver: 2918, items: [{ja: '用紙変更の比較表示と8方向ハンドル、絵も含めた拡大縮小を追加しました。入力欄の選択枠とコンテ読込直後のタイムライン表示を修正しました。', ko: '용지 변경 비교 표시·8방향 핸들과 그림을 포함한 확대·축소를 추가했습니다. 입력칸 테두리와 콘티를 연 직후 타임라인이 비는 문제를 고쳤습니다.', en: 'Added paper comparison, eight resize handles, and scaling with artwork. Fixed clipped input focus rings and empty Conte timelines on opening.', zh: '新增画纸变化对比、八方向控制柄和含图画的缩放。修复输入框焦点边框裁切及分镜打开后时间轴空白。'}] },
@@ -64182,7 +64183,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // Both readers share the legacy directory interpretation (including truncated STORE slices).
-    async function readZipDirectory(size, read, consume) {
+    async function readZipDirectory(size, read, consume, readHeaders, owner) {
       const tailStart = Math.max(0, size - 22 - 65535);
       const tail = await read(tailStart, size);
       const view = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
@@ -64197,7 +64198,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const directory = await read(directoryStart, directoryStart + directorySize);
       let cursor = 0;
       const decoder = new TextDecoder('utf-8'), out = [];
+      let localHeaders = new Map();
       for (let index = 0; index < entryCount; index += 1) {
+        const entryStart = cursor;
         const header = directory.subarray(cursor, cursor + 46);
         const central = new DataView(header.buffer, header.byteOffset, header.byteLength);
         if (central.getUint32(0, true) !== 0x02014b50) {
@@ -64215,7 +64218,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const name = decoder.decode(directory.subarray(cursor + 46, cursor + 46 + nameLength));
         cursor += 46 + nameLength + extraLength + commentLength;
         if (/\/$/.test(name)) continue;
-        const localBytes = await read(localOffset + 26, localOffset + 30);
+        if (readHeaders && !localHeaders.has(localOffset)) {
+          // These four-byte fields are scattered through media payloads. Coalesce only complete,
+          // in-range headers; consumption and malformed-directory errors keep their original order.
+          const offsets = [];
+          for (let next = index, pos = entryStart; next < entryCount && offsets.length < 128 && pos + 46 <= directory.length; next++) {
+            const ahead = new DataView(directory.buffer, directory.byteOffset + pos, 46);
+            if (ahead.getUint32(0, true) !== 0x02014b50) break;
+            const names = ahead.getUint16(28, true), end = pos + 46 + names + ahead.getUint16(30, true) + ahead.getUint16(32, true);
+            if (end > directory.length) break;
+            const offset = ahead.getUint32(42, true);
+            if (!names || directory[pos + 46 + names - 1] !== 47) {
+              if (offset + 30 > size) break;
+              offsets.push(offset);
+            }
+            pos = end;
+          }
+          localHeaders = new Map();
+          if (offsets.length > 1) {
+            try {
+              const headers = await readHeaders(offsets);
+              offsets.forEach(function(offset, i) { localHeaders.set(offset, headers.subarray(i * 4, i * 4 + 4)); });
+            } catch (_) { /* Retry the current header below; speculative reads must not change its error. */ }
+          }
+        }
+        if (owner) assertProjectIoOwner(owner);
+        const localBytes = localHeaders.get(localOffset) || await read(localOffset + 26, localOffset + 30);
         const local = new DataView(localBytes.buffer, localBytes.byteOffset, localBytes.byteLength);
         const dataStart = localOffset + 30 + local.getUint16(0, true) + local.getUint16(2, true);
         if (method !== 0 && method !== 8) throw new Error(t('msg.project.zipUnsupportedMethod', method));
@@ -64289,7 +64317,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (owner) assertProjectIoOwner(owner);
           }
           return { name: name, blob: blob };
-        });
+        }, function(offsets) {
+          const headers = new Blob(offsets.map(function(offset) { return file.slice(offset + 26, offset + 30); }));
+          return readZipBlobRange(headers, 0, headers.size, owner);
+        }, owner);
     }
 
     // A ZIP drawing whose ref already names a stored drawing (another project's gd:/gdd: row or a
