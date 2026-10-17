@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2929</title>
+  <title>MoArt ver2930</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -81011,7 +81011,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintStrokeBufferPool[key] = canvas;
       }
       delete owner.strokeBuffers;
-      owner.modeBaseCanvas = null; owner.shapeBase = null; owner.shapeBuf = null;
+      owner.modeBaseCanvas = null; owner.shapeBase = null; owner.shapeBuf = null; owner.shapeBaseTiles = null;
     }
     function paintClearStrokeBufferPool() {
       for (const key of ['base', 'stroke']) {
@@ -101905,7 +101905,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // delta 커밋 — 직전 그림이 칸(또는 delta)이고 잉크를 «더하는» 획이면, 기존 칸을 한 번도 보지 않고 「base
     // ref + 이번 획 창의 GPU 스냅」만 등록한다(커밋이 기존 잉크 양 N 과 무관해진다). 성립 못 하면 null — 부르는
     // 쪽이 칸 경로(gengaTileSetFromCanvas)로 간다: 통짜·벡터·격자/용지 불일치·소거 획·ink 없는 커밋·사슬 깊이
-    // 상한(콜드 스냅이 사슬을 리셋한다).
+    // 상한에서 base를 확인할 수 없는 경우. 정상 상한은 변경 칸만 합쳐 사슬을 리셋한다.
     const GENGA_DELTA_CHAIN_MAX = 8;
     function gengaTryCommitDelta(cv, scanRect, prevDrawing) {
       const prevRef = prevDrawing && prevDrawing.ref;
@@ -101917,11 +101917,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!(pv.pw === pw && pv.ph === ph)) return null;                       // 용지가 바뀌었다 — 격자가 다르다
       if (!gengaTileBaseAtPaperOrigin(prevDrawing, pv)) return null;          // 그림 좌표계(변환된 트림 그림)의 칸
       if (isTs && pv.tile !== GENGA_TILE_PX) return null;                     // 옛 격자 크기의 저장본
-      const depth = isD ? (Number(pv.depth) || 1) + 1 : 1;
-      if (depth > GENGA_DELTA_CHAIN_MAX) return null;
+      let depth = isD ? (Number(pv.depth) || 1) + 1 : 1;
       const g = gengaTileGrid(pw, ph);
       const cw = gengaDirtyCellWindow(scanRect.ink, g);
       if (!cw) return null;                                                   // 뒤집힌 창 — 못 믿는다
+      let baseRef = prevRef;
+      if (depth > GENGA_DELTA_CHAIN_MAX) {
+        // The active canvas already contains every delta. Rebase only their changed cells onto
+        // the original tile set; keep the old refs/snapshots intact for Undo and persistence.
+        let base = pv, remaining = GENGA_DELTA_CHAIN_MAX;
+        while (gengaIsDrawDelta(base) && remaining-- > 0) {
+          if (base.pw !== pw || base.ph !== ph) return null;
+          cw.c0 = Math.min(cw.c0, base.c0); cw.r0 = Math.min(cw.r0, base.r0);
+          cw.c1 = Math.max(cw.c1, base.c1); cw.r1 = Math.max(cw.r1, base.r1);
+          baseRef = base.deltaBase; base = gengaDrawStore.get(baseRef);
+        }
+        if (!gengaIsTileSet(base) || base.pw !== pw || base.ph !== ph || base.tile !== GENGA_TILE_PX) return null;
+        depth = 1;
+      }
       const wx0 = cw.c0 * GENGA_TILE_PX, wy0 = cw.r0 * GENGA_TILE_PX;         // 칸 정렬 창(CutCell 의 scanImg 경로 전제)
       const wx1 = Math.min(pw, (cw.c1 + 1) * GENGA_TILE_PX), wy1 = Math.min(ph, (cw.r1 + 1) * GENGA_TILE_PX);
       const snap = document.createElement('canvas');
@@ -101932,9 +101945,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const bx = Math.min(Number(pv.x) || 0, wx0), by = Math.min(Number(pv.y) || 0, wy0);
       const bw = Math.max((Number(pv.x) || 0) + (Number(pv.w) || 1), wx1) - bx;
       const bh = Math.max((Number(pv.y) || 0) + (Number(pv.h) || 1), wy1) - by;
-      const v = { deltaBase: prevRef, snap: snap, sx: wx0, sy: wy0, c0: cw.c0, r0: cw.r0, c1: cw.c1, r1: cw.r1,
+      const v = { deltaBase: baseRef, snap: snap, sx: wx0, sy: wy0, c0: cw.c0, r0: cw.r0, c1: cw.c1, r1: cw.r1,
         pw: pw, ph: ph, x: bx, y: by, w: bw, h: bh, depth: depth, at: performance.now() };
-      gengaDeltaBaseHold(prevRef, true);
+      gengaDeltaBaseHold(baseRef, true);
       gengaDrawStorePut(ref, v);
       gengaScheduleTileEncode(ref, v);                                        // 붕괴·인코드는 펌프가 잇는다
       gengaBakeQuietAt = performance.now();                                   // 잠잠 기준은 마지막 커밋 한 벌
@@ -122973,6 +122986,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // selection clip needs no offset — 0,0. 이 함수는 **포인터 이동마다**
       // 불린다(gengaShapeDragUpdate·gengaPenOutlineRedraw) — 세션을 소유자로 넘겨 마스크 사본 한 장을
       // 쓴다(그때마다 할당하면 재그리기 1회 0.017→0.597ms 실측).
+      const rect = changedRect || ((!sess.shape && (sess.penOutline || sess.penBufMode)) ? gengaScanClamp(sess.inkScan, sess.canvas) : null);
+      gengaCaptureHistoryBefore(sess, rect || { x: 0, y: 0, w: sess.canvas.width, h: sess.canvas.height });
       paintCompositeBufferOnto(sess.ctx, sess.shapeBase, sess.shapeBuf, {
         width: sess.canvas.width, height: sess.canvas.height,
         scratchOwner: sess,
@@ -122984,7 +122999,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         clip: gengaStrokeClipFor(sess),
         // Retained outlines supply the changed output rectangle, including erased tail pixels.
         // Other pen consumers use the accumulated scan; shapes/lasso retain the full surface.
-        rect: changedRect || ((!sess.shape && (sess.penOutline || sess.penBufMode)) ? gengaScanClamp(sess.inkScan, sess.canvas) : null)
+        rect: rect
       });
     }
     // A user selection stencil clips drawing across layers and frames. Tool-generated automatic bounds are
@@ -123302,19 +123317,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       sess.historyBefore.forEach(function(tile) { paintReleaseCanvas(tile.canvas); });
       sess.historyBefore.clear();
     }
-    // Direct pen writes have no immutable stroke base. Capture each affected tile once,
-    // before the first write, using the same conservative bounds as the stroke scan.
+    // Capture original pixels once per touched tile, before writing the active canvas.
+    // Buffered pens retain them in the stroke base; direct pens keep history patches.
     function gengaCaptureHistoryBefore(sess, rect) {
-      if (!sess || sess.shapeBase || sess.vector || sess.vectorErase || !rect) return;
+      if (!sess || (sess.shapeBase && !sess.shapeBaseTiles) || sess.vector || sess.vectorErase || !rect) return;
       const grid = gengaTileGrid(sess.canvas.width, sess.canvas.height);
       const clipped = gengaScanClamp({ x0: rect.x, y0: rect.y, x1: rect.x + rect.w, y1: rect.y + rect.h }, sess.canvas);
       const window = clipped && gengaDirtyCellWindow(clipped, grid); if (!window) return;
-      const tiles = sess.historyBefore || (sess.historyBefore = new Map());
+      const tiles = sess.shapeBaseTiles || sess.historyBefore || (sess.historyBefore = new Map());
       for (let y = window.r0; y <= window.r1; y++) for (let x = window.c0; x <= window.c1; x++) {
         const index = y * grid.gw + x;
         if (tiles.has(index)) continue;
         const tileRect = gengaTileRect(index, { gw: grid.gw, tile: GENGA_TILE_PX, pw: sess.canvas.width, ph: sess.canvas.height });
-        tiles.set(index, { rect: tileRect, canvas: paintCopyCanvasRegion(sess.canvas, tileRect) });
+        if (sess.shapeBaseTiles) {
+          sess.shapeBase.getContext('2d').drawImage(sess.canvas, tileRect.x, tileRect.y, tileRect.w, tileRect.h,
+            tileRect.x, tileRect.y, tileRect.w, tileRect.h);
+          tiles.add(index);
+        } else tiles.set(index, { rect: tileRect, canvas: paintCopyCanvasRegion(sess.canvas, tileRect) });
       }
     }
     function gengaHistoryPixels(sess, drawing, rect) {
@@ -123324,6 +123343,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const x = window.c0 * GENGA_TILE_PX, y = window.r0 * GENGA_TILE_PX;
       const r = { x: x, y: y, w: Math.min(cv.width, (window.c1 + 1) * GENGA_TILE_PX) - x,
         h: Math.min(cv.height, (window.r1 + 1) * GENGA_TILE_PX) - y };
+      if (sess.shapeBaseTiles) gengaCaptureHistoryBefore(sess, r);
       const before = paintCopyCanvasRegion(sess.shapeBase || cv, r);
       if (sess.historyBefore) {
         const ctx = before.getContext('2d');
@@ -123873,7 +123893,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // stroke can be masked before it reaches the layer, and it makes the live preview already clipped
         // instead of snapping at commit.
         const penBase = paintBorrowStrokeCanvas(gengaDrawSession, 'base', pw, ph);
-        penBase.getContext('2d').drawImage(cv, 0, 0);
+        // Mixing may sample beyond the output bounds; vector/shape paths keep their full base.
+        if (vectorDraw || paintMixOptionsFrom(gengaDrawSession)) penBase.getContext('2d').drawImage(cv, 0, 0);
+        else gengaDrawSession.shapeBaseTiles = new Set();
         const penBuf = paintBorrowStrokeCanvas(gengaDrawSession, 'stroke', pw, ph);
         const pb = penBuf.getContext('2d');
         pb.lineCap = 'round'; pb.lineJoin = 'round';
@@ -131425,7 +131447,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!projectIoOwnerCurrent(owner) || state.gengaPlaying || gengaPlaybackWarm || strokeInProgress()) return;
         const gt = owner.project.gengaTimeline;
         if (!gt) return;
-        const layers = (gt.layers || []).filter(function(layer) { return layer.visible !== false && layer.type !== 'camera'; });
+        const layers = (gt.layers || []).filter(function(layer) { return layer.type !== 'camera' && gengaLayerDrawsInComposite(layer); });
         const plan = [], end = frame + Math.max(1, gt.fps || 24);
         layers.forEach(function(layer) { (layer.exposures || []).forEach(function(exposure) {
           if (exposure.startFrame > frame && exposure.startFrame <= end) plan.push({ layer: layer, exposure: exposure });
