@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2939</title>
+  <title>MoArt ver2940</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -15072,6 +15072,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           en: 'Fixed work slots are full (4/4). Free up a slot, then try again.',
           zh: '固定工作槽已达上限（4/4）。请整理出一个槽位后再试。'
         },
+        'msg.project.closeTabHistory': { ja: 'このタブを閉じると、取り消し・やり直しの履歴が消えます（内容はバックアップに残ります）。閉じますか？', ko: '이 탭을 닫으면 되돌리기·다시 하기 기록이 사라집니다(내용은 백업에 남습니다). 닫을까요?', en: 'Closing this tab discards its undo/redo history (the content stays in the backup). Close it?', zh: '关闭此标签页会丢弃其撤销/重做记录（内容仍保留在备份中）。要关闭吗？' },
         'msg.project.unsavedClose': {
           ja: 'このプロジェクトには未保存の変更があります。保存してから閉じますか？',
           ko: '이 프로젝트에 저장하지 않은 변경 사항이 있습니다. 저장한 후 닫으시겠습니까?',
@@ -17538,7 +17539,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 확대·축소 한 단계 — 모든 뷰 표면이 같은 배율(곱셈, PS·CSP·Krita). 덧셈 단계는 400% 에서 거의 안 움직이고 20% 에서
     // 크게 튀었다(원화만 곱셈이었다).
     function zoomStepValue(zoom, dir) { return Math.round(zoom * (dir > 0 ? 1.25 : 1 / 1.25) * 100) / 100; }
-    const VIDEO_PREVIEW_WHEEL_FACTOR = 1.15; // wheel is multiplicative (genga parity); buttons/keyboard keep the additive step above
+    const VIDEO_PREVIEW_WHEEL_FACTOR = 1.15; // wheel is multiplicative (genga parity); buttons/keyboard use zoomStepValue
     // This is ONLY the label rail's column width — scroll content starts at frame 0 with NO label offset (--timeline-label-width inside the content is pinned to 0). 100: 토글 행의 라벨이 [눈][스피커][이름] 격자라(열 18+18, 간격 3×2, 안쪽 여백 10) 이름에 남는 폭이 48px 이다 — 9px 굵은 글꼴의 「V1 Media」가 잘리지 않는 바닥. 실제 폭은 timelineTrackLabelWidth() = 이 값 + 사용자가 경계를 끌어 더한 timelineHeadsExtraW.
     const TIMELINE_TRACK_LABEL_WIDTH = 100;
     const TIMELINE_HEADS_EXTRA_MAX = 240;
@@ -18181,13 +18182,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       document.body.dataset.uiHiddenBound = 'true';
       const bar = document.getElementById('uiRevealBar');
       if (bar) bar.addEventListener('click', function() { toggleUiHidden(false); });
-      // Esc reveals — but only when hidden, and never steal Esc from a text field or an open dialog.
+      // Esc 는 **떠 있는 것 하나**를 먼저 닫는다 — 팝오버 → 어니언 창 → 숨긴 UI 순. 닫았으면 그 Esc 는 끝이다(선택
+      // 해제·변형 취소로 이어지지 않는다). 전에는 선택이 있으면 선택 처리가 먼저 먹어 팝업이 남았고, UI 를 숨긴 채 누른
+      // Esc 는 UI 를 되살리면서 선택까지 풀었다. 열린 메뉴(window 캡처)와 드래그 취소(window 캡처)는 이보다 먼저다.
+      // 텍스트 입력과 열린 대화상자의 Esc 는 건드리지 않는다.
       document.addEventListener('keydown', function(ev) {
-        if (ev.key !== 'Escape' || !state.uiHidden) return;
+        if (ev.key !== 'Escape' || ev.isComposing) return;
         if (typeof isTypingTarget === 'function' && isTypingTarget(ev.target)) return;
         if (document.querySelector('dialog[open]')) return;
-        ev.preventDefault();
-        toggleUiHidden(false);
+        let handled = true;
+        if (typeof anchoredPopover !== 'undefined' && anchoredPopover) closeAnchoredPopover();
+        else if (state.onionSkinWindowOpen) windowSetOpen(windowDefById('windowOnionSkin'), false);
+        else if (state.uiHidden) toggleUiHidden(false);
+        else handled = false;
+        if (handled) { ev.preventDefault(); ev.stopImmediatePropagation(); }
       }, true);
     }
     // ── The drawing cursor ────────────────────────────────────────────────────────────────
@@ -24126,7 +24134,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function closeProjectSlot(id) {
       // The old tab DOM can remain visible while a new project is loading its slot list.
       const isCurrent = state.projectActive && state.project && state.project.projectId === id;
-      if (!isCurrent) { await unpinProjectSlot(id); releaseProjectTabHistory(id); return; }
+      if (!isCurrent) {
+        // 비활성 탭도 되돌리기 기록이 있으면 묻는다 — 닫으면 그 기록이 사라진다(내용은 백업에 남는다).
+        const hist = projectTabHistories.get(String(id));
+        if (hist && (hist.undo.length || hist.redo.length) && !await askConfirm(t('msg.project.closeTabHistory'))) return;
+        await unpinProjectSlot(id); releaseProjectTabHistory(id); return;
+      }
       const closingHead = projectSaveHeads.get(String(id));
       const request = beginProjectFileLoad();
       if (!(await confirmDiscardUnsaved('msg.project.unsavedClose', request.owner))) return;
@@ -24466,6 +24479,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2940, items: [{ja: '2本指タップを続けると、2回目から1回ごとにやり直しになります（3回で2回やり直し）。Macのdelete(⌫)キーで、選んだクリップ・キー・パネルなど絵以外のものを削除でき、原画のDeleteもショートカットの割り当てに従います。Escは開いているポップアップ・ウィンドウを先に1つだけ閉じます。投げなわはShiftで追加・Altで削除（ボタンの既定は「追加」のまま）、ペン・消しゴムでAltを押している間はスポイトになります。音声の削除確認はセリフや映像がつながっているときだけ出し、カメラ・FXキーのクリップボードは貼り付けた後も残ります。絵コンテへの画像の貼り付けは配置ダイアログを通し、取り消し履歴のある他のタブを閉じるときは確認します。トラックパッドの2本指スワイプは画面の移動になり、用紙ウィンドウを開いていてもポインタが映像の上なら表示ショートカットは映像に効きます。', ko: '두 손가락 탭을 이어서 누르면 두 번째부터 한 번마다 다시 하기가 됩니다(세 번이면 다시 하기 두 번). Mac의 delete(⌫) 키로 고른 클립·키·패널처럼 그림이 아닌 것을 지울 수 있고, 원화 Delete도 단축키 배정을 따릅니다. Esc는 열린 팝업·창을 먼저 하나만 닫습니다. 올가미는 Shift로 추가·Alt로 빼기(버튼 기본값은 「추가」 그대로)이고, 펜·지우개에서 Alt를 누르는 동안은 스포이트가 됩니다. 음성 삭제 확인은 대사나 영상이 연결돼 있을 때만 띄우고, 카메라·FX 키 클립보드는 붙여넣은 뒤에도 남습니다. 콘티에 이미지를 붙여넣으면 배치 창을 거치고, 되돌리기 기록이 있는 다른 탭을 닫을 때는 확인합니다. 트랙패드 두 손가락 스와이프는 화면 이동이 되고, 용지 창이 열려 있어도 포인터가 영상 위면 보기 단축키가 영상에 적용됩니다.', en: 'Repeated two-finger taps now redo once per tap from the second tap on (three taps = two redos). The Mac delete (⌫) key deletes non-drawing selections such as clips, keys and panels, and key animation Delete follows the shortcut binding. Escape closes one open popup or window first. Lasso: Shift adds and Alt subtracts (the default mode button stays Add), and holding Alt with the pen or eraser picks colors. Audio deletion asks only when dialogue or video is linked, and camera/FX key clipboards survive pasting. Image paste into storyboards goes through the placement dialog, and closing another tab with undo history asks first. A two-finger trackpad swipe pans the canvas, and with the paper window open the view shortcuts follow the pointer onto the video.', zh: '连续双指轻点时，从第二次起每点一次重做一次（三次=重做两次）。Mac的delete(⌫)键可删除所选片段、关键帧、画格等非绘图对象，原画的Delete也遵循快捷键分配。Esc先只关闭一个打开的弹出窗口。套索：Shift为添加、Alt为减去（按钮默认仍为“添加”），使用钢笔、橡皮擦时按住Alt为吸管。仅在连接了台词或视频时才显示音频删除确认，相机/FX关键帧剪贴板在粘贴后仍保留。向分镜粘贴图像会经过放置对话框，关闭有撤销记录的其他标签页时会确认。触控板双指滑动改为平移画面，打开用纸窗口时指针在视频上时视图快捷键作用于视频。'}] },
       { ver: 2939, items: [{ja: '絵コンテのカメラキーは、選んだキーをつかむと選択全体をドラッグし、押しただけでは選択が変わらないようにしました（Ctrlで押して少し動いたときにキーが消えることがあったのを直しました）。Shiftでのリップル移動は前のクリップに重ならないところで止まります。描いている途中のツール切り替えと取り消しは受け付けず、押している間だけのツールキーを途中で離したときはペンを離してから戻ります。絵コンテのセルのShift+クリックは範囲選択になり、矢印や貼り付けの基準パネルは最後に触ったパネルになりました。', ko: '콘티 카메라 키는 고른 키를 잡으면 선택 전체를 끌고, 누르기만 해서는 선택이 바뀌지 않게 했습니다(Ctrl로 누르고 조금 움직이면 키가 사라질 수 있던 것을 고쳤습니다). Shift 리플 이동은 앞 클립과 겹치지 않는 곳에서 멈춥니다. 그리는 도중의 도구 전환과 되돌리기는 받지 않고, 누르는 동안만 쓰는 도구 키를 도중에 떼면 펜을 뗀 뒤 돌아갑니다. 콘티 셀의 Shift+클릭은 범위 선택이 되고, 화살표·붙여넣기의 기준 패널은 마지막으로 짚은 패널이 됐습니다.', en: 'Storyboard camera keys: grabbing a selected key drags the whole selection, and a press alone no longer changes the selection (a Ctrl-press with a slight move could delete a key). Shift ripple moves stop before overlapping the clip in front. Tool switches and undo are ignored mid-stroke, and releasing a hold-to-use tool key mid-stroke switches back after the pen lifts. Shift+click on storyboard cells selects a range, and the reference panel for arrows and paste is the last one touched.', zh: '分镜相机关键帧：抓住已选关键帧会拖动整个选择，仅按下不会改变选择（修复了按住Ctrl稍微移动时可能删除关键帧的问题）。Shift波纹移动会停在不与前面片段重叠的位置。绘制途中不接受工具切换和撤销，按住期间临时使用的工具键在途中松开时会在抬笔后再切回。分镜单元格的Shift+点击变为范围选择，方向键和粘贴的基准画格改为最后触碰的画格。'}] },
       { ver: 2938, items: [{ja: '選択範囲があるときのDeleteは選択の中だけを消し、Ctrl+Xでコマごと切り取らないようにしました（原画でも選択の中を消します）。原画では変形ツール以外でEnterを押しても変形を適用せず、Escは変形を取り消してから選択を解除し、解除は取り消しで戻せます。ドラッグ中のEscでの取り消しをすべてのドラッグに広げ、In/Outはドラッグで反対側を越えないようにしました。リンクした映像クリップの削除は音声と一緒に、カメラツール中でも選んだものが削除されます。JISキーボードの＝・`、MacのCmd+S、Ctrl+Dで選択解除が効くようにし、矢印を割り当てたときの二重移動と、トグル系ショートカットの長押しでの切り替わりを直しました。タイムラインはCtrl+ホイールで拡大縮小でき、絵コンテの拡大縮小は原画と同じ倍率刻みになりました。メニューが開いているときはキー操作がメニューに向き、確認ダイアログで危険でない操作はEnterで決定できます。絵コンテの行の並べ替えで選択が広がらず、原画のソロ表示は選んだレイヤーをすべて表示します。', ko: '선택 영역이 있을 때 Delete는 선택 안쪽만 지우고, Ctrl+X로 코마째 잘라내지 않습니다(원화도 선택 안쪽을 지웁니다). 원화에서 변형 도구가 아닐 때 Enter를 눌러도 변형을 적용하지 않고, Esc는 변형을 먼저 취소한 뒤 선택을 풀며, 해제는 되돌리기로 되살릴 수 있습니다. 드래그 중 Esc 취소를 모든 드래그로 넓혔고, In/Out은 끌어서 반대쪽을 넘지 않습니다. 연결된 영상 클립은 음성과 함께 지워지고, 카메라 도구 중에도 고른 것이 지워집니다. JIS 키보드의 =·`, Mac의 Cmd+S, Ctrl+D 선택 해제가 동작하고, 화살표를 배정했을 때의 이중 이동과 토글 단축키를 길게 누를 때의 반복 전환을 고쳤습니다. 타임라인은 Ctrl+휠로 확대·축소되고, 콘티 확대·축소가 원화와 같은 배율 단계가 됐습니다. 메뉴가 열려 있으면 키 입력이 메뉴로 가고, 위험하지 않은 확인 창은 Enter로 확정됩니다. 콘티 행을 재배치해도 선택이 넓어지지 않고, 원화 솔로 보기는 고른 레이어를 모두 보여 줍니다.', en: 'With a selection, Delete clears only inside it and Ctrl+X no longer cuts the whole koma (key animation clears inside the selection too). In key animation, Enter outside the transform tools no longer applies a transform, and Escape cancels a pending transform before deselecting, with deselecting undoable. Escape now cancels every drag, and dragging In/Out stops at the other mark. Deleting a linked video clip removes its audio too, and with the camera tool on the selected item is what gets deleted. The JIS = and ` keys, Cmd+S on Mac and Ctrl+D to deselect now work; an arrow key assigned to a shortcut no longer moves twice, and holding a toggle shortcut no longer flips it repeatedly. Ctrl+wheel zooms the timelines, and storyboard zoom steps now match key animation. An open menu takes the keyboard, and Enter confirms non-destructive dialogs. Reordering storyboard rows keeps the selection, and key animation solo view shows every selected layer.', zh: '有选区时Delete只清除选区内，Ctrl+X不再剪切整个格（原画也清除选区内）。原画中在非变形工具下按Enter不会应用变形，Esc先取消变形再取消选区，取消选区可撤销。拖动中的Esc取消扩展到所有拖动，In/Out拖动不会越过另一端。删除链接的视频片段会连同音频一起删除，相机工具开启时也删除所选对象。JIS键盘的=和`、Mac的Cmd+S、Ctrl+D取消选区现已可用，修复了给方向键分配快捷键时的双重移动和长按切换类快捷键时的反复切换。时间轴可用Ctrl+滚轮缩放，分镜缩放与原画使用相同倍率级差。菜单打开时按键由菜单接收，非危险的确认对话框可按Enter确认。分镜行重新排序不再扩大选择，原画独显视图显示所有所选图层。'}] },
       { ver: 2937, items: [{ja: '原画で、保持中のコマの途中に貼り付けると、そのコマを分割して後ろを押し出し、間に貼り付けるように戻しました（空のコマの追加はこれまでどおりコマの後ろに入ります）。', ko: '원화에서 홀드 중인 코마 중간에 붙여넣으면 그 코마를 쪼개고 뒤를 밀어 그 사이에 붙이도록 되돌렸습니다(빈 코마 추가는 지금처럼 코마 뒤에 들어갑니다).', en: 'In key animation, pasting in the middle of a held koma again splits it, pushes the rest back and pastes in between (adding an empty koma still goes after the koma).', zh: '原画中在保持中的格中间粘贴时，恢复为拆分该格、把后面推后并粘贴在中间（添加空格仍放在该格之后）。'}] },
@@ -30750,6 +30764,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return;
       }
       const linked = audioClipLinkedDialogBlocks(project, clip);
+      // 함께 사라지는 것(링크 영상·대사)이 없으면 묻지 않는다 — Undo 로 되돌릴 수 있다. 메뉴와 Delete 키가 같은 판정.
+      if (!linked.length) {
+        if (commitAudioClipRemoveFast(clipId)) { guardedRender('inspector', renderInspector); guardedRender('chrome', updateChromeControls); }
+        return;
+      }
       const snapshot = function() { return JSON.stringify([clip, audioClipLinkedDialogBlocks(project, clip).map(function(b) { return dialogueComponentSignature(dialogueLinkComponent(project, b)); })]); };
       const signature = snapshot();
       const message = (linked.length > 1 ? t('dialog.follow.deleteShared') : t('dialog.follow.deleteVoiceConfirm'))
@@ -48576,6 +48595,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 휠 한 번의 확대 배율(위로 굴리면 > 1). 마우스 한 칸(100px, 줄·페이지 단위는 환산)이면 step 그대로이고,
     // 트랙패드 핀치처럼 작은 델타가 연달아 오면 크기에 비례한다(Chromium PDF 뷰어와 같은 exp 규칙). 한 이벤트가
     // 한 단계를 넘지 않는다. Shift+휠이 가로 델타로만 오는 브라우저에서는 그 값을 쓴다. 휠로 확대하는 화면은 모두 이것을 쓴다.
+    // 트랙패드 두 손가락 스와이프인가(핀치는 ctrlKey 가 실려 와 확대다). 마우스 휠은 노치마다 wheelDelta 가 120 의 배수로
+    // 온다(Chrome·Safari) — 그렇지 않거나 가로 델타가 있으면 트랙패드 스크롤로 보고 화면을 옮긴다. 판정할 수 없는
+    // 브라우저(wheelDelta 없음)는 종전대로 확대.
+    function wheelIsTrackpadPan(ev) {
+      if (ev.ctrlKey || ev.metaKey || ev.deltaMode !== 0) return false;
+      if (ev.deltaX && !ev.shiftKey) return true;
+      const w = ev.wheelDeltaY;
+      return typeof w === 'number' && w !== 0 && w % 120 !== 0;
+    }
     function wheelZoomFactor(ev, step) {
       let d = ev.deltaY || (ev.shiftKey ? ev.deltaX : 0);
       if (ev.deltaMode === 1) d *= 33; else if (ev.deltaMode === 2) d *= 100;
@@ -48852,7 +48880,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return 'redo';
       }
       if (redoGestureMode() === 'double-tap' && now - twoFingerLastTapAt <= TWO_FINGER_DOUBLE_TAP_MS) {
-        twoFingerLastTapAt = 0; // a third tap starts a fresh pair rather than chaining
+        // 연타는 이어진다 — 둘째 탭부터 탭마다 redo 한 번(셋 = redo 둘, 사용자 판정 ver2940). 전에는 셋째 탭이 다시
+        // undo 로 갈려 왔다갔다 했다.
+        twoFingerLastTapAt = now;
         // Tap 1 already applied an undo (undo has to stay instant — deferring it by the double-tap window
         // would put 350ms of lag on the most-used gesture). So take that undo back first, then redo, and a
         // double-tap reads as ONE redo from where the user started instead of a no-op undo/redo pair.
@@ -49098,10 +49128,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // wheel handler is bound on the preview canvas that fills its whole stage.
           event.preventDefault();
           event.stopPropagation();
+          if (wheelIsTrackpadPan(event)) {   // 두 손가락 스와이프 = 이동(원화와 같은 판정)
+            const uz = uiReadScale();
+            state.paintViewportPanX -= event.deltaX / uz; state.paintViewportPanY -= event.deltaY / uz; applyPaintViewportPan(); return;
+          }
           // Multiplicative, matching genga's wheel. An additive +0.1 would be +40% of the current size at zoom
           // 0.25 and +2.5% at zoom 4 — the same gesture violent zoomed out and inert zoomed in. Two canvases
-          // answering the same wheel differently is the parity break; the buttons and the keyboard keep the
-          // additive step, since those are operated with the cursor nowhere near the canvas.
+          // answering the same wheel differently is the parity break. (Buttons and keys use zoomStepValue, ×1.25.)
           // Shift+wheel arrives as a horizontal wheel on Windows/macOS Chrome (deltaX, deltaY 0) — with Shift
           // the horizontal delta stands in. No vertical intent (tilt wheel, sideways swipe) → no zoom.
           // 배율은 델타에 비례한다(wheelZoomFactor) — 반올림하지 않는다: 트랙패드의 작은 한 걸음이 0.01 단위에 삼켜진다.
@@ -82721,10 +82754,13 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     // THE eyedropper commit tail — both engines call this, so "same button, two behaviours" (e.g. one engine
     // forgetting the clear-on-success) is structurally impossible. Sampling stays per-engine (conte
     // multi-canvas order vs genga composited frame).
+    // 스포이트를 **누르고 있는 동안**(Alt·I 홀드)은 한 번 집어도 꺼지지 않는다 — 키를 놓을 때 홀드가 돌아간다. 꺼 버리면
+    // 키를 누른 채 다음 드래그가 그림을 그렸다(Relay 48297ca7f0be).
+    function eyedropperHeld() { return !!(paintToolHoldActive && paintToolHoldActive.actionId === 'eyedropper'); }
     function applyEyedropperSample(pixelOrNull) {
       if (pixelOrNull && pixelOrNull.a > 0) {
         setPaintBrushColor(rgbToHex(pixelOrNull), { custom: true, record: true });
-        state.paintEyedropper = false; // exit the one-shot eyedropper -> back to the tool that was active
+        state.paintEyedropper = eyedropperHeld(); // exit the one-shot eyedropper -> back to the tool that was active (a held one stays)
         saveEditorUiState();
         updatePaintUI();
         return true;
@@ -82732,7 +82768,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       // 빈 픽셀은 **흰색**이다(사용자 판정). 캔버스에서 빈 곳은 종이색(흰)으로 보이므로 「보이는 색을
       // 집는다」는 스포이트의 뜻에 맞다 — 색을 안 바꾸고 모드에서만 빠지면 아무 일도 안 난 것처럼 보인다.
       setPaintBrushColor('#ffffff', { custom: true, record: true });
-      state.paintEyedropper = false;
+      state.paintEyedropper = eyedropperHeld();
       saveEditorUiState();
       updatePaintUI();
       return true;
@@ -85807,11 +85843,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (queue) queue.entries.splice(0).forEach(function(entry) { entry.resolve({ status: 'cancelled' }); });
     }
 
+    // 이번 제스처의 선택 모드 — Shift = 추가, Alt = 빼기(PS·CSP·Krita). 수식키가 없으면 모드 버튼의 값(기본 「추가」 유지,
+    // 사용자 판정 ver2940).
+    function paintSelectionModeFor(event) {
+      return event && event.altKey ? 'sub' : (event && event.shiftKey ? 'add' : state.paintSelectionMode);
+    }
     function beginPaintLassoOp(event, canvas, layerTarget, localPoint) {
       const opTarget = paintRasterOpTargetFromLayerTarget(layerTarget);
       if (!opTarget) return false;
       state.paintRasterOp = Object.assign(opTarget, {
         type: state.paintEditTool === 'lasso-select' ? 'lasso-select' : 'lasso-stamp',
+        selectionMode: paintSelectionModeFor(event),
         points: [localPoint]
       });
       state.paintLassoPreview = {
@@ -85928,7 +85970,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       paintBinarizeCanvasAlpha(mask);                                  // 선택은 하드 엣지 고정
       paintFeatherCanvasAlpha(mask, paintSelectFeatherVal());
       state.paintLassoPreview = null;
-      combinePaintSelectionMask(op.drawingRef, mask, state.paintSelectionMode, {
+      combinePaintSelectionMask(op.drawingRef, mask, op.selectionMode || state.paintSelectionMode, {
         bitmapX: op.bitmapX,
         bitmapY: op.bitmapY
       });
@@ -88595,9 +88637,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (state.project && state.project.kind === 'genga') return 'genga';
       return state.videoEditMode ? 'video' : null;
     }
+    // 뷰 단축키(= - 0 `)의 표면 — 用紙 창이 떠 있어도 포인터가 영상 화면 위면 그쪽이다(제스처와 같은 「포인터가 있는
+    // 표면」, 사용자 판정 ver2940). 포인터 정보가 없거나 그 밖이면 종전대로 用紙.
+    let viewLastPointerTarget = null;
+    document.addEventListener('pointermove', function(e) { viewLastPointerTarget = e.target; }, { capture: true, passive: true });
     function activeViewSurfaceKey() {
       if (state.project && state.project.kind === 'genga') return 'genga';
-      return contePaperWindowIsOpen() ? 'paper' : stageViewSurfaceKey();
+      if (!contePaperWindowIsOpen()) return stageViewSurfaceKey();
+      const el = viewLastPointerTarget;
+      if (el && el.isConnected && el.closest && stageViewSurfaceKey() === 'video' && el.closest(VIEW_SURFACES.video.stage) && !paperGestureHostFor({ target: el })) return 'video';
+      return 'paper';
     }
     function viewSurfaceOf(key) { return key ? VIEW_SURFACES[key] : null; }
     function activeViewSurface() { return viewSurfaceOf(activeViewSurfaceKey()); }
@@ -89292,7 +89341,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             // 해제되고(gengaSelectPointerDown 이 먼저 커밋한다), 페인트 앱의 표준 제스처이기도 하다: 선택
             // 바깥을 누르면 선택이 풀린다. 새 선택(replace)을 만들려던 손짓일 때만 — 追加/部分解除 중이면 기존
             // 선택을 건드리지 않는다.
-            if (state.paintSelection && state.paintSelectionMode === 'replace') clearPaintSelection();
+            if (state.paintSelection && (op.selectionMode || state.paintSelectionMode) === 'replace') clearPaintSelection();
             updatePaintEditOverlays(op.drawingRef);
           }
           redrawActiveLayerCanvasTargets(op.drawingRef);
@@ -89741,7 +89790,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             // 해제되고(gengaSelectPointerDown 이 먼저 커밋한다), 페인트 앱의 표준 제스처이기도 하다: 선택
             // 바깥을 누르면 선택이 풀린다. 새 선택(replace)을 만들려던 손짓일 때만 — 追加/部分解除 중이면 기존
             // 선택을 건드리지 않는다.
-            if (state.paintSelection && state.paintSelectionMode === 'replace') clearPaintSelection();
+            if (state.paintSelection && (op.selectionMode || state.paintSelectionMode) === 'replace') clearPaintSelection();
             updatePaintEditOverlays(op.drawingRef);
           }
           redrawActiveLayerCanvasTargets(op.drawingRef);
@@ -94516,6 +94565,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       window.addEventListener('blur', endPaintToolHold, true); // the release event never fires if focus leaves the window mid-hold
     }
 
+    // 홀드를 **되돌리지 않고** 끝낸다 — 홀드 중에 사용자가 다른 도구를 직접 고른 경우(그 선택이 남아야 한다).
+    function abandonPaintToolHold() {
+      if (!paintToolHoldActive) return;
+      paintToolHoldActive = null;
+      document.removeEventListener('keyup', onShortcutHoldKeyUp, true);
+      window.removeEventListener('blur', endPaintToolHold, true);
+    }
     function endPaintToolHold() {
       const hold = paintToolHoldActive;
       if (!hold) return;
@@ -94545,6 +94601,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const hold = paintToolHoldActive;
       if (!hold || hold.source !== 'shortcut') return;
       if (String(event.key || '').toLowerCase() !== hold.rawKey) return; // a different key released — not ours
+      if (hold.rawKey === 'alt') event.preventDefault();   // Alt 를 떼는 것이 브라우저 메뉴 막대로 가지 않게
       // 획 도중에 키를 먼저 놓으면 그 획은 그 도구로 끝까지 긋고, 펜을 뗀 뒤 돌아간다(CSP·PS) — 지금 돌아가면 도구 전환이
       // 진행 중인 획을 버린다. 펜 꼬리 지우개(onPenEraserPointerUp)와 같은 미룸.
       if (paintStrokeInProgress()) {
@@ -94660,6 +94717,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     const SHORTCUT_REPEATABLE = new Set(['sizeDown', 'sizeUp', 'gengaExtendExposure', 'gengaShrinkExposure', 'gengaAddKoma', 'editUndo', 'editRedo',
       'zoomIn', 'zoomOut', 'frameForward', 'frameBackward', 'instanceForward', 'instanceBackward', 'videoTimelinePanelStepForward',
       'videoTimelinePanelStepBackward', 'conteLayerRowUp', 'conteLayerRowDown', 'gengaLayerSelectUp', 'gengaLayerSelectDown', 'prevPage', 'nextPage']);
+    // 「도구」 분류지만 도구를 바꾸지 않는 값 조절 — 획 도중에도 받고, 홀드를 끝내지 않는다.
+    const SHORTCUT_TOOL_PARAMS = new Set(['sizeUp', 'sizeDown', 'pressureToSizeToggle', 'pressureToAlphaToggle', 'transparentColor']);
     // 배정이 없을 때만 받는 별칭(PS·CSP 관례). 사용자가 그 키를 배정했으면 배정이 이긴다.
     const SHORTCUT_ALIASES = { 'ctrl+d': 'lassoSelectClear', 'meta+d': 'lassoSelectClear' };
     function isSaveShortcutKey(key) {
@@ -94698,8 +94757,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (event.repeat && !SHORTCUT_REPEATABLE.has(def.id) && !(def.holdable && state.shortcuts.__hold && state.shortcuts.__hold[def.id])) {
         event.preventDefault(); return true;   // 자동 반복은 삼킨다(홀드 키는 아래가 따로 거른다)
       }
-      // 획 도중의 도구 전환은 받지 않는다 — 전환이 진행 중인 획을 버린다(CSP 도 획 도중엔 무시).
-      if (def.category === 'tool' && paintStrokeInProgress()) { event.preventDefault(); return true; }
+      // 획 도중의 도구 전환은 받지 않는다 — 전환이 진행 중인 획을 버린다(CSP 도 획 도중엔 무시). 크기·필압 같은 값
+      // 조절은 도구를 바꾸지 않으므로 받는다.
+      const switchesTool = def.category === 'tool' && !SHORTCUT_TOOL_PARAMS.has(def.id);
+      if (switchesTool && paintStrokeInProgress()) { event.preventDefault(); return true; }
+      // Alt 스포이트 홀드 중에 Alt+키로 고른 도구는 새 도구다 — Alt 를 놓을 때 되돌리지 않는다(Relay 48297ca7f0be).
+      // 값 조절(Alt+[ 등)은 홀드를 그대로 둔다(Relay 217fbea0e016).
+      if (switchesTool && paintToolHoldActive && paintToolHoldActive.rawKey === 'alt') abandonPaintToolHold();
       const inGenga = !!(state.project && state.project.kind === 'genga');
       if (!shortcutActionScopeAllows(def, inGenga)) return false; // Shared with the ▦ window menu
       if (!def.manualEvent) { event.preventDefault(); event.stopPropagation(); } // editPaste decides whether it needs the native clipboard event.
@@ -94929,10 +94993,32 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Delete key in genga (priority): selected camera keyframe → solo-selected layer → koma at the playhead.
     // Nothing selected & no koma at the playhead → do nothing. Each target requires its own explicit selection
     // so layer / koma / keyframe deletion never collide.
-    function handleGengaDeleteKey(event) {
+    // Delete 키 판정 — 배정(editDelete)을 따른다(원화도). 기본 배정이면 물리 Delete 키(code)도 같다.
+    function isEditDeleteKeyEvent(event) {
+      const bound = String(state.shortcuts.editDelete || '');
+      return !!bound && (normalizeShortcutKeyFromEvent(event) === bound || (bound === 'delete' && isDeleteKeyEvent(event)));
+    }
+    // ⌫(Backspace)는 그림 지우기(clearDrawing)다. 다만 지울 대상이 **그림이 아닐 때**(클립·카메라/FX 키·단독 레이어·
+    // 콘티의 컷/패널) — Mac 의 delete 키가 바로 ⌫ 라 이것 없이는 키보드로 그것들을 못 지웠다(Premiere·Finder 와 같다).
+    function backspaceTargetsNonDrawing() {
+      if (!state.project) return false;
+      if (state.project.kind === 'genga') {
+        if (gengaSel && !gengaSel.auto) return false;   // 선택 영역이 있으면 그림이 대상이다
+        return !!(state.gengaSelectedAudioId || gengaSelectedCamKfs().length || state.gengaSelectedFxKf || (state.gengaSoloLayerId && gengaLayerById(state.gengaSoloLayerId)));
+      }
+      if (state.paintSelection || paintTargetIsMemoPage()) return false;   // 선택 영역·用紙 메모는 그림이 대상이다
+      return !!state.videoEditMode && ['audio', 'video', 'camera', 'cut', 'panel'].indexOf(state.activeConteSelectionType) >= 0;
+    }
+    function handleBackspaceAsDelete(event) {
+      if (!isBackspaceKeyEvent(event) || event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target) || !backspaceTargetsNonDrawing()) return false;
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (state.project.kind === 'genga') handleGengaDeleteKey(event, true); else runContextDelete(event);
+      return true;
+    }
+    function handleGengaDeleteKey(event, asDelete) {
       const gt = state.project && state.project.kind === 'genga' && state.project.gengaTimeline;
       if (!gt) return false;
-      if (isTypingTarget(event.target) || !isDeleteKeyEvent(event)) return false;
+      if (isTypingTarget(event.target) || !(asDelete || isEditDeleteKeyEvent(event))) return false;
       // 명시 선택(또는 미확정 변형)이 있으면 Delete 는 선택 안 픽셀을 지운다 — Backspace(gengaClearDrawing)와 같은
       // 규칙(PS·CSP·Krita). 자동 변형 범위는 Delete 를 갖지 않는다.
       if (gengaSel && (!gengaSel.auto || !gengaSelIsPristine(gengaSel))) {
@@ -95019,6 +95105,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       clearPaintSelection();
       return true;
     }
+    // Alt 를 누르는 동안 스포이트(PS·CSP·Krita) — 펜·지우개에서만(도형은 Alt 가 중심 기준, 선택 도구는 빼기). 놓으면
+    // 돌아간다 — 단축키 홀드와 같은 길(beginPaintToolHold, 획 도중엔 펜을 뗀 뒤).
+    function handleAltEyedropperKey(event) {
+      if (event.key !== 'Alt' || event.repeat || event.ctrlKey || event.metaKey || event.shiftKey || isTypingTarget(event.target)) return false;
+      if (paintToolHoldActive || paintStrokeInProgress() || state.paintEditTool || ['pen', 'eraser'].indexOf(state.paintTool) < 0) return false;
+      const def = SHORTCUT_ACTION_DEFS.find(function(x) { return x.id === 'eyedropper'; });
+      const inGenga = !!(state.project && state.project.kind === 'genga');
+      if (!def || !shortcutActionScopeAllows(def, inGenga)) return false;
+      event.preventDefault();
+      beginPaintToolHold('shortcut', { actionId: 'eyedropper', rawKey: 'alt' }, function() { def.run(event, { inGenga: inGenga }); });
+      return true;
+    }
     function handlePaintKeydown(event) {
       if (event.key === 'Escape' && !event.isComposing && !isTypingTarget(event.target) && state.paintEditTool === 'text-stamp') { event.preventDefault(); setActivePaintTool('pen'); return; }
       // Native selection controls own unmodified Space; Ctrl+Z/Y still reach application Undo.
@@ -95031,12 +95129,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         event.preventDefault();
         return;
       }
+      if (handleBackspaceAsDelete(event)) return;
       if (handleGengaDeleteKey(event)) return;
       if (handleGengaKeyframeClipboardKey(event)) return; // Most specific selection wins — see its own note
       if (handleGengaCelClipboardKey(event)) return;
       if (handleGengaLayerClipboardKey(event)) return;
       if (handlePaintSpacePanKeydown(event)) return;
       if (handlePaintTransformEnterKey(event)) return;
+      if (handleAltEyedropperKey(event)) return;
       if (handleConfiguredShortcut(event)) return; // undo/redo are dispatched from here too (editUndo/editRedo)
     }
 
@@ -95162,8 +95262,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         clearCameraKeyframeSelection();
         ids.forEach(function(id) { selectCameraKeyframe(id, true); });
       });
-      conteCameraClipboard = null;
-      setTimelineClipboardStatus(t('status.genga.kf.pasted', clip.length));
+      setTimelineClipboardStatus(t('status.genga.kf.pasted', clip.length));   // 클립보드는 남긴다 — 여러 곳에 붙인다(AE)
       return true;
     }
 
@@ -95313,15 +95412,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const selectedPanelIdsForDelete = selectedPicturePanelIdArray(state.activeConteSelectionType === 'panel');
       const selectedLayerIdsForDelete = state.activeConteSelectionType === 'layer' ? selectedConteLayerIdArray() : [];
       if (state.activeConteSelectionType === 'audio' && state.videoEditMode && state.selectedAudioClipId) {
-        const clipId = state.selectedAudioClipId;
-        if (audioClipLinkedVideoClip(state.project, audioClipById(state.project, clipId))) {
-          confirmDeleteAudioClip(clipId);
-          return;
-        }
-        if (commitAudioClipRemoveFast(clipId)) {
-          guardedRender('inspector', renderInspector);
-          guardedRender('chrome', updateChromeControls);
-        }
+        confirmDeleteAudioClip(state.selectedAudioClipId);   // 링크(영상·대사)면 확인, 아니면 즉시 — 메뉴와 같은 판정
         return;
       }
       if (state.activeConteSelectionType === 'video' && state.videoEditMode && state.selectedVideoClipId) {
@@ -95365,15 +95456,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return;
       }
       if (state.videoEditMode && state.selectedAudioClipId) {
-        const clipId = state.selectedAudioClipId;
-        if (audioClipLinkedVideoClip(state.project, audioClipById(state.project, clipId))) {
-          confirmDeleteAudioClip(clipId);
-          return;
-        }
-        if (commitAudioClipRemoveFast(clipId)) {
-          guardedRender('inspector', renderInspector);
-          guardedRender('chrome', updateChromeControls);
-        }
+        confirmDeleteAudioClip(state.selectedAudioClipId);   // 링크(영상·대사)면 확인, 아니면 즉시 — 메뉴와 같은 판정
         return;
       }
       if (state.videoEditMode && state.selectedVideoClipId) {
@@ -95413,7 +95496,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // defaultPrevented/typing/contePaperMemoArmed checks, so a Backspace press already claimed by the
     // configurable clearDrawing shortcut (paint mode) doesn't double-fire.
     function handleBackspaceClearKeydown(event) {
-      if (event.defaultPrevented) return;
+      // 그림 지우기가 Backspace 에 배정돼 있을 때만의 받침이다 — 다른 키로 바꿨으면 Backspace 는 그림을 지우지 않는다.
+      if (event.defaultPrevented || state.shortcuts.clearDrawing !== 'backspace') return;
       if (isTypingTarget(event.target)) return;
       if (isBackspaceKeyEvent(event) && state.videoEditMode && selectedConteLayerIdArray().length) {
         event.preventDefault();
@@ -103869,7 +103953,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       Array.from(files).forEach(function(f) { gengaAddAudioFile(f, atFrame, track); });
     }
-    function gengaDeleteAudioClip(id) { runCommand('音声削除', function(proj) { const gt = proj.gengaTimeline; gt.audioClips = (gt.audioClips || []).filter(function(c) { return String(c.id) !== String(id); }); }); }
+    // 대사가 연결된 음성만 확인한다(콘티 confirmDeleteAudioClip 과 같은 기준) — 지우면 대사의 링크가 풀린다.
+    async function gengaDeleteAudioClip(id) {
+      const gt0 = state.project && state.project.gengaTimeline, project = state.project;
+      const linked = ((gt0 && gt0.dialogue && gt0.dialogue.entries) || []).filter(function(e) { return e && e.audioClipId != null && String(e.audioClipId) === String(id); });
+      if (linked.length && !await askConfirm(t('dialog.follow.deleteVoiceConfirm'), { danger: true, okLabel: t('menu.delete') })) return;
+      if (state.project !== project) return;
+      runCommand('音声削除', function(proj) { const gt = proj.gengaTimeline; gt.audioClips = (gt.audioClips || []).filter(function(c) { return String(c.id) !== String(id); }); });
+    }
     // ---- 면도칼: 재생 위치 코마 f 에서 음성 클립·대사를 둘로(f 가 오른쪽 조각의 첫 코마) ----
     // 콘티의 「현재 재생 위치에서 분할」과 같은 뜻. 대사와 그 링크 음성은 함께 자른다 — 링크 대사의 구간은 클립의 트림
     // 구간이라(gengaNormalizeDialogue) 한쪽만 자르면 정규화가 대사를 클립 전체로 되돌린다. f 는 보이는 구간(트림 안)의
@@ -127704,7 +127795,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const found = findConteLayerById(state.project, state.selectedConteLayerId);
       const ref = found && found.layer && found.layer.drawingRef ? String(found.layer.drawingRef) : '';
       if (!ref) return false;
-      placeImageFileIntoConteLayer(files[0], state.selectedConteLayerId, { clipboard: true });
+      // 원화와 같은 배치 창(맞춤/원寸·위치·취소)을 거친다 — 즉시 합성은 자리를 고르거나 붙여넣기만 물릴 길이 없었다.
+      gengaOpenImageImportDialog(files);   // 기본 대상 = 선택 레이어·재생헤드
       return true;
     }
     // ---- lasso-stamp (conte-style): lasso COPIES a region into a stamp → it follows the cursor → click to rubber-stamp copies, right-click to exit ----
@@ -128560,8 +128652,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         cw.keyframes.sort(function(a, b) { return a.frame - b.frame; });
       });
     }
-    // Camera and FX snapshots keep their own value schema. Camera paste is contextual and consumed once;
-    // FX, koma and layer paste retain their existing most-recent-copy/repeat behavior.
+    // Camera and FX snapshots keep their own value schema. Every keyframe/koma/layer paste can repeat (the clipboard
+    // stays until the next copy — 사용자 판정 ver2940, AE 와 같다).
     let gengaKfClipboard = null; // { kind:'camera'|'fx', track?, keys:[{ dFrame, ...values }] }
     let gengaClipSeq = 0;
     const gengaClipStamps = { kf: 0, koma: 0, layer: 0, ref: 0 };   // ref = 자료 창 복사(refsCopy)
@@ -128627,8 +128719,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           state.gengaSelectedCamKfs = destinations;
           state.gengaCamKfAnchor = destinations[0];
         });
-        gengaKfClipboard = null; gengaClipStamps.kf = 0;
-        setTimelineClipboardStatus(t('status.genga.kf.pasted', clip.keys.length));
+        setTimelineClipboardStatus(t('status.genga.kf.pasted', clip.keys.length));   // 클립보드는 남긴다 — 여러 곳에 붙인다(AE)
         return true;
       }
       // FX: paste into the SELECTED layer, on the track the copy came from — never invent a track.
@@ -129158,11 +129249,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const pixels = gengaPrepareDrawing(dr, retry);
       return pixels.status === 'empty' || pixels.status === 'ready';
     }
-    function gengaLiftSelection(layer, frame, pts) {
+    function gengaLiftSelection(layer, frame, pts, modeArg) {
       gengaSelectionRequest = null;
       if (!pts || pts.length < 3) return false;
       const request = {}, project = state.project, selection = gengaSel, history = paintHistorySeqLast;
-      const tool = state.paintEditTool, mode = state.paintSelectionMode;
+      const tool = state.paintEditTool, mode = modeArg || state.paintSelectionMode;
       const paper = project.gengaTimeline.paper, pw = paper.w, ph = paper.h;
       // The stencil captures points, feather and AA now; decoding only controls when it may be published.
       let mask = gengaPolyMask(pw, ph, pts);
@@ -129267,9 +129358,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       // lasso-select is SELECT-ONLY (moving is the Transform tool's job, like conte) — no move-inside-selection here.
       // Add/Sub keep the current selection so the new lasso can combine with it; Replace (and other tools) commit first
-      const combining = (tool === 'lasso-select' && (state.paintSelectionMode === 'add' || state.paintSelectionMode === 'sub'));
+      const selMode = paintSelectionModeFor(ev);   // Shift = 추가, Alt = 빼기(이번 제스처만)
+      const combining = (tool === 'lasso-select' && (selMode === 'add' || selMode === 'sub'));
       if (gengaSel && !combining) gengaCommitSelection();
-      if (tool === 'lasso-select') { gengaLasso = { pts: [[p.x, p.y]], pointerId: ev.pointerId }; cap(); }
+      if (tool === 'lasso-select') { gengaLasso = { pts: [[p.x, p.y]], pointerId: ev.pointerId, mode: selMode }; cap(); }
       ev.preventDefault();
     }
     function gengaSelectPointerMove(ev) {
@@ -129311,13 +129403,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         drawGengaPreview(); return;
       }
       if (gengaLasso) {
-        const pts = gengaLasso.pts, stamp = gengaLasso.stamp; gengaLasso = null;
+        const pts = gengaLasso.pts, stamp = gengaLasso.stamp, selMode = gengaLasso.mode; gengaLasso = null;
         const layer = ensureGengaSelectedLayer();
         if (layer) {
           if (stamp) gengaCaptureStamp(layer, gengaCurrentFrame(), pts);
           else {
             const before = gengaSelSnapshot();
-            if (gengaLiftSelection(layer, gengaCurrentFrame(), pts)) gengaPushSelCommand('選択', before, gengaSelSnapshot());
+            if (gengaLiftSelection(layer, gengaCurrentFrame(), pts, selMode)) gengaPushSelCommand('選択', before, gengaSelSnapshot());
           }
         }
         try { ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
@@ -133320,6 +133412,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // drawing — one composite per notch, not draw / re-measure / correct / draw again.
         pv.addEventListener('wheel', function(ev) {
           ev.preventDefault();
+          if (wheelIsTrackpadPan(ev)) {   // 두 손가락 스와이프 = 이동(미러·회전을 푼 화면 델타, 손 방향 그대로)
+            const uz = uiReadScale(), dd = viewInverseOffset(-ev.deltaX / uz, -ev.deltaY / uz, gengaViewRotEff(), gengaViewFlipSign());
+            state.gengaPanX += dd.x; state.gengaPanY += dd.y; gengaScheduleViewDraw(); return;
+          }
           gengaPokeWheelViewLock(); // Reuse the composite for the whole wheel burst (drops on idle)
           const f = gengaPreviewFit(), xf = gengaPreviewXform;
           const c = gengaClientToCanvasXY(ev.clientX, ev.clientY);
@@ -137549,10 +137645,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
       }
       document.addEventListener('pointerdown', closeTopbarPopoversOnOutsidePress, true);
-      document.addEventListener('keydown', function(event) {
-        if (event.key !== 'Escape') return;
-        if (state.onionSkinWindowOpen) windowSetOpen(windowDefById('windowOnionSkin'), false); // 위와 같은 이유
-      });
+
       document.getElementById('blockList').addEventListener('dragover', function(event) {
         if (hasDragType(event, 'conte/cut-field') || hasDragType(event, 'conte/block-id')) {
           event.preventDefault();
