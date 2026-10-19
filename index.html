@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2953</title>
+  <title>MoArt ver2954</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24272,10 +24272,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       projectSaveReleaseHead(id, closingHead);
       // The last tab is closed, not parked: release its runtime through the normal project reset.
       if (!nextId) {
-        resetProjectForNewProject();
-        // Rebuildable display ownership only; shared pixels remain valid for other consumers.
-        gengaImageCache.clear();
-        gengaPreviewRender.composite = null;
+        resetProjectForNewProject(); // The project reset owns display-cache release too.
       }
       request.owner = projectIoOwner(request);
       renderProjectTabBar();
@@ -48090,6 +48087,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (host) host.hidden = !visible;
       const sheet = document.getElementById('contePaperStage');
       if (sheet) sheet.hidden = !visible;   // 이중 게이트: 껍데기가 창 안에 있어도 시트 자신이 답을 갖는다
+      if (!visible) updateMemoCanvasSize(); // Hidden paper owns no display backing; strokes remain in the project.
     }
 
     // ══ 用紙 메모 창 ══════════════════════════════════════════════════════════════════════════════
@@ -66052,13 +66050,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function updateMemoCanvasSize() {
       const canvas = document.getElementById('memoCanvas');
       if (!canvas) return false;
-      const paper = defaultPaperSpec();
-      const width = Math.max(1, paper.width);
-      const height = Math.max(1, paper.height);
+      const sheet = document.getElementById('contePaperStage');
+      const paper = sheet && sheet.hidden ? null : defaultPaperSpec();
+      const width = paper ? Math.max(1, paper.width) : 0;
+      const height = paper ? Math.max(1, paper.height) : 0;
       const changed = canvas.width !== width || canvas.height !== height;
       if (changed) {
         canvas.width = width;
         canvas.height = height;
+      }
+      if (!paper && canvas.paintScratch && canvas.paintScratch.preview) {
+        paintReleaseCanvas(canvas.paintScratch.preview);
+        delete canvas.paintScratch.preview;
       }
       return changed;
     }
@@ -76103,7 +76106,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         owner.readCanvas = document.createElement('canvas');
         owner.readCanvas.width = owner.readCanvas.height = side;
       }
-      const ctx = owner.readCanvas.getContext('2d', { willReadFrequently: false });
+      const ctx = owner.readCanvas.getContext('2d', { willReadFrequently: true }); // Every batch is consumed as CPU pixels.
       let jobs = [], x = 0, y = 0, rowH = 0, usedW = 0;
       const flush = function() {
         if (!jobs.length) return;
@@ -78516,7 +78519,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintMaterialWorkerRelease(s);
         if (!s) {
           s = { cv: document.createElement('canvas') };
+          s.cv.getContext('2d', { willReadFrequently: coverage });
           if (host) host.livePaint = s; else paintInkOneShotSession = s;
+        } else if (s.coverageMode !== coverage) {
+          // Alpha replacement reads coverage each frame. A reused one-shot field can change modes.
+          paintReleaseCanvas(s.cv);
+          s.cv = document.createElement('canvas');
+          s.cv.getContext('2d', { willReadFrequently: coverage });
         }
         if (s.cv.width !== w) s.cv.width = w;
         if (s.cv.height !== h) s.cv.height = h;
@@ -81347,9 +81356,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // The visible canvas already owns its unchanged base. Even a freshly cleared scratch only needs
       // to prepare the stroke's cumulative window; resized/new targets receive a complete first presentation.
       const ink = options.liveHost && options.liveHost.livePaint;
-      const rect = hardRect || (!options.skipStroke && stroke.tipSampling === 'mesh' && !stroke.waterEdge && !stroke.dualMask
-        && op.materialPresentW === w && op.materialPresentH === h && ink && ink.box
-        ? paintStrokeScratchBox(ink.box, null, null, w, h) : null);
+      const sameSize = op.materialPresentW === w && op.materialPresentH === h;
+      // Plain paths and filled shapes stay inside their point hull plus the round-cap radius.
+      // Include the previous shape so shrinking/replacing it restores its old pixels too.
+      const basic = !options.skipStroke && (stroke.shapeFill || !paintStrokeWantsWholePath(stroke));
+      const pointBounds = basic && paintLayerPointsBounds(pts, stroke.shapeFill ? 2 : Math.ceil((Number(stroke.size) || 1) / 2) + 2, op.geometry.paper);
+      const currentBounds = pointBounds ? paintStrokeScratchBox({ x0: pointBounds.x - op.bitmapX, y0: pointBounds.y - op.bitmapY,
+        x1: pointBounds.x + pointBounds.w - op.bitmapX, y1: pointBounds.y + pointBounds.h - op.bitmapY }, null, null, w, h, true) : null;
+      const rect = hardRect || (sameSize && currentBounds ? paintUnionLayerRect(op.compositeBounds, currentBounds) : null)
+        || (!options.skipStroke && stroke.tipSampling === 'mesh' && !stroke.waterEdge && !stroke.dualMask
+          && sameSize && ink && ink.box ? paintStrokeScratchBox(ink.box, null, null, w, h) : null);
+      op.compositeBounds = currentBounds;
       const surface = op.canvas.isConnected ? paintScratchCanvas(op.canvas, 'preview', w, h, rect) : op.canvas;
       paintCompositeBufferOnto(surface.getContext('2d'), op.modeBaseCanvas, buf, {
         width: w, height: h, rect: rect,
@@ -82954,6 +82971,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const canvas = document.getElementById('memoCanvas');
       if (!canvas || !stroke || !toPoint) return;
       updateMemoCanvasSize();
+      if (!canvas.width || !canvas.height) return;
       drawPaintStrokeSegment(canvas.getContext('2d'), stroke, fromPoint, toPoint, canvas.width, canvas.height);
     }
 
@@ -83098,6 +83116,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const canvas = document.getElementById('memoCanvas');
       if (!canvas) return;
       updateMemoCanvasSize();
+      if (!canvas.width || !canvas.height) return;
       const surface = paintScratchCanvas(canvas, 'preview', canvas.width, canvas.height);
       const ctx = surface.getContext('2d');
       // While a pressure-outline PAGE stroke is live, restore the pre-stroke snapshot and
@@ -124347,7 +124366,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // selection clip needs no offset — 0,0. 이 함수는 **포인터 이동마다**
       // 불린다(gengaShapeDragUpdate·gengaPenOutlineRedraw) — 세션을 소유자로 넘겨 마스크 사본 한 장을
       // 쓴다(그때마다 할당하면 재그리기 1회 0.017→0.597ms 실측).
-      const rect = changedRect || ((!sess.shape && (sess.penOutline || sess.penBufMode)) ? gengaScanClamp(sess.inkScan, sess.canvas) : null);
+      const boundedShape = sess.shape && !paintTipOrGrainActive(sess) && !sess.waterEdge && !sess.dualMask;
+      const rect = changedRect || (((!sess.shape && (sess.penOutline || sess.penBufMode)) || boundedShape) ? gengaScanClamp(sess.inkScan, sess.canvas) : null);
       gengaCaptureHistoryBefore(sess, rect || { x: 0, y: 0, w: sess.canvas.width, h: sess.canvas.height });
       paintCompositeBufferOnto(sess.ctx, sess.shapeBase, sess.shapeBuf, {
         width: sess.canvas.width, height: sess.canvas.height,
@@ -124359,7 +124379,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         replaceAlpha: !sess.shapeEraser && !sess.shapeAlphaLock && paintStrokeReplacesAlpha(sess),
         clip: gengaStrokeClipFor(sess),
         // Retained outlines supply the changed output rectangle, including erased tail pixels.
-        // Other pen consumers use the accumulated scan; shapes/lasso retain the full surface.
+        // Plain shapes use the accumulated scan, including every previous preview. Material effects keep full composition.
         rect: rect
       });
     }
@@ -124401,22 +124421,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
     }
     // 버퍼 모드 **비아웃라인 펜**의 재합성도 프레임당 1회 — 형제 셋(아웃라인 펜 outlineRaf · 도형 · 콘티
-    // paintScheduleLiveRedraw)과 같다. 재합성은 캔버스 면적에 비례한다(base 를 통째로 그리고 buffer 를 얹는다).
+    // paintScheduleLiveRedraw)과 같다. 아직 표시하지 않은 선분 창만 모아 바탕과 buffer를 합성한다.
     // 세션에 매다는 것이 요점이다: 제스처와 함께 죽고, 드래그가 끝났으면 콜백이 스스로 버린다.
     function gengaPenCompositeSchedule(sess) {
       if (!sess || sess.penCompositeRaf) return;
       sess.penCompositeRaf = requestAnimationFrame(function() {
-        sess.penCompositeRaf = 0;
-        if (gengaDrawSession !== sess) return; // 끝난 드래그 — 커밋 경로가 flush 로 흡수한다
-        gengaStrokeComposite(sess);
-        drawGengaPreview();
+        if (gengaDrawSession !== sess) { sess.penCompositeRaf = 0; return; }
+        if (gengaPenCompositeFlush(sess)) drawGengaPreview();
       });
     }
     // 입력 큐·커밋은 대기한 합성만 흡수한다. 이미 rAF/첫 dab이 끝낸 결과는 다시 만들지 않는다.
     function gengaPenCompositeFlush(sess) {
       if (!sess || !sess.penBufMode || !sess.penCompositeRaf) return false;
       cancelAnimationFrame(sess.penCompositeRaf); sess.penCompositeRaf = 0;
-      gengaStrokeComposite(sess);
+      const rect = sess.penCompositeRect;
+      sess.penCompositeRect = null;
+      gengaStrokeComposite(sess, rect || undefined);
       return true;
     }
     // 커밋 직전에 부른다 — gengaPenOutlineRedraw 와 같은 계약(대기분을 흡수).
@@ -125163,13 +125183,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 담은 probe를 만들어 넘긴다(스토어를 읽는 attach 함수들은 세션에도 같은 값을 심으므로 판정과 실제 렌더가
       // 어긋날 수 없다).
       const penWholeProbe = { ...pressureSettings };
-      // **이 프로브는 판정식이 읽는 필드만 싣는다** — 세션이 아니라 「어느 렌더러로 갈지」를 묻는 표본이다.
-      // 그래서 `paintAttachMix` 가 없는 것이 정상이다(스트로크 짝인 paintAttachBrushDynamics 는 넷을 다
-      // 싣는다). paintStrokeWantsWholePath 는 혼색을 안 보고, 볼 필요도 없다 — 혼색은 팁 이미지가 있어야
-      // 성립하는데(paintMixRowEnabled: 원형 dab 은 경로를 한 번에 fill 해서 dab 마다 색을 갈 자리가 없다) 팁이
-      // 있으면 팁 항이 이미 참이다. 실측: 팁×그레인×혼색×flow 16 조합에서 **혼색을 실어도 두 판정이 안
-      // 갈린다**. 세션 쪽에는 혼색이 실리므로(아래 gengaDrawSession) 렌더는 정상이다. ★판정식에 항을 더하면 이
-      // 프로브에도 그 필드를 실어야 한다(flow·taper 가 그 예다).
+      // Snapshot the renderer's dependencies, including CSP mixing without a tip image.
+      // Both the decision and the resulting session must carry the same mixing contract.
+      paintAttachMix(penWholeProbe);
       paintAttachTip(penWholeProbe);
       paintAttachPaperTex(penWholeProbe);
       paintAttachWaterEdge(penWholeProbe);
@@ -125436,9 +125452,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaScanMark(penSess, penSess.lastX, penSess.lastY, reach + 1);
         gengaScanMark(penSess, p.x, p.y, reach + 1);
         const historyPad = reach + 1 + GENGA_SCAN_PAD;
-        gengaCaptureHistoryBefore(penSess, { x: Math.min(penSess.lastX, p.x) - historyPad,
-          y: Math.min(penSess.lastY, p.y) - historyPad, w: Math.abs(p.x - penSess.lastX) + historyPad * 2,
-          h: Math.abs(p.y - penSess.lastY) + historyPad * 2 });
+        const segmentRect = { x: Math.floor(Math.min(penSess.lastX, p.x) - historyPad),
+          y: Math.floor(Math.min(penSess.lastY, p.y) - historyPad),
+          w: Math.ceil(Math.max(penSess.lastX, p.x) + historyPad) - Math.floor(Math.min(penSess.lastX, p.x) - historyPad),
+          h: Math.ceil(Math.max(penSess.lastY, p.y) + historyPad) - Math.floor(Math.min(penSess.lastY, p.y) - historyPad) };
+        gengaCaptureHistoryBefore(penSess, segmentRect);
+        if (penSess.penBufMode) penSess.penCompositeRect = paintUnionLayerRect(penSess.penCompositeRect, segmentRect);
         target.save();
         target.globalAlpha = target.globalAlpha * segAlpha;
         if (penSess.hardEdge) { // AA off: 실수 좌표·연속 반지름 캡슐(시작 반지름은 앞 선분의 끝)
@@ -126412,6 +126431,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       gengaDrawingReadyJobs.clear();
       gengaDrawingFailures.clear();
       gengaDrawStoreFaults.clear();
+      paintReleaseCanvas(gengaPreviewRender.composite);
+      gengaPreviewRender.composite = null;
       gengaPreviewRender.presentedView = null;
       gengaPreviewRender.scene = null;
       gengaEndDrawSession();                   // 진행 중 스트로크(옛 레이어 대상)
