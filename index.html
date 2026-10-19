@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2952</title>
+  <title>MoArt ver2953</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24585,6 +24585,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2953, items: [{ja: '選択範囲内の描画処理を軽くし、原画の連続入力中の画面更新を修正しました。', ko: '선택 영역 안의 그리기 처리를 줄이고, 원화의 연속 입력 중 화면 갱신을 수정했습니다.', en: 'Reduced selection-masked drawing work and fixed genga screen updates during queued input.', zh: '减少了选区内的绘画处理，并修复了原画连续输入时的画面更新。'}] },
       { ver: 2952, items: [{ja: 'コンテの部分再描画を軽くし、原画の画面拡大中も描画・選択操作を保つよう改善しました。', ko: '콘티의 부분 다시 그리기를 가볍게 하고, 원화 화면을 확대하는 중에도 그리기·선택 입력이 이어지도록 개선했습니다.', en: 'Reduced conte redraw work and preserved drawing and selection input while enlarging the genga viewport.', zh: '减少了分镜重绘开销，并在原画视口扩大时保持绘画与选择输入。'}] },
       { ver: 2951, items: [{ja: 'コンテの絵を用紙の余白の外へ動かすときの表示更新を改善し、コンテ・原画の不要な描き直しを減らしました。', ko: '콘티 그림을 용지 여백 밖으로 움직일 때의 화면 갱신을 개선하고, 콘티·원화의 불필요한 다시 그리기를 줄였습니다.', en: 'Improved display updates when moving conte artwork beyond the paper margin and reduced unnecessary redraws in conte and genga.', zh: '改进了分镜画稿移到画纸留白之外时的画面更新，并减少了分镜与原画中不必要的重绘。'}] },
       { ver: 2950, items: [{ja: '原画で、ウィンドウやパネル・タイムラインの大きさを変えている間に画面の絵が一瞬伸びて見えることがあったのを直しました。', ko: '원화에서 창·패널·타임라인 크기를 바꾸는 동안 화면 그림이 순간 늘어나 보일 수 있던 것을 고쳤습니다.', en: 'In genga, the picture no longer stretches for a moment while you resize the window, panels or timeline.', zh: '原画中调整窗口、面板或时间轴大小时画面会瞬间被拉伸的问题已修复。'}] },
@@ -81152,61 +81153,47 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintCompositeBufferOnto(targetCtx, baseCanvas, bufCanvas, options) {
       options = options || {};
       const w = options.width || bufCanvas.width, h = options.height || bufCanvas.height;
+      const rect = options.rect && options.rect.w > 0 && options.rect.h > 0 ? options.rect : null;
       let src = bufCanvas;
       let coverage = options.replaceAlpha ? (paintStrokeCoverage.get(bufCanvas) || bufCanvas) : null;
       const clip = options.clip;
       if (clip && clip.canvas) {
-        // 선택영역이 있으면 마스크 사본이 용지 크기다 — 원화의 gengaStrokeComposite 는 포인터 이동마다 이
-        // 커널을 부르므로 호출마다 할당하면 안 된다. scratchOwner 를 주면 제스처당 한 장을 씻어 쓴다(안 주면
-        // 호출마다 새 캔버스).
-        const masked = options.scratchOwner
-          ? paintScratchCanvas(options.scratchOwner, 'compositeMask', bufCanvas.width, bufCanvas.height)
-          : (function() { const c = document.createElement('canvas'); c.width = bufCanvas.width; c.height = bufCanvas.height; return c; })();
-        const mc = masked.getContext('2d');
-        mc.drawImage(bufCanvas, 0, 0);
-        mc.globalCompositeOperation = 'destination-in';
-        mc.drawImage(clip.canvas, Math.round(Number(clip.x) || 0), Math.round(Number(clip.y) || 0));
-        mc.globalCompositeOperation = 'source-over';
-        src = masked;
-        if (coverage) {
-          const mask = paintScratchCanvas(options.scratchOwner || {}, 'compositeCoverage', w, h), c = mask.getContext('2d');
-          c.drawImage(coverage, 0, 0);
-          c.globalCompositeOperation = 'destination-in';
-          c.drawImage(clip.canvas, Math.round(Number(clip.x) || 0), Math.round(Number(clip.y) || 0));
-          c.globalCompositeOperation = 'source-over';
-          coverage = mask;
-        }
+        // 선택 마스크도 소비할 창만 준비한다. 정수 경계는 소수 rect의 재샘플링 이웃까지 보존한다.
+        const window = rect && { x: Math.floor(rect.x), y: Math.floor(rect.y),
+          w: Math.ceil(rect.x + rect.w) - Math.floor(rect.x), h: Math.ceil(rect.y + rect.h) - Math.floor(rect.y) };
+        const owner = options.scratchOwner || {};
+        const maskSource = function(source, key, mw, mh) {
+          const masked = paintScratchCanvas(owner, key, mw, mh, window), ctx = masked.getContext('2d');
+          ctx.save();
+          try {
+            if (window) { const path = new Path2D(); path.rect(window.x, window.y, window.w, window.h); ctx.clip(path); }
+            ctx.drawImage(source, 0, 0);
+            ctx.globalCompositeOperation = 'destination-in';
+            ctx.drawImage(clip.canvas, Math.round(Number(clip.x) || 0), Math.round(Number(clip.y) || 0));
+          } finally { ctx.restore(); }
+          return masked;
+        };
+        src = maskSource(bufCanvas, 'compositeMask', bufCanvas.width, bufCanvas.height);
+        if (coverage) coverage = maskSource(coverage, 'compositeCoverage', w, h);
       }
       targetCtx.save();
-      targetCtx.setTransform(1, 0, 0, 1, 0, 0);
-      targetCtx.globalCompositeOperation = 'source-over';
-      targetCtx.globalAlpha = 1;
-      // rect 가 오면 그 창만 다시 합성한다 — 창 밖은 버퍼가 한 번도 안 그린 자리라(호출부가 「모든 붓질이
-      // 마크됐다」를 보증한다) 이전 합성 결과 = base 그대로로 동일하다. rect 없는 호출은 전체 경로다.
-      const rect = options.rect;
-      if (rect && rect.w > 0 && rect.h > 0) {
-        targetCtx.clearRect(rect.x, rect.y, rect.w, rect.h);
-        targetCtx.drawImage(baseCanvas, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-        if (coverage) {
-          targetCtx.globalCompositeOperation = 'destination-out';
-          targetCtx.drawImage(coverage, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-        }
+      try {
+        targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+        targetCtx.globalCompositeOperation = 'source-over';
+        targetCtx.globalAlpha = 1;
+        const draw = function(source) {
+          if (rect) targetCtx.drawImage(source, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
+          else targetCtx.drawImage(source, 0, 0);
+        };
+        // 呼出元が変更窓を渡す。範囲なしの確定・全体復元も同じ合成順序を使う。
+        if (rect) targetCtx.clearRect(rect.x, rect.y, rect.w, rect.h);
+        else targetCtx.clearRect(0, 0, w, h);
+        draw(baseCanvas);
+        if (coverage) { targetCtx.globalCompositeOperation = 'destination-out'; draw(coverage); }
         targetCtx.globalCompositeOperation = coverage ? 'lighter' : (options.gco || 'source-over');
         targetCtx.globalAlpha = options.alpha == null ? 1 : Math.max(0, Math.min(1, Number(options.alpha)));
-        targetCtx.drawImage(src, rect.x, rect.y, rect.w, rect.h, rect.x, rect.y, rect.w, rect.h);
-        targetCtx.restore();
-        return;
-      }
-      targetCtx.clearRect(0, 0, w, h);
-      targetCtx.drawImage(baseCanvas, 0, 0);            // pre-stroke content
-      if (coverage) {
-        targetCtx.globalCompositeOperation = 'destination-out';
-        targetCtx.drawImage(coverage, 0, 0);
-      }
-      targetCtx.globalCompositeOperation = coverage ? 'lighter' : (options.gco || 'source-over');
-      targetCtx.globalAlpha = options.alpha == null ? 1 : Math.max(0, Math.min(1, Number(options.alpha)));
-      targetCtx.drawImage(src, 0, 0);                   // the finished stroke, blended once
-      targetCtx.restore();
+        draw(src);
+      } finally { targetCtx.restore(); }
     }
 
     // The active selection as a stroke clip, placed in the op canvas's space. null when nothing is selected —
@@ -81363,7 +81350,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const rect = hardRect || (!options.skipStroke && stroke.tipSampling === 'mesh' && !stroke.waterEdge && !stroke.dualMask
         && op.materialPresentW === w && op.materialPresentH === h && ink && ink.box
         ? paintStrokeScratchBox(ink.box, null, null, w, h) : null);
-      const surface = op.canvas.isConnected ? paintScratchCanvas(op.canvas, 'preview', w, h) : op.canvas;
+      const surface = op.canvas.isConnected ? paintScratchCanvas(op.canvas, 'preview', w, h, rect) : op.canvas;
       paintCompositeBufferOnto(surface.getContext('2d'), op.modeBaseCanvas, buf, {
         width: w, height: h, rect: rect,
         gco: paintStrokeErases(stroke) ? 'destination-out' : paintBrushModeCompositeOp(stroke.mode), // eraser rides too (partial erase) / 透明色도
@@ -81693,7 +81680,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintReleaseCanvas(paintStrokeBufferPool[key]); paintStrokeBufferPool[key] = null;
       }
     }
-    function paintScratchCanvas(owner, key, w, h) {
+    // rect를 주는 호출자는 그 창만 소비한다. 창 밖의 재사용 픽셀은 그대로 둔다.
+    function paintScratchCanvas(owner, key, w, h, rect) {
       const store = owner.paintScratch || (owner.paintScratch = {});
       let buf = store[key];
       if (!buf) { buf = document.createElement('canvas'); store[key] = buf; }
@@ -81706,7 +81694,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = 1;
-      ctx.clearRect(0, 0, w, h);
+      if (rect) ctx.clearRect(rect.x, rect.y, rect.w, rect.h);
+      else ctx.clearRect(0, 0, w, h);
       return buf;
     }
 
@@ -124423,13 +124412,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         drawGengaPreview();
       });
     }
-    // **커밋 직전에 반드시 부른다.** 커밋 소스가 sess.canvas 인데 재합성을 미뤘으므로, 안 부르면 마지막 이동이
-    // 빠진 채 구워진다 — 도형의 flush 와 같은 자리다. 재합성은 멱등이라(base+buffer 를 다시 만든다) 이미
-    // 최신이어도 결과가 같다.
+    // 입력 큐·커밋은 대기한 합성만 흡수한다. 이미 rAF/첫 dab이 끝낸 결과는 다시 만들지 않는다.
     function gengaPenCompositeFlush(sess) {
-      if (!sess || !sess.penBufMode) return;
-      if (sess.penCompositeRaf) { cancelAnimationFrame(sess.penCompositeRaf); sess.penCompositeRaf = 0; }
+      if (!sess || !sess.penBufMode || !sess.penCompositeRaf) return false;
+      cancelAnimationFrame(sess.penCompositeRaf); sess.penCompositeRaf = 0;
       gengaStrokeComposite(sess);
+      return true;
     }
     // 커밋 직전에 부른다 — gengaPenOutlineRedraw 와 같은 계약(대기분을 흡수).
     function gengaShapeRedrawFlush(sess) {
@@ -125355,7 +125343,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (sess && sess.outlineRaf) {
         cancelAnimationFrame(sess.outlineRaf); sess.outlineRaf = 0;
         gengaPenOutlineRedraw(sess); scheduleGengaPreviewRedraw();
-      } else if (sess && sess.penBufMode) gengaPenCompositeFlush(sess);
+      } else if (gengaPenCompositeFlush(sess)) scheduleGengaPreviewRedraw();
     }
     function gengaPreviewPointerMove(ev) {
       if (paintInputDeferEvent(ev, gengaPreviewPointerMove, gengaPresentQueuedInput)) return;
