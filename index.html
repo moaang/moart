@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2962</title>
+  <title>MoArt ver2963</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24581,6 +24581,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2963, items: [{ja: '同じZIPへの保存が重なったとき、自身の保存を外部の変更と誤認したり、後の保存が取り消されたりする問題を修正しました。', ko: '같은 ZIP에 저장 요청이 겹칠 때 자체 저장을 외부 변경으로 오인하거나 뒤의 저장이 취소되는 문제를 수정했습니다.', en: 'Fix overlapping saves to the same ZIP being mistaken for outside changes or cancelling the later save.', zh: '修复对同一ZIP连续保存时，将自身保存误判为外部更改或取消后续保存的问题。'}] },
       { ver: 2962, items: [{ja: '作業フォルダーからZIPのコピーを書き出しても、元プロジェクトの未保存編集の表示を保持するよう修正しました。', ko: '작업폴더에서 ZIP 복사본을 내보내도 원본 프로젝트의 미저장 편집 표시를 유지하도록 수정했습니다.', en: 'Keep edits marked as unsaved in the original project when exporting a ZIP copy from a working folder.', zh: '从工作文件夹导出ZIP副本后，保留原项目的未保存编辑标记。'}] },
       { ver: 2961, items: [{ja: '異なるフォルダーの同名動画をZIP保存で区別し、原画の小さな音源読み込みで元データの再読み込みを減らしました。', ko: 'ZIP 저장에서 다른 폴더의 동명 영상을 구분하고, 작은 원화 음원 가져오기의 원본 재읽기를 줄였습니다.', en: 'Preserve same-name videos from different folders in ZIP saves and avoid rereading small genga audio imports.', zh: '修复ZIP保存时不同文件夹同名视频的混淆，并减少小型原画音频导入时的源数据重复读取。'}] },
       { ver: 2960, items: [{ja: 'プロジェクト切り替えで回収した原画の遅いデコード結果を解放し、不要になった画像準備を停止するよう修正しました。', ko: '프로젝트 전환으로 회수한 원화의 늦은 디코드 결과를 해제하고, 불필요해진 그림 준비를 중단하도록 수정했습니다.', en: 'Release late decode results for reclaimed genga drawings and stop obsolete image preparation when switching projects.', zh: '修复项目切换后已回收原画的延迟解码结果释放，并停止不再需要的图像准备。'}] },
@@ -64210,27 +64211,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         assertProjectIoOwner(owner);
         if (handle) zipName = handle.name || zipName;
         currentFile = zipName;
-        const initialFile = handle ? await handle.getFile() : null;
+        // A newly selected destination keeps the version observed after the picker.
+        // A linked ZIP is read only inside its write queue, after prior own writes publish.
+        const selectedFile = handle && !reuse ? await handle.getFile() : null;
         assertProjectIoOwner(owner);
-        let expectedVersion = reuse ? source.fileVersion : initialFile && projectFileVersionOf(initialFile);
-        // The opened ZIP changed outside MoArt (another app, a sync client, another tab): the save button only
-        // overwrites, so ask instead of failing — a new file keeps both, an overwrite discards the outside change.
-        if (reuse && !projectFileVersionMatches(initialFile, expectedVersion)) {
-          const choice = await askActionChoice(t('project.source.changedChoice'), [
-            { value: 'saveAs', label: t('project.source.saveAs'), primary: true },
-            { value: 'overwrite', label: t('project.source.overwrite'), danger: true },
-            { value: 'cancel', label: t('ui.cancel') }]);
-          assertProjectIoOwner(owner);
-          if (choice === 'saveAs') return await exportConteFolderZip(Object.assign({}, options, { owner: owner, reuseSource: false }));
-          if (choice !== 'overwrite') return false;
-          expectedVersion = projectFileVersionOf(initialFile);
-        }
+        const selectedVersion = selectedFile && projectFileVersionOf(selectedFile);
         const recoveryPreparation = handle && !reuse ? await prepareLocalProjectRecovery(owner, handle) : null;
-        if (handle) await assertProjectFileVersion(handle, expectedVersion, owner);
-        return await runWorkspaceWrite(owner, async function() {
+        const result = await runWorkspaceWrite(owner, async function() {
           try {
             const chunks = [], savedAudio = [], tempAudio = [];
             let zipBytes = 0;
+            let expectedVersion = selectedVersion;
+            if (reuse) {
+              const initialFile = await handle.getFile();
+              assertProjectIoOwner(owner);
+              expectedVersion = source.fileVersion;
+              // Ask about genuine outside changes against a coherent queued observation.
+              if (!projectFileVersionMatches(initialFile, expectedVersion)) {
+                const choice = await askActionChoice(t('project.source.changedChoice'), [
+                  { value: 'saveAs', label: t('project.source.saveAs'), primary: true },
+                  { value: 'overwrite', label: t('project.source.overwrite'), danger: true },
+                  { value: 'cancel', label: t('ui.cancel') }]);
+                assertProjectIoOwner(owner);
+                if (choice === 'saveAs') return 'saveAs';
+                if (choice !== 'overwrite') return false;
+                expectedVersion = projectFileVersionOf(initialFile);
+              }
+            }
             if (handle) {
               await assertProjectFileVersion(handle, expectedVersion, owner);
               phase = 'createWritable'; writable = await handle.createWritable(); assertProjectIoOwner(owner);
@@ -64294,7 +64301,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               // A folder's explicit ZIP export remains a copy; a ZIP Save As adopts
               // the selected file only after its writable close is confirmed.
               if (savedSource && (!owner.handle || source)) {
-                setProjectFileSource(owner.project, savedSource);
+                // Keep queued owners for this same linked original. Version observations
+                // are local to the write queue; a different destination replaces the source.
+                if (reuse) source.fileVersion = savedSource.fileVersion;
+                else setProjectFileSource(owner.project, savedSource);
                 Object.assign(owner, projectIoOwner(owner.request));
                 if (owner.request) owner.request.owner = owner;
                 await rememberProjectSource(owner, savedSource);
@@ -64315,6 +64325,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
           }
         });
+        // Release the queue/Web Lock before recursively selecting another destination.
+        if (result === 'saveAs') return await exportConteFolderZip(Object.assign({}, options, { owner: owner, reuseSource: false }));
+        return result;
       } catch (error) {
         if (!projectIoOwnerCurrent(owner)) console.warn('[zip-export] Previous project save discarded', zipName, error);
         else alert(t('msg.export.shareZipFailed', projectFileOperationError(error, phase, currentFile).message));
