@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2970</title>
+  <title>MoArt ver2971</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24583,6 +24583,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2971, items: [{ja: 'コンテのカット番号入力でもパネル尺を確定し、用紙の尺を0にすると対象を削除するよう統一しました。', ko: '콘티 번호 입력 시 패널 길이를 확정하고, 용지에서 길이를 0으로 입력하면 해당 패널·컷을 삭제하도록 통일했습니다.', en: 'Storyboard numbering now assigns panel durations. Entering zero in paper timing deletes the panel or cut.', zh: '输入分镜镜头编号时确定面板时长，画纸中时长输入0时删除对应面板或镜头。'}] },
       { ver: 2970, items: [{ja: 'コンテのパネル移動で絵・カット所属・長さがずれる不具合を修正しました。BGは元のカットに残し、移動した絵のFXは除きます。', ko: '콘티 패널 이동 시 그림·컷 소속·길이가 어긋나는 문제를 고쳤습니다. BG는 원래 컷에 남고, 이동한 그림의 FX는 제외합니다.', en: 'Fixed artwork ownership and duration errors when moving storyboard panels. BG stays in the original cut; moved artwork excludes FX.', zh: '修复移动分镜面板时图像归属与时长错位的问题。BG保留在原镜头，移入图像不带FX。'}] },
       { ver: 2968, items: [{ja: '描画編集の履歴用データの重複作成を減らしました。', ko: '그림 편집에서 이력용 데이터의 불필요한 사본 생성을 줄였습니다.', en: 'Removed redundant history-data copies during drawing edits.', zh: '减少绘图编辑时不必要的历史数据副本。'}] },
       { ver: 2967, items: [{ja: '内部の関数名を役割に合わせて整理しました。操作とファイル形式は変わりません。', ko: '내부 함수명을 역할에 맞게 정리했습니다. 조작과 파일 형식은 유지합니다.', en: 'Internal function names now reflect their roles. Behavior and file formats are unchanged.', zh: '按实际职责整理内部函数名，操作与文件格式保持不变。'}] },
@@ -52817,14 +52818,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function commitInlineTimeEditor(cutId, fieldName, value) {
       const frames = parseTimeInput(value);
       if (frames === null) return;
-      runTimelineStructureCommand(fieldName === 'durationFrames' ? 'Edit cut time' : 'Edit frame time', function(project) {
-        if (fieldName === 'durationFrames') {
+      const changed = runTimelineStructureCommand(fieldName === 'durationFrames' ? 'Edit cut time' : 'Edit panel time', function(project) {
+        if (fieldName === 'durationFrames' && frames > 0) {
           setCutGroupDurationFromInput(project, cutId, frames);
+        } else if (fieldName === 'durationFrames') {
+          if (!updateCutDurationFrames(project, cutId, frames)) return;
         } else {
-          setPictureFrameTimeByCutId(project, cutId, frames);
+          if (!updatePanelDurationFrames(project, cutId, frames)) return;
         }
-        setCurrentPicturePanelId(cutId);
+        if (project.cuts.some(function(cut) { return cut.id === cutId; })) setCurrentPicturePanelId(cutId);
       }, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.cutStructure, partialTimeline: true, skipPlayheadSelectionSync: true });
+      if (!changed) {
+        guardedRender('inspector', renderInspector);
+        guardedRender('chrome', updateChromeControls);
+      }
     }
 
     function createCell(className, text) {
@@ -53038,16 +53045,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const targetIndex = project.cuts.findIndex(function(item) { return item.id === cutId; });
         const target = project.cuts[targetIndex];
         if (!target || String(target.cutNo || '').trim()) return;
-        // Only a cut with no numbered cut before it gets here (a continuation panel returned above): there is no
-        // previous group to pad and the cut had no timeline slot, so the added frames shift media from the new end.
-        target.cutNo = cutNumberSuggestionForSlot(project, targetIndex).value;
-        const result = ensureCutGroupPanelsHaveOneSecondMinimum(project, target.id);
-        if (result.addedFrames > 0) {
-          shiftTimelineMediaAfterFrame(project, buildVideoTimeline(project).totalFrames, result.addedFrames);
-        }
-        target.meta = target.meta || {};
-        target.meta.userOverride = true;
-        setCurrentPicturePanelId(target.id);
+        applyCutNoEdit(project, target.id, cutNumberSuggestionForSlot(project, targetIndex).value);
         state.activeConteSelectionType = 'cut';
       }, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.cutStructure, partialTimeline: true, skipPlayheadSelectionSync: true });
     }
@@ -53178,7 +53176,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         setCurrentPicturePanelId(target.id);
         return;
       }
+      const creating = !String(target.cutNo || '').trim();
       target.cutNo = normalizeCutNoLabel(text);
+      if (creating) {
+        const result = ensureCutGroupPanelsHaveOneSecondMinimum(project, target.id);
+        if (result.addedFrames > 0) {
+          shiftTimelineMediaAfterFrame(project, buildVideoTimeline(project).totalFrames, result.addedFrames);
+        }
+      }
       target.inheritedCutNoHidden = false;
       target.meta = target.meta || {};
       target.meta.userOverride = true;
@@ -57755,7 +57760,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function updateCutDurationFrames(project, cutId, frames) {
       const cut = project && project.cuts.find(function(item) { return item.id === cutId; });
-      if (!cut || cutGroupPanelCount(project, cut.id) !== 1) {
+      if (!cut) return false;
+      const nextFrames = Math.max(0, Math.round(Number(frames) || 0));
+      if (!nextFrames) {
+        const panels = cutGroupSiblingCuts(project, cut);
+        const item = timelineGroupItemForOwner(project, panels[0].id);
+        if (item && audioClipsOverlapFrameRange(project, item.startFrame, item.endFrame)) {
+          state.timelineStatus = t('status.panelTime.blockedDelete');
+          return false;
+        }
+        return removePicturePanelsByIds(project, panels.map(function(panel) { return panel.id; }));
+      }
+      if (cutGroupPanelCount(project, cut.id) !== 1) {
         state.timelineStatus = t('status.cutTime.singlePanelOnly');
         return false;
       }
@@ -57765,8 +57781,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return false;
       }
       const currentFrames = slot ? Math.max(1, Math.round(Number(slot.frames) || 1)) : Math.max(0, Math.round(Number(cut.durationFrames) || 0));
-      const nextFrames = Math.max(0, Math.round(Number(frames) || 0));
-      if (!nextFrames) return removePicturePanelsByIds(project, [cut.id]);
       const delta = nextFrames - currentFrames;
       setPictureFrameTimeByCutId(project, cut.id, nextFrames);
       setCutGroupDurationByCutId(project, cut.id, nextFrames);
