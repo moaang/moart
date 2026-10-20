@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2971</title>
+  <title>MoArt ver2975</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -17526,7 +17526,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const DIALOG_FRAMES_PER_MORA = 3;
     const DIALOG_HANDLE_FRAMES = 6;
     const TIMING_UNIT_FRAMES = 6;
-    const DIALOG_AUDIO_SAFETY_FRAMES = 12;
     const WORKSPACE_DB_NAME = 'conteEditorWorkspace.v1';
     const WORKSPACE_STORE_NAME = 'handles';
     const WORKSPACE_HANDLE_KEY = 'workingDirectory';
@@ -17674,6 +17673,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // APP: STATE STORE
     // ## SECTION: STATE SINGLETON
+    const timelineStatusState = { value: '', applyRequest: null };
     const state = {
       project: createInitialProject(),
       projectActive: false,
@@ -17841,7 +17841,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       voicevoxGenerating: false,
       voicevoxCancelRequested: false,
       voicevoxAbortController: null,
-      timelineStatus: '',
+      get timelineStatus() {
+        const request = timelineStatusState.applyRequest;
+        if (request && !request.stillPending()) {
+          timelineStatusState.applyRequest = null;
+          if (request.ownsStatus) timelineStatusState.value = '';
+        }
+        return timelineStatusState.value;
+      },
+      set timelineStatus(value) {
+        timelineStatusState.value = value;
+        if (timelineStatusState.applyRequest) timelineStatusState.applyRequest.ownsStatus = false;
+      },
       ttsPendingClipIds: new Set(),
       get videoEditMode() { return Boolean(this.project && this.project.kind !== 'genga'); },
       videoPlayheadFrames: 0,
@@ -19502,8 +19513,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         conteLayers: [],
         rowSpan: 1,
         pictureFrames: 0,
-        pictureFramesManual: false,
-        pictureFramesInferred: 0,
         durationFrames: 0,
         durationFramesLocked: false,
         actionText: '',
@@ -19957,7 +19966,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (gt) return JSON.stringify([gt.paper, (gt.layers || []).map(gengaLayer)]);
       const cuts = (p.cuts || []).map(function(item) {
         const cut = item.cut || item;
-        return [pick(cut, ['id', 'cutNo', 'pictureFrames', 'pictureFramesManual', 'durationFrames', 'hidden', 'groupId']),
+        return [pick(cut, ['id', 'cutNo', 'pictureFrames', 'durationFrames', 'hidden', 'groupId']),
           (cut.conteLayers || []).map(function(l) { return pick(l, ['id', 'drawingRef', 'order', 'layerLineOrder', 'startPanelCutId', 'panelStart', 'panelSpan', 'visible', 'opacity', 'blend', 'effect']); })];
       });
       const drawings = Object.keys(p.layerDrawings || {}).sort().map(function(ref) {
@@ -22224,7 +22233,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       project.video.clips = Array.isArray(project.video.clips) ? project.video.clips : [];
       // normalizeCameraTrack runs BELOW the cut-duration sync — it clamps each keyframe's local frame to its
       // cut's slot length, so running it here (pre-sync) would clamp a keyframe in a cut that
-      // updateCutGroupFrameTimes later GROWS. See the deferred call after normalizeVideoClips.
+      // ensureCutGroupDurationFitsPanels later GROWS. See the deferred call after normalizeVideoClips.
       project.timeline = project.timeline && typeof project.timeline === 'object' ? project.timeline : { tracks: [] };
       project.timeline.tracks = Array.isArray(project.timeline.tracks) ? project.timeline.tracks : [];
       project.sourceDocuments = Array.isArray(project.sourceDocuments) ? project.sourceDocuments : [];
@@ -22236,8 +22245,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cut.order = index + 1;
         cut.rowSpan = 1;
         cut.pictureFrames = Math.max(0, Math.round(Number(cut.pictureFrames) || 0));
-        cut.pictureFramesManual = typeof cut.pictureFramesManual === 'boolean' ? cut.pictureFramesManual : cut.pictureFrames > 0;
-        cut.pictureFramesInferred = Math.max(0, Math.round(Number(cut.pictureFramesInferred) || 0));
         cut.durationFrames = Math.max(0, Math.round(Number(cut.durationFrames) || 0));
         cut.durationFramesLocked = Boolean(cut.durationFramesLocked || cut.durationFrames > 0);
         cut.cutNo = normalizeCutNoLabel(cut.cutNo || ''); // load-norm strips "007" padding -> "7"
@@ -22250,7 +22257,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       normalizeConteLayers(project);
       normalizeLayerDrawings(project);
       updateCutGroupDurations(project);
-      updateCutGroupFrameTimes(project);
+      ensureCutGroupDurationFitsPanels(project);
       updateCutGroupDurations(project);
       clearOrphanCutShaku(project);
       // Invariant: cuts[] holds only real cuts. A cut that ends up completely empty
@@ -24583,6 +24590,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2975, items: [{ja: '変形の読み込み中でも、取り消すと適用待ちの表示をすぐに終了します。', ko: '변형을 읽는 중에도 취소하면 적용 대기 표시를 즉시 내립니다.', en: 'Canceling a transform ends its pending-apply status without waiting for loading.', zh: '取消变形时立即结束等待应用提示，无需等待读取完成。'}] },
+      { ver: 2974, items: [{ja: '変形の読み込みを取り消した後に、適用待ちの表示が残る問題を修正しました。', ko: '변형 읽기를 취소한 뒤 적용 대기 표시가 남는 문제를 고쳤습니다.', en: 'Canceled transform loads no longer leave an apply-pending message.', zh: '修复取消变形读取后仍显示等待应用的问题。'}] },
+      { ver: 2973, items: [{ja: 'コンテのコマ・変形ツール切替時にプレビューを追従させ、古い読み込み結果の変形適用を防ぎました。', ko: '콘티 코마·변형 도구 전환 시 프리뷰를 맞추고 오래된 읽기 결과가 변형을 적용하지 않도록 고쳤습니다.', en: 'Storyboard transform previews now follow target and tool changes; stale loading results no longer apply edits.', zh: '分镜变形预览跟随目标和工具切换，过期的读取结果不再应用编辑。'}] },
+      { ver: 2972, items: [{ja: 'コンテのパネル尺の自動配分を廃止しました。', ko: '콘티 패널 길이 자동 배분을 폐기했습니다.', en: 'Removed automatic storyboard panel duration allocation.', zh: '移除了分镜面板时长的自动分配。'}] },
       { ver: 2971, items: [{ja: 'コンテのカット番号入力でもパネル尺を確定し、用紙の尺を0にすると対象を削除するよう統一しました。', ko: '콘티 번호 입력 시 패널 길이를 확정하고, 용지에서 길이를 0으로 입력하면 해당 패널·컷을 삭제하도록 통일했습니다.', en: 'Storyboard numbering now assigns panel durations. Entering zero in paper timing deletes the panel or cut.', zh: '输入分镜镜头编号时确定面板时长，画纸中时长输入0时删除对应面板或镜头。'}] },
       { ver: 2970, items: [{ja: 'コンテのパネル移動で絵・カット所属・長さがずれる不具合を修正しました。BGは元のカットに残し、移動した絵のFXは除きます。', ko: '콘티 패널 이동 시 그림·컷 소속·길이가 어긋나는 문제를 고쳤습니다. BG는 원래 컷에 남고, 이동한 그림의 FX는 제외합니다.', en: 'Fixed artwork ownership and duration errors when moving storyboard panels. BG stays in the original cut; moved artwork excludes FX.', zh: '修复移动分镜面板时图像归属与时长错位的问题。BG保留在原镜头，移入图像不带FX。'}] },
       { ver: 2968, items: [{ja: '描画編集の履歴用データの重複作成を減らしました。', ko: '그림 편집에서 이력용 데이터의 불필요한 사본 생성을 줄였습니다.', en: 'Removed redundant history-data copies during drawing edits.', zh: '减少绘图编辑时不必要的历史数据副本。'}] },
@@ -32259,7 +32270,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return id && findConteLayerById(state.project, id);
       });
       const nextPrimaryId = ids.length ? String(primaryLayerId || ids[ids.length - 1] || '') : '';
-      if (state.selectedConteLayerId !== nextPrimaryId) paintDiscardPendingBucketFill();
+      if (state.selectedConteLayerId !== nextPrimaryId) {
+        paintDiscardPendingBucketFill();
+        if (state.paintRasterOp && state.paintRasterOp.type === 'transform-edit') {
+          const pointerId = state.paintPointerId;
+          paintAbortGestureSession();
+          safeReleasePointerCapture(document.getElementById('conteVideoStage'), pointerId);
+          clearActiveLayerCanvasTargets();
+        }
+      }
       if (!ids.length) {
         state.selectedConteLayerId = '';
         state.selectedConteLayerIds = new Set();
@@ -32336,17 +32355,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.conteLayerAnchorId = id;
       const set = selectedConteLayerSet();
       if (additive) {
+        let primaryId;
         if (set.has(id) && set.size > 1) {
           set.delete(id);
-          state.selectedConteLayerId = Array.from(set).pop() || '';
+          primaryId = Array.from(set).pop() || '';
         } else {
           set.add(id);
-          state.selectedConteLayerId = id;
+          primaryId = id;
         }
-        state.selectedConteLayerIds = set;
-        const found = state.selectedConteLayerId ? findConteLayerById(state.project, state.selectedConteLayerId) : null;
-        state.selectedConteLayerLineKey = found && found.layer ? conteLayerLineKey(found.layer) : '';
-        state.selectedConteLayerRowIndex = found && found.layer ? Math.max(0, conteLayerRowIndexForLayer(state.project, found.layer.id)) : -1;
+        setSelectedConteLayers(Array.from(set), primaryId);
       } else {
         setSelectedConteLayers([id], id);
       }
@@ -32361,8 +32378,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function clearConteLayerSelection(options) {
       options = options || {};
       if (state.activeConteSelectionType === 'layer') state.activeConteSelectionType = '';
-      state.selectedConteLayerId = '';
-      state.selectedConteLayerIds = new Set();
+      setSelectedConteLayers([], '', { keepLineKey: true, activate: false });
       if (options.clearLineKey === true) {
         state.selectedConteLayerLineKey = '';
         state.selectedConteLayerRowIndex = -1;
@@ -32956,14 +32972,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.selectedConteLayerLineKey = conteLayerLineKeyForRowIndex(project, targetCutId, index);
       const entry = conteLayerRowActiveAtPanel(project, targetCutId, index);
       if (entry && entry.layer && entry.layer.id) {
-        state.selectedConteLayerId = entry.layer.id;
-        state.selectedConteLayerIds = new Set([entry.layer.id]);
+        setSelectedConteLayers([entry.layer.id], entry.layer.id, { activate: false });
         state.activeConteSelectionType = options.activate === false ? previousActiveType : 'layer';
         if (leavingRef && String(entry.layer.id) !== leavingLayerId) invalidateTimelineLayerThumbnailForRef(leavingRef);
         return entry;
       }
-      state.selectedConteLayerId = '';
-      state.selectedConteLayerIds = new Set();
+      setSelectedConteLayers([], '', { keepLineKey: true, activate: false });
       // 사용자가 **셀을 짚은** 빈 칸(셀 클릭·↑↓·코마 삭제 뒤, options.cell)은 셀 선택이다 — 'panel' 로 두면 그
       // Delete 가 패널(다른 줄의 코마까지)을 지운다. 업계 표준·원화와 같이 빈 셀의 Delete 는 아무 일도 안 한다.
       // 렌더·재생헤드 동기화가 지나가도 셀 선택은 셀로 남는다. 패널을 짚은 경우(패널 클릭·←→)는 종전대로 패널.
@@ -33703,7 +33717,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       invalidateLayerDrawingPastePreview(drawingRef);
       targetOwner.conteLayers.push(layer);
       markConteLayerOwnerHasLayers(targetOwner);
-      updateConteLayerOrderCodes(targetOwner.conteLayers);
+      assignConteLayerOrders(targetOwner.conteLayers);
       if (options.select !== false) {
         setSelectedConteLayers([layer.id], layer.id);
         setConteLayerPasteTargetPanel(project, targetCutId);
@@ -34454,9 +34468,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cut.meta && cut.meta.videoMedia ||
         String(cut.actionText || '').trim() ||
         String(cut.dialogText || '').trim() ||
-        isFixedPictureFrame(cut) ||
-        Math.max(0, Math.round(Number(cut.pictureFramesInferred) || 0)) ||
-        cut.pictureFramesManual ||
+        allocatedPictureFrames(cut) ||
         cut.durationFramesLocked ||
         Math.max(0, Math.round(Number(cut.durationFrames) || 0)) ||
         hasArrayItems(cut.sourceBlockIds) ||
@@ -34488,42 +34500,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function updateCutGroupFrameTimes(project) {
+    function ensureCutGroupDurationFitsPanels(project) {
       for (let index = 0; index < project.cuts.length; index += 1) {
         if (!String(project.cuts[index] && project.cuts[index].cutNo || '').trim()) continue;
         const lastIndex = cutGroupLastIndex(project, index);
-        const frameSlots = [];
-        for (let cursor = index; cursor <= lastIndex; cursor += 1) {
-          const cut = project.cuts[cursor];
-          const wasAutoConfirmed = isAutoConfirmedPictureFrame(cut);
-          cut.pictureFramesInferred = 0;
-          if (wasAutoConfirmed) clearAutoConfirmedPictureFrame(cut);
-          frameSlots.push(cursor);
+        const panelFrames = cutGroupPictureFrames(project, index);
+        if (panelFrames > Math.max(0, Math.round(Number(project.cuts[index].durationFrames) || 0))) {
+          setCutGroupDurationByIndex(project, index, panelFrames, true);
         }
-        let duration = Math.max(0, Math.round(Number(project.cuts[index].durationFrames) || 0));
-        const fixedSlots = frameSlots.filter(function(cursor) { return isFixedPictureFrame(project.cuts[cursor]); });
-        const fixedSum = fixedSlots.reduce(function(sum, cursor) {
-          return sum + Math.max(0, Math.round(Number(project.cuts[cursor].pictureFrames) || 0));
-        }, 0);
-        if (fixedSum > duration) {
-          duration = fixedSum;
-          setCutGroupDurationByIndex(project, index, duration, true);
-        }
-        const openSlots = frameSlots.filter(function(cursor) { return !isFixedPictureFrame(project.cuts[cursor]); });
-        const remaining = Math.max(0, duration - fixedSum);
-        if (openSlots.length === 1 && remaining > 0) {
-          const only = project.cuts[openSlots[0]];
-          only.pictureFrames = remaining;
-          only.pictureFramesManual = true;
-          only.pictureFramesInferred = 0;
-          only.meta = only.meta || {};
-          only.meta.pictureFramesAutoConfirmed = true;
-        } else if (openSlots.length > 1 && remaining > 0) {
-          openSlots.forEach(function(cursor, offset) {
-            project.cuts[cursor].pictureFramesInferred = distributedFrameValue(remaining, openSlots.length, offset);
-          });
-        }
-        enforceCutGroupFrameSum(project, index, frameSlots, duration);
         index = lastIndex;
       }
     }
@@ -34543,16 +34527,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!cut || covered.has(index)) return;
         if (String(cut.cutNo || '').trim()) return; // numbered cuts are always group starts; defensive
         const hadShaku = Math.max(0, Math.round(Number(cut.pictureFrames) || 0))
-          || Math.max(0, Math.round(Number(cut.pictureFramesInferred) || 0))
           || Math.max(0, Math.round(Number(cut.durationFrames) || 0))
-          || cut.pictureFramesManual || cut.durationFramesLocked;
+          || cut.durationFramesLocked;
         if (!hadShaku) return;
         cut.pictureFrames = 0;
-        cut.pictureFramesInferred = 0;
-        cut.pictureFramesManual = false;
         cut.durationFrames = 0;
         cut.durationFramesLocked = false;
-        if (cut.meta) delete cut.meta.pictureFramesAutoConfirmed;
       });
     }
 
@@ -34660,12 +34640,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (owner && owner.id) rescaleCameraKeyframesForCutDuration(project, owner.id, previousDuration, duration);
     }
 
-    // 고정 장면 길이의 합 — 컷 尺은 이보다 짧아질 수 없다(updateCutGroupFrameTimes 와 같은 판정).
-    function cutGroupFixedPictureFrames(project, startIndex) {
+    // 고정 장면 길이의 합 — 컷 尺은 이보다 짧아질 수 없다(ensureCutGroupDurationFitsPanels 와 같은 판정).
+    function cutGroupPictureFrames(project, startIndex) {
       let sum = 0;
       for (let cursor = startIndex; cursor <= cutGroupLastIndex(project, startIndex); cursor += 1) {
         const cut = project.cuts[cursor];
-        if (isFixedPictureFrame(cut) && !isAutoConfirmedPictureFrame(cut)) sum += Math.max(0, Math.round(Number(cut.pictureFrames) || 0));
+        sum += allocatedPictureFrames(cut);
       }
       return sum;
     }
@@ -34682,7 +34662,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const startIndex = cutGroupStartIndex(project, cutIndexById(project, cutId));
       if (startIndex < 0) return;
       const requested = Math.max(0, Math.round(Number(frames) || 0));
-      setCutGroupDurationByIndex(project, startIndex, Math.max(requested, cutGroupFixedPictureFrames(project, startIndex)), true);
+      const panelFrames = cutGroupPictureFrames(project, startIndex);
+      const duration = Math.max(requested, panelFrames);
+      const last = project.cuts[cutGroupLastIndex(project, startIndex)];
+      if (duration > panelFrames && last) setPictureFrameTimeByCutId(project, last.id, allocatedPictureFrames(last) + duration - panelFrames);
+      setCutGroupDurationByIndex(project, startIndex, duration, true);
     }
 
     function setPictureFrameTimeByCutId(project, cutId, frames) {
@@ -34690,62 +34674,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!cut) return;
       const value = Math.max(0, Math.round(Number(frames) || 0));
       cut.pictureFrames = value;
-      cut.pictureFramesManual = value > 0;
-      cut.pictureFramesInferred = 0;
       cut.meta = cut.meta || {};
       cut.meta.userOverride = true;
-      delete cut.meta.pictureFramesAutoConfirmed;
     }
 
     function allocatedPictureFrames(cut) {
-      if (!cut) return 0;
-      return Math.max(0, Math.round(Number(isFixedPictureFrame(cut) ? cut.pictureFrames : cut.pictureFramesInferred) || 0));
-    }
-
-
-
-    function isFixedPictureFrame(cut) {
-      return Boolean(cut && cut.pictureFramesManual && Math.max(0, Math.round(Number(cut.pictureFrames) || 0)));
-    }
-
-    function isAutoConfirmedPictureFrame(cut) {
-      return Boolean(cut && cut.meta && cut.meta.pictureFramesAutoConfirmed);
-    }
-
-    function clearAutoConfirmedPictureFrame(cut) {
-      if (!cut || !cut.meta || !cut.meta.pictureFramesAutoConfirmed) return;
-      cut.pictureFrames = 0;
-      cut.pictureFramesManual = false;
-      delete cut.meta.pictureFramesAutoConfirmed;
-    }
-
-    function enforceCutGroupFrameSum(project, startIndex, frameSlots, duration) {
-      const targetDuration = Math.max(0, Math.round(Number(duration) || 0));
-      if (!project || !frameSlots.length || !targetDuration) return;
-      const sum = frameSlots.reduce(function(total, cursor) {
-        return total + allocatedPictureFrames(project.cuts[cursor]);
-      }, 0);
-      if (sum === targetDuration) return;
-      if (sum > targetDuration) {
-        setCutGroupDurationByIndex(project, startIndex, sum, true);
-        return;
-      }
-      const target = project.cuts[frameSlots[frameSlots.length - 1]];
-      if (!target) return;
-      const addition = targetDuration - sum;
-      if (isFixedPictureFrame(target)) {
-        target.pictureFrames = Math.max(0, Math.round(Number(target.pictureFrames) || 0)) + addition;
-        target.pictureFramesManual = true;
-      } else {
-        target.pictureFramesInferred = Math.max(0, Math.round(Number(target.pictureFramesInferred) || 0)) + addition;
-      }
-    }
-
-    function distributedFrameValue(total, count, offset) {
-      if (!count) return 0;
-      const base = Math.floor(total / count);
-      const remainder = total % count;
-      return base + (offset < remainder ? 1 : 0);
+      return Math.max(0, Math.round(Number(cut && cut.pictureFrames) || 0));
     }
 
     function roundFramesToTimingUnit(frames) {
@@ -34756,12 +34690,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function ceilFramesToTimingUnit(frames) {
       const unit = Math.max(1, TIMING_UNIT_FRAMES);
       return Math.max(0, Math.ceil(Math.max(0, Number(frames) || 0) / unit) * unit);
-    }
-
-    function roundFramesToTimingUnitAtLeast(frames, minimum) {
-      const min = Math.max(0, Math.round(Number(minimum) || 0));
-      const rounded = roundFramesToTimingUnit(frames);
-      return rounded >= min ? rounded : ceilFramesToTimingUnit(min);
     }
 
     function cutGroupDurationDisplayIndex(project, startIndex) {
@@ -34803,15 +34731,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const source = durationSourceCutForSlot(cut);
       return source ? Math.max(0, Math.round(Number(source.durationFrames) || 0)) : 0;
     }
-
-    function displayPictureFramesForCut(cut) {
-      return isFixedPictureFrame(cut) ? Math.max(0, Math.round(Number(cut.pictureFrames) || 0)) : 0;
-    }
-
-    function inferredPictureFramesForCut(cut) {
-      return !isFixedPictureFrame(cut) ? Math.max(0, Math.round(Number(cut && cut.pictureFramesInferred) || 0)) : 0;
-    }
-
 
     // ★尺 표기의 식은 `framesToShakuLength` **한 벌**이다(공유 계약 c-shaku — "0+03" 스타일, 초 무패딩 +
     // 코마 2자리, 전 프로그램 통일 — 사용자 판정). 0 에 빈 문자열을 내는 것은 **이 함수만의 계약**이다 — 컷
@@ -35673,13 +35592,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function cutGroupTimelineItems(project) {
-      const fps = fpsForProject(project);
       const groups = collectCutTimingGroups(project);
       const items = [];
       let cursor = 0;
       groups.forEach(function(group, gi) {
-        const fallback = isTimingMarkerGroup(group) ? Math.max(1, Math.round(fps / 2)) : estimatedCutGroupFallbackFrames(project, group);
-        const frames = Math.max(1, Math.round(Number(group.durationFrames) || fallback));
+        const frames = Math.max(0, Math.round(Number(group.durationFrames) || 0));
         let start = cursor;
         let olPrevFrames = 0;
         if (gi > 0) {
@@ -35706,13 +35623,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return items;
     }
 
-    function estimatedCutGroupFallbackFrames(project, group) {
-      const fps = fpsForProject(project);
-      const dialog = cutGroupDialogTiming(project, group);
-      const dialogFrames = dialog.handledFrames || (dialog.speechFrames + dialog.units * DIALOG_HANDLE_FRAMES * 2);
-      const rowFrames = Math.max(1, (group.cuts || []).length) * fps;
-      return Math.max(rowFrames, dialogFrames, fps);
-    }
 
     function normalizeDialogTags(value) {
       const raw = Array.isArray(value) ? value.join(' ') : String(value || '');
@@ -36434,25 +36344,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const cuts = group.cuts && group.cuts.length ? group.cuts : [];
         slotsByGroup[groupIndex] = [];
         if (!cuts.length) return;
-        const allocated = cuts.map(function(cut) { return allocatedPictureFrames(cut); });
-        const fixedSum = allocated.reduce(function(sum, frames) { return sum + frames; }, 0);
-        const openCount = allocated.filter(function(frames) { return !frames; }).length;
         let cursor = item.startFrame;
-        cuts.forEach(function(cut, index) {
-          let frames = allocated[index];
-          if (!frames) {
-            frames = openCount ? distributedFrameValue(Math.max(0, item.frames - fixedSum), openCount, allocated.slice(0, index + 1).filter(function(value) { return !value; }).length - 1) : 0;
-          }
-          if (!frames) frames = distributedFrameValue(item.frames, cuts.length, index);
-          frames = Math.max(1, Math.round(frames));
-          frames = Math.max(1, Math.min(frames, Math.max(1, item.endFrame - cursor)));
+        cuts.forEach(function(cut) {
+          const frames = allocatedPictureFrames(cut);
           const slot = {
             group: group,
             groupStartFrame: item.startFrame,
             groupEndFrame: item.endFrame,
             cut: cut,
             cutNo: group.cutNo,
-            startFrame: Math.min(cursor, item.endFrame),   // rows past a 尺 shorter than the row count are empty slots AT the group end, never after it (video.slots must stay ordered for videoSlotAtFrame)
+            startFrame: Math.min(cursor, item.endFrame),
             endFrame: Math.min(item.endFrame, cursor + frames),
             frames: frames
           };
@@ -43221,17 +43122,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const live = adjacentCutGroupMergeInfo(project, targetCutId, side);
         if (!live) return;
         const combined = live.selfFrames + live.neighborFrames;
-        // 두 그룹의 패널 길이를 지금 자리 그대로 고정한다. 자동으로 정해진 길이(한 장짜리 컷의
-        // pictureFramesAutoConfirmed, 여러 장의 균등 분배)는 정규화가 합친 그룹 길이로 다시 나눠서, 그대로
-        // 두면 패널 경계(그림이 바뀌는 프레임)와 그 패널 기준의 카메라 키가 옮겨진다 — 아래 판정 「그림 배치는 안 바뀐다」와 어긋난다. 사용자가 고정한 길이는 건드리지 않는다.
-        buildVideoTimeline(project).slots.forEach(function(slot) {
-          const ownerId = cutGroupOwnerIdFromSlot(slot);
-          if (!slot.cut || (ownerId !== live.ownerId && ownerId !== live.neighborOwnerId) || hasUserFixedPictureFrame(slot.cut)) return;
-          slot.cut.pictureFrames = slot.frames;
-          slot.cut.pictureFramesManual = true;
-          slot.cut.pictureFramesInferred = 0;
-          if (slot.cut.meta) delete slot.cut.meta.pictureFramesAutoConfirmed;
-        });
         // 병합은 같은 컷 취급이 될 뿐이고 그림 배치는 안 바뀌므로, 두 분기 다 카메라 키프레임을 건드리지
         // 않는다(사용자 판정). normalizeCameraTrack 은 「키프레임의 cutId 는 그룹 오너가 아니라 그룹 안의 아무
         // 패널이나 가리켜도 된다」는 모델이고, 매 정규화마다 그 패널이 그룹 안 어디에
@@ -47888,13 +47778,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
 
-    function dialogAutoTimingFramesForText(text) {
-      const moraFrames = estimateDialogMora(text) * DIALOG_FRAMES_PER_MORA + DIALOG_HANDLE_FRAMES * 2;
-      const voicevoxFrames = voicevoxTargetFramesForText(text) + DIALOG_AUDIO_SAFETY_FRAMES;
-      const minimum = Math.max(moraFrames, voicevoxFrames);
-      return roundFramesToTimingUnitAtLeast(minimum, minimum);
-    }
-
     function estimateDialogMora(value) {
       const text = cleanDialogTextForTiming(value);
       const kana = (text.match(/[ぁ-ゖァ-ヺー]/g) || []).length;
@@ -47926,30 +47809,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function isTimingMarkerGroup(group) {
       return /^(OP|ED|CM|END)$/i.test(String(group && group.cutNo || '').trim());
-    }
-
-    function cutGroupDialogTiming(project, group) {
-      const units = linkedBlocksForCutGroup(project, group).filter(function(block) {
-        return DIALOG_AREA_TYPES.indexOf(block.type) >= 0;
-      }).map(function(block) {
-        return block.text || block.rawText || '';
-      });
-      if (!units.length) {
-        group.cuts.forEach(function(cut) {
-          String(cut.dialogText || '').split(/\n+/).forEach(function(line) {
-            const text = line.trim();
-            if (text) units.push(text);
-          });
-        });
-      }
-      const mora = units.reduce(function(sum, text) { return sum + estimateDialogMora(text); }, 0);
-      const handledFrames = units.reduce(function(sum, text) { return sum + dialogAutoTimingFramesForText(text); }, 0);
-      return {
-        units: units.length,
-        mora: mora,
-        speechFrames: mora * DIALOG_FRAMES_PER_MORA,
-        handledFrames: handledFrames
-      };
     }
 
     function linkedBlocksForCutGroup(project, group) {
@@ -52746,7 +52605,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function renderTimeCellContent(el, cut, durationSource) {
-      const pictureFrameText = framesToTime(displayPictureFramesForCut(cut));
+      const pictureFrameText = framesToTime(allocatedPictureFrames(cut));
       const cutDurationText = framesToTime(durationSource ? durationSource.durationFrames : 0);
       el.textContent = '';
       if (pictureFrameText) {
@@ -53313,9 +53172,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { start: sourceIndex };   // gap model: a move reads only where the marker is
     }
 
-    function hasUserFixedPictureFrame(cut) {
-      return Boolean(cut && isFixedPictureFrame(cut) && !(cut.meta && cut.meta.pictureFramesAutoConfirmed));
-    }
 
     // A cut's vertical position == how many continuation panels sit in the gap ABOVE it (those panels
     // belong to the PREVIOUS cut). So moving is purely gap adjustment, never a reorder/swap:
@@ -55078,9 +54934,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function voicevoxTargetFramesForText(text) {
       const moraFrames = estimateDialogMora(text) * DIALOG_FRAMES_PER_MORA;
-      // 이 6 은 DIALOG_HANDLE_FRAMES(6)의 ×2 가 **아니다.** 이 추정에는
-      // DIALOG_AUDIO_SAFETY_FRAMES(12)가 호출부에서 따로 붙으므로 핸들을 절반으로 둔다 —
-      // dialogAutoTimingFramesForText 가 두 추정을 Math.max 로 합친다. 맞추면 재생 길이가 바뀐다.
       const handleFrames = 3 * 2;
       const pauseFrames = voicevoxPunctuationPauseCount(text) * 6;
       return Math.max(12, moraFrames + handleFrames + pauseFrames);
@@ -57712,7 +57565,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function inspectorPanelFramesForCut(cut) {
       const slot = videoSlotForCutId(state.project, cut && cut.id);
       if (slot) return Math.max(0, Math.round(Number(slot.frames) || 0));
-      return Math.max(displayPictureFramesForCut(cut), inferredPictureFramesForCut(cut));
+      return allocatedPictureFrames(cut);
     }
 
     function inspectorCanEditCutDuration(project, durationCut) {
@@ -57951,8 +57804,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function markCutAsOneSecondPicturePanel(project, cut) {
       const frames = oneSecondFrames(project);
       cut.pictureFrames = frames;
-      cut.pictureFramesManual = true;
-      cut.pictureFramesInferred = 0;
       cut.meta = cut.meta || {};
       cut.meta.userOverride = true;
       cut.meta.insertedPanel = true;
@@ -57961,7 +57812,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function ensureCutHasOneSecondPicturePanel(project, cut) {
       if (!cut) return 0;
-      const current = Math.max(0, Math.round(Number(cut.pictureFrames || cut.pictureFramesInferred || 0) || 0));
+      const current = Math.max(0, Math.round(Number(cut.pictureFrames || 0) || 0));
       if (current > 0) return current;
       return markCutAsOneSecondPicturePanel(project, cut);
     }
@@ -57980,10 +57831,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let totalFrames = 0;
       for (let cursor = start; cursor <= end; cursor += 1) {
         const cut = project.cuts[cursor];
-        const before = Math.max(0, Math.round(Number(cut.pictureFrames || cut.pictureFramesInferred || 0) || 0));
+        const before = Math.max(0, Math.round(Number(cut.pictureFrames || 0) || 0));
         const frames = ensureCutHasOneSecondPicturePanel(project, cut);
         if (!before && frames) addedFrames += frames;
-        totalFrames += Math.max(0, Math.round(Number(cut.pictureFrames || cut.pictureFramesInferred || 0) || 0));
+        totalFrames += Math.max(0, Math.round(Number(cut.pictureFrames || 0) || 0));
       }
       if (totalFrames > 0 && String(project.cuts[start] && project.cuts[start].cutNo || '').trim()) setCutGroupDurationByIndex(project, start, totalFrames, true);
       return { addedFrames: addedFrames, totalFrames: totalFrames };
@@ -58258,12 +58109,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         panel.id = 'panel-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
         // cutNo 는 createBlankCut 이 준 빈 문자열 그대로 둔다 — 그것이 「같은 컷에 남는다」의 전부다.
         panel.pictureFrames = plan.total - plan.splitAt;
-        panel.pictureFramesManual = true;
-        panel.pictureFramesInferred = 0;
         panel.meta = Object.assign({}, panel.meta, { userOverride: true, insertedPanel: true });
         src.pictureFrames = plan.splitAt;
-        src.pictureFramesManual = true;
-        src.pictureFramesInferred = 0;
         src.meta = Object.assign({}, src.meta, { userOverride: true });
         plan.widening.forEach(function(layer) {
           layer.panelSpan = Math.max(1, Math.round(Number(layer.panelSpan) || 1)) + 1;
@@ -58345,7 +58192,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!plan) return;
         const panel = project.cuts[plan.index];
         const owner = plan.owner;
-        const framesOf = allocatedPictureFrames; // manual 尺, else the inferred share -- what the timeline draws
+        const framesOf = allocatedPictureFrames;
         let tailFrames = 0;
         for (let c = plan.index; c <= plan.lastIndex; c += 1) tailFrames += framesOf(project.cuts[c]);
         let headFrames = 0;
@@ -86821,7 +86668,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 항등이다(실측 오차 2.8e-14 px).
       if (!forceReset && state.paintTransformBox && state.paintTransformBox.drawingRef === ref
           && state.paintTransformBox.baseKey === baseKey) {
-        updatePaintEditOverlays(ref);
+        if (paintTransformBoxIsPending(state.paintTransformBox)
+            && (!state.paintTransformPreview || state.paintTransformPreview.box !== state.paintTransformBox)) {
+          paintTransformApplyQuadFromUI(paintTransformBoxQuadArray(state.paintTransformBox), target);
+        } else updatePaintEditOverlays(ref);
         return state.paintTransformBox;
       }
       const bounds = paintTransformBoundsForTarget(target);
@@ -86874,7 +86724,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           [bounds.x, bounds.y + bounds.h]
         ]
       };
-      updatePaintEditOverlays(ref);
+      state.paintTransformPreview = null;
+      if (paintTransformBoxIsPending(state.paintTransformBox)) {
+        paintTransformApplyQuadFromUI(paintTransformBoxQuadArray(state.paintTransformBox), target);
+      } else updatePaintEditOverlays(ref);
       return state.paintTransformBox;
     }
 
@@ -86911,6 +86764,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (state.paintEditTool !== 'transform' && state.paintEditTool !== 'perspective') return null;
       const target = currentPaintTransformLayerTarget();
       if (!target) return null;
+      const box = state.paintTransformBox;
+      if (!forceReset && box && box.drawingRef === target.drawingRef && box.baseKey === paintTransformBaseKey(target)
+          && (!paintTransformBoxIsPending(box) || state.paintTransformPreview && state.paintTransformPreview.box === box)) {
+        updatePaintEditOverlays(target.drawingRef);
+        return box;
+      }
       const activeTarget = prepareLayerRasterTarget(target);
       if (!activeTarget) return null;
       return ensurePaintTransformBoxForTarget(target, activeTarget, forceReset);
@@ -87348,14 +87207,21 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         return [q[0][0] + e1x * dx + e2x * dy, q[0][1] + e1y * dx + e2y * dy];
       });
     }
-    // Apply on (both engines): when target drawings are still loading, report how many, and re-run the apply once they
-    // are ready if the same pending transform still stands. A failed load leaves the transform pending.
+    // One pending Apply owns its loading status. Other status writes revoke only that display ownership.
     function transformApplyAfterLoading(loads, stillPending, retry, redraw) {
-      state.timelineStatus = t('status.transform.loading', loads.length); redraw();
-      Promise.all(loads).then(function() {
-        state.timelineStatus = '';
-        if (stillPending()) retry(); else redraw();
-      }, function() { state.timelineStatus = t('status.genga.drawing.unavailable'); redraw(); });
+      state.timelineStatus = t('status.transform.loading', loads.length);
+      const request = { ownsStatus: true, stillPending: stillPending };
+      timelineStatusState.applyRequest = request;
+      redraw();
+      const finish = function(failed) {
+        if (timelineStatusState.applyRequest !== request) return;
+        const pending = stillPending();
+        timelineStatusState.applyRequest = null;
+        if (request.ownsStatus) state.timelineStatus = pending && failed ? t('status.genga.drawing.unavailable') : '';
+        if (pending && !failed) retry();
+        else if (request.ownsStatus || pending) redraw();
+      };
+      Promise.all(loads).then(function() { finish(false); }, function() { finish(true); });
     }
     // Apply on (both engines): carry the pending quad relation onto another drawing base in the same coordinate frame.
     // Invalid inputs or non-finite results return null; crossing the vanishing line uses the affine fallback.
@@ -87657,16 +87523,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return refs;
     }
     // Pixels of a drawing that is not on screen: live canvas, the decoded preview cache, or a load made for this apply.
-    const conteTransformLoaded = new Map();
-    function conteTransformImageFor(ref) {
+    function conteTransformImageFor(ref, loaded) {
       const drawing = ensureLayerDrawingData(state.project, ref), key = layerDrawingContentKey(ref, drawing);
-      return layerLiveBitmapFor(ref) || cachedLayerPreviewImage(key) || conteTransformLoaded.get(key) || null;
+      return layerLiveBitmapFor(ref) || cachedLayerPreviewImage(key) || loaded && loaded.get(key) || null;
     }
     // The same coordinate rules as the primary: the selection's region, or (no selection) the target's own ink bounds
     // carrying the pending relation in layer coordinates (work canvas = layer + offset).
-    function conteBakeTransformTarget(preview, ref) {
+    function conteBakeTransformTarget(preview, ref, loaded) {
       const geometry = contePaperGeom(state.project);
-      const image = conteTransformImageFor(ref); if (!image) return null;
+      const image = conteTransformImageFor(ref, loaded); if (!image) return null;
       const drawing = ensureLayerDrawingData(state.project, ref);
       const selection = preview.source.selection ? state.paintSelection : null;
       const work = layerWorkCanvasFromVisibleLayerCanvas(image, drawing, selection ? paintSelectionLayerBounds(selection) : null, layerDrawingBitmapRect(drawing), geometry);
@@ -87924,7 +87789,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         inverted: !!selection.inverted
       };
     }
-    function commitPaintTransformPreview(extraRefs) {
+    function commitPaintTransformPreview(extraRefs, loaded) {
       const preview = state.paintTransformPreview;
       if (!preview || !preview.drawingRef || !preview.source) return false;
       // 쓰기 직전 한 번 더 — 호출부(Enter/Apply)가 늘어나도 "보이지 않는 대상에는 굽지 않는다"가
@@ -87964,7 +87829,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const result = paintTransformResultCanvas(preview);
       if (!result || !result.canvas || !result.bounds) return false;
       const selectionBefore = snapshotPaintSelection(); // 그림과 같은 undo 스텝에 실을 값
-      const extras = (extraRefs || []).map(function(r) { return conteBakeTransformTarget(preview, r); }).filter(Boolean); // 선택이 그림을 따라가기 전에
+      const extras = (extraRefs || []).map(function(r) { return conteBakeTransformTarget(preview, r, loaded); }).filter(Boolean); // 선택이 그림을 따라가기 전에
       if (preview.source.selection && state.paintSelection) { // 전역 스텐실 — 소속 비교 불필요
         state.paintSelection = paintSelectionAfterTransform(preview); // 선택이 그림을 따라간다
       }
@@ -87989,7 +87854,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           bitmapWidth: e.result.bounds.w, bitmapHeight: e.result.bounds.h, trimAlpha: true, skipGlobalHistory: true });
       });
       if (extras.length) { pushLayerDrawingEditCommand('Edit conte layer drawing', beforeAll, refs, selectionHistory); updatePaintUndoRedoButtonsOnly(); }
-      conteTransformLoaded.clear();
       updatePaintEditOverlays(ref);
       updatePaintUI();
       return true;
@@ -93989,6 +93853,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
     }
     function updatePaintUI() {
+      const status = state.timelineStatus;
+      document.querySelectorAll('.timeline-status').forEach(function(el) {
+        if (el.textContent !== status) el.textContent = status;
+      });
       normalizePaintColorState();
       syncTransformApplyOnControls();
       updateDrawBlockedCursors(); // 禁止 cursor follows selection/visibility changes
@@ -94103,9 +93971,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Shared gesture teardown and engine exit/entry own the transition; callers do not assign tool state.
     const PAINT_DRAW_TOOL_IDS = ['pen', 'eraser', 'line', 'curve', 'rect', 'ellipse', 'lasso-fill', 'bucket'];
     const PAINT_EDIT_TOOL_IDS = ['lasso-select', 'lasso-stamp', 'text-stamp', 'transform', 'perspective', 'camera'];
-    // 툴을 떠날 때 반드시 사라져야 하는 것들. **누가 남겼는지 묻지 않는다** — 목적지 툴이 다르면 전부 버린다.
-    // 툴별 owns 테이블을 두면 "이 툴이 저 상태를 남길 수 있다"를 13×5칸 전부 맞게 유지해야 하고, 한 칸만 틀려도
-    // 조용히 샌다. paintTransformBox는 목록에 없다 — 좌표는 툴 전환을 넘어 살아남는 게 TVPaint 규약이다.
+    // 도구 전환 때 임시 상태를 놓는다. Transform↔Perspective는 같은 픽셀 프리뷰를 유지한다.
+    // paintTransformBox의 미확정 관계는 일반 도구를 거쳐도 유지한다.
     const PAINT_TOOL_TRANSIENT_KEYS = ['paintLassoPreview', 'paintStamp', 'paintTransformPreview', 'cameraFrameDrag'];
     // 진행 중인 포인터 제스처. 툴과 무관한 공통 세션이라 콘티·원화 양쪽이 같은 커널을
     // 쓴다(applyContePaperMemoArmed·resetProjectTransientRuntime 도 이것을 부른다).
@@ -94131,10 +93998,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (abandoned && abandoned.type === 'page-draw') redrawMemoCanvas();
       else if (abandoned && abandoned.drawingRef) redrawActiveLayerCanvasTargets(abandoned.drawingRef);
     }
-    function paintDropToolTransients() {
+    function paintDropToolTransients(nextTool) {
       if (textStampSession.stamp) paintReleaseCanvas(textStampSession.stamp.image);
       textStampSession.stamp = null; textStampSession.key = '';
-      PAINT_TOOL_TRANSIENT_KEYS.forEach(function(key) { state[key] = null; });
+      PAINT_TOOL_TRANSIENT_KEYS.forEach(function(key) {
+        if (key === 'paintTransformPreview'
+            && (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective')
+            && (nextTool === 'transform' || nextTool === 'perspective')) return;
+        state[key] = null;
+      });
       clearPaintStampPreview(); // 프리뷰는 오버레이 리프레시를 동반하므로 자기 함수로
     }
     // 원화 엔진의 툴 상태(gengaSel/gengaStamp/FX 패널)를 여닫는 훅 — 콘티/원화의 "툴을 떠난다/들어간다" 규칙을
@@ -94217,7 +94089,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         paintCancelBrushDrags();
         imageBrushStopPreview();
         paintAbortGestureSession();
-        paintDropToolTransients();
+        paintDropToolTransients(nextEdit);
       }
       paintToolEngineExit(prevEdit, nextEdit, toolChanged);
       paintToolEngineEnter(nextEdit);
@@ -95525,7 +95397,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // Apply the current transform/perspective edit but KEEP the manipulation UI (box + panel) so you
     // can immediately transform again — without toggling the tool off and back on.
-    function applyPaintTransformKeepingUI(tool) {
+    function applyPaintTransformKeepingUI(tool, loaded) {
       // The drag gizmo (commitPaintTransformPreview) is the ONLY conte transform/perspective apply path.
       // 프리뷰가 없어도 좌표(box)가 남아 있으면 굽는다 — TVPaint에서는 툴을 갔다 온 그 상태로 Enter를 누르면
       // 그대로 적용된다. 남은 좌표로 프리뷰를 먼저 만든 뒤(=드래그가 하는 일과 같은 레시피) 굽는다.
@@ -95556,18 +95428,37 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const nextKeepsake = state.paintTransformBox
         ? paintTransformKeepsakeFromBox(state.paintTransformBox) : null;
       const targets = state.paintTransformBox ? conteTransformTargetRefs() : [];
-      const missing = targets.filter(function(ref) { return !conteTransformImageFor(ref); });
+      const missing = targets.filter(function(ref) { return !conteTransformImageFor(ref, loaded); });
       if (missing.length) {
-        const box = state.paintTransformBox, quad = JSON.stringify(box.quad);
+        const images = loaded || new Map();
+        const project = state.project, box = state.paintTransformBox, preview = state.paintTransformPreview;
+        const selection = state.paintSelection, toolEpoch = imageBrushRuntime.toolEpoch;
+        const selected = state.selectedConteLayerIds;
+        const requestKey = function() {
+          const target = currentPaintTransformLayerTarget();
+          return JSON.stringify([state.videoEditMode, state.paintEditTool, state.videoPlayheadFrames,
+            target && [target.cutId, target.layerId, target.drawingRef, paintTransformBaseKey(target)],
+            state.paintTransformApplyOn, Array.from(selectedConteLayerSet()), conteTransformTargetRefs(), box.quad,
+            paintSelectionLayerBounds(state.paintSelection),
+            targets.map(function(ref) {
+              const drawing = project.layerDrawings[ref];
+              return [ref, drawing && drawing.version, drawing && layerDrawingContentKey(ref, drawing)];
+            })]);
+        };
+        const key = requestKey();
+        const stillPending = function() {
+          return state.project === project && state.paintTransformBox === box && state.paintTransformPreview === preview
+            && state.paintSelection === selection && state.selectedConteLayerIds === selected
+            && imageBrushRuntime.toolEpoch === toolEpoch && paintTransformUiRefValid(box.drawingRef) && requestKey() === key;
+        };
         const loads = missing.map(function(ref) {
           const drawing = ensureLayerDrawingData(state.project, ref), key = layerDrawingContentKey(ref, drawing);
-          return drawing.bitmapDataUrl ? loadImageAsync(drawing.bitmapDataUrl).then(function(image) { conteTransformLoaded.set(key, image); }) : Promise.reject(new Error('no pixels'));
+          return drawing.bitmapDataUrl ? loadImageAsync(drawing.bitmapDataUrl).then(function(image) { if (stillPending()) images.set(key, image); }) : Promise.reject(new Error('no pixels'));
         });
-        transformApplyAfterLoading(loads, function() { return state.paintTransformBox === box && JSON.stringify(box.quad) === quad; },
-          function() { applyPaintTransformKeepingUI(tool); }, updatePaintUI);
+        transformApplyAfterLoading(loads, stillPending, function() { applyPaintTransformKeepingUI(tool, images); }, updatePaintUI);
         return;
       }
-      const committed = commitPaintTransformPreview(targets);
+      const committed = commitPaintTransformPreview(targets, loaded);
       // ── 확정한 관계를 지키는 규칙 둘 ──────────────────────────────
       // **굽지 않았으면 건드리지 않는다**, 그리고 **항등 관계는 저장하지 않는다**(재적용해도 아무 일이 없는
       // 값인데, 저장하는 순간 살아 있는 관계를 파괴한다 — 파괴가 유일한 효과다). commitPaintTransformPreview()
@@ -100212,7 +100103,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         drawCenteredText(ctx, cut.cutNo || '', cutCol.x, row.y + row.h * 0.04, cutCol.w, row.h * 0.18, Math.max(20, width * 0.0215), '700');
         drawWrappedText(ctx, cut.actionText || '', actionCol.x + actionCol.w * 0.035, textTop, actionCol.w * 0.93, textHeight, Math.max(17, width * 0.0151));
         drawWrappedText(ctx, cut.dialogText || '', dialogCol.x + dialogCol.w * 0.035, textTop, dialogCol.w * 0.93, textHeight, Math.max(17, width * 0.0151));
-        const pictureFrameText = framesToTime(displayPictureFramesForCut(cut));
+        const pictureFrameText = framesToTime(allocatedPictureFrames(cut));
         const cutDurationText = framesToTime(displayDurationFramesForCut(cut));
         if (pictureFrameText && cutDurationText) {
           drawCenteredText(ctx, pictureFrameText, timeCol.x, row.y + row.h * 0.70, timeCol.w, row.h * 0.11, Math.max(13, width * 0.0097));
@@ -121819,9 +121710,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 모든 입력 경로(콘티 캔버스 드래그·숫자패널, 원화 캔버스 드래그, 공용 기즈모 메뉴)가 지킨다. 「제스처 하나
     // = undo 하나」로 쌓으면 미확정 변형을 여러 번 만질 때 Ctrl+Z 도 그만큼 눌러야 한다. 취소는 전부
     // cancelPendingPaintTransform / cancelPendingGengaTransform 몫이다.
-    function paintTransformApplyQuadFromUI(nextQuad) {
+    function paintTransformApplyQuadFromUI(nextQuad, activeTarget) {
       const layerTarget = currentPaintTransformLayerTarget(); if (!layerTarget) return false;
-      const target = prepareLayerRasterTarget(layerTarget); if (!target) return false;
+      const target = activeTarget || prepareLayerRasterTarget(layerTarget); if (!target) return false;
       const box = state.paintTransformBox;
       if (!box || String(box.drawingRef || '') !== String(target.drawingRef || '')) return false;
       const existingPreview = state.paintTransformPreview && String(state.paintTransformPreview.drawingRef || '') === String(target.drawingRef || '') && state.paintTransformPreview.mode === paintTransformMode()
