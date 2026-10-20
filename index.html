@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2964</title>
+  <title>MoArt ver2965</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24581,6 +24581,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2965, items: [{ja: '原画の未確定選択から描き始めるとき、選択の確定と描画の下地で同じ合成画像を再利用するようにしました。', ko: '원화의 미확정 선택에서 그리기를 시작할 때 선택 확정과 획 바탕이 같은 합성 결과를 재사용하도록 개선했습니다.', en: 'Reuse the selection composite for both committing a pending genga selection and seeding the next stroke.', zh: '从原画待确认选区开始绘制时，让选区确认和笔画底图复用同一合成结果。'}] },
       { ver: 2964, items: [{ja: '原画の選択範囲からスタンプ用の画像を準備するとき、不要なキャンバス全体のコピーを省きました。', ko: '원화 선택 영역에서 스탬프용 그림을 준비할 때 불필요한 전체 canvas 복사를 줄였습니다.', en: 'Avoid an unnecessary full-canvas copy when preparing genga stamp pixels from a lifted selection.', zh: '准备原画选区的印章图像时，省去不必要的整张画布复制。'}] },
       { ver: 2963, items: [{ja: '同じZIPへの保存が重なったとき、自身の保存を外部の変更と誤認したり、後の保存が取り消されたりする問題を修正しました。', ko: '같은 ZIP에 저장 요청이 겹칠 때 자체 저장을 외부 변경으로 오인하거나 뒤의 저장이 취소되는 문제를 수정했습니다.', en: 'Fix overlapping saves to the same ZIP being mistaken for outside changes or cancelling the later save.', zh: '修复对同一ZIP连续保存时，将自身保存误判为外部更改或取消后续保存的问题。'}] },
       { ver: 2962, items: [{ja: '作業フォルダーからZIPのコピーを書き出しても、元プロジェクトの未保存編集の表示を保持するよう修正しました。', ko: '작업폴더에서 ZIP 복사본을 내보내도 원본 프로젝트의 미저장 편집 표시를 유지하도록 수정했습니다.', en: 'Keep edits marked as unsaved in the original project when exporting a ZIP copy from a working folder.', zh: '从工作文件夹导出ZIP副本后，保留原项目的未保存编辑标记。'}] },
@@ -125007,7 +125008,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     // One transient prepared target: paper coordinates, seeded canvas, and its owner/scan metadata.
-    // It does not register an active canvas or create a draw session; commit keeps that ownership.
+    // It consumes the previous active registration and may commit a pending selection
+    // (publishing its new ref/active canvas), but creates no draw session. The caller owns that.
     function gengaPrepareDrawTarget(ev, layer, diagDownT) {
       const p = gengaPreviewPointerXY(ev); if (!p) return;
       const gt = state.project.gengaTimeline;
@@ -125017,6 +125019,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 코마의 최신 ref 와 일치하면 완비 검사·시드 합성·매 획 용지 할당 없이 그 픽셀에서 바로 시작한다. 벡터
       // 레이어는 제외(픽셀이 정본이 아니다 — 스트로크 재렌더), 뜬 선택도 제외(아래 확정이 픽셀을 바꾼다).
       const activeExp = gengaExposureAt(layer, frame);
+      // Entry drawing for the sessions' previewBaseRef; selection commit below may publish a newer ref.
       const activeDr = gengaExposureDrawing(layer, activeExp);
       const reuseActive = Boolean(gengaActiveCanvas && activeExp && (!activeDr || activeDr.ref)
         && gengaActiveCanvas.ref === (activeDr && activeDr.ref || null)
@@ -125073,8 +125076,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       let seedRect = null;       // The seed's footprint, captured HERE and nowhere else
       let scanEligible = true;   // A lifted float's pixels are wherever the transform left them
       if (gengaSelLifted(gengaSel) && String(gengaSel.layerId) === String(layer.id) && gengaSel.frame === frame) {
-        seedCanvas = gengaSelCompositeFrom(gengaSel); // A select-only marquee has nothing floating to seed — the stored art already is the truth
-        gengaCommitSelection();
+        // Compose once with the commit's readback attributes; the stroke still owns
+        // its separate canvas, so drawing cannot mutate the committed selection pixels.
+        seedCanvas = gengaSelCompositeFrom(gengaSel, true);
+        gengaCommitSelection(null, seedCanvas);
         scanEligible = false;
       }
       if (seedCanvas) {
@@ -126716,7 +126721,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       entry.key = key; entry.result = moved ? out : null; entry.bailed = bailed;
       return entry.result;
     }
-    // Paper-resolution selection preview: transformed vector strokes or a warped raster patch.
+    // Paper-resolution selection pixels: owned raster composite or borrowed vector-cache canvas.
     function gengaSelCompositeFrom(sel, readback) {
       // LIFTED selections only. Every caller gates on gengaSelLifted() — this is the backstop, because
       // compositing a select-only marquee is exactly the AA-eroding recombination the lazy lift exists to avoid.
@@ -126879,7 +126884,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return scan;
     }
     // bake the floating selection back into the layer drawing.
-    function gengaCommitSelection(extraTargets) {
+    // An actual raster bake may reuse this selection's synchronously prepared readback composite.
+    function gengaCommitSelection(extraTargets, rasterComposite) {
       if (!gengaSel) return;
       const sel = gengaSel; gengaSelDrag = null;
       // 툴을 바꿔 픽셀은 원위치로 돌아갔지만 좌표는 남아 있는 상태 — Enter 는 그 좌표를 적용해야 한다(TVPaint
@@ -126915,7 +126921,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const entry = GENGA_VECTOR_TRANSFORM_CACHE.get(sel);
         if (entry && entry.bailed) { state.timelineStatus = t('status.genga.vector.transformBailed', entry.bailed); renderGengaView(); }
       }
-      const out = selStrokes0 ? null : gengaSelCompositeFrom(sel, true); // ← 굽기가 끝난 **뒤에** 좌표를 비운다(먼저 비우면 항등으로 구워진다)
+      const out = selStrokes0 ? null : (rasterComposite || gengaSelCompositeFrom(sel, true)); // ← 굽기가 끝난 **뒤에** 좌표를 비운다(먼저 비우면 항등으로 구워진다)
       const scan = out ? gengaSelectionCommitScan(sel, out) : null;
       // Batch publication owns all drawings together. Keep its compact whole-raster representation;
       // per-stroke tiles retain substantially more decoded pixels for a many-drawing transform.
