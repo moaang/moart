@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2976</title>
+  <title>MoArt ver2978</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24590,6 +24590,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2978, items: [{ja: 'カット結合の境界でカメラを保持し、元のカメラワークを保ちます。', ko: '컷 결합 경계에서 카메라를 유지해 원래 카메라워크를 보존합니다.', en: 'Cut merging preserves the original camera work with boundary holds.', zh: '合并镜头时使用边界保持以保留原有摄影机运动。'}] },
+      { ver: 2977, items: [{ja: 'カット結合時の背景を元のパネル範囲の通常コマにし、後ろのカットのレイヤーFXのタイミングを保ちます。', ko: '컷 결합 때 배경을 원래 패널 범위의 일반 코마로 바꾸고 뒤 컷의 레이어 FX 시점을 유지합니다.', en: 'Merging cuts converts backgrounds to ordinary komas spanning their original panels and preserves the trailing cut’s layer FX timing.', zh: '合并镜头时将背景转为覆盖原面板范围的普通格，并保留后方镜头的图层特效时序。'}] },
       { ver: 2976, items: [{ja: 'パネル分割時に背景を複製せず、元の透明度と絵を保ちます。', ko: '패널 분할 때 배경을 복제하지 않고 원래 투명도와 그림을 유지합니다.', en: 'Panel splitting preserves the original background image and opacity without duplicating it.', zh: '拆分面板时不复制背景，保留原图和透明度。'}] },
       { ver: 2975, items: [{ja: '変形の読み込み中でも、取り消すと適用待ちの表示をすぐに終了します。', ko: '변형을 읽는 중에도 취소하면 적용 대기 표시를 즉시 내립니다.', en: 'Canceling a transform ends its pending-apply status without waiting for loading.', zh: '取消变形时立即结束等待应用提示，无需等待读取完成。'}] },
       { ver: 2974, items: [{ja: '変形の読み込みを取り消した後に、適用待ちの表示が残る問題を修正しました。', ko: '변형 읽기를 취소한 뒤 적용 대기 표시가 남는 문제를 고쳤습니다.', en: 'Canceled transform loads no longer leave an apply-pending message.', zh: '修复取消变形读取后仍显示等待应用的问题。'}] },
@@ -43123,14 +43125,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const live = adjacentCutGroupMergeInfo(project, targetCutId, side);
         if (!live) return;
         const combined = live.selfFrames + live.neighborFrames;
-        // 병합은 같은 컷 취급이 될 뿐이고 그림 배치는 안 바뀌므로, 두 분기 다 카메라 키프레임을 건드리지
-        // 않는다(사용자 판정). normalizeCameraTrack 은 「키프레임의 cutId 는 그룹 오너가 아니라 그룹 안의 아무
-        // 패널이나 가리켜도 된다」는 모델이고, 매 정규화마다 그 패널이 그룹 안 어디에
-        // 놓였는지(panelSlot.startFrame − ownerSlot.startFrame = localOffset)로 cutId → 그룹 오너, frame →
-        // 정확한 오프셋(예: 오너 길이 144 에 흡수된 쪽 5 → 149)을 다시 계산한다. 수동으로 옮겨 붙이거나 미는
-        // 코드는 그 결과와 충돌해 키 하나를 통째로 잃게 한다(같은 cutId+frame 로 겹쳐 dedupe 된다). 흡수되는
-        // 컷이 cutNo 없는 패널로 남아 있기만 하면 나머지는 normalizeCameraTrack 의 몫이다 — project.cuts 에
-        // 없는 cutId 의 키도 같은 정규화가 걸러낸다.
+        const leftOwner = conteLayerOwnerCut(project, side === 'prev' ? live.neighborOwnerId : targetCutId);
+        const rightOwner = conteLayerOwnerCut(project, side === 'prev' ? targetCutId : live.neighborOwnerId);
+        // 결합 전 각 BG의 패널 범위·그림은 유지하고 기존 BG 해제와 같은 일반 코마로 만든다.
+        const bgIds = (leftOwner.conteLayers || []).concat(rightOwner.conteLayers || [])
+          .filter(function(layer) { return layer.layerRole === 'bg'; }).map(function(layer) { return layer.id; });
+        unmakeConteLayersBg(project, bgIds);
+        // FX는 컷 로컬 시간이다. 뒤 컷의 같은 절대 시각을 새 owner의 시간으로 옮긴다.
+        const rightOffset = side === 'prev' ? live.neighborFrames : live.selfFrames;
+        (rightOwner.conteLayers || []).forEach(function(layer) {
+          const keys = layer.effect && layer.effect.keyframes;
+          if (Array.isArray(keys)) keys.forEach(function(key) { key.frame += rightOffset; });
+        });
+        // 기존 구간 안의 곡선은 나누지 않는다. 왼쪽 끝은 hold, 오른쪽 시작은 원래 첫 값/기본값이다.
+        const cameraKeys = cameraKeyframesByOwnerCut(project);
+        const leftKeys = cameraKeys.get(leftOwner.id) || [];
+        const rightKeys = cameraKeys.get(rightOwner.id) || [];
+        if (leftKeys.length || rightKeys.length) {
+          let tail = leftKeys[leftKeys.length - 1];
+          if (!tail || tail.frame < rightOffset - 1) {
+            tail = Object.assign({}, tail || cameraDefaultTransform(), {
+              id: cameraKeyframeId(), cutId: leftOwner.id, frame: rightOffset - 1
+            });
+            project.camera.keyframes.push(tail);
+          }
+          tail.interp = 'hold';
+          if (!rightKeys.length || rightKeys[0].frame > 0) {
+            project.camera.keyframes.push(Object.assign({}, rightKeys[0] || cameraDefaultTransform(), {
+              id: cameraKeyframeId(), cutId: rightOwner.id, frame: 0
+            }));
+          }
+        }
+        // cutId/frame의 owner 이관·오프셋은 기존 정규화가 한 번만 적용한다.
         if (side === 'prev') {
           // this cut is absorbed as a trailing panel of the left neighbor (which survives).
           alignAbsorbedConteLayerLines(project, targetCutId, live.neighborOwnerId);
