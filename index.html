@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2982</title>
+  <title>MoArt ver2983</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -19827,6 +19827,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!panelIds.length && slot && slot.cut && slot.cut.id) panelIds.push(slot.cut.id);
       return {
         videoPlayheadFrames: frame,
+        selectedPicturePanelId: currentPicturePanelId(),
         selectedPicturePanelIds: panelIds,
         selectedConteLayerRowIndex: normalizeConteLayerRowIndexValue(state.selectedConteLayerRowIndex, -1),
         activeConteSelectionType: String(state.activeConteSelectionType || '')
@@ -19844,7 +19845,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const totalFrames = videoTimelineDisplayTotalFrames(project);
       const frame = clampTimelinePlayheadFrame(context.videoPlayheadFrames, totalFrames);
       const slot = state.videoEditMode ? videoSlotAtFrame(project, frame) : null;
-      const targetPanelId = panelIds[0] || (slot && slot.cut && slot.cut.id) || '';
+      const primaryPanelId = panelIds.includes(context.selectedPicturePanelId) ? context.selectedPicturePanelId : '';
+      const framePanelId = (slot && slot.cut && slot.cut.id) || '';
+      const targetPanelId = primaryPanelId || (panelIds.includes(framePanelId) ? framePanelId : panelIds[0]) || framePanelId;
       state.videoPlayheadFrames = frame;
       const selectedPanels = selectedPicturePanelSet();
       selectedPanels.clear();
@@ -20014,6 +20017,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 눈금은 **한 번만** 찍는다 — redo 로 되살아난 명령이 다시 찍히면 用紙 획과의 순서가
       // 뒤집힌다(그 명령은 새로 생긴 것이 아니다).
       if (command.histSeq == null) command.histSeq = paintNextHistorySeq();
+      // Existing drawing contexts also identify the edit location. Other commands capture a
+      // runtime-only location here; do not mark them as drawings (recording reads that distinction).
+      if (!(options && options.historyTraversal) && !command.memoPageEdit && !command.drawingContext && !command.gengaDrawingContext) {
+        command.historyLocation = state.project && state.project.kind === 'genga'
+          ? { layerId: state.gengaSelectedLayerId, frame: gengaCurrentFrame() }
+          : Object.assign({ videoPlayheadFrames: Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0)) }, captureTimelineSelectionState());
+      }
       const lenBeforePush = state.undoStack.length;
       state.undoStack.push(command);
       if (!(options && options.historyTraversal)) {
@@ -20464,6 +20474,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!options.sameProject) resetProjectTransientRuntime();
       else { cancelPointerDrags(); if (longPressContacts) longPressContacts.cancelPending(); }
       state.project = normalizeProjectSnapshot(project);
+      // A queued history action replaces the snapshot, not the FIFO's project. Real project
+      // replacement still cancels the old queue through resetProjectTransientRuntime above.
+      if (previousProject && paintInputQueueState && paintInputQueueState.running && paintInputQueueState.project === previousProject) {
+        paintInputQueueState.project = state.project;
+      }
       if (previousProject) {
         retirePcmAudioSources(previousProject);
         const audioCache = audioStorageOptimizations.get(previousProject);
@@ -21817,11 +21832,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ONE dispatcher for undo and redo: the direction picks the stack, the counter-push, and which payload side
     // (before/after) is applied — so a new command type is added once, not to two mirror twins.
     function applyHistoryCommand(dir) {
+      const undoing = dir === 'undo';
+      const stack = undoing ? state.undoStack : state.redoStack;
+      const command = stack[stack.length - 1];
+      if (!command || revealHistoryCommand(command)) return false;
       if (state.project && state.project.kind === 'genga') gengaSelectionRequest = null;
       paintDiscardPendingBucketFill();
-      const undoing = dir === 'undo';
-      const command = (undoing ? state.undoStack : state.redoStack).pop();
-      if (!command) return;
+      stack.pop();
       // Tag every counter-push as a TRAVERSAL so the memory budget skips it - moving a command
       // between stacks allocates nothing, and trimming here would eat the far end of the stack the user is
       // walking. Wrapped here rather than at the pushOther(command) call sites below, so the dispatcher stays
@@ -21842,6 +21859,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (viewBefore) { gengaCarryLayerViewState(viewBefore, gengaHistoryPayloadLayers(command.before)); gengaCarryLayerViewState(viewBefore, gengaHistoryPayloadLayers(command.after)); }
       const restoredPixels = gengaApplyHistoryPixels(command, undoing);
       applyHistoryCommandPayload(command, undoing, pushOther);
+      revealHistoryCommand(command, false); // Structural edits may change the frame range; retain payload selection.
       if (viewBefore && state.project && state.project.gengaTimeline && gengaCarryLayerViewState(viewBefore, state.project.gengaTimeline.layers)) {
         gengaFrameStackInvalidate(); onionClearGhostCache(); renderGengaView();
       }
@@ -21859,6 +21877,43 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (command.gengaGeometryUi) restoreGengaGeometryUi(undoing ? command.gengaGeometryUi.before : command.gengaGeometryUi.after);
       restoreGengaDrawingEditContext(command.gengaDrawingContext);
       drawingRecordingNotifyCommand(command, true);
+      return true;
+    }
+    // First input away from the edit reveals its current result. At that location the same
+    // command remains on top, so the next input applies it without a separate armed state.
+    function revealHistoryCommand(command, restoreTimelineSelection) {
+      if (command.memoPageEdit) {
+        const page = clampInt(command.pageNo, 1, totalPages(), 1);
+        if (state.project.currentPage === page) return false;
+        state.project.currentPage = page;
+        refresh({ skipSource: true });
+        return true;
+      }
+      if (state.project && state.project.kind === 'genga') {
+        const context = command.gengaDrawingContext || command.historyLocation;
+        if (!context) return false;
+        const frame = gengaClampFrame(context.frame);
+        if (gengaCurrentFrame() === frame) return false;
+        if (state.gengaPlaying || gengaPlaybackWarm) stopGengaPlayback();
+        const layer = gengaLayerById(context.layerId);
+        if (layer && String(state.gengaSelectedLayerId) !== String(layer.id)) selectGengaLayer(layer.id);
+        setGengaFrame(frame);
+        return true;
+      }
+      const context = command.drawingContext || command.historyLocation;
+      if (!context) return false;
+      const frame = clampInt(Math.round(Number(context.videoPlayheadFrames) || 0), 0, Math.max(0, videoTimelineContentFrames(state.project) - 1), 0);
+      if (Math.round(state.videoPlayheadFrames) === frame) return false;
+      stopTimelinePlayback(false);
+      if (command.drawingContext) {
+        restoreLayerDrawingEditContext(Object.assign({}, context, { videoPlayheadFrames: frame }));
+      } else {
+        state.videoPlayheadFrames = frame;
+        if (restoreTimelineSelection !== false) applyTimelineSelectionState(context);
+        setCurrentPageToCut(state.project, currentPicturePanelId());
+      }
+      updateLayerDrawingEdit([]);
+      return true;
     }
     // Drawing history follows its edit target, including the exact frame inside a held exposure.
     // This context belongs to the command, independently of the disposable pixel acceleration cache.
@@ -22068,14 +22123,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
     function undo() {
-      if (paintInputDeferAction(undo)) return;
-      if (state.project && state.project.kind === 'genga') gengaSelectionRequest = null;
-      if (cancelPendingPaintTransform()) return;
-      if (cancelPendingGengaTransform()) return; // 원화도 같은 계약
-      applyHistoryCommand('undo');
-      gengaKickTileEncodePump();   // 되돌아온 그림이 대기 중(굽지 않은 prev)이면 펌프가 이제 그것을 참조 ref 로 굽는다
+      if (paintInputDeferAction(undo)) return false;
+      if (cancelPendingPaintTransform()) return false;
+      if (cancelPendingGengaTransform()) return false;
+      const applied = applyHistoryCommand('undo');
+      if (applied) gengaKickTileEncodePump();
+      return applied;
     }
-    function redo() { if (paintInputDeferAction(redo)) return; applyHistoryCommand('redo'); gengaKickTileEncodePump(); }   // Undo 와 같은 이유
+    function redo() {
+      if (paintInputDeferAction(redo)) return false;
+      const applied = applyHistoryCommand('redo');
+      if (applied) gengaKickTileEncodePump();
+      return applied;
+    }
 
     // 두 히스토리(명령 스택 · 用紙 메모 스택)를 **한 줄로 세우는 눈금**.
     // 벽시계를 바닥으로 쓰되 단조 증가시킨다 — 같은 ms 안의 두 동작도 안 겹치고, 세션을 넘겨도
@@ -22115,32 +22175,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 보면, 컷을 한 번이라도 편집한 세션에서는 방금 그은 用紙 획 대신 타임라인 편집이 되돌아간다.
     function runPrimaryUndo() {
       // 획 도중의 Undo 는 받지 않는다(PS) — 펜을 떼는 순간 획이 시작 때 잡은 원본 위로 커밋되어, 되돌린 것이 다시 쓰인다.
-      if (paintStrokeInProgress()) return;
-      if (paintInputDeferAction(runPrimaryUndo)) return; // Choose the history after pending input commits.
+      if (paintStrokeInProgress()) return false;
+      if (paintInputDeferAction(runPrimaryUndo)) return false; // Choose the history after pending input commits.
       // A pending transform is cancellable even before the first history command.
-      if (cancelPendingPaintTransform() || cancelPendingGengaTransform()) return;
+      if (cancelPendingPaintTransform() || cancelPendingGengaTransform()) return false;
       const memoSeq = paintMemoTopHistorySeq('undo');
       const cmdSeq = paintCommandTopHistorySeq('undo');
-      if (memoSeq != null && (cmdSeq == null || memoSeq > cmdSeq)) { paintUndo(); return; }
-      if (state.undoStack.length) {
-        undo();
-        return;
-      }
-      if (primaryUndoShouldUsePaintHistory('undo')) paintUndo();
+      if (memoSeq != null && (cmdSeq == null || memoSeq > cmdSeq)) return paintUndo();
+      if (state.undoStack.length) return undo();
+      return primaryUndoShouldUsePaintHistory('undo') ? paintUndo() : false;
     }
 
     function runPrimaryRedo() {
-      if (paintStrokeInProgress()) return;   // runPrimaryUndo 와 같은 이유
-      if (paintInputDeferAction(runPrimaryRedo)) return; // Choose the history after pending input commits.
+      if (paintStrokeInProgress()) return false;   // runPrimaryUndo 와 같은 이유
+      if (paintInputDeferAction(runPrimaryRedo)) return false; // Choose the history after pending input commits.
       // redo 는 **작은 쪽**이다 — undo 가 큰 쪽부터 걷어냈으므로 되돌리는 순서는 그 반대다.
       const memoSeq = paintMemoTopHistorySeq('redo');
       const cmdSeq = paintCommandTopHistorySeq('redo');
-      if (memoSeq != null && (cmdSeq == null || memoSeq < cmdSeq)) { paintRedo(); return; }
-      if (state.redoStack.length) {
-        redo();
-        return;
-      }
-      if (primaryUndoShouldUsePaintHistory('redo')) paintRedo();
+      if (memoSeq != null && (cmdSeq == null || memoSeq < cmdSeq)) return paintRedo();
+      if (state.redoStack.length) return redo();
+      return primaryUndoShouldUsePaintHistory('redo') ? paintRedo() : false;
     }
 
 
@@ -23903,6 +23957,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function resetProjectTransientRuntime() {
+      twoFingerLastTapAt = 0;
+      twoFingerLastTapUndid = false;
       if (paraparaKeyHold) paraparaClear();
       closeAudioInputSettings();
       cancelPointerDrags();
@@ -24590,6 +24646,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2983, items: [{ja: '編集したフレームから離れたとき、Undo・Redoの最初の入力は編集位置を表示し、同じ位置で次の入力が履歴を適用します。', ko: '편집 프레임을 떠난 뒤 Undo·Redo의 첫 입력은 편집 위치를 보여주고, 같은 위치에서 다음 입력이 이력을 적용합니다.', en: 'After leaving an edited frame, the first Undo or Redo reveals its edit location; the next input there applies the history step.', zh: '离开编辑帧后，首次撤销或重做会显示编辑位置，在同一位置再次操作才应用历史步骤。'}] },
       { ver: 2982, items: [{ja: 'コンテのサイズ変更時の重複計算を省き、位置と表示密度の変更では編集オーバーレイを更新します。', ko: '콘티 크기 변경의 중복 계산을 줄이고, 위치·표시 밀도 변경에는 편집 오버레이를 갱신합니다.', en: 'Storyboard resizing avoids duplicate sizing work while position and display-density changes update the edit overlay.', zh: '分镜调整大小时减少重复计算，位置和显示密度变化仍更新编辑叠加层。'}] },
       { ver: 2981, items: [{ja: '原画作業中は非表示のコンテのサイズ・カメラ・レイヤーFXを更新しません。', ko: '원화 작업 중에는 숨겨진 콘티의 크기·카메라·레이어 FX를 갱신하지 않습니다.', en: 'Genga resizing skips the hidden storyboard’s sizing, camera, and layer FX updates.', zh: '原画调整大小时跳过隐藏分镜的尺寸、摄影机和图层特效更新。'}] },
       { ver: 2980, items: [{ja: 'メモがなく、メモ描画がオフの用紙は表示バッファを保持しません。既存メモはそのまま表示します。', ko: '메모가 없고 메모 그리기가 꺼진 용지는 메모 표시 버퍼를 유지하지 않습니다. 기존 메모는 계속 표시합니다.', en: 'Empty paper releases its memo display buffer when memo drawing is off; existing notes remain visible.', zh: '关闭备注绘制时，无备注纸张释放备注显示缓冲区，已有备注保持显示。'}] },
@@ -48948,12 +49005,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return false;
     }
     function twoFingerGestureClear() { twoFingerTapCandidate = null; twoFingerLongPressCancel(); twoFingerUnpin(); }
-    // Would runPrimary<kind>() actually change anything? Same decision runPrimaryUndo/Redo themselves make,
-    // so the answer can never drift from what the gesture is about to do.
-    function twoFingerHistoryAvailable(kind) {
-      const stack = kind === 'redo' ? state.redoStack : state.undoStack;
-      if (stack && stack.length) return true;
-      return primaryUndoShouldUsePaintHistory(kind);
+    // The compensation belongs to the executed tap, including taps queued behind pending input.
+    // Queue the decision with the action: an earlier deferred Undo may only reveal or cancel.
+    function twoFingerTapHistory(redoTap) {
+      if (paintInputDeferAction(function() { twoFingerTapHistory(redoTap); })) return;
+      if (redoTap) {
+        if (twoFingerLastTapUndid) {
+          if (runPrimaryRedo() !== true) return;
+          twoFingerLastTapUndid = false;
+        }
+        runPrimaryRedo();
+      } else {
+        twoFingerLastTapUndid = runPrimaryUndo() === true;
+      }
     }
     // Call on a clean end (pointerup / touchend — NOT pointercancel). Returns 'undo' | 'redo' | null.
     // cancelStroke 는 **탭이 확정된 뒤 · undo 가 돌기 전**에 불린다 — 핀치(twoFingerGestureMove 의 edge)와 같은
@@ -49001,17 +49065,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 연타는 이어진다 — 둘째 탭부터 탭마다 redo 한 번(셋 = redo 둘, 사용자 판정 ver2940). 전에는 셋째 탭이 다시
         // undo 로 갈려 왔다갔다 했다.
         twoFingerLastTapAt = now;
-        // Tap 1 already applied an undo (undo has to stay instant — deferring it by the double-tap window
-        // would put 350ms of lag on the most-used gesture). So take that undo back first, then redo, and a
-        // double-tap reads as ONE redo from where the user started instead of a no-op undo/redo pair.
-        if (twoFingerLastTapUndid) runPrimaryRedo();
-        twoFingerLastTapUndid = false;
-        runPrimaryRedo();
+        // If the first tap applied Undo, compensate it before the requested Redo.
+        // A reveal or cancellation needs no compensation; keep the first tap immediate.
+        twoFingerTapHistory(true);
         return 'redo';
       }
       twoFingerLastTapAt = now;
-      twoFingerLastTapUndid = twoFingerHistoryAvailable('undo');
-      runPrimaryUndo();
+      twoFingerLastTapUndid = false; // No compensation until this tap actually traverses history.
+      twoFingerTapHistory(false);
       return 'undo';
     }
 
@@ -90446,35 +90507,35 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 그림 히스토리는 전역 스택 하나다. 그림별 로컬 undo/redo 스택은 없다 — 그런 스택은 채우는 곳이
         // 자신(undo↔redo 맞교환)뿐이라 영원히 비고, 필드만 갈아끼워 live 캔버스(픽셀 정본)를 방치하는 잠재
         // 결함이 된다.
-        if (layerDrawingGlobalHistoryAvailable('undo', selectedLayer.layer.drawingRef)) undo();
-        return;
+        return layerDrawingGlobalHistoryAvailable('undo', selectedLayer.layer.drawingRef) ? undo() : false;
       }
-      if (!memoPageHistory(state.project.currentPage).length) return;
+      if (!memoPageHistory(state.project.currentPage).length) return false;
       const page = ensureMemoPageData(state.project.currentPage);
       const stroke = page.strokes.pop();
-      if (!stroke) return;
+      if (!stroke) return false;
       page.redo.push(stroke);
       redrawMemoCanvas();
       updatePaintUndoRedoButtonsOnly();
       drawingRecordingChanged({ kind: 'drawing', history: true, surface: 'page' });
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+      return true;
     }
 
     function paintRedo() {
       const selectedLayer = findConteLayerById(state.project, state.selectedConteLayerId);
       if (selectedLayer && selectedLayer.layer && selectedLayer.layer.drawingRef) {
-        if (layerDrawingGlobalHistoryAvailable('redo', selectedLayer.layer.drawingRef)) redo(); // 위 paintUndo 와 같은 정리
-        return;
+        return layerDrawingGlobalHistoryAvailable('redo', selectedLayer.layer.drawingRef) ? redo() : false;
       }
-      if (!memoPageHistory(state.project.currentPage, 'redo').length) return;
+      if (!memoPageHistory(state.project.currentPage, 'redo').length) return false;
       const page = ensureMemoPageData(state.project.currentPage);
       const stroke = page.redo.pop();
-      if (!stroke) return;
+      if (!stroke) return false;
       page.strokes.push(stroke);
       redrawMemoCanvas();
       updatePaintUndoRedoButtonsOnly();
       drawingRecordingChanged({ kind: 'drawing', history: true, surface: 'page' });
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+      return true;
     }
 
     function applyContePaperMemoArmed(enabled) {
