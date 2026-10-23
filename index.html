@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2990</title>
+  <title>MoArt ver2991</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24659,6 +24659,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2991, items: [{ja: '原画のピンチ・パン・回転中は通常表示を使い、操作後はペン用の低遅延表示に戻します。', ko: '원화의 핀치·팬·회전 중에는 일반 표시를 사용하고, 조작 후 펜용 저지연 표시로 돌아옵니다.', en: 'Genga uses synchronized presentation while pinching, panning or rotating, then restores low-latency pen presentation.', zh: '原画在双指缩放、平移和旋转时使用常规显示，操作结束后恢复画笔低延迟显示。'}] },
       { ver: 2990, items: [{ja: '一部のAndroid端末で原画を描くときブラシ周りに黒い四角が出たり、拡大縮小で画面が点滅したりする問題を修正しました。', ko: '일부 Android 기기에서 원화를 그릴 때 브러시 주변에 검은 네모가 뜨거나 확대·축소 때 화면이 깜빡이던 문제를 고쳤습니다.', en: 'Fixed black squares around the brush and flicker while zooming in genga on some Android devices.', zh: '修复了部分 Android 设备上绘制原画时笔刷周围出现黑色方块、缩放时画面闪烁的问题。'}] },
       { ver: 2989, items: [{ja: '一部のAndroid端末で原画キャンバスの外側が点滅する問題を修正しました。', ko: '일부 Android 기기에서 원화 캔버스 바깥이 깜빡이던 문제를 고쳤습니다.', en: 'Fixed flickering around the genga canvas on some Android devices.', zh: '修复了部分 Android 设备上原画画布外侧闪烁的问题。'}] },
       { ver: 2988, items: [{ja: '入力中の値をキャンバス操作の前に確定し、スタンプ保存欄のキーボード操作とタイムライン境界の同時操作を修正しました。', ko: '캔버스 조작 전에 입력값을 확정하고, 스탬프 보관함의 키보드 초점과 타임라인 경계의 동시 조작을 바로잡았습니다.', en: 'Commit field edits before canvas interaction, retain keyboard focus in stamp bins, and prevent competing timeline resize gestures.', zh: '画布操作前确认输入值，保留图章收藏栏的键盘焦点，并防止时间轴调整手势相互干扰。'}] },
@@ -89364,9 +89365,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function cancelPaintSpacePan() {
+      const wasGengaDrag = state.paintSpacePanDrag && state.paintSpacePanDrag.inGenga;
       state.paintSpacePanActive = false;
       state.paintSpacePanDrag = null;
       updatePaintSpacePanCursorClass();
+      if (wasGengaDrag) gengaScheduleViewDraw();
     }
 
     function handlePaintSpacePanKeyup(event) {
@@ -89417,7 +89420,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 그 폴백에 못 간다).
       if (beginPaperScrollPan(event)) return true;
       state.paintSpacePanDrag = {
-        pointerId: event.pointerId, mode: 'pan',
+        pointerId: event.pointerId, mode: 'pan', inGenga: inGenga,
         startX: event.clientX,
         startY: event.clientY,
         baseX: inGenga ? (Number(state.gengaPanX) || 0) : Math.round(Number(state.paintViewportPanX) || 0),
@@ -89497,7 +89500,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!drag || drag.pointerId !== event.pointerId) return false;
       state.paintSpacePanDrag = null;
       updatePaintSpacePanCursorClass();
-      if (state.project && state.project.kind === 'genga' && perfSoftwareCanvas()) gengaScheduleViewDraw(); // redraw once at full smoothing (the pan used nearest)
+      if (state.project && state.project.kind === 'genga') gengaScheduleViewDraw(); // Restore low-latency presentation and full smoothing.
       // Genga does not persist pan via saveEditorUiState; only the conte video-transform backend's pan position
       // is part of editorUiState.
       if (!(state.project && state.project.kind === 'genga')) saveEditorUiState();
@@ -123721,11 +123724,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
       });
     }
-    // 표시 면 셋(원화·콘티 정지 합성·페이지 메모)의 첫 context 취득은 이곳이다.
-    // 저지연 힌트를 유지하되 clear→draw의 중간 상태를 직접 표시하지 않는다.
-    // 전체 재그리기는 오프스크린에서 끝낸 뒤 paintPresentCanvas로 같은 호출 안에서 반영한다.
+    // 표시 면 셋(원화·콘티 정지 합성·페이지 메모)의 context 취득. 기본은 저지연이며 원화 뷰 조작은 일반 표시를 요청한다.
+    // 옵션은 생성 시 고정되므로 drawGengaPreview가 모드 경계에서 표시 면을 교체한다.
+    // 전체 재그리기는 오프스크린에서 끝낸 뒤 paintPresentCanvas로 제출한다.
     // 옵션은 첫 getContext에서만 적용된다. 브라우저/기기의 실제 표시 지연은 실측 대상이다.
-    function gengaPreviewCtx(canvas) {
+    function gengaPreviewCtx(canvas, desynchronized) {
       // **저지연 수단은 이것 하나다** — 잉크 트레일 같은 상호배타 수단(하나는 컴포지터를 우회하고 하나는
       // 컴포지터가 대신 그린다)을 사용자 토글로 고르게 하면 「켜면 브러시에 따라 이득도 손해도 되는」 스위치가
       // 된다(팁·종이결 브러시에서는 애초에 안 걸리고, 걸리는 브러시에서도 체감 A/B 로 구별되지 않는다 — 사용자
@@ -123734,7 +123737,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 用紙(#memoCanvas 부팅 바인딩)는 첫 getContext 를 여기로 심는다(이후의 맨 getContext('2d') 는 같은 ctx
       // 를 돌려받는다). 콘티 레이어 데이터 표면(conteLayerDataCtx)·표시 전용(.picture-layer-canvas)·오프스크린
       // (스크래치·createReadbackCanvas)은 대상이 아니다 — 저지연 캔버스는 크기를 바꾸면 상자와 픽셀이 따로 나간다.
-      return canvas.getContext('2d', { desynchronized: true });
+      return canvas.getContext('2d', { desynchronized: desynchronized !== false });
     }
     // 원화 라쏘의 짝 — pointermove 마다 프리뷰를 **통째로 재합성**(리타깃·어니언·합성·오버레이 전부)하지 않고,
     // 점을 솎아 rAF 에 모은다(penOutline·카메라 드래그와 같은 rAF 모양).
@@ -123756,15 +123759,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       updateGengaDrawBlockedCursor(); // Selection, folder state and history all converge at presentation.
       // A direct draw also satisfies the pending screen redraw; do not present it again next rAF.
       if (gengaPreviewRedrawRaf) { cancelAnimationFrame(gengaPreviewRedrawRaf); gengaPreviewRedrawRaf = 0; }
+      let canvas = document.getElementById('gengaPreviewCanvas');
+      const desynchronized = !gengaPinch && !gengaViewLockToken();
+      const modeChanged = canvas && canvas.paintPreviewDesynchronized !== desynchronized;
+      if (modeChanged) gengaPreviewRender.viewState = null; // An unchanged scene still needs the new display mode.
       const result = drawGengaPreviewInner(boxHint);
       gengaPreviewRender.inspection = Boolean(paintFillInspectionCurrent());
-      let canvas = document.getElementById('gengaPreviewCanvas');
       if (canvas && result.status === 'ready') {
-        // 입력 캡처는 고정 래퍼가 소유한다. 표시 면 확대는 DOM 밖에서 준비해 한 번에 교체한다.
+        // 입력 캡처는 고정 래퍼가 소유한다. 크기/표시 모드 교체는 DOM 밖에서 채워 한 번에 게시한다.
         const surface = result.surface;
         const grow = canvas.width < surface.width || canvas.height < surface.height;
+        const replace = grow || modeChanged;
         const oldCanvas = canvas;
-        if (grow) {
+        if (replace) {
           canvas = oldCanvas.cloneNode(false);
           if (canvas.width < surface.width) canvas.width = Math.ceil(surface.width / 128) * 128;
           if (canvas.height < surface.height) canvas.height = Math.ceil(surface.height / 128) * 128;
@@ -123773,9 +123780,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // 그림이 줄어 보이고 포인터(1:1)와 어긋난다(Relay 08f24bf92d34).
         if (canvas.style.width !== canvas.width + 'px') canvas.style.width = canvas.width + 'px';
         if (canvas.style.height !== canvas.height + 'px') canvas.style.height = canvas.height + 'px';
-        gengaPreviewCtx(canvas);
-        paintPresentCanvas(canvas, surface, grow || !result.rect ? { x: 0, y: 0, w: surface.width, h: surface.height } : result.rect, true); // 표면은 무대색까지 채워 불투명하다
-        if (grow) {
+        gengaPreviewCtx(canvas, desynchronized);
+        canvas.paintPreviewDesynchronized = desynchronized; // Requested mode, independent of browser support.
+        paintPresentCanvas(canvas, surface, replace || !result.rect ? { x: 0, y: 0, w: surface.width, h: surface.height } : result.rect, true); // 표면은 무대색까지 채워 불투명하다
+        if (replace) {
           canvas.paintScratch = oldCanvas.paintScratch; delete oldCanvas.paintScratch;
           oldCanvas.replaceWith(canvas);
           if (paintMarqueeBoxFrame === oldCanvas) paintMarqueeBoxFrame = canvas;
@@ -125709,6 +125717,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // clean lift → two-finger tap (undo) / double-tap (redo); a cancel is never a tap
       if (evType === 'pointercancel') twoFingerGestureClear();
       else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps);
+      gengaScheduleViewDraw(); // The last zoom frame can be unchanged; restore its display mode too.
     }
     function gengaPreviewPointerEnd(ev) {
       if (paintInputDeferEvent(ev, gengaPreviewPointerEnd, gengaPresentQueuedInput, gengaDrawSession && gengaDrawSession.pointerId === ev.pointerId ? gengaDrawSession : null)) return;
@@ -126678,7 +126687,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaPokeWheelViewLock() { // wheel has no down/up — hold the lock across the burst, drop it on idle
       if (!gengaWheelViewToken) gengaWheelViewToken = {};
       clearTimeout(gengaWheelViewTimer);
-      gengaWheelViewTimer = setTimeout(function() { gengaWheelViewToken = null; if (perfSoftwareCanvas()) drawGengaPreview(); }, 300); // Final frame at full smoothing
+      gengaWheelViewTimer = setTimeout(function() { gengaWheelViewToken = null; gengaScheduleViewDraw(); }, 300); // Restore low-latency presentation and full smoothing
     }
     // Coalesce VIEW-gesture redraws (wheel zoom / space-pan / pinch) into one draw per animation frame. A pan
     // pointermove or a trackpad wheel fires far faster than a full-viewport blit can complete — on a software
