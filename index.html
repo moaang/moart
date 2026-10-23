@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver2992</title>
+  <title>MoArt ver2993</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24659,6 +24659,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 2993, items: [{ja: 'コンテの小さな描画変更を部分更新し、原画の空バッファやサムネイル、水彩境界の重複処理を削減しました。', ko: '콘티의 작은 획 변경을 부분 갱신하고, 원화의 빈 버퍼·썸네일과 수채 경계의 중복 처리를 줄였습니다.', en: 'Conte now updates small stroke regions; reduced empty Genga buffers and redundant thumbnail and watercolor-edge work.', zh: '分镜的小范围笔画改为局部更新，并减少原画空缓冲区、缩略图及水彩边缘的重复处理。'}] },
       { ver: 2992, items: [{ja: '原画の拡大縮小直後の描画遅れと、表示更新の二重予約を修正しました。', ko: '원화 확대·축소 직후 획 표시 지연과 화면 갱신 중복 예약을 고쳤습니다.', en: 'Fixed delayed strokes immediately after Genga wheel zoom and duplicate preview redraw scheduling.', zh: '修复原画滚轮缩放后笔迹显示延迟及重复预约画面更新。'}] },
       { ver: 2991, items: [{ja: '原画のピンチ・パン・回転中は通常表示を使い、操作後はペン用の低遅延表示に戻します。', ko: '원화의 핀치·팬·회전 중에는 일반 표시를 사용하고, 조작 후 펜용 저지연 표시로 돌아옵니다.', en: 'Genga uses synchronized presentation while pinching, panning or rotating, then restores low-latency pen presentation.', zh: '原画在双指缩放、平移和旋转时使用常规显示，操作结束后恢复画笔低延迟显示。'}] },
       { ver: 2990, items: [{ja: '一部のAndroid端末で原画を描くときブラシ周りに黒い四角が出たり、拡大縮小で画面が点滅したりする問題を修正しました。', ko: '일부 Android 기기에서 원화를 그릴 때 브러시 주변에 검은 네모가 뜨거나 확대·축소 때 화면이 깜빡이던 문제를 고쳤습니다.', en: 'Fixed black squares around the brush and flicker while zooming in genga on some Android devices.', zh: '修复了部分 Android 设备上绘制原画时笔刷周围出现黑色方块、缩放时画面闪烁的问题。'}] },
@@ -51260,6 +51261,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return ctx;
     }
+    // Only known writes record bounds. Any intervening unknown write breaks the revision chain.
+    function recordConteLayerDamage(canvas, before, rect) {
+      const after = canvas.conteStillRevision;
+      if (!rect || typeof after !== 'number' || after === before) return;
+      const prev = canvas.conteStillDamage;
+      const continuous = prev && prev.to === before;
+      canvas.conteStillDamage = { from: continuous ? prev.from : before, to: after,
+        rect: continuous ? paintUnionBounds(prev.rect, rect) : rect };
+    }
     function conteStillPlaneFor(prev, rects, paper) {
       const grow = function(a, b) { return a ? paintUnionBounds(a, b) : { x: b.x, y: b.y, w: b.w, h: b.h }; };
       const mx = Math.ceil(paper.w * CONTE_STILL_PLANE_MARGIN), my = Math.ceil(paper.h * CONTE_STILL_PLANE_MARGIN);
@@ -51341,7 +51351,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           item.box = { x: b.x - pad, y: b.y - pad, w: b.w + 2 * pad, h: b.h + 2 * pad };
         }
         const f = item.fx;
-        item.key = [index, el.conteStillRevision || 0, el.dataset.layerDrawingRef, r.x, r.y, r.w, r.h, item.z, item.alpha,
+        item.revision = el.conteStillRevision || 0;
+        item.key = [index, el.dataset.layerDrawingRef, r.x, r.y, r.w, r.h, item.z, item.alpha,
           f && [f.px, f.py, f.e.tx, f.e.ty, f.e.rot, f.e.scale, f.blur].join(',')].join('|');
         return item;
       }).filter(Boolean).sort(function(a, b) { return a.z - b.z; });
@@ -51363,13 +51374,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const include = function(box) { region = paintUnionBounds(region, box); };
         items.forEach(function(item) {
           const old = remaining.get(item.el); remaining.delete(item.el);
-          if (!old || old.key !== item.key) { if (old) include(old.box); include(item.box); }
+          if (!old || old.key !== item.key || old.revision !== item.revision) {
+            const damage = item.el.conteStillDamage;
+            if (old && old.key === item.key && !item.fx && damage && damage.from === old.revision && damage.to === item.revision) {
+              include({ x: item.r.x + damage.rect.x, y: item.r.y + damage.rect.y, w: damage.rect.w, h: damage.rect.h });
+            } else { if (old) include(old.box); include(item.box); }
+          }
         });
         remaining.forEach(function(item) { include(item.box); });
         if (!region) return;
         const x = Math.max(0, Math.floor(region.x - plane.x) - 2), y = Math.max(0, Math.floor(region.y - plane.y) - 2);
         const right = Math.min(plane.w, Math.ceil(region.x + region.w - plane.x) + 2), bottom = Math.min(plane.h, Math.ceil(region.y + region.h - plane.y) + 2);
-        if (right <= x || bottom <= y) { stack.conteStillItems = items; return; }
+        if (right <= x || bottom <= y) {
+          items.forEach(function(item) { delete item.el.conteStillDamage; });
+          stack.conteStillItems = items; return;
+        }
         region = { x: x, y: y, w: right - x, h: bottom - y };
       }
       const touchesRegion = function(item) {
@@ -51405,6 +51424,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } finally { sctx.restore(); }
       paintPresentCanvas(view, surface, region);
       stack.conteStillItems = items;
+      items.forEach(function(item) { delete item.el.conteStillDamage; });
       if (view !== oldView) {
         if (oldView) stack.replaceChild(view, oldView);
         else stack.insertBefore(view, stack.firstChild);
@@ -77920,7 +77940,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const weReset = function(c) {
           const x = c.getContext('2d');
           x.setTransform(1, 0, 0, 1, 0, 0); x.globalCompositeOperation = 'source-over';
-          x.globalAlpha = 1; x.filter = 'none'; x.clearRect(0, 0, eW, eH); return x;
+          x.globalAlpha = 1; x.filter = 'none'; return x;
         };
         // ★ 침식을 **획 그림 자체**로 하면 안 된다: `destination-in` 은 알파를 **곱하므로**
         //   반투명한 획(잉크 장 본체 α≈0.5)을 8 번 겹치면 α⁹ ≈ 0 이 되어 침식본이 통째로
@@ -81504,7 +81524,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!canvas || !canvas.isConnected || !stroke || !toPoint) return;
       const offsetX = Math.round(Number(canvas.dataset.layerBitmapX || stroke.layerBitmapX) || 0);
       const offsetY = Math.round(Number(canvas.dataset.layerBitmapY || stroke.layerBitmapY) || 0);
-      drawPaintStrokeSegment(canvas.getContext('2d'), stroke, fromPoint, toPoint, paper.w, paper.h, offsetX, offsetY); // Position=paper
+      const ctx = canvas.getContext('2d'), before = canvas.conteStillRevision || 0;
+      drawPaintStrokeSegment(ctx, stroke, fromPoint, toPoint, paper.w, paper.h, offsetX, offsetY); // Position=paper
+      if (ctx.conteStillWired) {
+        const points = [fromPoint, toPoint], bounds = paintLayerPointsBounds(points, paintStrokeLayerPadPx(stroke, points), paper);
+        if (bounds) recordConteLayerDamage(canvas, before, { x: bounds.x - offsetX, y: bounds.y - offsetY, w: bounds.w, h: bounds.h });
+      }
     }
 
 
@@ -81716,7 +81741,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const h = Math.min(canvas.height, Math.ceil(rect.y + rect.h)) - y;
         if (w > 0 && h > 0) {
           const windowPath = new Path2D(); windowPath.rect(x, y, w, h); ctx.clip(windowPath);
+          const before = canvas.conteStillRevision || 0;
           ctx.drawImage(source, x, y, w, h, x, y, w, h);
+          if (ctx.conteStillWired) recordConteLayerDamage(canvas, before, { x: x, y: y, w: w, h: h });
         }
       } else ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
       ctx.restore();
@@ -83628,13 +83655,12 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
           w: Math.max(1, Math.round(Number(options.preserveActiveCanvasRect.w) || 1)),
           h: Math.max(1, Math.round(Number(options.preserveActiveCanvasRect.h) || 1))
         } : rect;
-        const displayCanvas = cloneCanvas(sourceCanvas);
         (Array.isArray(state.paintActiveLayerCanvasEls) ? state.paintActiveLayerCanvasEls : []).forEach(function(activeCanvas) {
           if (!activeCanvas || String(activeCanvas.dataset.layerDrawingRef || '') !== ref) return;
           applyLayerCanvasBitmapRectGeometry(activeCanvas, preserveRect, contePaperGeom(state.project));
           const ctx = activeCanvas.getContext('2d');
           ctx.clearRect(0, 0, activeCanvas.width, activeCanvas.height);
-          ctx.drawImage(displayCanvas, rect.x - preserveRect.x, rect.y - preserveRect.y);
+          ctx.drawImage(committedSnapshot, rect.x - preserveRect.x, rect.y - preserveRect.y);
         });
       }
       const skipCanvases = options.preserveActiveCanvas
@@ -102271,10 +102297,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function gengaThumbUrlFor(dr) {
       if (!dr) return '';
       const cached = dr.ref ? gengaThumbCache.get(dr.ref) : '';
-      if (cached && !gengaThumbBakeFailed.has(dr.ref)) {
-        gengaThumbImageFor(dr, scheduleGengaLayerThumbsRedraw);
-        return cached;
-      }
+      if (cached && !gengaThumbBakeFailed.has(dr.ref)) return cached;
       if (dr.dataUrl) {
         if (!dr.ref || gengaThumbBakeFailed.has(dr.ref)) return dr.dataUrl;
         gengaThumbBakeFromDataUrl(dr.ref, dr.dataUrl);
@@ -102288,6 +102311,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return '';
     }
+    // DOM thumbnails own their decode failures; URL queries do not create a second header Image.
+    document.addEventListener('error', function(event) {
+      const img = event.target;
+      if (!img || !img.isConnected || !img.matches
+          || !img.matches('#gengaStage .genga-exposure-thumb-img[data-genga-thumb-ref], #gengaCelPickPop img[data-genga-thumb-ref]')) return;
+      const ref = img.dataset.gengaThumbRef, url = gengaThumbCache.get(ref);
+      if (!url || gengaThumbBakeFailed.has(ref) || img.getAttribute('src') !== url) return;
+      gengaThumbBakeFailed.add(ref);
+      scheduleGengaLayerThumbsRedraw();
+    }, true);
     // 썸네일용 200px 캔버스. 레이어 헤드(canvas drawImage)와 코마 <img>(아래 dataUrl)가 같은 것을
     // 본다. 잉크 상자를 한 번 합쳐서 줄인다 — 칸을 축소 배율로 낱장씩 그리면 칸 경계의
     // 안티에일리어싱이 이음매 줄로 남는다(스케일 그리기 규칙과 같은 이유).
@@ -122150,7 +122183,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!sig || !sig.eligible) return null;
       if (sig.cv !== cv || sig.cw !== cw || sig.ch !== ch || sig.pad !== pad || sig.frame !== frame) return null;
       if (!sess || sig.sessCanvas !== sess.canvas || sig.centerId !== String(sess.layerId)) return null;
-      if (sess.shape || sess.vectorErase || !scene.fxFree || !scene.aboveFoldable || sig.aboveEmpty !== scene.aboveEmpty) return null;
+      if (sess.shape || sess.vectorErase || !scene.fxFree || !scene.aboveFoldable || sig.aboveEmpty !== scene.aboveEmpty || sig.belowEmpty !== scene.belowEmpty) return null;
       const store = sig.store;
       if (!store || store.belowCache !== sig.below || store.aboveCache !== sig.above || store.aboveFoldable !== true) return null;
       if (store !== gengaPreviewRender.stack) return null;
@@ -122241,7 +122274,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const centerId = sess ? sess.layerId : state.gengaSelectedLayerId;
       const centerIdx = layers.findIndex(function(l) { return String(l.id) === String(centerId); });
       let stackable = centerIdx >= 0 && gengaFrameStackUsable(noFx, reuse, centerId);
-      let fxFree = true, onion = false, aboveEmpty = true, aboveFoldable = centerIdx >= 0 && !gengaDougaFillActive();
+      let fxFree = true, onion = false, aboveEmpty = true, belowEmpty = true, aboveFoldable = centerIdx >= 0 && !gengaDougaFillActive();
       for (let i = 0; i < layers.length; i++) {
         const visible = gengaLayerDrawsInComposite(layers[i]);
         const layerState = layerStates[i] = { draws: visible, fx: undefined };
@@ -122251,11 +122284,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (!visible) continue;
         if (fx) fxFree = false;
         if (i < centerIdx) aboveEmpty = false;
+        if (i > centerIdx) belowEmpty = false;
         if (layers[i].onion) onion = true;
         if (i < centerIdx && (layers[i].blend || 'source-over') !== 'source-over') aboveFoldable = false;
       }
       return { centerIdx: centerIdx, stackable: stackable, fxFree: fxFree,
-        aboveFoldable: aboveFoldable, aboveEmpty: aboveEmpty, regionEligible: stackable && fxFree && !onion };
+        aboveFoldable: aboveFoldable, aboveEmpty: aboveEmpty, belowEmpty: belowEmpty, regionEligible: stackable && fxFree && !onion };
     }
     function gengaCompositeFrame(frame, pad, noFx, reuse, playback) {
       const gt = state.project && state.project.gengaTimeline; if (!gt) return null;
@@ -122467,7 +122501,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         cx2.save();
         cx2.beginPath(); cx2.rect(clipInk.x, clipInk.y, clipInk.w, clipInk.h); cx2.clip();
         cx2.clearRect(clipInk.x, clipInk.y, clipInk.w, clipInk.h);
-        cx2.drawImage(cs.store.belowCache, -pad, -pad);
+        if (cs.store.belowCache) cx2.drawImage(cs.store.belowCache, -pad, -pad);
         if (layerStates[cs.centerIdx].draws) drawLayer(cx2, layers[cs.centerIdx], layerStates[cs.centerIdx].fx);
         cx2.setTransform(1, 0, 0, 1, 0, 0); // aboveCache 는 pad 를 담고 있다 — 클립은 디바이스 공간에 이미 서 있다
         if (cs.store.aboveCache) cx2.drawImage(cs.store.aboveCache, 0, 0);
@@ -122502,7 +122536,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           store = gengaPreviewRender.stack;
         }
         // below-stack cache (layers array is top-first → indices AFTER centerIdx are below)
-        if (!store.belowCache || store.belowCache.width !== cw || store.belowCache.height !== ch) {
+        if (scene.belowEmpty) {
+          paintReleaseCanvas(store.belowCache); store.belowCache = null;
+        } else if (!store.belowCache || store.belowCache.width !== cw || store.belowCache.height !== ch) {
           paintReleaseCanvas(store.belowCache);
           const bc = document.createElement('canvas'); bc.width = cw; bc.height = ch;
           const bctx = bc.getContext('2d');
@@ -122514,8 +122550,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           bc._complete = missingArt === missingBefore;
           store.belowCache = bc;
         }
-        if (store.belowCache._complete === false) cv._complete = false;
-        cx2.drawImage(store.belowCache, -pad, -pad);
+        if (store.belowCache) {
+          if (store.belowCache._complete === false) cv._complete = false;
+          cx2.drawImage(store.belowCache, -pad, -pad);
+        }
         if (layerStates[centerIdx].draws) drawLayer(cx2, layers[centerIdx], layerStates[centerIdx].fx);
         // 위 스택도 접는다. 획을 긋는 동안 위 레이어의 내용은 안 바뀌므로 아래와 같은 이유로 한 장이면 된다 —
         // 접지 않으면 **매 move** 위 그림을 전부 다시 그린다(실측 3508×2480 · 위 그림 6장에서 프레임당 7.1ms ·
@@ -122549,16 +122587,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           drawLayerRange(cx2, centerIdx - 1, 0); // layers above (blend vs live content stays correct)
         }
         // 래스터 펜은 버퍼 사용 여부와 관계없이 누적 inkScan 안만 바꾼다.
-        // 비중심은 완비 캐시 또는 명시적으로 빈 위 스택이어야 한다.
+        // 비중심은 완비 캐시 또는 명시적으로 빈 위·아래 스택이어야 한다.
         // 도형·벡터 지우개·FX·動画필·진단·뜬 선택은 기존 전체 합성 경로를 유지한다.
         gengaPreviewRender.clip = null;
         if (cv._complete && sess && !sess.shape && !sess.vectorErase
-            && store.aboveFoldable === true && store.belowCache && (scene.aboveEmpty || store.aboveCache)
+            && store.aboveFoldable === true && (scene.belowEmpty || store.belowCache) && (scene.aboveEmpty || store.aboveCache)
             && !gengaDougaFillActive() && !state.gengaSilDebug && !gengaSelLifted(gengaSel)) {
           if (scene.fxFree) {
             gengaPreviewRender.clip = { eligible: true, cv: cv, cw: cw, ch: ch, pad: pad, frame: frame,
               sessCanvas: sess.canvas, centerId: String(sess.layerId), centerIdx: centerIdx, store: store,
-              below: store.belowCache, above: store.aboveCache, aboveEmpty: scene.aboveEmpty };
+              below: store.belowCache, above: store.aboveCache, aboveEmpty: scene.aboveEmpty, belowEmpty: scene.belowEmpty };
           }
         }
         return cv;
@@ -123812,11 +123850,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (resolved && !resolved.ref) return null; // 참조 없는 이미지에는 안정된 내용 서명이 없다
       const drawingRef = resolved ? resolved.ref : null; // 픽셀 ref는 deltaLive/trimmed 표현이 바뀌어도 같다
       const next = { key: key, stack: stack, below: stack.belowCache, above: stack.aboveCache,
-        aboveSig: stack.aboveSig, aboveEmpty: gengaPreviewRender.scene.aboveEmpty, drawingRef: drawingRef, session: sess };
+        aboveSig: stack.aboveSig, aboveEmpty: gengaPreviewRender.scene.aboveEmpty, belowEmpty: gengaPreviewRender.scene.belowEmpty, drawingRef: drawingRef, session: sess };
       const prev = surface && gengaPreviewRender.viewState;
       let ink = null, unchanged = false;
       if (prev && surface.width === W && surface.height === H && prev.key === key && prev.stack === stack
-          && prev.below === next.below && prev.above === next.above && prev.aboveSig === next.aboveSig && prev.aboveEmpty === next.aboveEmpty) {
+          && prev.below === next.below && prev.above === next.above && prev.aboveSig === next.aboveSig && prev.aboveEmpty === next.aboveEmpty && prev.belowEmpty === next.belowEmpty) {
         if (sess && (prev.session === sess || (!prev.session && prev.drawingRef === sess.previewBaseRef))) {
           ink = gengaScanClamp(sess.inkScan, sess.canvas);
           unchanged = !ink; // 첫 dab 전의 동일한 시드에는 표시할 변경이 없다
