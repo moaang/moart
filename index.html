@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3039</title>
+  <title>MoArt ver3043</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -17889,16 +17889,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const ua = nav && nav.userAgent ? nav.userAgent : '';
       return /Android|iPhone|iPad|iPod/i.test(ua) || isIpadOsMacUa();
     }
-    // A Wacom Movink (touch+pen display, 10-pt multi-touch) plugs into an ordinary desktop host (Windows, or a Mac
-    // that isn't itself the touch surface), so its UA/platform match none of mobileOrTabletRuntime()'s checks. That
-    // function conflates "has a finger" with "is a mobile/tablet OS", which also drives file-system-access/autosave/
-    // memory-budget/video-decode assumptions that are correctly desktop for Movink's host. This is narrower: does
-    // this input surface deliver finger touches at all (navigator.maxTouchPoints). Wacom's documented Movink
-    // gestures (2-finger tap = undo, 2-finger drag = pan, 1-finger double-tap = fit) are what this app already
-    // gives iPad. Use it for the finger/gesture input gates (finger-draw toggle, the canvas 2-finger pinch/pan/tap
-    // surfaces, finger long-press context menus, browser-zoom suppression on touch), never for the
-    // OS/filesystem/memory/video-decode call sites mobileOrTabletRuntime() also serves. Mouse/pen paths stay gated
-    // the desktop way (right-click menus, dblclick) so a desktop host never behaves like a phone.
+    // Finger input is separate from mobileOrTabletRuntime's OS heuristic: a Windows host with a Movink
+    // can keep desktop filesystem/memory rules while delivering finger touches. MacIntel + touch still
+    // follows isIpadOsMacUa; that heuristic does not distinguish a touch-equipped Mac from iPadOS.
+    // Use this capability for finger-draw, canvas pinch/pan/tap, long-press menus and browser-zoom suppression,
+    // never for the OS/filesystem/memory/video-decode gates. The shared gestures include two-finger tap
+    // (undo), two-finger drag (pan) and one-finger double-tap (fit). Mouse right-click/dblclick bindings stay
+    // independent; pen long-press can share the touch gate.
     function touchInputCapable() {
       if (mobileOrTabletRuntime()) return true;
       const nav = typeof navigator !== 'undefined' ? navigator : null;
@@ -18265,9 +18262,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // redo 제스처. 기기 전역이라 콘티·원화·용지 어디서나 같은 값이 선다. 기본은 double-tap 이다.
     const REDO_GESTURE_IDS = ['double-tap', 'long-press', 'three-finger', 'none'];
-    // IOS 는 세 손가락 탭을 시스템이 먼저 가져간다(편집 메뉴가 뜨고, 웹에서 그것을
+    // iOS 는 세 손가락 탭을 시스템이 먼저 가져간다(편집 메뉴가 뜨고, 웹에서 그것을
     // 끄는 공식 API 가 없다). 그래서 고를 수 없게 막는다 — 고르게 두면 「골랐는데 안 된다」가 된다.
-    // iOS 의 브라우저는 전부 WebKit 이므로 기기 판정이 곧 엔진 판정이다.
+    // 이 함수는 제스처용 OS 추정이며 렌더링 엔진 검사가 아니다.
     function iosWebkitRuntime() {
       const nav = typeof navigator !== 'undefined' ? navigator : null;
       if (!nav) return false;
@@ -18279,7 +18276,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         try { v = String(localStorage.getItem('memoRedoGesture') || ''); } catch (e) {}
         state.redoGesture = REDO_GESTURE_IDS.indexOf(v) >= 0 ? v : 'double-tap';
       }
-      // 다른 기기에서 고른 값을 들고 iOS 로 열었을 때 조용히 안 먹는 상태가 되지 않게 되돌린다.
+      // iOS에서 허용하지 않는 저장값은 실행 시 double-tap으로 읽고, 저장된 선택은 덮어쓰지 않는다.
       if (state.redoGesture === 'three-finger' && iosWebkitRuntime()) return 'double-tap';
       return state.redoGesture;
     }
@@ -18415,12 +18412,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // docking model (fixed-px side stacks + docked timeline) needs real leftover space and simply
     // has none below this width, so phone-layout mode turns that whole system off.
     const PHONE_MAX = 700;
-    // Width alone is wrong for landscape: every current iPhone except the SE is wider than 700 when rotated, so
-    // turning the phone sideways would restore the desktop docking model on a ~390px-tall viewport (tiny free
-    // canvas, oversized TOOLS window, no tab bar). So a phone-sized short side also counts as phone.
-    // iPhone short side maxes at 440; iPad's smallest is 744 (mini 6/7) — a 300px gap, so 500 is safe.
-    // `pointer: coarse` is a capability query (not UA sniffing) and gates only this landscape branch, so a
-    // merely short desktop window keeps the desktop layout. iPad is excluded by the 500 threshold either way.
+    // A landscape phone can exceed PHONE_MAX while leaving little vertical canvas room. The short-side
+    // branch also enables the phone shell, but requires pointer:coarse so a short desktop window alone
+    // keeps the desktop layout. A narrow tablet Split View can still enter through the width branch:
+    // this predicate describes the viewport, not device identity.
     const PHONE_SHORT_MAX = 500;
     function isPhoneLayout() {
       if (typeof window === 'undefined') return false;
@@ -18481,27 +18476,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (wasPhone !== isPhone && typeof applyPaintToolPaletteDockState === 'function') applyPaintToolPaletteDockState();
     }
 
-    // ── Global UI scale (설정 popover gauge, all devices — not a phone feature) ─────────────
-    // Coordinate conversion follows the runtime getBoundingClientRect probe and the pointer rule below.
-    // getBoundingClientRect fields use uiReadScale(); pointer clientX/Y use the pointer helpers below.
-    //   • style left/top/width writes                → local px (rendered ×z) — both engines
-    //   • window.innerWidth/innerHeight              → physical, zoom-independent — both engines
-    // Therefore (a gBCR field and a pointer read do not always share a space):
-    //   • gBCR reads (getBoundingClientRect field, or a delta of two) normalize by uiReadScale() — a
-    //     once-per-session 100px-probe that returns z on Chromium and 1 on WebKit. Use localRect(el) for a
-    //     whole rect.
-    //   • Pointer reads (clientX/Y) are visual px (already ×z) on both Chromium and current iOS WebKit
-    //     (on-device #perf probe: clientX ranged 0..innerWidth=1024 while a full-bleed canvas gBCR read
-    //     1280 local), so a raw clientX does not match a WebKit gBCR (which is local). Convert it:
-    //       – to raw-gBCR space (ratio/subtraction against a raw rect): uiPointerX()/uiPointerY()
-    //         (= ×uiReadScale/z — no-op on Chromium & z=1, 1/z on WebKit).
-    //       – straight to local px (pair with localRect() or a local constant): uiPointerLocalX()/Y (= /z).
-    //   • Write-side conversions (innerWidth/innerHeight → local space, applying the zoom itself) keep
-    //     uiScaleValue() — they never read scaled geometry, so they are engine-independent.
-    //   • Ratio-form ((clientX-rect.left)/rect.width — drawing, gauges) is not coherent as-is: on WebKit the
-    //     visual clientX meets a local rect. Wrap the pointer term with uiPointerX().
-    // A gBCR read must never be divided by uiScaleValue() directly (double-corrects on WebKit — "rail creep"); a pointer read is the opposite and does take /uiScaleValue (that is uiPointerLocalX()).
-    // KNOWN LIMIT (recorded, not re-verified): editor-content px-delta interactions (timeline clip drag/trim, genga koma drag etc.) can be proportionally off at scale≠100%.
+    // ── Global UI scale (설정 popover gauge, all devices) ──────────────────────────────
+    // Coordinate conversion uses the runtime rectangle probe, not a fixed browser-name rule.
+    // uiReadScale is the rectangle divisor: the probe selects UI zoom or 1; near 100% it uses 1.
+    //   • style left/top/width/height are local CSS px, rendered by uiScaleValue().
+    //   • raw getBoundingClientRect fields/deltas become local by /uiReadScale(); use localRect for a rect.
+    //   • clientX/Y are visual CSS px. Raw-gBCR pairs use uiPointerX/Y (uiReadScale()/uiScaleValue(),
+    //     with the existing near-100% unit fast path); localRect pairs use uiPointerLocalX/Y (/uiScaleValue()).
+    //   • viewport dimensions/writes use uiScaleValue(), independently of the rectangle probe.
+    // Raw (clientX - rect.left)/rect.width is valid only when the pointer and rect share a space.
+    // uiReadScale alone is not a local-pointer divisor when the rectangle probe excludes zoom.
+    // Recorded limit, not re-verified: editor-content px deltas (timeline clip drag/trim, genga koma drag)
+    // can be proportionally off at scale≠100%.
     const UI_SCALE_MIN = 0.8;
     const UI_SCALE_MAX = 1.25;
     const UI_SCALE_STORAGE_KEY = 'conteEditorUiScale'; // own key: works on phone too (editorUi saves are phone-guarded)
@@ -18543,34 +18529,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (z === 1) return r;
       return { left: r.left / z, top: r.top / z, right: r.right / z, bottom: r.bottom / z, width: r.width / z, height: r.height / z };
     }
-    // Pointer clientX/Y are visual px (already multiplied by the CSS zoom) on both Chromium and current iOS
-    // WebKit (on-device probe: clientX ranged 0..innerWidth while a full-bleed canvas's gBCR read the larger
-    // local px). getBoundingClientRect, by contrast, is engine-split: Chromium scales it by zoom
-    // (uiReadScale()=z), iOS WebKit does not (uiReadScale()=1). Normalizing both with uiReadScale() is right on
-    // Chromium only; on WebKit it leaves clientX in visual px against a local-px rect, so every
-    // (clientX-rect.left) lands offset by the zoom delta at UI scale != 100% (the pen feels ~z*position).
-    // uiPointerToRectScale() converts a raw pointer read into the raw getBoundingClientRect space: 1 on
-    // Chromium and at z=1 (already shared -> no-op), 1/z on WebKit (visual -> local). Wrap any clientX/clientY
-    // (absolute, delta, or hit-test bound) that is then combined with a raw gBCR value; because it is exactly 1
-    // on desktop it is blanket-safe and cannot regress Chromium.
+    // Raw pointer values must share the gBCR space before subtraction or ratios. LocalRect pairs instead
+    // use uiPointerLocalX/Y; the section contract above defines both conversions.
     function uiPointerToRectScale() {
       const z = uiScaleValue();
       if (Math.abs(z - 1) < 0.005) return 1;
-      return uiReadScale() / z; // Chromium: z/z = 1 ; iOS WebKit: 1/z
+      return uiReadScale() / z;
     }
     function uiPointerX(clientX) { return clientX * uiPointerToRectScale(); }
     function uiPointerY(clientY) { return clientY * uiPointerToRectScale(); }
-    // A raw pointer read normalized straight to local px. Use when the site pairs the pointer with a
-    // localRect()/already-local value: clientX/z is correct on both engines (clientX is visual on both), and
-    // since uiReadScale()==uiScaleValue() on Chromium it equals `clientX / uiReadScale()` there. Pick
-    // uiPointerX for raw-gBCR ratio/subtraction sites, uiPointerLocalX for local-px sites.
+    // Use for localRect()/already-local pairs; raw gBCR pairs use uiPointerX/Y.
     function uiPointerLocalX(clientX) { return clientX / uiScaleValue(); }
     function uiPointerLocalY(clientY) { return clientY / uiScaleValue(); }
     function uiLocalViewportW() { return window.innerWidth / uiScaleValue(); }
-    // 높이의 기준은 실제로 보이는 뷰포트다(사용자 판정). iOS Safari 의 innerHeight 는 툴바가 접힌 상태의 큰
-    // 뷰포트(= 100lvh)를 돌려주므로, 주소창·툴바가 떠 있는 동안에는 화면에 없는 높이까지 센다. 그 값으로 자리를
-    // 잡으면 스테이지가 그만큼 화면 아래로 흘러내린다. 데스크톱에서는 innerHeight = visualViewport.height =
-    // uiLocalViewportH() 라 이 차이가 재현되지 않는다.
+    // 높이의 기준은 실제로 보이는 뷰포트다(사용자 판정). 툴바·키보드 때문에 visualViewport.height가
+    // innerHeight보다 작을 수 있어 둘 중 작은 높이를 쓴다. uiLocalViewportH는 그 값을 UI 배율로 나눈
+    // 로컬 높이이며, 두 뷰포트 높이가 같아도 UI 배율이 100%가 아니면 같은 수치가 아니다.
     // uiLocalViewportH() 를 읽는 자리는 예외 없이 「고정위치 크롬을 보이는 화면 안에 앉히거나 가둔다」이다:
     // 폰 시트 높이·윗변(phoneSheetHeightPx / updatePhoneSheetResizeHandle / phoneRepositionReuseTarget /
     // repositionActivePhoneSheet / openPhoneTab), 타임라인 하단 패널 최대높이, 토스트 y, 앵커 팝오버의 위로
@@ -19901,8 +19875,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         out.nodes += 1;
         if (node === null || node === undefined) continue;
         const type = typeof node;
-        // base64/ids/labels are ASCII, one byte per char. Do not dedup by value: with deferred encoding, N snapshots
-        // can each hold a distinct copy of the same stale bitmapDataUrl, which is N real megabytes.
+        // String costs are length-based estimates: two bytes per code unit when collecting URLs, otherwise one.
+        // Equal string values do not establish shared storage, so do not deduplicate them by value.
         if (type === 'string') { out.bytes += node.length * (out.urls ? 2 : 1); if (out.urls && node.indexOf('blob:') === 0) out.urls.add(node); continue; }
         if (type === 'number' || type === 'boolean') { out.bytes += 8; continue; }
         if (type !== 'object') continue;
@@ -24411,6 +24385,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3043, items: [{ja: '変形・パースの初期化ボタンにフォーカスが残っても、Enterで適用します。ファイル共有に不要なファイル名テキストを付けないようにしました。', ko: '변형·퍼스펙티브의 초기화 버튼에 포커스가 남아도 Enter로 적용합니다. 파일 공유에 불필요한 파일명 텍스트를 붙이지 않도록 고쳤습니다.', en: 'Enter applies transforms even when Reset retains focus. File sharing no longer adds redundant filename text.', zh: '即使焦点停留在重置按钮，Enter也会应用变换。文件分享不再附加多余的文件名文本。'}] },
+      { ver: 3042, items: [{"ja": "描画診断で、明るい線と描画領域の境界が重なるだけで原因を断定しないようにしました。", "ko": "그리기 진단에서 밝은 선과 렌더 구역 경계가 겹친다는 이유만으로 원인을 단정하지 않도록 고쳤습니다.", "en": "Drawing diagnostics no longer claim a cause solely from bright columns overlapping render-region boundaries.", "zh": "绘图诊断不再仅因亮线与渲染区域边界重合就断定原因。"}] },
+      { ver: 3041, items: [{"ja": "資料画像の読み込み中にプロジェクトを切り替えると、前の読み込み進捗が残る問題を修正しました。", "ko": "자료 이미지를 가져오는 중 프로젝트를 바꾸면 이전 가져오기 진행 표시가 남던 문제를 고쳤습니다.", "en": "Switching projects during a reference image import no longer leaves the previous import progress visible.", "zh": "修复导入参考图片时切换项目后仍显示旧导入进度的问题。"}] },
+      { ver: 3040, items: [{ja: 'GPU情報の読み取り中に描画コンテキストが失われた場合、GPUが有効と断定せず不明と表示します。', ko: 'GPU 정보 확인 중 렌더링 컨텍스트를 잃으면 GPU가 켜졌다고 단정하지 않고 알 수 없음으로 표시합니다.', en: 'GPU information reports unknown when the rendering context is lost during the probe.', zh: '读取GPU信息时若渲染上下文丢失，将显示未知，不再断定GPU已启用。'}, {"ja": "2ピクセルの短い選択範囲でも、横・縦の輪郭の終点が欠けないようにしました。", "ko": "2픽셀짜리 짧은 선택에서도 가로·세로 윤곽의 끝점이 빠지지 않게 했습니다.", "en": "Short two-pixel selections now include the final point of horizontal and vertical outlines.", "zh": "修复两像素短选区的横向和纵向轮廓缺少终点的问题。"}] },
       { ver: 3039, items: [{ja: 'ver3038 で起動しなかった問題を修正しました。', ko: 'ver3038에서 앱이 시작되지 않던 문제를 고쳤습니다.', en: 'Fixed ver3038 failing to start.', zh: '修复 ver3038 无法启动的问题。'}] },
       { ver: 3038, items: [{ja: 'スタート画面の「ファイルを開く」に .moart を表示するようにしました。', ko: '시작 화면의 「파일 열기」에 .moart를 표시합니다.', en: 'The Open file button on the start screen now lists .moart.', zh: '开始界面的“打开文件”现在会显示 .moart。'}] },
       { ver: 3037, items: [{ja: 'プロジェクトを開くとき、ブラウザー保存が応答しなくなっても長く止まらずに読み込みを終えるようにしました（保存できなかった素材は不足として表示します）。', ko: '프로젝트를 열 때 브라우저 저장소가 응답하지 않아도 오래 멈추지 않고 불러오기를 마칩니다(저장하지 못한 소재는 누락으로 표시합니다).', en: 'Opening a project no longer stalls for long when browser storage stops responding; assets that could not be stored are reported missing.', zh: '打开项目时，即使浏览器存储无响应也不会长时间停住，会完成读取（未能保存的素材显示为缺失）。'}] },
@@ -36852,13 +36830,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           '<div class="timeline-topbar">',
             // Dot grab at the top-left — the only drag/dock handle (whole-bar dragging misfired on iPad)
             '<span class="tl-win-grab" data-tl-win-grab="true" title="' + escapeAttr(t('toolbar.dragMove')) + '"></span>',
-            // head zones: [transport + timecode] | [status] | [zoom] — no "Video / Audio Timeline" text label;
-            // the surface speaks for itself
+            // No extra timeline label: transport/timecode, status and project information identify this surface.
             '<span class="timeline-head-zone">' + timelineSettingsButtonHtml() + '<span class="tl-onion-slot"></span>' + renderTimelineTransportControls() +
               '<span id="timelineTimecode">' + framesToTimeInput(state.videoPlayheadFrames) + ' / ' + framesToTimeInput(totalFrames) + '</span>' +
             '</span>',
-            // 줌은 원화와 같은 자리(타임코드 바로 뒤)다. 음성 도구 셋과 그 상태는 타임라인 설정(⚙)에
-            // 있다(첨삭) — 여기에는 작업 상태줄만 남는다. 버튼 id 는 같아 커널 호출이 그대로다.
+            // 음성 도구는 타임라인 설정(⚙)에 두고 여기에는 작업 상태줄만 남긴다.
             '<span class="timeline-head-zone tools">' +
               '<small class="timeline-status">' + escapeHtml(state.timelineStatus || '') + '</small>' +
             '</span>',
@@ -37409,9 +37385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const scrollRect = scroll.getBoundingClientRect();
       const bodyRect = timeline.querySelector('.timeline-body').getBoundingClientRect();
       const tracksMetrics = timelineTracksMetrics();
-      // gBCR deltas/heights below are viewport px (x uiScale) but the style writes are local px — divide
-      // once here or every label row renders z-times short and the CUT/카메라 rows creep upward at
-      // scale != 100%.
+      // Normalize gBCR deltas/heights with the shared rectangle divisor before local-px style writes.
       const uz = uiReadScale();
       applyTimelineHeadWidthDom(timeline); // 폭은 상수가 아니라 timelineTrackLabelWidth()
       [
@@ -37484,7 +37458,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         const fixedLabel = timeline.querySelector('[data-timeline-fixed-label-section="' + item.kind + '"] .timeline-track-label');
         const label = fixedLabel || track.querySelector('.timeline-track-label') || track;
-        const uz = uiReadScale(); // viewport-px deltas -> local-px style writes (see updateTimelineFixedLowerLabels)
+        const uz = uiReadScale(); // gBCR deltas -> local-px style writes (see updateTimelineFixedLowerLabels)
         const timelineRect = timeline.getBoundingClientRect();
         const labelRect = label.getBoundingClientRect();
         const topRect = section ? section.getBoundingClientRect() : labelRect;
@@ -38164,7 +38138,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // keyframe carries its paper-space rect (normalizeCameraTrack derives it; files store it); lerpCameraRect
     // lerps x/y/w/h and the absolute rotation as stored (old saves are unwrapped by unwrapShortestPathRotations).
     // The result converts back to the working {x,y,scale,rotation} through cameraPaperRectToLegacy. Lerping
-    // rect x/y/w/h is affine-equivalent to a flat lerp for pan/zoom; only rotation differs.
+    // rect x/y/w/h is affine-equivalent to a flat lerp for pan/zoom before the converter's rounding.
     function cameraTransformFromKeyframes(keyframes, localFrame, project) {
       if (!keyframes || !keyframes.length) return cameraDefaultTransform();
       let previous = null;
@@ -40142,8 +40116,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // when clipped) or clientX+clientY (open under the pointer); toggle=true → reopening the same id just
     // closes it; onClose fires exactly once on any close path (outside press, ESC, project teardown, or an
     // explicit closeAnchoredPopover() after a pick).
-    // zoom² contract: anchor gBCR is visual px while style/offset* are local px — normalize via
-    // uiReadScale()/uiPointerLocal* and clamp both axes against the local viewport. ESC closes every popover.
+    // Convert raw anchor rectangles with uiReadScale() and pointers with uiPointerLocal* before local-px
+    // style writes; clamp both axes to the local viewport. The shared Escape handler owns closing.
     // 최상단바·툴바의 버튼에서 여는 메뉴·팝오버의 공용 위치. 간격을 두지 않는 것이 규격이다.
     //
     // 세로는 바의 밑변, 가로는 앵커의 왼쪽에 맞춘다(사용자 판정). 앵커의 아랫변이 아니다 — 버튼은 바 안에서
@@ -40151,7 +40125,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //
     // 바는 앵커에서 가장 가까운 머리줄(header.topbar · .pane-header · 타임라인 머리줄)이다. 못 찾으면 앵커
     // 자신을 바로 삼는다.
-    // zoom² 계약: gBCR 은 visual px, style/offset* 은 local px 이라 uiReadScale() 로 나눈다.
+    // raw gBCR은 uiReadScale()로 정규화하고 style/offset*은 로컬 px로 쓴다.
     //
     // 떠 있는 도구창(.draw-ui)은 바가 아니다. 그 창들은 상단바 밖에서 `position: fixed` 로 뜨므로 그 안의
     // 버튼은 앵커 자신을 쓴다. .draw-ui 에서 멈추는 것은 창이 바 안으로 다시 들어가도 상단바가 잡혀 팝오버가
@@ -43629,7 +43603,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const lane = root.querySelector('[data-conte-layer-lane="true"]');
       if (!lane) return null;
       const rect = lane.getBoundingClientRect();
-      // pointer/rect deltas are viewport px, timelineInnerWidth is local content px; normalize
+      // Normalize the matched pointer/gBCR delta before combining it with local timelineInnerWidth.
       const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || (rect.width / uiReadScale()) || 1));
       return Math.max(0, Math.min(1, (uiPointerX(event.clientX) - rect.left) / uiReadScale() / width));
     }
@@ -45042,9 +45016,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           event.stopPropagation();
           const keyframe = cameraKeyframeById(state.project, marker.dataset.cameraKeyframeId || '');
           if (!keyframe) return;
-          // 누르는 순간에는 선택을 바꾸지 않는다(원화 gengaCamKfPointerDown 과 같은 순서, 업계 표준). 고른 키를 잡으면 선택
-          // 전부를 끌고, 안 고른 키를 수정키 없이 잡으면 그것 하나를 고른 뒤 끈다. 수정키 선택(토글·범위)은 놓았을 때만
-          // 한다. 누를 때 하면 Ctrl·다중선택 모드로 고른 키가 선택에서 빠진 채 나머지가 끌려, 빠진 키가 착지 덮어쓰기로 지워진다.
+          // 선택된 키는 누를 때 선택을 유지해 선택 전체를 끌고, 안 고른 키는 하나만 끈다.
+          // 수정키 없이 미선택 키를 누르면 먼저 단일 선택한다. 토글·범위는 드래그 없이 놓을 때만 한다.
+          // 누를 때 수정키로 고른 키를 빼면 나머지가 끌리고, 빠진 키가 착지 덮어쓰기로 지워질 수 있다.
           const mode = selectionModifierMode(event);
           const wasSelected = selectedCameraKeyframeSet().has(keyframe.id);
           if (!wasSelected && !mode) { selectCameraKeyframe(keyframe.id, ''); updateCameraTrackSelectionDom(root); }
@@ -45176,7 +45150,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Middle-button drag = hand-pan the conte timeline, mirroring the genga dopesheet
     // pan (gengaStartTimelinePan). Horizontal rides the native .timeline-scroll.scrollLeft (its scroll
     // listener syncs the sibling scrolls + custom scrollbar + state); vertical rides the .timeline-scroll-section
-    // (video/audio) under the pointer. Pointer delta is visual px, scroll is local px → divide by uiReadScale().
+    // (video/audio) under the pointer. This adapter currently uses uiReadScale() for raw pointer deltas.
+    // The shared UI-scale section records the remaining editor-content delta limitation.
     function conteStartTimelinePan(ev, owner) {
       const tgt = ev.target;
       const hscroll = tgt && tgt.closest ? tgt.closest('.timeline-scroll') : null;
@@ -49798,15 +49773,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
 
-    // The paper's on-screen box, measured at most once per task. The camera subsystem asks for it from several
-    // places in one pass (updateChromeControls alone: updateVideoPreviewZoomDom's applyCameraPreviewTransform, the
-    // one inside its renderCameraFrameOverlay, and updatePaintUI's second renderCameraFrameOverlay), each after a
-    // DOM write, so each would be a separate full-document reflow.
+    // Reuse the paper's measured box within a synchronous pass until invalidated. Camera transforms and
+    // overlays query it from several UI consumers; sharing the measurement avoids repeated geometry reads.
     // Not derived from state, though .conte-paper's width is calc(--video-preview-width × …): that is CSS px,
-    // while gBCR returns viewport px (ratio = uiScale), so swapping them would silently change what the camera
-    // coordinates mean. The cache self-clears on the microtask queue, so the next task/frame re-measures. The
-    // only mid-task write that resizes the paper is updateVideoPreviewZoomDom's --video-preview-width, which
-    // calls invalidateCameraPaperRect.
+    // while raw gBCR follows the shared runtime rectangle probe. Substituting CSS arithmetic could change the
+    // camera's coordinate space. The queued microtask clears the cache before a later pass re-measures.
+    // updateVideoPreviewZoomDom invalidates it after writing --video-preview-width.
     let cameraPaperRectCache = null; // { el, rect }
     let cameraPaperRectFlushQueued = false;
     function invalidateCameraPaperRect() { cameraPaperRectCache = null; }
@@ -49837,15 +49809,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // left/top/width/height = the camera-frame box (gizmo drag math),
       // originX/Y             = the frame box relative to the overlay parent (= the paper),
       // overlayWidth/Height   = the overlay parent's size (key-dot path svg viewBox).
-      // Every field is local px. Raw gBCR equals it only at 100% UI scale. Under `UIサイズ` (a real CSS `zoom` on
-      // <html>) Chromium multiplies the zoom into gBCR, and the overlay writes these back as CSS px inside that
-      // zoomed subtree (box.style.left, the mask box, the camera-target's translate), where the zoom applies a
-      // second time and the box sits off the real frame. WebKit's gBCR is already local, so uiReadScale() is 1
-      // there and this divide is a no-op. The gizmo drag normalizes its pointer with uiPointerLocalX/Y
-      // (see beginCameraFrameDrag).
+      // Projected positions/sizes are local CSS px; frame retains paper data. Divide measured rectangles by
+      // the shared divisor: 1 for already-local gBCR, or UI scale when gBCR includes that scale.
+      // The gizmo pairs these values with uiPointerLocalX/Y (see beginCameraFrameDrag).
       const cp = contePaperGeom(project).cp;
-      const uz = Math.max(1e-6, uiReadScale()); // gBCR space → local px (Chromium: = the zoom; WebKit: 1)
-      const measured = screen && screen.getBoundingClientRect ? cameraPaperRectOf(screen) : null; // Same measure, once per task
+      const uz = Math.max(1e-6, uiReadScale()); // raw gBCR space -> local px
+      const measured = screen && screen.getBoundingClientRect ? cameraPaperRectOf(screen) : null; // Reuse the current synchronous-pass measure
       const paperRect = measured
         ? { left: measured.left / uz, top: measured.top / uz, width: measured.width / uz, height: measured.height / uz }
         : { left: 0, top: 0, width: cp.paper.w, height: cp.paper.h }; // fallback is already local (paper units)
@@ -50058,8 +50027,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         path.setAttribute('d', '');
         return;
       }
-      // Draw the sampled interpolated path (shared cameraTrajectorySamples). With linear lerp the collinear fold
-      // collapses it to the key-to-key polyline; if the interpolation eases or splines, the curve follows.
+      // Draw shared cameraTrajectorySamples, which folds collinear centre spans.
+      // Easing changes travel speed along a straight centre span, not its geometry.
       const samples = cameraTrajectorySamples(
         keyframes.map(function(k) { return k.frame + 1; }),
         function(frame) { return cameraFrameKeyPoint(cameraTransformFromKeyframes(keyframes, frame - 1, project), screenRect); }
@@ -51145,8 +51114,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ---- Per-layer-row effects: static opacity / blur / move-scale-rotate, plus keyframes (below).
-    // tx/ty/blur are in paper units; preview and export scale them by displayed width / project frame width.
-    // transform-origin = the layer's own center. Applied in both preview (CSS) and export (canvas).
+    // tx/ty/blur are work pixels; preview/export adapters supply the destination scale.
+    // Drawing pivots come from layerDrawingFxOrigin, including stored offsets after bitmap growth.
+    // CSS uses center without a drawing; the canvas drawing consumer preserves the same drawing pivot.
     function normalizeLayerEffect(eff) {
       eff = eff || {};
       const num = function(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d; };
@@ -58843,10 +58813,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return run();
       });
     }
-    // Cached connection: every IndexedDB user here (audio/layer blob refs, picker-handle memory, workspace folder
-    // handle) uses this one store, and a ZIP import calls put/getWorkspaceDbValue once per media file. Reopening
-    // per call would dominate a large import, and open/close cycling is where WebKit's IndexedDB is flakiest. Open
-    // once; drop the cache when the connection closes, is lost or stalls.
+    // Reuse the workspace-store connection for asset and remembered-handle operations. ZIP import mixes
+    // per-asset reads with batched writes; the cache avoids reopening for each operation/transaction.
+    // Drop it when the connection closes, is lost or stalls.
     let workspaceDbPromise = null;
     // 저장/참조 변경은 진행 중인 GC를 취소한다. 입력과 저장이 GC를 기다리지 않는다.
     // 세대는 scan 이전부터 delete 완료까지 유효해야 하며, 보유 해제 뒤에도 되돌리지 않는다.
@@ -59142,7 +59111,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 자료 창(프로젝트 참고 이미지)의 저장. 바이트는 IDB 'rf:' 행이고, 실행 중 항목은 콘티 그림과 같은 저장
     // 기술자(bitmapStorage.kind 'indexeddb')를 들어 storedAssetKeysFrom 이 열린 프로젝트·Undo·저장 슬롯·판본·쓰기
     // lease 를 새 집합 없이 GC root 로 센다. 파일 사본만 {dir,fileName}(ZIP·폴더) 또는 dataUrl(단일 JSON)을 들고,
-    // 열 때 refsHydrate 가 IDB 로 옮긴다. 자료는 불변(insert-only)이다. Undo 스냅샷(snapshotProject)에서는 빠져
+    // 열 때 refsHydrate 가 IDB 로 옮긴다. 자료의 픽셀을 직접 편집하는 UI는 없다. Undo 스냅샷(snapshotProject)에서는 빠져
     // 그리기 Undo 를 무겁게 하거나 그 순서에 끼지 않는다.
     const REFS_KEY_PREFIX = 'rf:';
     const REFS_THUMB_KEY_PREFIX = 'rft:';   // 썸네일 캐시. 파일에는 안 실리고 본체 키의 생존을 따른다
@@ -59417,6 +59386,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // insertOnly adds instead of overwriting. A transaction one record spoils falls back to per-record writes;
     // a stall (after its retry) means storage is not answering, so this batch's later writes fail at once instead
     // of each waiting out the watchdog again.
+    // Abort synchronous submission failures before retrying, so earlier queued inserts cannot commit later.
     function createWorkspaceDbWriteBatch(owner, insertOnly) {
       let pending = [], bytes = 0, scheduled = false, tail = Promise.resolve(), stalled = null;
       const flush = function() {
@@ -60890,7 +60860,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // 살아 있는 참조를 전부 모은다. 하나라도 빠지면 그 그림이 「미사용」으로 세어지고, 정리가 이 판정을 쓰므로
-    // 그 오차가 곧 삭제다. root 는 다섯 갈래:
+    // 그 오차가 곧 삭제다. 기본 프로젝트 참조는 아래 다섯 갈래며, 실행 중 보유·차분 base·소재 참조도 더한다:
     //   ① 지금 열린 프로젝트  ② 클립보드(코마+레이어)  ③ undo/redo 스택
     //   ④ 저장된 프로젝트 payload 전부  ⑤ 버전 롤백 링 전부
     // ④⑤ 는 portable:false 라 그림을 ref 로만 든다 — 빠뜨리면 되돌리기가 빈 코마가 된다.
@@ -63813,7 +63783,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!shareRequested) file = fileDeliveryShareFile(blob, fileName);
       if (file) {
         if (!await fileDeliveryActivation(fileName)) return '';
-        try { await navigator.share(Object.assign({}, shareData, { files: [file], title: fileName })); return 'shared'; }
+        try { await navigator.share(Object.assign({}, shareData, { files: [file] })); return 'shared'; }
         catch (error) { if (error && error.name === 'AbortError') return ''; throw error; }
       }
       downloadBlobAs(blob, fileName);
@@ -65543,8 +65513,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           await chooseJsonFileForLoad();
           return;
         }
-        // folder or file: genga bundles are single .moart files (no working folder), conte projects live
-        // in folders — offer both instead of hiding file loading behind Shift-click.
+        // Offer folders and packaged files directly instead of hiding file loading behind Shift-click.
         const loadAnchor = document.getElementById('loadJsonBtn');
         openSimpleContextMenu(event, [
           { label: t('menu.project.loadFolder'), action: function() {
@@ -66593,7 +66562,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       stabilizer: { def: 2,     legacy: 'paintStabilizer',      parse: function(r) { const n = Number(r); return Number.isFinite(n) && n >= 0 ? Math.min(10, Math.round(n)) : 2; }, ser: function(v) { return String(v); } },
       // 絵の具量(flow). 不透明度와 다른 축이다 — 不透明度는 획 하나가 끝났을 때의 진하기고, flow 는 dab 한 번이
       // 얹는 양이라 같은 자리를 여러 번 지나면 쌓인다(1-(1-f)^N). 100 = dab 하나가 전부 얹는다.
-      // 이 축이 TVPaint 에어브러쉬(`power 12`)와 .sut 의 `BrushFlow` 를 받는다. 저장은 0~100 정수(UI 단위), 렌더에서 /100.
+      // 이 축이 TVPaint 에어브러쉬(`power 12`)와 .sut 의 `BrushFlow` 를 받는다. 저장은 1~100 정수(UI 단위), 렌더에서 /100.
       flow:       { def: 100,   legacy: null, parse: function(r) { const n = Number(r); return Number.isFinite(n) ? Math.max(1, Math.min(100, Math.round(n))) : 100; }, ser: function(v) { return String(v); } },
       pSize:      { def: true,  legacy: 'paintPressureSize',     parse: function(r) { return r !== '0'; }, ser: function(v) { return v ? '1' : '0'; } },
       pAlpha:     { def: false, legacy: 'paintPressureAlpha',    parse: function(r) { return r === '1'; }, ser: function(v) { return v ? '1' : '0'; } },
@@ -66917,10 +66886,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintPressureSizeOn() { return paintBrushEnsure('pSize') !== false; } // default on
     function paintPressureAlphaOn() { return paintBrushEnsure('pAlpha') === true; } // default off
     // ── paint-tool style brush shape settings (筆圧設定) ─────────────────────────────────────────
-    // Two controls define the pen's "shape" (the paint tool model: 最小サイズ + 筆圧カーブ; presets like
-    // Gペン/丸ペン are just named combinations of these):
-    //   最小サイズ (%): the width floor at zero pressure. 0 = full taper to a point.
-    //   筆圧カーブ: gamma on the pressure (soft = thickens easily, hard = needs real pressure).
+    // Pen pressure uses an editable curve and a minimum-size control. Curve points already include
+    // their output floor; paintPressureCurve uses min/gamma only when no curve points are present.
+    // Existing stroke pressureGamma values remain readable; the gamma table below is migration-only.
     // Values are captured per stroke at pointerdown, so saved strokes re-render identically.
     // 이 표는 데이터 1 회 수술 전용이다(사용자 판정 — 프리셋 칩은 없다). 감마 단계를 만들 UI 도, 새로 감마를
     // 싣는 경로도 없다 — 곡선이 우선하고, 곡선이 없으면 커널이 감마 1(「標準」)로 평가한다.
@@ -67570,13 +67538,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 스와치에 손떨림을 넣지 않는다 — 스와치는 이 브러시가 남기는 마크를 보이는 자리이고(Procreate·CLIP STUDIO·
     // Photoshop 도 같다), 떨림은 브러시가 아니라 손의 성질이다. 프리뷰 경로에는 스태빌라이저도 적용하지 않는다.
     const BRUSH_PREVIEW_ERASER_BAND = '#9a9a9a';  // the eraser needs ink to remove, or its stroke is invisible
-    const BRUSH_PREVIEW_AMP_FRAC = 8 / BRUSH_PREVIEW_BOX_H; // the authored wave amplitude, as a fraction of height
+    const BRUSH_PREVIEW_AMP_FRAC = 8 / BRUSH_PREVIEW_BOX_H; // layout amplitude allowance, as a fraction of height
     // One symmetric period of a shallow wave, as brush libraries draw swatches (Procreate, CLIP STUDIO,
     // Photoshop): equal humps keep a fat brush from clipping the top of the box and read as the brush, not a
-    // squiggle. Authored in 220x44: centred on y=22, amplitude 8, so a stroke at the 50%-of-height cap stays
-    // inside the box. Control points at L/3 and 2L/3 with offset 4A/3 are the standard cubic fit to a sine
-    // half-period; the halves share a tangent at the midpoint (32,10), so the inflection, where a fat brush's
-    // joins must be legible, is exactly at the centre.
+    // squiggle. Authored in 220x44 around y=22: control offsets of 10 give peaks 7.5px from the centre,
+    // leaving headroom within the height-based size limit. The cubics share their position and tangent
+    // at (110,22), keeping the inflection at the centre where a fat brush's joins must be legible.
     const BRUSH_PREVIEW_PATH = [
       { p0: { x: 14,  y: 22 }, c1: { x: 46,  y: 12 }, c2: { x: 78,  y: 12 }, p1: { x: 110, y: 22 } },
       { p0: { x: 110, y: 22 }, c1: { x: 142, y: 32 }, c2: { x: 174, y: 32 }, p1: { x: 206, y: 22 } }
@@ -69022,9 +68989,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const libraryEntry = preset.libraryId && brushLibraryFindEntry(preset.libraryId);
       if (libraryEntry && !(libraryEntry.brush && libraryEntry.brush.imageBrushRef)) brushLibraryApplyEntry(preset.libraryId, { only: PRESET_BRUSH_IDENTITY_FIELDS, tool: preset.brush && preset.brush.tool });   // Reset identity on the preset's tool slot, not the pen entry's
       const b = preset.brush;
-      // Restore the tool first (the only ordering constraint) through the choke point (never write
-      // state.paintTool directly), so every paintBrushSet below lands in the restored tool's memory. Old presets
-      // (no .tool/.size) skip those and stay on the current tool/size.
+      // Restore a recorded tool through the shared setter before color/fields. Field setters below
+      // target the explicit preset tool (pen for legacy records). Missing tool/size supply no restore
+      // value of their own; the library application above may already have selected its tool.
       if (b.tool) setActivePaintTool(b.tool);
       if (preset.color) setPaintBrushColor(preset.color, { record: true });
       // Restore only the fields this preset carries; the rest stay as the user has them. Writing every field
@@ -69047,8 +69014,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 점은 곡선 위의 점이 아니라 당기는 점이다(사용자 판정). 곡선은 양 끝점만 지나고 가운데 점들은 끌어당길 뿐
     // 통과하지 않는다 — CLIP STUDIO 가 같은 데이터를 그렇게 쓰고(제어 폴리곤과 곡선을 따로 그린다), `.sut` 의
     // 곡선 섹션 헤더도 그 필드를 「제어점 수」라 부른다. 통과점으로 읽으면 임포트한 브러시의 획이 CSP 와 달라진다.
-    // 곡선은 균등 2 차 B-spline(끝점 고정, 사용자 선택)이다. 곡선이 제어 폴리곤의 볼록 껍질 안에 있어 오버슈트가
-    // 없으므로 「더 눌렀는데 얇아지는 구간」이 생기지 않는다.
+    // Uniform quadratic B-spline with fixed endpoints (user choice). Its convex-hull property avoids
+    // overshoot beyond control values; monotonic output also requires monotonic control y values.
     function paintCurveEvalPts(pts, x) {
       if (!Array.isArray(pts) || pts.length < 2) return null;
       const v = Math.max(0, Math.min(1, Number(x) || 0));
@@ -69139,10 +69106,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const theta = Math.atan(Math.hypot(Math.tan(tx * rad), Math.tan(ty * rad))) / rad;
       return Math.max(0, Math.min(1, theta / 90));
     }
-    // 펜 방위(azimuth) — 배럴이 향하는 쪽. altitude(기울기 크기)의 짝이고 비원형 팁을 "돌리는" 값이다. Apple
-    // Pencil/최신 Chromium은 azimuthAngle(라디안, +x에서 반시계), Wacom/Windows Ink는 tiltX/tiltY에서 방향을
-    // 유도한다. 도(deg) 0..359로 정규화, pen 전용. 기기가 방위를 전혀 안 주면 null — 호출부가 'off'로 강등한다
-    // (추측한 각도로 마크를 돌리지 않는다).
+    // Pen azimuth orients a non-round tip. Native azimuthAngle is converted directly from radians.
+    // The tilt-only legacy branch uses atan2(tiltY, tiltX) in degrees; it differs from native
+    // PointerEvent conversion for some tilt pairs. Return degrees 0..359 for a pen, or null when
+    // orientation is unavailable; callers treat null as no azimuth tracking.
     // 방위(각도)의 보정. 새 커널 없이 sin·cos 을 각각 `paintStabilizeScalar` 에 태우고 `atan2` 로 되돌린다(원형
     // 평균). 각도를 그냥 평균하면 0°↔359° 를 넘나들 때 정반대 값이 나온다(단순 179.5° vs 원형 359.5°). sin·cos 은
     // -1..1 이라 0..1 로 접는 `paintStabilizeAux` 를 못 쓰고 스칼라 커널을 직접 부른다 — 창이 좌표·필압·기울기와
@@ -69673,9 +69640,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // 종이결은 팁과 독립이다 — 팁 없는 브러시도 거친 종이에 그려야 하므로 paintAttachTip의 `if (!tipId) return`
     // 조기 반환에 갇히면 안 된다. 값은 같은 이유로 스트로크 시점에 고정된다.
-    // 스트로크에 브러시의 성격을 싣는 자리는 여기 하나다. conte 의 빌더들(映像 레이어 · 用紙 페이지 메모)이 같은
-    // 줄을 각자 가지면 필드가 늘 때마다 두 번 적어야 하고, 빠뜨리면 用紙에서만 조용히 사라진다. genga 는 수명이
-    // 다른 세션을 만들어 여기 들어오지 않고 같은 필드 이름을 쓴다. 도형(shapeKind)은 이 성격을 받지 않는다.
+    // Shared Conte brush-field capture for video layers and paper memo; genga captures its own
+    // session with the same field names. Shapes also get appearance fields; captured pressure
+    // settings, taper and the first input sample are freehand-only.
     // `plainBrush` — 외부 브러시(팁)와 종이결을 싣지 않는다(用紙 페이지 메모는 노트라 기본 브러시만 쓴다 —
     // 사용자 판정). 필압·기울기·굵기는 그대로다.
     function paintAttachBrushDynamics(stroke, event, shapeKind, opts) {
@@ -69692,7 +69659,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintAttachWaterEdge(stroke);                    // 水彩境界도 팁과 독립
         paintAttachDual(stroke);
         paintDiagStart(null, event, stroke);
-        paintAttachMix(stroke);                          // 혼색 — 팁이 있어야 걸리므로 여기 함께 둔다
+        paintAttachMix(stroke); // same plainBrush ownership as the other brush fields
         // 絵の具量도 이 게이트 안이다. flow 는 팁이 없어도 걸리지만 用紙 메모 획은 paintRenderPageStrokeInto 라는
         // 별도 경로로 그려져 잉크 장을 안 지난다 — 싣기만 하고 안 읽히면 「설정은 있는데 안 먹는」다.
         paintAttachFlow(stroke);
@@ -69700,9 +69667,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // (gengaShapeRedraw)은 radii 에 taper 를 안 곱해 콘티 도형에만 실으면 엔진이 갈린다.
         if (!shapeKind) paintAttachTaper(stroke);
       }
-      // 도형에 안 맞는 것은 필압뿐이다 — 드래그로 만드는 도형에는 필압 곡선을 실을 자리가 없다(사용자 판정).
-      // 팁·종이결은 「선을 어떤 붓으로 긋는가」라 직선·사각·원의 외곽선에도 뜻이 있다 — 도형의 붓은 펜과 같은
-      // 슬롯이고 어느 쪽에서든 바꿀 수 있다.
+      // Shapes retain the line-appearance fields above but have no freehand head sample.
       if (shapeKind) return;
       paintAttachPressure(stroke.points[0], event, stroke); // attach the head unconditionally; the function gates pressure/tilt/azimuth itself (a tilt-only head needs t/a too)
     }
@@ -71490,10 +71455,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (e.brush && e.brush.imageBrushRef) imageBrushReleaseAsset(e.brush.imageBrushRef).catch(imageBrushReportFailure);
       brushLibraryRenderGrid();
     }
-    // 타일 클릭 = 적용. applyCustomBrushPreset과 같은 규약: 툴 먼저(초크포인트), 들고 있는 필드만 복원.
-    // 도형 도구를 고른 채 적용하면 도구를 바꾸지 않는다 — 브러시에 적힌 도구(대개 pen)로 강제 전환하면 도형
-    // 도구로 연 라이브러리에서 펜으로 튕겨 나가 고른 브러시를 도형에서 확인할 수 없다. paintBrushSet 은 현재 도구
-    // 키에 쓰므로 도구를 그대로 두면 값이 그 슬롯에 들어간다(「툴 먼저」가 가리키는 성질).
+    // Tile click applies through the preset field setters. An active shape tool stays active,
+    // so its outline can use the selected brush without switching to the entry's pen/eraser tool.
+    // Pass that shape or the selected entry/preset tool explicitly to each field setter.
     // `opts.only` = 이 엔트리에서 적용할 필드 이름들(Set 또는 배열). 안 주면 전부. 커스텀 패널 프리셋이 쓴다 —
     // 프리셋은 「어느 도구를·어느 브러시로·몇 px」만 바꾸고 불투명도·손떨림·필압 같은 손맛은 사용자가 맞춘 채로
     // 둔다(사용자 판정). 라이브러리 창에서 직접 고르면 「이 브러시로 통째로 바꾼다」라 opts 없이 부른다.
@@ -71880,7 +71844,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         u32();                       // undetermined2
         const flag = u32();
         const pmin = i32();
-        // 기울기의 최소치도 이 자리다(pressure_curve_csp_parity 7 절의 「뜻 모를 +16」) — 사용자 CSP 화면(수채 평붓
+        // 기울기의 최소치도 이 자리다 — 사용자 CSP 화면(수채 평붓
         //   「기울기 최소치 100 · 최대치 300」)과 `.sut` 의 +16=100 · +40=300 이 맞는다.
         const tmin = i32();          // tMin
         const vmax = i32();         // vMax: 값은 보존하되 속도 정규화식은 미확정
@@ -72624,7 +72588,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // .sut Variant → the app's brush settings. Values are what the samples and the CSP probes showed; certain
     // values and estimates both go into `notes` (shown per entry in the brush library), and each axis records
     // whether it applies a measured rule, an approximation or no mapping.
-    // The call sequence below owns dependency order; the import golden also compares note order.
+    // The call sequence below owns dependency and note order.
     function brushLibraryApplySutVariant(brush, v, notes, preparedTip, tipPaths) {
       if (!v) return;
       const ctx = {
@@ -72985,6 +72949,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const key = refsKey();
       if (refsRt.key === key) return;
       refsRt.key = key;
+      refsStatus('');
       refsCloseViewer();
       refsResetThumbs();
       refsRt.selected.clear(); refsRt.anchor = ''; refsRt.lastTap = null;
@@ -73078,6 +73043,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       refsStatus(t('refs.importing', 0, files.length));
       await Promise.all(files.map(async function(file, order) {
         const r = await refsDecode(file, true);
+        if (owner.project !== state.project) return;
         refsStatus(t('refs.importing', ++done, files.length));
         if (!r.ok) { failed += 1; console.warn('[refs] import skipped', file.name, r.message); return; }
         const mime = r.blob ? r.blob.type : (file.type || bundleMimeFromFileName(file.name) || 'image/png');
@@ -74272,10 +74238,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 농도는 여기서 바꾸지 않는다: 반투명 dab을 source-over로 겹치면 진해져 dab 경계가 드러난다. 농도는
     // paintStampInkField가 불투명 회색 + lighten(=정확한 max)으로 맡는다. max라 겹쳐도 진해지지 않아 dab마다 다른
     // 농도를 줘도 안전하다.
-    // resume — 이 걷기는 세그먼트에 대한 left-fold다(세그먼트를 넘는 상태는 carry와 dabIndex 뿐). {seg, carry,
-    // dabIndex, firstEmitted}를 보관해 두면 점이 늘어난 같은 경로를 이어 걷는 것이 처음부터 다시 걷는 것과 비트 단위로
-    // 같다(지터도 dabIndex가 해시 좌표라 재현된다). 라이브 증분 세션(paintInkSessionStep)이 이걸로 프레임마다 새
-    // dab만 찍는다. 1점 시점에는 진행 방향이 없어, 라이브 세션은 첫 dab도 임시 꼬리로 두어 다음 점에서 다시 정한다.
+    // resume carries seg, carry, lead, dabIndex, firstEmitted and cached direction state between calls.
+    // paintInkSessionStep owns the stable prefix and mutable-tail replay. Reuse its complete walker record
+    // when continuing; dabIndex is also the deterministic jitter coordinate. With a single point there
+    // is no path direction yet, so the live session keeps the first dab in its mutable tail.
     // cb(x, y, d, rad, i, t, di) — d는 지터를 반영한 최종 지름, i/t는 경로상 위치, di는 dab 번호다.
     function paintWalkTipDabs(pts, radii, tip, cb, resume) {
       const n = pts.length;
@@ -74312,7 +74278,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
         }
         dabIndex += 1;
-        if (typeof paintDiagCur !== 'undefined' && paintDiagCur) paintDiagCur.dabs += 1;   // Typeof 가드: 골든이 이 함수만 잘라 돌려 전역이 없다
+        if (typeof paintDiagCur !== 'undefined' && paintDiagCur) paintDiagCur.dabs += 1; // Standalone kernel callers may omit diagnostic runtime.
         cb(x, y, d, rad, i, t, di);
       };
       // 진행 방향(`dir`)도 점 사이를 보간한다. 세그먼트 안에서 일정하게 두면 세그먼트가 바뀔 때 각도가 점프해, 붓끝이
@@ -74411,8 +74377,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 선을 만든다. 같은 조각을 짧은 간격으로 도장 찍으면 우글거림의 주기가 팁 길이가 아니라 간격에서 나와 CSP 와
     // 다른 그림이 된다.
     //
-    // 커널을 둘로 나눈 이유: 소비자가 둘(모양 스탬퍼·잉크 장)이고 같은 걷기를 써야 자리가 어긋나지 않는다.
-    // paintWalkTipDabs 가 dab 을 방출하는 것과 같은 규격이고, 이 함수도 아무것도 그리지 않는다.
+    // paintWalkRibbonPieces emits geometry for both shape and ink consumers; it draws nothing.
+    // paintDrawRibbonJoin below renders a piece. Keep the shared walk separate so their geometry agrees.
     // 팁 앞뒤에 붙이는 wrap 여백(px). 조각이 짧을수록 필요한 소스 확장이 커진다: srcSeam = seam × srcLen / L
     // 이고 L 은 선 폭에 비례하므로 가는 선에서 가장 크다(오버드로우 2px 기준).
     const PAINT_RIBBON_SRC_PAD = 16;
@@ -76580,10 +76546,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!ok || x0 === Infinity) return null;
       return { x0: x0, y0: y0, x1: x1, y1: y1 };
     }
-    // The one renderer for the body of a pressure-size stroke — conte's whole-path branch and genga's outline
-    // redraw both call it (a second copy would drop the tip branch in 原画, the mode the texture is for). The fifth
-    // argument is one tip options object: callers pass paintTipOptionsFrom(stroke|session) (conte drawPaintStroke /
-    // genga gengaPenOutlineRedraw).
+    // paintFillVariableWidthBody renders pressure-size stroke bodies for conte's whole-path branch
+    // and genga's outline redraw. Its fifth argument is opts, containing tip/grain/alphaFor and
+    // effect/live-output options. Callers derive tip settings with paintTipOptionsFrom(stroke|session)
+    // rather than passing a tip object directly.
     // grain = paintGrainOptionsFrom()'s result + paper origin ({id,depth,scale,originX,originY}) or null. Grain
     // applies to the finished shape as a whole whether or not there's a tip (paper is not a property of the
     // tip), so when it's on this renders into an isolated scratch, masks it with destination-in, then blits the
@@ -76591,10 +76557,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // globalAlpha/composite op, so the eraser (destination-out) erases with the grain baked in too. originX/Y
     // anchor the pattern to the paper, not the stroke, so overlapping strokes share the same grain (CSP's
     // behaviour).
-    // `alphaFor`(筆圧→不透明度)는 마스크가 아니다. 켜져 있으면 스트로크 전체가 잉크 장(paintStampInkField)으로
-    // 만들어진다. dab이 곧 브러시 팁이고, 그 팁의 알파에 필압 알파를 곱해 max로 쌓은 한 장이 모양이자 농도다(곱할
-    // 두 겹이 없으므로 제곱 문제도, 원/격자 얼룩도 없다). 종이결은 용지에 정렬한다. perDab이면 찍힘 안에서,
-    // 나머지는 완성 획에 적용한다.
+    // alphaFor supplies pressure alpha to the ink field, not a second coverage mask.
+    // paintStampInkField selects max/screen composition. Grain applies per dab when supported,
+    // otherwise to the completed stroke in paper coordinates. If field conversion fails,
+    // paintFillVariableWidthBody falls back to average alpha or shape-only output.
     // ── 획 진단 ─────────────────────────────────────────────────────────────────────────
     // 제보를 재현하려면 그 기기의 그 획이 필요하다: 필압이 어디까지 왔는지, 기울기·방위가 실제로 들어오는지, dab 이
     // 몇 개였는지, 어느 단계가 몇 ms 였는지. 외부에서 스파이를 심어 재면 측정 조건이 바뀌어 값이 왜곡된다(rAF 없이
@@ -76632,8 +76598,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (event) paintDiagSample(event); // document 캡처보다 늦게 시작하므로 down은 여기서 기록한다.
     }
     function paintDiagSample(ev) {
-      // 골든은 함수를 잘라서 돌린다. 이 함수만 실려 오고 위 `let` 이 안 오면 참조 자체가 예외가 되므로 typeof 로
-      //   먼저 막는다(진단은 없어도 그리기는 돌아야 한다).
+      // Standalone consumers may omit diagnostic globals; check typeof before touching them
+      // so omitted diagnostics never prevent drawing.
       if (typeof paintDiagCur === 'undefined') return;
       const c = paintDiagCur; if (!c || !ev || (c.pointerId != null && c.pointerId !== ev.pointerId)) return;
       // 이 리스너는 pointerdown 에도 걸려 있다(paintObservePressure) — move 만 센다.
@@ -76769,11 +76735,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try { showToast(line); } catch (err) {}
       try { paintDiagHudPush(c); } catch (err) {}   // 콘솔이 없는 기기(iPad)의 회수 채널
     }
-    // 「흰 세로선이 렌더 구역 경계인가」를 앱이 직접 대조한다.
-    //   구역 경계는 한 획에 수십~백 개가 불규칙하게 흩어져 있어 눈으로 맞추면 우연히 겹친다. 그림에서 밝은 세로
-    //   열을 찾아내고, 그 자리가 경계에 붙어 있는 비율을 같은 수의 무작위 자리와 비교한다(무작위보다 유의하게
-    //   높지 않으면 구역 경계는 원인이 아니다).
-    //   쓰는 법: 격자가 보이는 획을 긋고 `moartDiagStripes()`.
+    // Compare detected bright columns with reported render-region boundaries and a random baseline.
+    // This is an association probe, not a causal test: authored detail may align, and a missing
+    // association cannot exclude a renderer defect. Run moartDiagStripes() after recording a stroke.
     window.moartDiagStripes = function(tol) {
       const d = paintDiagLast;
       if (!d || !d.boxes || !d.boxes.length) return '먼저 moartDiag(true) 로 켜고 한 획 긋는다';
@@ -76827,9 +76791,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < R; i++) if (near(x0 + Math.floor(Math.random() * w))) rndHit++;
       const obs = stripes.length ? hit / stripes.length : 0;
       const exp = rndHit / R;
-      const verdict = !stripes.length ? '흰선을 못 찾았다(이 획에는 없다)'
-        : (obs > exp * 1.8 && obs > 0.5) ? '★구역 경계와 일치 — 렌더 구역이 원인이다'
-        : '구역 경계와 무관 — 다른 계통이다';
+      const verdict = !stripes.length ? '이 기준으로 흰선을 찾지 못했다'
+        : (obs > exp * 1.8 && obs > 0.5) ? '구역 경계와 위치가 겹침 — 원인 추가 확인 필요'
+        : '구역 경계와 위치 연관을 확인하지 못함';
       return { 획범위: [x0, y0, w, h], '흰선 x': stripes, '흰선 수': stripes.length,
                '경계에 붙은 비율': +(obs * 100).toFixed(0) + '%', '무작위였다면': +(exp * 100).toFixed(0) + '%',
                '구역 경계 수': ek.length, 판정: verdict };
@@ -77308,12 +77272,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const { x: wx, y: wy, w: ww, h: wh } = work;
       const w = sc.cv.width, h = sc.cv.height;
       // ── 水彩境界 ─────────────────────────────────────────────────────────────────────────────
-      // 완성된 획 모양의 가장자리 안쪽 R px 띠를 한 번 더 겹쳐 진하게 한다.
-      // · 침식: Canvas2D 에 erode 가 없으므로 8 방향 offset 의 destination-in 교집합으로 만든다. 프레임마다
-      // 작업 구역 전체를 처리한다. dab 단위 종이결과는 별도 비용이다.
-      // · 띠 = 모양 − 침식(destination-out). 그 띠를 알파 `fill` 로 모양 위에 source-over 하면 a' = a +
-      // (1−a)·fill 이 되어 CSP 단면(본체 0.506 → 띠 0.682)이 그대로 재현된다.
-      // · 띠의 알파는 획 모양에서 얻고 색은 아래에서 현재 획 색으로 채운다.
+      // CSP mode applies paintWaterEdgeCsp's pixel formula to a padded readback.
+      // The non-CSP branch instead saturates alpha, erodes it with eight offset draws, subtracts
+      // that mask, colors the boundary and overlays it once with wEdge.fill.
       // 수채 경계일 때 incOk가 부분 후처리를 막는다. 획 전체의 원래 알파에 종이결을 적용한 sc를 읽어야 한다.
       // paintStrokeWantsWholePath는 이 함수로 보내는 판정이며, liveHost의 dab 누적이나 sc.reused를 끄는 판정은
       // 아니다.
@@ -77393,7 +77354,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintFillVariableWidthBody(ctx, pts, radii, color, opts) {
       opts = opts || {};
-      const diagOn = (typeof paintDiagCur !== 'undefined') && paintDiagCur;   // Typeof 가드(골든 자립성)
+      const diagOn = (typeof paintDiagCur !== 'undefined') && paintDiagCur; // Diagnostics are optional for standalone kernel callers.
       const diagT0 = diagOn ? performance.now() : 0;
       if (diagOn) {
         // fill 호출 간격이다. 실제 화면 표시 간격이나 입력→표시 지연은 별도 계측해야 한다.
@@ -77819,10 +77780,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       s.tailBox = null;
       return box;
     }
-    // 라이브 증분 세션을 이어 그릴 수 있는 호스트인가. 도형과 Shift 직선은 매 프레임 점 배열을 처음부터 다시 만들어
-    // 개수가 안 늘거나 줄기까지 한다. 세션은 `n >= s.done` 을 「새로 찍을 것이 없다」로 읽으므로 그림이 첫 프레임에서
-    // 굳는다. 세 호출부(콘티 라이브 · 用紙 페이지 · 원화 펜)가 모두, 조건이 하나뿐인 호출부도 이 커널을 거친다(자기
-    // 자리에서만 맞는 조건식이 다음 표면을 빠뜨린다). 아래 색(mixBase)은 여기서 안 본다 — 별개의 명제다.
+    // A live host retains a freehand path's stable prefix; shapes and Shift replacements rebuild
+    // geometry and must not borrow that session. n >= s.done is append eligibility, not a no-change
+    // test: pointRevision/final also participate in paintInkSessionStep. Each live builder uses this
+    // gate; the pre-stroke base for mixing (mixBase) is a separate ownership question.
     function paintIncrementalInkHost(host, shapeKind, shiftLine) {
       if (!host || shapeKind || shiftLine === true) return null;
       return host;
@@ -78417,7 +78378,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // ## SECTION: BRUSH IMPORT — minimal tar reader (a .sut's MaterialFile.FileData BLOB is a plain tar
     // archive). POSIX ustar: 512-byte header per entry (name/size/typeflag fields at fixed offsets, size is
     // octal ASCII) + ceil(size/512)*512 bytes of data, ending at two all-zero blocks. ustar's `prefix` field
-    // (long-path extension) is honored; GNU longname (typeflag 'L') is not — .sut tar members don't use it,
+    // (long-path extension) is honored; GNU longname (typeflag 'L') is not — the sampled .sut archives did not require it,
     // and this only reads .sut archives, not arbitrary tarballs.
     //
     // 이 섹션은 아래 세 함수(tarParseOctal/tarReadNullTerminated/tarReadEntries)로 끝난다. 그 뒤는 tar와 무관한
@@ -79819,11 +79780,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 콘텐츠 주소 디코드 캐시, 썸네일, 그리고 "이 drawingRef를 어느 캔버스 엘리먼트에 그려야 하는가"의 해석.
     // 페인트 커널이 아니라 저장·표시 계층이라 별도 섹션이다.
     // ===========================================================================================
-    // Content-addressed decode cache. drawing.version changes on every commit and every undo, so a
-    // version-keyed cache could never hit on undo — the repaint would wait on a fresh async decode, and any
-    // rebuilt canvas (the video preview rebuilds its layer stack) would sit blank meanwhile (undo flicker).
-    // Content key = dataUrl length + base64 tail + rect: undo restores an already decoded bitmap →
-    // synchronous paint, regardless of element rebuilds.
+    // Preview decoding uses layerDrawingContentKey: live-canvas identity when present, otherwise
+    // ref + URL length/tail + bitmap rect. An already decoded source can be reused across undo or
+    // rebuilt DOM; cache misses still decode asynchronously. Live pixels need no PNG serialization
+    // just to obtain this key.
     // ── canvas-backed layer bitmaps with lazy dataUrl serialization ─────────────────────────────────
     // A synchronous sourceCanvas.toDataURL('image/png') on stroke commit costs milliseconds at 480 and a
     // multi-frame freeze at 2480x3485, blocking higher canvas resolutions. At commit we keep only a canvas
@@ -80047,9 +80007,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const rect = layerDrawingBitmapRect(drawing);
         const cameraTarget = canvas.closest('.video-preview-camera-target');
         const bokehR = previewBokehRadius480(canvas.dataset.conteLayerId || '', cameraTarget && cameraTarget.dataset.cameraCutId);
-        // Content-addressed (version-free) — the cache key is the raw bitmap identity; the
-        // per-canvas dedup key additionally carries the bokeh radius (bokeh changes how the same
-        // bitmap is painted, but not the decoded image itself).
+        // Source reuse is version-free. The per-canvas key also includes rounded bokeh radius
+        // and paper/frame geometry, which change the projection without changing the decoded image.
         const contentKey = rendered ? rendered.key : layerDrawingContentKey(ref, drawing);
         const key = contentKey + ':bk' + Math.round(bokehR * 10) + ':' + JSON.stringify([geometry.paper, geometry.frame]);
         // This canvas already shows this exact bitmap → nothing to do. Skips a needless async re-decode for
@@ -80085,9 +80044,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           paint(liveBitmap);
           return;
         }
-        // A decoded image for this exact bitmap is cached → paint it synchronously, so a freshly (re)created
-        // canvas never flashes blank during an async decode. The content-addressed cache also hits on undo/redo
-        // (restored bitmaps were decoded when first shown).
+        // Reuse a matching decoded image synchronously; otherwise preserve the surface while decoding below.
         const cachedImage = cachedLayerPreviewImage(contentKey);
         if (cachedImage) {
           paint(cachedImage);
@@ -80137,7 +80094,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (startDecode) decodeEntry.image.src = drawing.bitmapDataUrl;
         return decodeEntry.done;
       } else {
-        // Content-addressed cache needs no per-ref eviction here (bounded LRU handles it)
+        // Decode cache needs no per-ref eviction here (bounded LRU handles it)
         resetLayerCanvasBitmapGeometry(canvas, geometry); // also sizes the canvas to the paper
         const ctx = canvas.getContext('2d');
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -84863,7 +84820,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function drawPaintStampPreviewOverlay(ctx, preview, paper) {
       const stamp = state.paintStamp;
       if (!ctx || !preview || !stamp || !stamp.image || !preview.point) return;
-      const x = conteNormToPlaneX(preview.point.x, paper) - stamp.width / 2; // overlay ctx = layer space
+      const x = conteNormToPlaneX(preview.point.x, paper) - stamp.width / 2; // overlay ctx = paper plane
       const y = conteNormToPlaneY(preview.point.y, paper) - stamp.height / 2;
       ctx.save();
       ctx.globalAlpha = STAMP_PREVIEW_ALPHA;
@@ -84871,16 +84828,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.restore();
     }
 
-    // Stage-level selection overlay (genga parity). All selection UI — marquee, lasso preview, transform box +
-    // handles, live transform preview, stamp preview — draws on one screen-covering canvas
-    // (#videoPaintStageOverlay, a child of .editor-stage) in layer space, so it is visible anywhere in the
-    // viewport, with no per-layer pad clip. The layer→backing transform is derived purely from the frame element's
-    // gBCR relative to the overlay's own gBCR (both in the same CSS-zoom context, so the Chromium-vs-WebKit
-    // gBCR-under-zoom difference cancels — no pointer math, no uiReadScale needed), so it stays aligned on both
-    // engines. Every inner draw (drawPaintMaskOutline / drawPaintTransformOverlay /
-    // drawPaintStampPreviewOverlay) works in layer coords, so they are reused unchanged.
-    // The overlay canvas is a persistent child of the preview screen (.editor-stage — the whole dark
-    // viewport, genga .genga-preview parity). Survives cut/mode rebuilds; drawn only in video edit mode.
+    // Stage-level selection overlay (genga parity): marquee, lasso, transform box/preview and stamp preview
+    // share canvas.video-paint-stage-overlay under .editor-stage, covering the viewport without per-layer pad clip.
+    // The base paper-to-backing projection compares .conte-paper and overlay rectangles in the same zoom
+    // context. Rotated paper dimensions also use the shared rectangle divisor before view flip/rotation.
+    // Each draw branch owns its paper or FX-local coordinates and any FX context; the base projection
+    // does not apply layer FX to the global paper stencil.
+    // The canvas survives cut/mode rebuilds and draws only in video-edit mode.
     function ensureVideoStageOverlayCanvas() {
       const stage = document.querySelector('.editor-stage');
       if (!stage) return null;
@@ -84935,7 +84889,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const ctx = canvas.getContext('2d');
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, backW, backH);
-      // frame rect in overlay backing px (both gBCRs share the same visual/zoom space → normalize by the
+      // Paper rect in overlay backing px (both gBCRs share the same rectangle space → normalize by the
       // overlay's own backing/visual ratio, engine-agnostic).
       const sx = backW / oRect.width, sy = backH / oRect.height;
       // 회전이 걸리면 gBCR 은 회전 bbox 라 종이보다 크다 — 그 폭·위치로 좌표계를 세우면
@@ -84945,14 +84899,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const uzo = uiReadScale() || 1;
       const fpw = (paperEl.offsetWidth || paperRect.width / uzo) * uzo, fph = (paperEl.offsetHeight || paperRect.height / uzo) * uzo;
       const fcx = paperRect.left + paperRect.width / 2, fcy = paperRect.top + paperRect.height / 2;
-      // The paper's layer rect from the canonical norm→layer mapping (norm 0/1 = paper edges; fRect above comes
-      // from .conte-paper). The f*-prefixed locals hold paper values (the anchor is the paper, not the camera
-      // frame).
+      // Canonical normalized-to-paper mapping: norm 0/1 are the paper edges. The f*-prefixed locals hold
+      // paper values; their anchor is .conte-paper, not the camera frame.
       const fx0 = conteNormToPlaneX(0, geometry.paper), flw = conteNormToPlaneX(1, geometry.paper) - fx0;
       const fy0 = conteNormToPlaneY(0, geometry.paper), flh = conteNormToPlaneY(1, geometry.paper) - fy0;
       if (!(flw > 0) || !(flh > 0)) return;
       const scaleX = fpw / flw, scaleY = fph / flh;   // layer px → display px
-      // enter layer space (draw layer coords directly; inner draws reused unchanged)
+      // Enter the paper plane; local-target preview branches apply FX below.
       // Mirror the horizontal axis about the paper's centre, not the overlay's — the overlay spans the whole
       // viewport while the paper is a box inside it, so mirroring about the wrong one puts every handle on the
       // far side of the screen. The paper centre and backing size define that box.
@@ -85117,8 +85070,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // 이 조각을 닫아도 되는가 — 끝이 시작의 8이웃일 때만. 어떤 추적을 쓰든 참이어야 하는 계약이라
     // 마퀴를 그리는 두 자리(콘티·원화)가 같은 판정을 쓴다. 열린 조각을 닫으면 가짜 선분이 생긴다.
-    // 걷기는 경계 픽셀을 전부 어떤 조각엔가 담는다(점 하나짜리 조각 포함 — 커널이 점으로 찍는다). 열린
-    // 조각을 안 닫아서 잃는 것은 대시 위상의 연속성과 조각 끝 사이의 한 칸이다.
     function paintMaskContourClosed(path) {
       if (!path || path.length < 6) return false;
       return Math.abs(path[0] - path[path.length - 2]) <= 1
@@ -85137,7 +85088,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // · 세그먼트를 1px 간격으로 채운다 — 윤곽 「점마다」 하나씩 찍으면 확대할 때 점 사이가 1px 보다 벌어져
     // 대시가 이어지지 않고 점으로 보인다. 화면 거리로 걸으면 배율과 무관하게 대시가 이어진다.
     // mapPoint(x, y) → 오버레이 좌표. 생략하면 마스크 좌표를 그대로 쓴다. pts = ctx 의 현재 좌표계 기준 {x,y}
-    // 배열. dash=false 면 실선(그리는 중).
+    // 배열. dash=false 면 실선(그리는 중). 열린 선분의 마지막 끝점도 같은 대시 위상으로 찍는다.
     // 확정 마퀴가 화면 어디에 그려졌는가도 여기서 모은다 — 選択解除 버튼을 선택영역 옆에 두려면 그 답이
     // 필요한데, 좌표 수학을 새로 짜면 갈라진다(두 엔진 × 팬/줌 × 변형 쿼드 × UI 배율). 이 커널은 양 엔진의
     // 확정/진행 마퀴를 모두 그리고 그리기 직전에 점을 디바이스 px 로 변환하므로 그 값을 상자로 모으기만
@@ -85177,7 +85128,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const dx = bx - ax, dy = by - ay;
         const len = Math.sqrt(dx * dx + dy * dy);
         const steps = Math.max(1, Math.ceil(len));
-        for (let k = 0; k < steps; k += 1) {
+        const samples = steps + (!closed && i === last - 1 ? 1 : 0);
+        for (let k = 0; k < samples; k += 1) {
           const t = k / steps;
           const qx = Math.round(ax + dx * t), qy = Math.round(ay + dy * t);
           if (!dash || (phase % period) < MARQUEE_DASH_ON) {
@@ -90182,14 +90134,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       win.style.setProperty('--paint-window-w', w + 'px');
     }
 
-    // One clamp box, all inputs local. A clamp of
-    // maxX = window.innerWidth − rect.width − 8
-    // fed to a CSS-var position mixes three different spaces the moment UIサイズ≠100%: innerWidth is physical
-    // viewport px on both engines, rect.width is physical on Chromium (zoom is multiplied into gBCR) but local
-    // on WebKit, and the CSS var is consumed as local px inside the zoomed subtree. At 85% on a 1920 screen the
-    // right ~309 local px would be unreachable (windows snap back on release); at 125% they could leave the
-    // screen — on iPad too, because innerWidth is physical there as well. So: rect/uiReadScale() (÷zoom on
-    // Chromium, ÷1 on WebKit) against uiLocalViewportW/H() (=inner/uiScale).
+    // Raw gBCR input; sizes and clamp limits returned in local px. Normalize rect sizes with uiReadScale()
+    // and viewport dimensions with uiLocalViewportW/H(), as defined by the shared UI-scale contract.
+    // Do not use innerWidth minus raw rect.width directly as a local-px clamp under UI scaling.
     function localWindowClampBox(rect, floorW, floorH, defW, defH) {
       const uz = uiReadScale();
       const width = Math.max(floorW, Math.round((rect.width / uz) || defW));
@@ -95017,7 +94964,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Enter while the Transform / Perspective tool is active = Apply (same as the panel's Apply button), not a
     // re-trigger of the focused tool button.
     function handlePaintTransformEnterKey(event) {
-      if (event.key !== 'Enter' || event.ctrlKey || event.metaKey || event.altKey) return false;
+      if (event.key !== 'Enter' || isImeEnter(event) || event.ctrlKey || event.metaKey || event.altKey) return false;
       if (isTypingTarget(event.target)) return false;
       const tool = state.paintEditTool;
       if (tool !== 'transform' && tool !== 'perspective') return false;
@@ -95116,7 +95063,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (isTypingTarget(event.target)) return false; // don't hijack the instance-value inline edit
       // Enter 는 변형 도구에서만 변형을 건다(콘티 handlePaintTransformEnterKey 와 같다) — 펜으로 선택 안을 칠하다 누른
       // Enter 가 보이지 않는 지난 변형을 굽지 않게.
-      if (event.key === 'Enter' && (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective')) { event.preventDefault(); event.stopImmediatePropagation(); gengaApplySelectionTransform(); return true; } // 눈앞의 대상에 적용
+      if (event.key === 'Enter' && !isImeEnter(event) && !event.ctrlKey && !event.metaKey && !event.altKey && (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective')) { event.preventDefault(); event.stopImmediatePropagation(); gengaApplySelectionTransform(); return true; } // 눈앞의 대상에 적용
       if (event.key === 'Escape') {
         event.preventDefault(); event.stopImmediatePropagation();
         // 미확정 변형이 있으면 먼저 그것만 취소한다(선택은 남는다, PS·CSP). 다음 Esc 가 선택을 푼다 — Undo 로 되살릴 수
@@ -95258,10 +95205,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function handlePaintKeydown(event) {
       if (event.defaultPrevented) return;
       if (event.key === 'Escape' && !event.isComposing && !isTypingTarget(event.target) && state.paintEditTool === 'text-stamp') { event.preventDefault(); setActivePaintTool('pen'); return; }
-      // Local controls and native activation own their keys before canvas selection/pan handlers.
+      // Local controls keep native activation; transform command Enter belongs to Apply below.
       if ((event.key === ' ' || event.key === 'Enter') && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey &&
           event.target && event.target.closest) {
-        if (event.target.closest('button, summary, input[type="button"], input[type="submit"], input[type="reset"]')) return;
+        const command = event.target.closest('button, summary, input[type="button"], input[type="submit"], input[type="reset"]');
+        const transformCommand = event.key === 'Enter' && !isImeEnter(event) &&
+          ((state.paintEditTool === 'transform' && command && command.matches('#paintTransformApplyBtn, #paintTransformResetBtn')) ||
+           (state.paintEditTool === 'perspective' && command && command.matches('#paintPerspectiveApplyBtn, #paintPerspectiveResetBtn')));
+        if (command && !transformCommand) return;
         if (event.key === ' ' && event.target.closest('input[type="checkbox"], input[type="radio"]')) return;
       }
       if (cancelInProgressLassoOnEscape(event)) { event.preventDefault(); return; }
@@ -117810,11 +117761,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return ' data-genga-window-start="' + start + '" data-genga-window-end="' + end + '"';
     }
     function gengaCellW() { return timelineZoomValue(state.gengaCellW, 8, 64, GENGA_BASE_CELL_W); }
-    // One genga timeline pointer→frame/cell normalization, shared by the ruler and every drag handler.
-    // gengaCellW() is a stored local-px config, so a viewport-px pointer read/delta must be divided by
-    // uiReadScale() before dividing by the cell width — Chromium reflects the CSS ui-zoom in clientX/gBCR,
-    // WebKit does not (uiReadScale()==1 on iPad, so this only corrects the Chromium/Wacom UI-scale≠100%
-    // case). Routing the ruler and the drags through these keeps them from diverging.
+    // Shared pointer-to-frame/cell conversions for the ruler and drag handlers.
+    // uiPointerX matches the raw rectangle space before uiReadScale normalizes the difference; gengaCellW
+    // is local px. The signed delta helper follows the corresponding linear conversion.
     function gengaFrameAtClientX(clientX, rectLeft) { return Math.floor((uiPointerX(clientX) - rectLeft) / uiReadScale() / gengaCellW()) + 1; } // pointer→rect space; 1-based frame at a viewport X
     function gengaCellsAtClientX(clientX, rectLeft) { return Math.floor((uiPointerX(clientX) - rectLeft) / uiReadScale() / gengaCellW()); }    // pointer→rect space; 0-based cell index (no +1)
     function gengaCellDelta(dxViewport) { return Math.round(uiPointerX(dxViewport) / uiReadScale() / gengaCellW()); }                          // pointer delta→local; signed cell count for a viewport-px drag delta
@@ -125709,8 +125658,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const dbg = gl.getExtension('WEBGL_debug_renderer_info');
           // 확장이 없으면 마스킹된 `gl.RENDERER` 라도 읽는다 — 마스킹 문자열은 소프트웨어 이름을 담지 않으므로
           // 그 경우의 답은 unknown 이다.
-          const r = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || '') || 'masked';
-          probe = { renderer: r, backend: SOFTWARE_RENDERER_RE.test(r) ? 'software' : (dbg ? 'gpu' : 'unknown') };
+          const r = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || '');
+          probe = { renderer: r || 'masked', backend: SOFTWARE_RENDERER_RE.test(r) ? 'software' : (dbg && r ? 'gpu' : 'unknown') };
         }
       } catch (e) { probe = { renderer: 'probe failed', backend: 'unknown' }; }
       _gpuProbe = probe;
