@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3032</title>
+  <title>MoArt ver3033</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -4248,7 +4248,7 @@
       width: var(--ctl-btn-w);
       min-width: var(--ctl-btn-w);
       /* 높이는 --ctl-h — 이 버튼이 더 높으면 콘티 타임라인 topbar 가 창 머리 규격(--win-head-h 20)을 벗어난다.
-         폭 24 는 글리프가 앉는 자리다. */
+         폭(--ctl-btn-w 22)은 글리프가 앉는 자리다. */
       height: var(--ctl-h);
       min-height: var(--ctl-h);
       padding: 0;
@@ -14969,12 +14969,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           zh: function(name, frame) { return '已将 ' + name + ' 放在第 ' + frame + ' 格。'; }
         },
         'msg.genga.tvppImport.decoding': { ja: '絵を展開中', ko: '그림 푸는 중', en: 'Decoding drawings', zh: '正在解码画稿' },
-        // 「遅い」ではなく「粗くなる」— 予算不足は速度ではなく表示の精細さに出る
+        // 予算不足は精細さではなく速度（再デコード）に出る — 縮小コピーは無い
         'msg.genga.heavyPaper': {
-          ja: function(need, budget) { return '用紙が大きい作品です（1コマ ' + need + 'MB / 表示用の上限 ' + budget + 'MB）。表示は縮小した絵で描かれるので、拡大するとやや粗く見えます。'; },
-          ko: function(need, budget) { return '용지가 큰 작품입니다(한 코마 ' + need + 'MB / 표시용 상한 ' + budget + 'MB). 표시는 축소한 그림으로 그려지므로 확대하면 다소 거칠게 보입니다.'; },
-          en: function(need, budget) { return 'This project has large paper (' + need + 'MB per frame vs a ' + budget + 'MB display budget). Drawings are shown from downscaled copies, so zooming in looks softer.'; },
-          zh: function(need, budget) { return '此项目画布较大（每帧 ' + need + 'MB，显示预算 ' + budget + 'MB）。显示使用缩小后的副本，放大时会略显粗糙。'; } },
+          ja: function(need, budget) { return '用紙が大きい作品です（1コマ最大 ' + need + 'MB / 表示用の上限 ' + budget + 'MB）。コマ移動や再生で絵の表示が遅れることがあります。'; },
+          ko: function(need, budget) { return '용지가 큰 작품입니다(한 코마 최대 ' + need + 'MB / 표시용 상한 ' + budget + 'MB). 코마 이동·재생 때 그림 표시가 늦어질 수 있습니다.'; },
+          en: function(need, budget) { return 'This project has large paper (up to ' + need + 'MB per frame vs a ' + budget + 'MB display budget). Drawings may appear late when changing frames or playing.'; },
+          zh: function(need, budget) { return '此项目画布较大（每帧最多 ' + need + 'MB，显示预算 ' + budget + 'MB）。切换帧或播放时画稿可能显示较慢。'; } },
         'msg.genga.tvppImport.empty': { ja: '絵のあるレイヤーが見つかりませんでした。', ko: '그림이 있는 레이어를 찾지 못했습니다.', en: 'No layer with drawings was found.', zh: '未找到含有画的图层。' },
         'msg.genga.clipImport.inbetweenSkipped': {
           ja: function(n) { return '中割り点' + n + '個はコマ先頭または露出外のため取り込めませんでした。'; },
@@ -23191,10 +23191,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!keyframes.length) return [];
       const normalized = keyframes.map(function(keyframe) {
         const transform = normalizedCameraFrameTransform(keyframe);
-        return Object.assign({}, transform, {
+        return copyKeyInterp(keyframe, Object.assign({}, transform, {
           id: String(keyframe && keyframe.id || ''),
           frame: Math.max(0, Math.round(Number(keyframe && keyframe.frame) || 0))
-        });
+        }));
       });
       return cameraKeyframesHaveWork(normalized) ? normalized : [];
     }
@@ -23595,9 +23595,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return cameraRectCorners(cameraFrameTransformToFrameRect(transform, frame));
     }
 
-    // Paper presentation only: linear rect interpolation + shortest-angle rotation, exactly the
-    // lerpCameraRect kernel used by playback. Time spacing changes speed, not the continuous sweep.
-    // Conte has no hold/easing switch in that kernel; equal transforms are a stationary hold.
+    // Paper presentation only: linear rect interpolation + absolute-angle rotation, exactly the
+    // lerpCameraRect kernel used by playback. Easing changes speed along the same path, not the swept area.
+    // A 'hold' segment (the earlier key's interp) stays on its first rect and jumps to the next, so it
+    // contributes only its two end rects (user decision: the paper shows no band for a FIX). Equal
+    // transforms are stationary too.
     // Bounds need only a curvature-bounded sampling pass. The heavier union path is lazy and lives
     // on this bounds object, never in a permanent cache or in saved project data.
     function cameraPaperSweep(keyframes, frame) {
@@ -23606,8 +23608,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const tolerance = radius / 1024;
       let minX = 0, minY = 0, maxX = frame.w, maxY = frame.h;
       const segments = [];
+      const addCorners = function(rect, error) {
+        cameraRectCorners(rect).forEach(function(p) {
+          minX = Math.min(minX, p.x - error); minY = Math.min(minY, p.y - error);
+          maxX = Math.max(maxX, p.x + error); maxY = Math.max(maxY, p.y + error);
+        });
+      };
       rects.forEach(function(b, index) {
         const a = rects[Math.max(0, index - 1)];
+        if (index > 0 && keyInterpOf(keyframes[index - 1]) === 'hold') {
+          addCorners(a, 0); addCorners(b, 0);
+          segments.push({ a: a, b: a, pieces: 0 }, { a: b, b: b, pieces: 0 });
+          return;
+        }
         const angle = Math.abs(b.rotation - a.rotation);
         const r = Math.max(Math.hypot(a.w, a.h), Math.hypot(b.w, b.h)) / 2;
         const dr = Math.hypot(b.w - a.w, b.h - a.h) / 2;
@@ -23615,12 +23628,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const curvature = r * angle * angle + 2 * dr * angle;
         const count = Math.max(1, Math.ceil(Math.sqrt(curvature / (8 * tolerance))));
         const error = curvature / (8 * count * count);
-        for (let i = 0; i <= count; i++) {
-          cameraRectCorners(lerpCameraRect(a, b, i / count)).forEach(function(p) {
-            minX = Math.min(minX, p.x - error); minY = Math.min(minY, p.y - error);
-            maxX = Math.max(maxX, p.x + error); maxY = Math.max(maxY, p.y + error);
-          });
-        }
+        for (let i = 0; i <= count; i++) addCorners(lerpCameraRect(a, b, i / count), error);
         // Exact ruled edge patches below need only the corner chord error, not a first-order hull bound.
         segments.push({ a: a, b: b, pieces: count });
       });
@@ -24238,10 +24246,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 창 복원은 **프로젝트가 선 뒤** 한 번이다. 시작 화면에서 되살리면 아직 열지도 않은
       // 프로젝트 위로 도구창이 뜨고, 프로젝트 종류(conte/genga)를 몰라 없는 창까지 켜려 든다.
       if (state.projectActive) { try { restoreOpenWindowsOnce(); } catch (error) { console.warn('[window] 복원 진입 실패', error); } }
-      if (state.projectActive) { try { gengaNoticeHeavyPaper(); } catch (error) { console.warn('[genga] 무거운 용지 알림 실패 — 축소 표시를 말없이 지나친다', error); } }
+      if (state.projectActive) { try { gengaNoticeHeavyPaper(); } catch (error) { console.warn('[genga] 무거운 용지 알림 실패 — 알림 없이 지나간다', error); } }
     }
-    // **한 프레임이 디코드 예산에 안 들면 그 사실을 말한다.** 그런 프로젝트는 느려지는 대신 **표시가 축소본으로
-    // 바뀌어 확대할 때 거칠어진다** — 조용히 흐려지면 사용자는 이유를 모른다(조용한 실패 금지). 큰 용지 × 여러
+    // **한 프레임이 디코드 예산에 안 들면 그 사실을 말한다.** 축소 사본은 없으므로 표시가 흐려지지 않는 대신
+    // 디코드 캐시가 밀려 코마 이동·재생이 느려진다 — 조용히 느려지면 사용자는 이유를 모른다(조용한 실패 금지). 큰 용지 × 여러
     // 레이어면 한 프레임이 예산을 넘는다. 무게는 **레이어마다 가장 큰 그림**의 합이다 — 어느 프레임이 최악인지
     // 전부 훑지 않고도 그 상한을 준다.
     let gengaHeavyPaperNoticedFor = '';
@@ -24271,7 +24279,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       gengaHeavyPaperNoticedFor = id;
       const needMb = Math.round(w.bytes / 1048576), budMb = Math.round(budget / 1048576);
       console.warn('[paperWeight] one frame needs ' + needMb + 'MB of decoded pixels but the image cache budget is '
-        + budMb + 'MB - display falls back to downscaled copies (sharpness, not speed)');
+        + budMb + 'MB - frames re-decode from the originals (speed, not sharpness)');
       showToast(t('msg.genga.heavyPaper', needMb, budMb));
     }
 
@@ -24736,6 +24744,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 하지 말 것 — 독자가 다르면 같은 사실이라도 문장이 달라진다. **새 판을 내면 맨 앞에 한 항목을
     // 더한다**(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3033, items: [{ja: '大きい用紙の作品で出る案内の文言を、実際の動作（コマ移動や再生で絵の表示が遅れることがある）に合わせました。', ko: '큰 용지 작품에서 뜨는 안내 문구를 실제 동작(코마 이동·재생 때 그림 표시가 늦어질 수 있음)에 맞췄습니다.', en: 'The large-paper notice now says what actually happens: drawings may appear late when changing frames or playing.', zh: '大画布作品的提示改为实际情况：切换帧或播放时画稿可能显示较慢。'}, {ja: '絵コンテ用紙のカメラ軌跡で、停止（ホールド）区間を移動の帯として描かず、前後の枠だけを表示するようにしました。', ko: '콘티 용지의 카메라 궤적에서 정지(홀드) 구간을 이동 띠로 그리지 않고 앞뒤 틀만 표시합니다.', en: 'Storyboard paper camera trails no longer draw a moving band across hold segments; only the frames at each end are shown.', zh: '分镜纸的摄像机轨迹不再把停止（保持）区间画成移动带，只显示前后两个框。'}, {ja: '1ピクセルだけの選択や斜めにつながった小さな選択で、欠けていた選択範囲の点線も表示されるようにしました。', ko: '1픽셀짜리 선택이나 대각선으로 이어진 작은 선택에서 빠지던 선택 점선을 표시합니다.', en: 'Selection outlines now show the single-pixel pieces they used to skip, as in one-pixel or diagonally connected selections.', zh: '单像素选择及斜向相连的小选择中原先缺失的选区虚线现在也会显示。'}, {ja: 'レイヤーを結合した後の塗りで、結合前の塗り情報を確認なしに使わないようにしました。', ko: '레이어를 합친 뒤 채색할 때 합치기 전 채색 정보를 확인 없이 다시 쓰지 않게 했습니다.', en: 'Fill after merging layers no longer reuses the pre-merge fill data without asking.', zh: '合并图层后上色时，不再未经确认就沿用合并前的上色数据。'}, {ja: '韓国語のCSVシートを読み込むときの文字コード判別で、韓国語キーワードの重みをAuto Sheetに合わせました。', ko: '한국어 CSV 시트를 가져올 때 문자 인코딩 판별의 한국어 키워드 가중치를 Auto Sheet와 맞췄습니다.', en: 'Korean CSV sheet import now weighs Korean keywords like Auto Sheet when detecting text encoding.', zh: '导入韩文CSV时间表时，文字编码判别中的韩文关键词权重已与Auto Sheet一致。'}] },
       { ver: 3032, items: [{ja: 'タイムライン表示更新後に残るドラッグと、古いホイールズーム予約の反映を修正しました。', ko: '타임라인 표시 갱신 뒤 남는 드래그와 이전 휠 줌 예약의 반영을 고쳤습니다.', en: 'Fixed timeline drags surviving control rebuilds and outdated wheel zoom updates.', zh: '修复时间轴控件重建后残留拖动及过期滚轮缩放更新。'}] },
       { ver: 3031, items: [{ja: '絵コンテの行移動や時間端の操作中に表示が更新されても、タイムラインを閉じた後にドラッグが残らないようにしました。', ko: '콘티 행 이동·시간 경계 조절 중 표시가 갱신돼도 타임라인을 접은 뒤 드래그가 남지 않게 했습니다.', en: 'Storyboard row and time-edge drags now end when the timeline is collapsed, including after its controls are rebuilt.', zh: '分镜行移动与时间边缘拖动在控件重建后折叠时间轴时也会结束。'}] },
       { ver: 3030, items: [{ja: 'スマートフォンのインスペクターで本文と下部をまとめてスクロールでき、低い表示でも各項目へ移動できるようにしました。', ko: '폰 인스펙터의 본문과 하단을 함께 스크롤해 낮은 화면에서도 각 항목에 접근할 수 있게 했습니다.', en: 'The phone inspector now scrolls its content and footer together so fields remain reachable in short views.', zh: '手机属性面板的正文与底部现在统一滚动，较矮视口中也可访问各项。'}] },
@@ -29372,7 +29381,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const safe = Array.from(dlg.querySelectorAll('button[value]')).find(function(button) {
           return (button.value || fallback) === fallback;
         });
-        // 파괴적 선택지가 없으면 Enter 가 주 버튼이다(HIG). 파괴적인 것이 있으면 지금처럼 안전한 쪽(취소)에 둔다.
+        // 파괴적 선택지가 없으면 Enter 가 주 버튼이다(HIG). 파괴적인 것이 있으면 안전한 쪽(fallback, 보통 취소)에 둔다.
         const primary = !choices.some(function(c) { return c.danger; }) && dlg.querySelector('button.primary');
         (primary || safe || { focus: function() {} }).focus();
         const answer = await pending;
@@ -32884,7 +32893,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                    d.bitmapX = b.rect.x; d.bitmapY = b.rect.y;
                    d.bitmapWidth = b.rect.w; d.bitmapHeight = b.rect.h;
                    delete d.fxOriginX; delete d.fxOriginY;
-                   d.bitmapStorage = null; d.version = (Number(d.version) || 0) + 1; }
+                   d.bitmapStorage = null; d.version = (Number(d.version) || 0) + 1;
+                   if (d.fillModel) d.fillModel = paintFillModelState(d.fillModel, 'stale'); }
           clearLayerLiveBitmap(b.ref);   // 옛 픽셀 캐시를 버린다 — after 스냅샷이 그것을 담기 전에
         });
         if (dropIds.length) {
@@ -40528,13 +40538,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 세로는 **바의 밑변**, 가로는 앵커의 왼쪽에 맞춘다(사용자 판정). 앵커의 아랫변이 아니다 — 버튼은 바 안에서
     // 위아래 여백을 가지므로, 앵커에 붙이면 메뉴가 바 **안쪽으로 파고든** 자리에 떠서 바 밑변과 어긋나 보인다.
     //
-    // 바는 런타임에 찾는다 — `#openWindowMenuBtn` 은 마크업상 `#stageToolbar` 안이지만 도킹 구조가 실제로는
-    // `header.topbar` 로 옮긴다. 못 찾으면 앵커 자신을 바로 삼는다.
+    // 바는 앵커에서 가장 가까운 머리줄(header.topbar · .pane-header · 타임라인 머리줄)이다. 못 찾으면 앵커
+    // 자신을 바로 삼는다.
     // zoom² 계약: gBCR 은 VISUAL px, style/offset* 은 LOCAL px 이라 uiReadScale() 로 나눈다.
     //
-    // **떠 있는 도구창(.draw-ui)은 바가 아니다.** 그 창들은 마크업상 `header.topbar` 안에 살면서 `position:
-    // fixed` 로 화면 아무 데나 떠 있다 — 바를 찾아 올라가면 **상단바**가 잡혀 팝오버가 버튼에서 멀리 떨어진
-    // 화면 맨 위에 뜬다. 바보다 먼저 만나면 거기서 멈춰 앵커 자신을 쓴다.
+    // **떠 있는 도구창(.draw-ui)은 바가 아니다.** 그 창들은 상단바 밖에서 `position: fixed` 로 뜨므로 그 안의
+    // 버튼은 앵커 자신을 쓴다. .draw-ui 에서 멈추는 것은 창이 바 안으로 다시 들어가도 **상단바**가 잡혀 팝오버가
+    // 화면 맨 위로 튀지 않게 하는 방어다(마크업의 도구창 주석).
     // **바는 「버튼이 여백을 갖고 늘어서는 줄」이다** — `--win-head-h` 를 쓰는 머리줄이 전부 여기 든다(타임라인
     // 머리줄 `.timeline-topbar` · `.genga-topbar` 포함). 빠지면 그 줄의 ⚙ 와 전구가 **버튼 밑변**에 붙어 줄
     // 밑변과 어긋나 보인다.
@@ -48595,7 +48605,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const rendering = renderConteVideoFrameToCanvas(scratch, frame, {
           outWidth: outWidth,
           cache: cache,
-          videoMedia: true,   // Composite the V1 footage under the layers (export does not pass this — q2)
+          videoMedia: true,   // Composite the V1 footage under the layers (export passes it too, with videoMediaSeek)
           subtitle: false,  // subtitles remain an export feature
           bold: false,      // live bold plates come from the DOM .preview-bold-layer (z-index above this
                             // canvas) — drawing them here too would double-render them at export positions,
@@ -66757,17 +66767,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (alt) { x0 = ax - dx; y0 = ay - dy; }
       return { x0: x0, y0: y0, x1: x1, y1: y1 };
     }
-    // 자유 브러시의 Shift 직선. 각도의 뜻은 도형 도구와 **같은 커널**(snapAngleRad, 15°)이지만
-    // 각도를 정하는 시점이 다르다 - 도형은 매 이동마다 스냅샷 위에 다시 그리므로 각도를 계속 갱신해도
-    // 되지만, 자유 브러시의 라이브 캔버스는 **누적**이라 이미 그린 획을 못 지운다. 매 프레임 스냅하면
-    // 손이 15° 넘게 흔들릴 때마다 새 각도의 직선이 하나씩 더 남아 부채꼴이 된다. 그래서 각도는 첫
+    // 자유 브러시의 Shift 직선. 각도는 자유각이고 가로·세로(90도 배수) 1도 안에서만 붙는다
+    // (snapAngleToQuarter · PAINT_LINE_QUARTER_SNAP_RAD — 도형 도구의 15° 스냅과 다르다). 각도를 정하는 시점도
+    // 다르다 - 도형은 매 이동마다 스냅샷 위에 다시 그리므로 각도를 계속 갱신해도 되지만, 자유 브러시의 라이브
+    // 캔버스는 **누적**이라 이미 그린 획을 못 지운다. 매 프레임 각도를 다시 정하면 손이 흔들릴 때마다
+    // 새 각도의 직선이 하나씩 더 남아 부채꼴이 된다. 그래서 각도는 첫
     // 유의미 이동에서 한 번 정해 **잠그고**, 그 뒤의 모든 점을 그 축에 정사영한다. 잠기기 전의 샘플은
     // 아예 버린다(null) - 그래야 각도가 정해지기 전의 곡선 토막이 캔버스에 남지 않는다.
     // 좌표계는 호출부가 맞춰서 넘긴다(sx/sy = 그 공간의 1 이 몇 픽셀인가). 각도는 픽셀 공간에서만 뜻이
     // 있고 conte 의 정규화 좌표는 비등방이라, 그대로 재면 45° 가 화면에서 45° 가 아니다.
     // 잠그기 전에 요구하는 이동거리(화면 기준). 짧을수록 선이 빨리 나오지만 각도가 손떨림에 휘둘린다 -
-    // 떨림 1px 에 대해 각도 오차는 atan(1/거리) 이고 15° 스냅의 허용은 ±7.5° 이므로, 10px 이면 오차가
-    // 5.7° 라 경계에서 자주 어긋나고 16px 이면 3.6° 로 떨어진다. 16px 은 손끝으로 거의 즉시 지나는
+    // 떨림 1px 에 대해 각도 오차는 atan(1/거리)라 10px 이면 5.7°, 16px 이면 3.6° 다 — 자유각에서는 이 오차가
+    // 곧 선의 기울기 오차이고 1° 정위치 판정도 흔든다. 16px 은 손끝으로 거의 즉시 지나는
     // 거리다. 그래도 어긋나면 Shift 를 뗐다 다시 누르면 그 자리에서 새 각도로 다시 잠긴다.
     const PAINT_SHIFT_LINE_ARM_SCREEN_PX = 16;
     // Shift 직선의 정위치 스냅 허용각 — 1도(사용자 판정). 뷰 회전의 VIEW_ROT_SNAP_RAD(5도)보다 좁다 — 그림은
@@ -69037,7 +69048,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       renderCustomPanelSlotsModal(); // render after openModal has set .open (renderCustomPanelSlotsModal guards on dlg.open)
     }
 
-    // Auto-draw the entry icon from the preset's own brush data (user decision — no manual icons). A circle
+    // Entry icon: a valid glyph picked in the preset settings window wins; otherwise it is drawn from the preset's
+    // own brush data. The drawn icon is a circle
     // whose DIAMETER maps from brush size (sqrt so a 500px brush doesn't blow the tile), FILLED with the
     // preset's color — or WHITE for an eraser, BLACK when no color was saved. Hard edge (2値化/binarize) =
     // crisp solid circle; soft = radial falloff (the airbrush look in the sheet-tool reference). Returns an
@@ -69046,8 +69058,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // palette.
     function buildPresetIconHtml(preset) {
       const b = (preset && preset.brush) || {};
-      // A chosen glyph wins over the generated dot. '' (the default, and what every existing preset
-      // has) keeps the size/hardness/colour circle below, so nothing already saved changes appearance.
+      // A chosen glyph wins over the generated dot. '' (the default) or an unknown key keeps the
+      // size/hardness/colour circle below.
       const chosen = preset && preset.icon;
       if (chosen && APP_ICONS[chosen]) {
         const color = (b.tool === 'eraser') ? '#f2f2f2' : (preset.color || 'currentColor'); // .tli strokes with currentColor
@@ -81956,9 +81968,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } else ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
       ctx.restore();
     }
-    // 제스처 하나가 쓰는 스크래치 캔버스들. **소유자(owner)에 매달리므로** 제스처가 끝나면
-    // 같이 죽는다 — 전역 캐시가 아니다. owner 는 콘티의 paintRasterOp 이거나 원화의 draw 세션이고,
-    // key 로 용도를 가른다('stroke' = 평면 렌더용, 'compositeMask' = 선택 마스크 적용용).
+    // 제스처 하나가 쓰는 스크래치 캔버스들은 대여 중 **소유자(owner)에 매달린다.** owner 는 콘티의 paintRasterOp
+    // 이거나 원화의 draw 세션이고, key 로 용도를 가른다('stroke' = 평면 렌더용, 'compositeMask' = 선택 마스크
+    // 적용용). 예외로 'base'·'stroke' 는 용도당 1장을 보관하는 전역 풀(paintStrokeBufferPool)에서 빌리고
+    // paintReleaseStrokeBuffers 가 풀로 돌려준다(이미 보관 중이면 해제, 프로젝트 리셋 때
+    // paintClearStrokeBufferPool 이 비운다). 그 밖의 key 는 owner 와 같이 죽는다.
     // 크기의 정본은 호출부가 준다: conte 는 ensurePaintRasterOpBounds 가 **제스처 도중** op.canvas 를
     // 키우므로 매번 대조해야 하고, 재사용 캔버스는 앞 회차의 컨텍스트 상태(변환·합성모드·알파)를 물고
     // 있으므로 되돌린 뒤 넘긴다. 크기를 대입하면 캔버스가 초기화되니 그때는 clear 가 필요 없다.
@@ -85933,7 +85947,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           }
           cur = next;
         }
-        if (path.length >= 4) contours.push(path);
+        if (path.length >= 2) contours.push(path);   // 점 하나짜리 조각(외딴 1px·대각선 끝)도 윤곽을 그린다
       }
       paintMaskEdgeCache.set(maskCanvas, contours);
       return contours;
@@ -85941,8 +85955,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // 이 조각을 닫아도 되는가 — **끝이 시작의 8이웃일 때만**. 어떤 추적을 쓰든 참이어야 하는 계약이라
     // 마퀴를 그리는 두 자리(콘티·원화)가 같은 판정을 쓴다. 열린 조각을 닫으면 가짜 선분이 생긴다.
-    // ★열려 있어도 윤곽이 비지는 않는다 — 걷기는 경계 픽셀을 전부 어떤 조각엔가 담고, 그 양 끝
-    // 사이는 다른 조각이 채운다. 안 닫아서 잃는 것은 **대시 위상의 연속성**뿐이다.
+    // ★걷기는 경계 픽셀을 전부 어떤 조각엔가 담는다(점 하나짜리 조각 포함 — 커널이 점으로 찍는다). 열린
+    // 조각을 안 닫아서 잃는 것은 **대시 위상의 연속성**과 조각 끝 사이의 한 칸이다.
     function paintMaskContourClosed(path) {
       if (!path || path.length < 6) return false;
       return Math.abs(path[0] - path[path.length - 2]) <= 1
@@ -85951,11 +85965,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // 마퀴 점 찍기의 **한 벌** — **마퀴를 그리는 단 하나의 자리.** 콘티/원화 × 확정선택/그리는중 ×
     // 라쏘선택/라쏘스탬프가 전부 여기로 들어온다(그대로 그리기와 변형 quad 로 휘어 그리기가 같은 몸을 쓴다). 둘
-    // 다 (a) 대시를 **화면 거리**로 재고 (b) 점을 **디바이스 픽셀 격자에 정수로** 찍는다.
+    // 다 (a) 대시를 **화면 거리**로 재고 (b) 점을 **백킹 픽셀 격자에 정수로** 찍는다.
     // (a) 화면 거리로 재야 확대/축소와 무관하게 간격이 일정하고, 퍼스펙티브로 휘어도 균일하다(휜 뒤의 화면
     // 좌표로 재기 때문이다 — 마스크 좌표로 재면 원근에서 다시 갈린다).
     // (b) 레이어 좌표로 찍으면 변환이 소수점을 만들어 캔버스가 안티에일리어싱으로 번지게 한다(「펜으로 그은
-    // 느낌」). 정수 디바이스 픽셀은 번지지 않고, 두께도 1 device px(고DPI 에서 0.5 CSS px)라 1px 보다 얇다.
+    // 느낌」). 정수 백킹 픽셀은 번지지 않고, 두께는 1 백킹 px 다 — 물리 픽셀과의 비는 그 캔버스의 백킹 배율이
+    // 정한다(콘티 오버레이는 DPR 최대 2·각 축 4096 상한, 원화 미리보기는 CSS px 1:1).
     // Canvas2D 는 패스 안티를 못 끄지만 이 방법은 애초에 안티가 생길 여지를 안 만든다.
     // · **세그먼트를 1px 간격으로 채운다** — 윤곽 「점마다」 하나씩 찍으면 확대할 때 점 사이가 1px 보다 벌어져
     // 대시가 이어지지 않고 **점**으로 보인다. 화면 거리로 걸으면 배율과 무관하게 대시가 이어진다.
@@ -85977,7 +85992,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (y < b.t) b.t = y; else if (y > b.b) b.b = y;
     }
     function drawCrispMarqueePolyline(ctx, pts, color, dash, closed) {
-      if (!ctx || !pts || pts.length < 2) return false;
+      if (!ctx || !pts || !pts.length || (pts.length < 2 && !dash)) return false;
       const m = (typeof ctx.getTransform === 'function') ? ctx.getTransform() : null;
       const toX = m ? function(x, y) { return m.a * x + m.c * y + m.e; } : function(x) { return x; };
       const toY = m ? function(x, y) { return m.b * x + m.d * y + m.f; } : function(x, y) { return y; };
@@ -85986,6 +86001,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.fillStyle = color || MARQUEE_COLOR;
       if (m) ctx.setTransform(1, 0, 0, 1, 0, 0);
       let phase = 0;
+      if (pts.length === 1) {   // 확정 마퀴의 점 하나짜리 조각 — 그 자리에 한 점
+        const m0 = pts[0], qx = Math.round(toX(m0.x, m0.y)), qy = Math.round(toY(m0.x, m0.y));
+        ctx.fillRect(qx, qy, 1, 1); paintMarqueeBoxAdd(qx, qy);
+        ctx.restore();
+        return true;
+      }
       const last = closed ? pts.length : pts.length - 1;
       for (let i = 0; i < last; i += 1) {
         const a = pts[i], b = pts[(i + 1) % pts.length];
@@ -86022,8 +86043,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return drew;
     }
-    // thin colored dashes with TRANSPARENT gaps (no white halo, no white counter-dash); 점은 언제나 1 device px
-    // 다(공용 커널 주석 참고).
+    // thin colored dashes with TRANSPARENT gaps (no white halo, no white counter-dash); 점은 1 백킹 px 다(물리
+    // px 수는 캔버스 배율을 따른다 — 공용 커널 주석 참고).
     function drawPaintMaskOutline(ctx, maskCanvas, color) {
       if (!ctx || !maskCanvas) return;
       drawMarqueeContourDashes(ctx, maskCanvas, color, null);
@@ -89020,7 +89041,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 방해받지 않는다. 정규화((-PI, PI])는 호출부가 이미 clampPaperRotation 으로 하므로 여기서 안 한다.
     const VIEW_ROT_SNAP_RAD = 5 * Math.PI / 180;
     // 정위치(90도) 스냅의 정본. 허용각만 호출부가 정한다 — 뷰 회전은 5도, 그리기의
-    // Shift 직선은 3도다(그리기가 더 섬세한 작업이라 좁게. 사용자 판정).
+    // Shift 직선은 1도다(PAINT_LINE_QUARTER_SNAP_RAD — 그리기가 더 섬세한 작업이라 좁게. 사용자 판정).
     function snapAngleToQuarter(rad, tolRad) {
       const q = Math.PI / 2;
       const nearest = Math.round(rad / q) * q;
@@ -95402,7 +95423,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return !!(dialog && (dialog.open || (dialog.hasAttribute && dialog.hasAttribute('open'))));
     }
 
-    // The ⚙ menu and the windowShortcutSettings action open this the same way. The menu MUST tuck itself away
+    // Every entry — the ⚙ menu, the window* shortcut actions, 保存 entry points and the category rail — comes
+    // through here. The menu MUST tuck itself away
     // first — left open it stays parked on top of the dialog it just opened. 카테고리를 지정해 연다. 이미 열려
     // 있으면 탭만 바꾼다(다시 openModal 하면 포커스가 튄다).
     function openPrefsWindow(tab) {
@@ -95417,8 +95439,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         prefsApplySearch();
         openModal(dialog);
       }
-      // 保存 카테고리는 열릴 때마다 목록을 다시 그린다 — 그 사이 편집으로 참조가 달라졌을 수 있다. 창이 닫힌 채
-      // 그려졌으면 자리가 전부 0 이다 — 보이게 된 뒤에 다시 잰다.
+      // ショートカット 의 분류 위치는 창이 닫힌 채 잰 값이 전부 0 이라 보이게 된 뒤 다시 잰다. 保存 카테고리는
+      // 열릴 때마다 목록을 다시 그린다(맨 아래 줄) — 그 사이 편집으로 참조가 달라졌을 수 있다.
       if (shown === 'shortcut') { shortcutCacheCategoryTops(); shortcutUpdateStickyCategory(); }
       if (shown === 'performance') renderPrefsPerfEnv(); // 진단은 열 때 실측한다(값이 세션 중 변한다 — 필압 관측 등)
       return (shown === 'storage') ? prefsStorageTabEnter() : null;
@@ -95642,8 +95664,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       const openWindowMenuBtn = document.getElementById('openWindowMenuBtn');
       if (openWindowMenuBtn) openWindowMenuBtn.addEventListener('click', openWindowMenu);
-      // 環境設定 — 닫는 버튼 하나, 카테고리는 위임으로 받는다. (여는 쪽은 ⚙ 메뉴의 항목이다 —
-      // openStageSettingsMenu.)
+      // 環境設定 — 닫는 버튼 하나, 카테고리는 위임으로 받는다. 여는 길(⚙ 메뉴·단축 동작·保存 진입·카테고리
+      // 클릭)은 모두 openPrefsWindow 다.
       const prefsDialogEl = document.getElementById('prefsDialog');
       if (prefsDialogEl) prefsDialogEl.addEventListener('close', function() { if (!prefsWindowIsOpen()) invalidatePrefsStorageRequests(); });
       const prefsCloseBtn = document.getElementById('prefsCloseBtn');
@@ -98462,8 +98484,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // composite after the eye toggles). Gate + discriminate the key.
       const conteTrackHidden = videoTrackIsHidden(project);
       // A cut with a V1 clip under it gets a TRANSPARENT base — the footage is drawn under it per frame
-      // by paintConteSlotFrame (playback compositor only: opts.videoMedia). Every other cut keeps the opaque white
-      // base, so the export path and V1-less projects are byte-identical to before. The key carries the variant.
+      // by paintConteSlotFrame (opts.videoMedia: playback and export; export also passes videoMediaSeek). Every
+      // other cut keeps the opaque white base, so cuts without footage are byte-identical to before. The key
+      // carries the variant.
       const videoUnder = Boolean(opts.videoMedia && !opts.paperArea && videoMediaClipShownAtFrame(project, f, slot && slot.cut ? slot.cut.id : ''));   // Preview parity past the last cut
       const baseKey = cutId + '|' + camKey + '|' + outW + 'x' + outH + '|' + frameCrop + '|' + showFrameBox + kfTag + (conteTrackHidden ? '|th' : '') + (videoUnder ? '|vm' : '');
       const useCache = !opts.paperArea && opts.cacheFrames !== false;
@@ -98552,10 +98575,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return base;
     }
 
-    // ═══ V1 footage in the playback compositor ══════════════════════════════════════════
+    // ═══ V1 footage in the compositor ══════════════════════════════════════════
     // A cut with footage under it renders a transparent layer base and this pair paints white → the pooled
-    // <video>'s current frame → that base (the compositor does not switch itself off for V1 frames). Only
-    // opts.videoMedia callers (renderPlaybackCompositorFrame) take this road; export never passes it.
+    // <video>'s frame → that base (the compositor does not switch itself off for V1 frames). opts.videoMedia
+    // callers take this road: playback draws the element's current frame; export (videoMediaSeek) first lands
+    // the same pooled <video> on the frame (videoMediaSeekForRender waits for this seek's own 'seeked'), and
+    // strict output throws instead of encoding a stale picture.
     let videoMediaScratch = null;
     function videoMediaScratchCanvas(w, h) {
       if (!videoMediaScratch) videoMediaScratch = document.createElement('canvas');
@@ -103036,7 +103061,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     const GENGA_TILE_ENCODE_MS = 5;
     // 획이 살아 있는 동안 백그라운드 펌프·썸 타이머는 이만큼 뒤로 물러난다. 획 중에는 획만 — 썸 타이머 300ms 는
     // 연타 간격(~120ms)보다 길어 다음 획의 한중간에 발화한다. 소실 창은 획 길이만큼 늘 뿐이고, 저장·스왑의 동기
-    // flush(gengaFlushTileEncodes)는 이 게이트를 안 지난다. 「획 중」 판정은 strokeInProgress 한 벌이다 — 원화
+    // flush(gengaFlushTileEncodes)는 이 게이트를 안 지난다. 백그라운드 펌프의 「획 중」 판정은 strokeInProgress 한
+    // 벌이다(예외: gengaFrameStackOnArtReady 는 같은 지연값을 쓰되 원화 세션 존재로 판정한다 — 곡선 대기 중에도
+    // 완성 캐시 갱신을 미룬다) — 원화
     // 세션만 보면 콘티 획을 못 보고(원화→콘티 전환 그리기에서 밀린 인코드가 콘티 획 중 발화), 곡선 phase-1
     // pending(포인터 없음, 무기한)을 획으로 오인하면 확정이 무기한 밀린다(소실 창 확대).
     const GENGA_BG_STROKE_DEFER_MS = 250;
@@ -104092,8 +104119,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return 'vec:' + e.seq;
     }
     // 그림 하나를 **문자열로 부르는 유일한 자리**. 「ref 아니면 dataUrl 꼬리」를 소비처마다 따로 두면 벡터를
-    // 모르는 사본이 생긴다(벡터를 아는 어니언 고스트 쪽 규칙이 정본이다). 순서는 gengaDrawDrawingInto 와 같다 -
-    // 키와 그림이 같은 층을 가리켜야 한다.
+    // 모르는 사본이 생긴다(벡터를 아는 어니언 고스트 쪽 규칙이 정본이다). 순서(ref → dataUrl → strokes)는 캐시
+    // 정체성의 우선순위다 — gengaDrawDrawingInto 의 소스 선택 순서(canvas → tileSet → dataUrl → strokes)와 같을
+    // 필요가 없다.
     function gengaDrawingCacheKey(dr) {
       if (!dr) return '';
       if (dr.ref) return String(dr.ref);
@@ -104104,7 +104132,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // **래스터 픽셀 캐시(gengaImageCache · gengaDrawnBoundsCache)의 키는 여기서만 나온다.** gengaImageFor 와
     // gengaDecodeIntoCache 가 각자 판정하면 갈리고, 갈리는 순간 예열해 둔 그림을 소비처가 못 찾아 **내보내기에
     // 빈 레이어**가 나온다. dataUrl 검사가 키 계산보다 **먼저**인 것이 요점이다 — 위 커널의 벡터 분기는
-    // gengaVectorBakeCache 에 엔트리를 만드는 부작용이 있고, 디코드 대상은 래스터뿐이다. 키가 비면 그 그림은
+    // gengaVectorStrokesIdCache 에 일련번호 엔트리를 만드는 부작용이 있고, 디코드 대상은 래스터뿐이다. 키가 비면 그 그림은
     // 디코드 대상이 아니다.
     function gengaRasterCacheKey(dr) {
       return (dr && typeof dr.dataUrl === 'string' && dr.dataUrl) ? gengaDrawingCacheKey(dr) : '';
@@ -108315,9 +108343,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return exps;
     }
-    // ---- CSV sheet support (equivalent port of #preview decodeTextFile / parseCSV / layersFromCsvRows) --------
-    // CSV content signals follow Auto Sheet scoreDecodedCsvText. Korean and
-    // Japanese letters have equal weight when comparing candidate decodings.
+    // ---- CSV sheet support (decode, parse and layer extraction for imported sheet CSV) --------
+    // Content scoring follows Auto Sheet scoreDecodedCsvText: Korean and Japanese letters and timeline keywords
+    // weigh the same when comparing candidate decodings (an unequal Korean bonus read CP949 sheets as EUC-JP).
+    // The candidate encodings here are a subset of Auto Sheet's list.
     function gengaSheetScoreDecodedText(text) {
       const value = String(text || ''), total = Math.max(1, value.length);
       const splitKoreanMark = (value.match(/\uff61\uff7f/g) || []).length;
@@ -108339,7 +108368,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (value.indexOf(word) !== -1) score += 10;
       });
       ['프레임', '카메라', '레이어'].forEach(function(word) {
-        if (value.indexOf(word) !== -1) score += 6;
+        if (value.indexOf(word) !== -1) score += 10;
       });
       score -= suspicious * 6 + replacement * 20 + splitKoreanMark * 35 + controls * 24;
       if (isFrameCsv && (crosses || dots)) score += Math.min(80, ((crosses + dots) * 6) + (blackDots * 10));
@@ -122261,10 +122290,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // cameraWork base until keys exist, then writes a key at the playhead; conte commits through its camera
     // adapter.
     // 카메라 중심점 우클릭 메뉴는 두 표면(원화·콘티)이 공용으로 쓴다(원화에만 두면 콘티에서 안 뜬다). **커널은
-    // 메뉴만 연다. 「중심점을 눌렀는가」는 표면이 자기 방식으로 판정한다** — 두 표면이 다른 물건을 그리기
-    // 때문이다: 원화는 canvas 라 좌표로 재야 하고(cameraCenterHit), 콘티는 오버레이가 **DOM**이라 그 요소를
-    // 눌렀는지 보면 끝이다. 좌표를 억지로 맞춰 넘기는 것보다 각자 있는 방식으로 판정하고 **결과만 같은 커널로
-    // 모으는** 편이 정확하다. 뜨는 메뉴·문구·크기는 이 한 곳이 정하므로 두 벌로 갈라질 수 없다.
+    // 메뉴만 연다.** 「중심점을 눌렀는가」는 두 표면 모두 이 좌표 커널(cameraCenterHit · CAMERA_HIT.keyDot)로
+    // 잰다 — 원화는 용지 좌표 + 화면 배율, 콘티는 카메라 박스 중심 + 배율 1. 콘티에서 DOM 히트(closest)는 쓰지
+    // 않는다: 키 도트가 이동 핸들을 덮어 target 을 가로챈다. 뜨는 메뉴·문구·크기는 이 한 곳이 정하므로 두 벌로
+    // 갈라질 수 없다.
     function cameraCenterHit(pt, center, viewScale) {
       if (!pt || !center) return false;
       const tol = CAMERA_HIT.keyDot / Math.max(1e-4, Number(viewScale) || 1); // 화면 점 반경을 그 공간으로
@@ -122610,7 +122639,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // 벡터 그림(ref 없음)의 서명 식별자 — strokes 배열 참조에 일련번호를 발급한다
     // (gengaResolveDrawing 은 매번 새 객체를 내지만 strokes 는 저장본 배열 그대로라 참조가 안정적이다.
-    // 벡터 획 커밋은 full runCommand 라 배열이 갈리는 변경은 어차피 명령 경계 무효화를 지난다).
+    // 벡터 획 커밋은 매번 새 strokes 배열(concat)을 만들어 일련번호가 바뀌므로 서명이 자연히 갈린다 — 배열을
+    // 제자리에서 고치는 경로는 없다).
 
     // 레이어 하나가 이 프레임에 그리는 내용의 서명. 해석된 노출(pre/post behavior·링크 노출·공유풀
     // 포함 — gengaResolveExposureSample→gengaExposureDrawing 이 hold/repeat 를 흡수한다)의 그림
@@ -122647,7 +122677,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // 캐시 구축 중 디코드 미완 그림(칸 fault-in · 이미지 미스)을 만나면 onReady 가 이것을 부른다 — 부분만 담긴
     // 캐시를 버리고 다시 굽는다. 준비 경계는 성공과 실패 모두 알리며, 실패한 소스는 error 상태로 남아 재렌더가
-    // 같은 I/O를 반복하지 않는다. 디코드 도착이 **획 중**이면 완성 캐시의 갱신만 획 끝으로 미룬다 —
+    // 같은 I/O를 반복하지 않는다. 디코드 도착 때 **원화 그리기 세션이 있으면**(획 중·곡선 확정 대기 포함) 완성
+    // 캐시의 갱신만 세션 끝으로 미룬다(250ms 마다 다시 확인) —
     // 리로드·스크럽 직후의 첫 획은 캐시가 미완 그림을 문 채 시작되므로, 도착마다 무효화 + 전체 재합성(~75ms)을
     // 하면 획 한중간에 선다(「리로드 직후 첫 획만 전 구간 씹힘」). 미완 캐시는 도착 시 갱신해 새 획 표시를 막지
     // 않는다. 타이머는 하나로 합쳐진다 — 도착이 몇 번이어도 획 끝의 무효화+재렌더는 1회다.
@@ -124496,7 +124527,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // lasso path while drawing (open marching-ants polyline) — open while dragging; close+fill happens in one
       // step at release, for both lasso-select and 投げ縄塗りつぶし.
       if (gengaLasso && gengaLasso.pts.length > 1) {
-        // 콘티와 **같은 커널** — 실선 빨강 1 device px, 안티 0. 라쏘선택·라쏘스탬프 공통이다
+        // 콘티와 **같은 커널** — 실선 빨강 1 백킹 px, 안티 0. 라쏘선택·라쏘스탬프 공통이다
         // (gengaLasso 는 둘 다 쓰는 세션이다: stamp 플래그만 다르다).
         drawCrispMarqueePolyline(ctx, gengaLasso.pts.map(function(pt) { return S(pt[0], pt[1]); }),
           MARQUEE_COLOR_PENDING, false, false);
@@ -130071,7 +130102,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     // Until the first key exists every camera edit — frame drag, the numbers in the camera settings, Reset
     // position — moves the base only; once a key exists the same edits record a key at the playhead (user
-    // decision). Only ◆ (and a key paste) creates the first key on purpose.
+    // decision). Only explicit key verbs create the first key: ◆, key paste, and the camera lane's empty-spot
+    // double-click / add-key menu (gengaCamLaneAddKeyAt).
     function gengaCommitCameraRect(rect) {
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
       const r = { x: Number(rect.x) || 0, y: Number(rect.y) || 0, w: Math.max(20, Number(rect.w) || 20), h: Math.max(20, Number(rect.h) || 20), rotation: Number(rect.rotation) || 0 };
