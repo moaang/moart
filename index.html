@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3066</title>
+  <title>MoArt ver3067</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24385,6 +24385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3067, items: [{ja: '音声・動画の移動とトリム中に対象やリンクが変わった場合、古い操作を適用しません。', ko: '오디오·영상 이동과 트림 중 대상·연결이 바뀌면 이전 조작을 적용하지 않습니다.', en: 'Prevent stale audio/video move and trim gestures from applying after target or link changes.', zh: '音视频移动或裁剪期间对象及关联变化时，不再应用过期操作。'}] },
       { ver: 3066, items: [{ja: '音量線のドラッグをEscで取り消し、対象変更後の古い操作の適用を防ぎます。', ko: '음량선 드래그의 Esc 취소와 대상 변경 후 오래된 조작 적용을 바로잡습니다.', en: 'Cancel volume-line drags with Esc and prevent stale edits after target changes.', zh: '支持Esc取消音量线拖动，并防止对象变更后应用过期操作。'}] },
       { ver: 3065, items: [{ja: '素材差し替えは最後に選んだファイルを優先し、古い処理の適用と別のリンク先への割り込みを防ぎます。', ko: '소재 교체는 마지막에 고른 파일을 우선하고, 오래된 작업 적용과 다른 연결 짝 침범을 막습니다.', en: 'Prioritize the last chosen replacement file and prevent stale work or link edits from affecting another target.', zh: '素材替换优先采用最后选择的文件，防止过期任务及关联操作影响其他对象。'}] },
       { ver: 3064, items: [{ja: '絵コンテの音声・動画メニューと確認画面が、変更後の別クリップやリンク先に適用される問題を修正しました。', ko: '콘티 오디오·영상 메뉴와 확인창이 교체된 다른 클립·연결 대상에 적용되던 문제를 고쳤습니다.', en: 'Keep conte media menus and confirmations from applying to replacement clips or changed linked partners.', zh: '修复分镜音视频菜单及确认窗口误作用于替换片段或变化后的关联对象的问题。'}] },
@@ -46444,6 +46445,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       select: function(id, root) { selectVideoMediaClip(id, root); },
       contextMenu: function(event, id, root) { showVideoMediaClipContextMenu(event, id, root); },
       onSpecialPress: null,
+      linkedClip: videoMediaLinkedAudioClip,
+      linkedSnapshot: function(clip) { return AUDIO_CLIP_DRAG_SPEC.snapshot(clip); },
       snapshot: function(clip) {
         return {
           startFrame: Math.max(0, Math.round(Number(clip.startFrame) || 0)),
@@ -46534,18 +46537,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // missing rebind guard, no volume line). The flow below is the audio one; the spec supplies the selectors,
     // the store accessors, the trim/move previews and the commit functions.
     // ── Timeline media clip gestures: registration, trim and move sessions ──
-    // A press owns the original clip/coordinates; liveTotalFrames still reads the current view. Session helpers
-    // retain beginDragStrand cancellation and preview-before-commit ordering.
+    // A press owns the original clip/coordinates; liveTotalFrames still reads the current view.
+    // Retain cancellation and preview-before-commit ordering; a press cannot outlive its target, geometry or linked peer.
     function beginTimelineClipTrim(event, spec, press, trimEdge) {
       const { root, clipEl, track, clipId, clip, startX, originalClip, liveTotalFrames } = press;
       const previewEl = createAudioDragPreview(track, originalClip.startFrame, originalClip.durationFrames, liveTotalFrames());
       // The kernel owns listeners and coalescing; the trim handle owns capture, the clip its class.
       const cleanupPreview = function() { updateTimelineSnapGuide(root, 0, 1, false); spec.removePreview(previewEl); };
       beginDragStrand(event, {
-        el: clipEl,
+        key: press, owner: press.owner, el: clipEl,
         captureEl: (event.target && event.target.setPointerCapture) ? event.target : clipEl,
         raf: true,
         onMove: function(moveEvent) {
+          if (!press.isCurrent(false)) { press.cancel(); return; }
           const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track);
           const preview = spec.previewTrim(originalClip, trimEdge, deltaFrames);
           updateAudioDragPreview(previewEl, preview.startFrame, preview.durationFrames, liveTotalFrames());
@@ -46554,6 +46558,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         onCancel: cleanupPreview,
         onCommit: function(upEvent) {
           cleanupPreview();
+          if (!press.isCurrent(true)) return;
           const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
           if (!deltaFrames) return;
           spec.commitTrim(clipId, trimEdge, originalClip, deltaFrames, { clip: clip, track: track });
@@ -46567,6 +46572,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const maxStart = Math.max(0, liveTotalFrames() - originalClip.durationFrames);
       const rippleMode = Boolean(event.shiftKey); // shift+drag = move this clip + everything to its right
       const rippleMin = rippleMode ? rippleLeftLimit(state.project, originalStart) : 0;
+      // The ripple limit and affected cohort belong to the press, including preceding/hidden clips.
+      const rippleClips = function() {
+        const project = state.project;
+        return ((project.audio && project.audio.clips) || []).concat((project.video && project.video.clips) || []);
+      };
+      const rippleBasis = rippleMode ? rippleClips().map(function(item) {
+        return { clip: item, start: item.startFrame, duration: item.durationFrames, track: item.trackId, hidden: item.hidden };
+      }) : null;
+      const rippleIsCurrent = function() {
+        if (!rippleMode) return true;
+        const clips = rippleClips();
+        return clips.length === rippleBasis.length && rippleBasis.every(function(before, index) {
+          const current = clips[index];
+          return current === before.clip && current.startFrame === before.start && current.durationFrames === before.duration
+            && current.trackId === before.track && current.hidden === before.hidden;
+        });
+      };
       // Delay capture/preview until movement crosses the threshold so a still press can open its menu.
       const MOVE_DRAG_THRESHOLD_PX = 8;
       let dragActive = false;
@@ -46592,8 +46614,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         try { clipEl.releasePointerCapture(pointerId); } catch (error) {}
       };
       beginDragStrand(event, {
-        raf: true,
+        key: press, owner: press.owner, raf: true,
         onMove: function(moveEvent) {
+          if (!press.isCurrent(false)) { press.cancel(); return; }
           if (!dragActive && Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < MOVE_DRAG_THRESHOLD_PX) return;
           activateMoveDrag();
           if (!movePreviewEl) return;
@@ -46630,6 +46653,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // so a fast valid drag commits even when it never needed a preview allocation.
           if (!dragActive && Math.hypot(upEvent.clientX - startX, upEvent.clientY - startY) < MOVE_DRAG_THRESHOLD_PX) return;
           if (dragActive) teardownMoveDrag();
+          if (!press.isCurrent(true) || !rippleIsCurrent()) return;
           const targetTrack = spec.trackFromPointer(root, upEvent) || track;
           const targetTrackId = targetTrack.dataset[spec.trackIdKey] || originalTrackId;
           const deltaFrames = timelineDragFrameDelta(startX, upEvent.clientX, liveTotalFrames(), track);
@@ -46672,6 +46696,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const trimEdge = audioTrimEdgeFromPointer(clipEl, event);
           const originalClip = spec.snapshot(clip);
           const press = { root, clipEl, track, clipId, clip, startX, startY, originalClip, liveTotalFrames };
+          const project = state.project, linked = spec.linkedClip(project, clip);
+          const fields = ['startFrame', 'durationFrames', 'trackId', 'hidden', 'linkedAudioClipId', 'linkedVideoClipId'];
+          const values = fields.map(function(key) { return clip[key]; });
+          const linkedValues = linked && fields.map(function(key) { return linked[key]; });
+          const originalKey = JSON.stringify(originalClip), linkedKey = linked && JSON.stringify(spec.linkedSnapshot(linked));
+          press.owner = root.closest('#timingDashboard') || root;
+          press.isCurrent = function(checkSnapshot) {
+            if (state.project !== project || !root.isConnected || !track.isConnected || !clipEl.isConnected
+              || spec.clipById(clipId) !== clip || spec.linkedClip(project, clip) !== linked) return false;
+            if (!fields.every(function(key, index) { return clip[key] === values[index] && (!linked || linked[key] === linkedValues[index]); })) return false;
+            return !checkSnapshot || JSON.stringify(spec.snapshot(clip)) === originalKey
+              && (!linked || JSON.stringify(spec.linkedSnapshot(linked)) === linkedKey);
+          };
+          press.cancel = function() {
+            const session = pointerDragSessions.get(press);
+            if (session) session.cancel();
+          };
           if (trimEdge) beginTimelineClipTrim(event, spec, press, trimEdge);
           else beginTimelineClipMove(event, spec, press);
         });
@@ -46686,6 +46727,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       clipById: function(id) { return (state.project.audio.clips || []).find(function(item) { return item.id === id; }) || null; },
       select: function(id, root) { selectAudioClip(id, root); },
       contextMenu: function(event, id, root) { showAudioClipContextMenu(event, id, root); },
+      linkedClip: audioClipLinkedVideoClip,
+      linkedSnapshot: function(clip) { return VIDEO_MEDIA_CLIP_DRAG_SPEC.snapshot(clip); },
       // a press on the volume line is its own drag, not a move
       onSpecialPress: function(event, clipEl, clip, clipId) {
         if (!(event.target && event.target.closest && event.target.closest('[data-audio-volume-line]'))) return false;
