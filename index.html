@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3062</title>
+  <title>MoArt ver3063</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24385,6 +24385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3063, items: [{ja: '原画の音声レーン音量が別レーンに適用される問題を修正し、連続キー操作と空レーンのUndoを改善しました。', ko: '원화 오디오 레인 음량이 다른 레인에 적용되던 문제를 고치고 연속 키 조절과 빈 레인의 Undo를 개선했습니다.', en: 'Keep genga lane-volume edits on their original lane and preserve repeated keyboard control and empty-lane Undo.', zh: '修复原画音轨音量误作用于其他轨道的问题，改进连续键盘操作与空轨道撤销。'}] },
       { ver: 3062, items: [{ja: '原画の音声メニュー・音量が変更後の別クリップに適用される問題と不要なUndoを修正しました。', ko: '원화 오디오 메뉴·음량이 교체된 다른 클립에 적용되던 문제와 불필요한 Undo를 고쳤습니다.', en: 'Prevent stale genga audio menus and volume edits from affecting replacement clips or adding empty Undo steps.', zh: '修复原画音频菜单与音量操作作用于替换后的片段及产生空撤销记录的问题。'}] },
       { ver: 3061, items: [{ja: '原画の音声操作中に対象が変わった場合、古い移動・トリム・フェードを確定しないよう修正しました。', ko: '원화 오디오 조작 중 대상이 바뀌면 오래된 이동·트림·페이드를 확정하지 않도록 고쳤습니다.', en: 'Discard stale genga audio move, trim and fade gestures when their target changes.', zh: '修复原画音频操作中目标变化后仍确认旧移动、修剪和淡入淡出的情况。'}] },
       { ver: 3060, items: [{ja: '原画画面の更新で使わないHTMLを組み立てる重複処理を減らします。', ko: '원화 화면 갱신에서 쓰지 않는 HTML을 조립하던 중복을 줄입니다.', en: 'Avoid assembling unused HTML during genga view updates.', zh: '减少原画视图更新时未使用 HTML 的重复构建。'}] },
@@ -104334,7 +104335,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!state.project || state.project.kind !== 'genga') return;
       const li = Math.max(0, Math.round(Number(lane) || 0));
       const v = Math.max(0, Math.min(1, Number(vol) || 0));
-      runCommand('音声レーン音量', function(p) { const g2 = p.gengaTimeline; if (!g2) return; if (!Array.isArray(g2.audioLaneVol)) g2.audioLaneVol = []; g2.audioLaneVol[li] = v; });
+      const gt = state.project.gengaTimeline;
+      const current = gt && gt.audioLaneVol && gt.audioLaneVol[li];
+      if (!gt || li >= gengaAudioLaneCount(gt) || (current != null ? current : 1) === v) return;
+      runCommand('音声レーン音量', function(p) { const g2 = p.gengaTimeline; if (!Array.isArray(g2.audioLaneVol)) g2.audioLaneVol = []; g2.audioLaneVol[li] = v; });
     }
     let gengaAudioDrag = null;
     function gengaAudioClipPointerDown(ev) {
@@ -133588,11 +133592,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         else { cur.opacity = v / 100; gengaFrameStackInvalidate(); drawGengaPreview(); drawGengaLayerThumbs([id]); // 라이브 쓰기는 명령 밖 — 비선택(=캐시 안) 레이어의 게이지가 캐시에 막히면 화면이 안 따라온다. 드래그 중 재그리기는 이 레이어 몫만(사용자 판정) — 인자 없는 호출은 매 프레임 전 썸네일 × 레이어 find 다
         } // The % readout lives inside the gauge — gaugeSetP writes it
       } else if (a.indexOf('genga-lane-vol:') === 0) { // per-lane volume (heads-column gauge); one undo step on release
-        const li = Math.max(0, Math.round(Number(a.slice(15)) || 0));
-        const gtv = state.project && state.project.gengaTimeline; if (!gtv) return;
-        if (!Array.isArray(gtv.audioLaneVol)) gtv.audioLaneVol = [];
-        if (phase === 'end') { gtv.audioLaneVol[li] = drag ? (drag.origVol != null ? drag.origVol : 1) : 1; setGengaAudioLaneVolume(li, v / 100); }
-        else { gtv.audioLaneVol[li] = Math.max(0, Math.min(1, v / 100)); if (drag && drag.volLabel) drag.volLabel.title = t('project.genga.audio.laneVolTitle', li + 1, Math.round(v)); }
+        if (!drag || !drag.laneVolumeCurrent) return;
+        const li = drag.volumeLane, volumes = drag.laneVolumes;
+        if (!drag.laneVolumeCurrent(drag.liveVol, drag.liveVolLength)) {
+          // Never restore the old origin into the lane now occupying the same index.
+          drag.restoreLaneVolume(drag.liveVol, drag.liveVolLength);
+          return;
+        }
+        const value = Math.max(0, Math.min(1, v / 100));
+        if (phase === 'end') {
+          const returnFocus = document.activeElement === g || drag.returnFocus;
+          drag.restoreLaneVolume(drag.liveVol, drag.liveVolLength);
+          setGengaAudioLaneVolume(li, value);
+          if (returnFocus && document.activeElement === document.body) gaugeSetP(g, v).focus({ preventScroll: true });
+        } else {
+          volumes[li] = value; drag.liveVol = value; drag.liveVolLength = volumes.length;
+          if (drag.volLabel) drag.volLabel.title = t('project.genga.audio.laneVolTitle', li + 1, Math.round(v));
+        }
       } else if (a.indexOf('genga-aclip-vol:') === 0) { // per-clip volume (popover gauge); one undo step on release
         const owner = drag && drag.audioOwner; if (!owner) return;
         const clip = owner.clip, gt = owner.timeline, pop = drag.avolPop;
@@ -133655,7 +133671,28 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           startValue: Number(g.dataset.value), value: Number(g.dataset.value),
           width: Math.max(1, g.getBoundingClientRect().width - (g.classList.contains('ggauge-flat') ? 0 : 14 * uiReadScale())) };
         if (a.indexOf('genga-op:') === 0) { const cur = gengaLayerById(a.slice(9)); s.origOp = cur ? (cur.opacity != null ? cur.opacity : 1) : 1; }
-        if (a.indexOf('genga-lane-vol:') === 0) { const gtv = state.project && state.project.gengaTimeline; const li = Math.max(0, Math.round(Number(a.slice(15)) || 0)); s.origVol = (gtv && gtv.audioLaneVol && gtv.audioLaneVol[li] != null) ? gtv.audioLaneVol[li] : 1; s.volLabel = g.closest('.genga-audio-vol'); }
+        if (a.indexOf('genga-lane-vol:') === 0) {
+          const project = state.project, gt = project && project.gengaTimeline;
+          const li = Math.max(0, Math.round(Number(a.slice(15)) || 0));
+          if (!gt || !Array.isArray(gt.audioLaneVol) || li >= gengaAudioLaneCount(gt)) return null;
+          const volumes = gt.audioLaneVol, length = volumes.length, lanes = gt.audioLanes;
+          s.laneVolumes = volumes; s.volumeLane = li;
+          const original = volumes[li], hadValue = Object.prototype.hasOwnProperty.call(volumes, li);
+          s.liveVol = original != null ? original : 1; s.liveVolLength = length;
+          s.laneVolumeCurrent = function(liveVolume, liveLength) {
+            return state.project === project && project.gengaTimeline === gt && gt.audioLaneVol === volumes &&
+              volumes.length === liveLength && gt.audioLanes === lanes && (volumes[li] != null ? volumes[li] : 1) === liveVolume;
+          };
+          s.restoreLaneVolume = function(liveVolume, liveLength) {
+            if ((volumes[li] != null ? volumes[li] : 1) !== liveVolume) return;
+            if (hadValue) volumes[li] = original;
+            else {
+              delete volumes[li];
+              if (li >= length && volumes.length === liveLength) volumes.length = length;
+            }
+          };
+          s.volLabel = g.closest('.genga-audio-vol');
+        }
         if (a.indexOf('genga-aclip-vol:') === 0) {
           const pop = g.closest('#gengaAVolPop'), owner = pop && pop.gengaAudioOwner;
           if (!owner || state.project !== owner.project || owner.project.gengaTimeline !== owner.timeline ||
@@ -133679,9 +133716,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if ((s.g.dataset.gauge || '').startsWith('af-')) gaugeSetP(s.g, s.startValue);
       },
       openEditor: function(s) {
+        const returnFocus = document.activeElement === s.el;
         fxBeginFieldEdit(s.el, String(s.startValue), function(value) {
+          if (s.laneVolumeCurrent && !s.laneVolumeCurrent(s.liveVol, s.liveVolLength)) return;
           // Capture undo origins at confirmation, before any live mutation.
           const current = gaugeScrubHost.begin(s.el); if (!current) return;
+          current.returnFocus = returnFocus;
           current.value = gaugeScrubHost.clamp(current, value);
           gaugeScrubHost.commit(current);
         });
