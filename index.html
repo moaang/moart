@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3060</title>
+  <title>MoArt ver3061</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24385,6 +24385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3061, items: [{ja: '原画の音声操作中に対象が変わった場合、古い移動・トリム・フェードを確定しないよう修正しました。', ko: '원화 오디오 조작 중 대상이 바뀌면 오래된 이동·트림·페이드를 확정하지 않도록 고쳤습니다.', en: 'Discard stale genga audio move, trim and fade gestures when their target changes.', zh: '修复原画音频操作中目标变化后仍确认旧移动、修剪和淡入淡出的情况。'}] },
       { ver: 3060, items: [{ja: '原画画面の更新で使わないHTMLを組み立てる重複処理を減らします。', ko: '원화 화면 갱신에서 쓰지 않는 HTML을 조립하던 중복을 줄입니다.', en: 'Avoid assembling unused HTML during genga view updates.', zh: '减少原画视图更新时未使用 HTML 的重复构建。'}] },
       { ver: 3059, items: [{ja: '原画の一括移動・長押しの引き継ぎ・セル選択で、操作中に変わった対象への適用を防ぎます。', ko: '원화 일괄 이동·롱프레스 인계·셀 선택에서 조작 중 바뀐 대상에 적용되는 문제를 고칩니다.', en: 'Keep genga batch moves, long-press handoffs and cell selections on their original targets.', zh: '修复原画批量移动、长按交接和单元选择应用到已变化目标的问题。'}] },
       { ver: 3058, items: [{ja: 'Shiftで動画点を移動する際のフォルダーロックと、操作中に変わった対象の判定を修正します。', ko: 'Shift 동화점 이동의 폴더 잠금과 조작 중 바뀐 대상 판정을 고칩니다.', en: 'Respect folder locks and original targets when Shift-dragging in-between marks.', zh: '修复 Shift 拖动中间帧标记时的文件夹锁定和原始目标检查。'}] },
@@ -104116,10 +104117,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (ev.button != null && ev.button !== 0) return;
       ev.stopPropagation(); ev.preventDefault(); // don't start a clip move
       const h = ev.currentTarget, id = h.getAttribute('data-genga-audio'), side = h.getAttribute('data-genga-fade');
-      const gt = state.project && state.project.gengaTimeline;
+      const project = state.project, gt = project && project.gengaTimeline;
       const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === String(id); }); if (!clip) return;
       const el = h.closest('.genga-audio-clip'); if (!el) return;
-      const d = { id: String(id), side: side, el: el, rect: el.getBoundingClientRect(),
+      const start = clip.startFrame, track = clip.track, duration = clip.durationSec;
+      const d = { side: side, el: el, rect: el.getBoundingClientRect(),
         dur: Math.max(0.05, clip.durationSec), fps: gengaMediaFps(gt),   // Px → seconds
         base: (side === 'in') ? Math.max(0, Number(clip.trimStartSec) || 0) : Math.max(0, Number(clip.trimEndSec) || 0),
         other: (side === 'in') ? Math.max(0, Number(clip.trimEndSec) || 0) : Math.max(0, Number(clip.trimStartSec) || 0),
@@ -104139,10 +104141,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         onCancel: function() { if (d.next != null) gengaResetAudioTrimPreview(d); }, // discard only the live --fi/--fo preview, no full timeline rebuild
         onCommit: function() {
           if (d.next == null) return;
+          // Only the clip/geometry pressed at the start owns this trim preview.
+          if (state.project !== project || project.gengaTimeline !== gt || !(gt.audioClips || []).includes(clip) ||
+              clip.startFrame !== start || clip.track !== track || clip.durationSec !== duration ||
+              Math.max(0, Number(d.side === 'in' ? clip.trimStartSec : clip.trimEndSec) || 0) !== d.base ||
+              Math.max(0, Number(d.side === 'in' ? clip.trimEndSec : clip.trimStartSec) || 0) !== d.other) {
+            gengaResetAudioTrimPreview(d); return;
+          }
           if (Math.abs(d.next - d.base) < 0.001) { gengaResetAudioTrimPreview(d); return; }
-          runCommand('音声トリム', function(proj) {
-            const c = (proj.gengaTimeline.audioClips || []).find(function(x) { return String(x.id) === d.id; }); if (!c) return;
-            if (d.side === 'in') c.trimStartSec = +d.next.toFixed(3); else c.trimEndSec = +d.next.toFixed(3);
+          runCommand('音声トリム', function() {
+            if (d.side === 'in') clip.trimStartSec = +d.next.toFixed(3); else clip.trimEndSec = +d.next.toFixed(3);
           });
         }
       });
@@ -104155,22 +104163,24 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (ev.button != null && ev.button !== 0) return;
       ev.stopPropagation(); ev.preventDefault();
       const h = ev.currentTarget;
-      const d = { id: String(h.getAttribute('data-genga-audio')), side: h.getAttribute('data-genga-fade'), startY: ev.clientY, dy: 0 };
+      const id = h.getAttribute('data-genga-audio'), side = h.getAttribute('data-genga-fade');
+      const project = state.project, gt = project && project.gengaTimeline;
+      const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === String(id); }); if (!clip) return;
+      const cur = side === 'in' ? Boolean(clip.fadeIn) : Boolean(clip.fadeOut);
+      const d = { side: side, startY: ev.clientY, dy: 0 };
       // Thin spec on beginDragStrand (capture:true, same as its trim sibling above)
       beginDragStrand(ev, {
         capture: true,
         onMove: function(mv) { d.dy = mv.clientY - d.startY; },
         onCancel: function() {}, // no toggle from a canceled press — and nothing was previewed, so nothing to undo
         onCommit: function() {
-          const gt = state.project && state.project.gengaTimeline;
-          const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === d.id; }); if (!clip) return;
-          const cur = d.side === 'in' ? Boolean(clip.fadeIn) : Boolean(clip.fadeOut);
+          if (state.project !== project || project.gengaTimeline !== gt || !(gt.audioClips || []).includes(clip) ||
+              (d.side === 'in' ? Boolean(clip.fadeIn) : Boolean(clip.fadeOut)) !== cur) return;
           // pull up ≥5px → fade on; push down ≥5px → hard trim; a plain tap toggles
           const next = d.dy <= -5 ? true : (d.dy >= 5 ? false : !cur);
           if (next === cur) return;
-          runCommand(next ? (d.side === 'in' ? '音声FI' : '音声FO') : '音声フェード解除', function(proj) {
-            const c = (proj.gengaTimeline.audioClips || []).find(function(x) { return String(x.id) === d.id; }); if (!c) return;
-            if (d.side === 'in') c.fadeIn = next; else c.fadeOut = next;
+          runCommand(next ? (d.side === 'in' ? '音声FI' : '音声FO') : '音声フェード解除', function() {
+            if (d.side === 'in') clip.fadeIn = next; else clip.fadeOut = next;
           });
         }
       });
@@ -104325,9 +104335,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (ev.button != null && ev.button !== 0) return;
       ev.stopPropagation(); ev.preventDefault();
       const el = ev.currentTarget, id = el.getAttribute('data-genga-audio');
-      const gt = state.project && state.project.gengaTimeline; const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === String(id); }); if (!clip) return;
+      const project = state.project, gt = project && project.gengaTimeline;
+      const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === String(id); }); if (!clip) return;
       const content = document.querySelector('#gengaStage .genga-tl-content'); if (!content) return;
-      const cw = gengaCellW();
       // 레인 수는 gengaAudioLaneCount 로 센다(빈 레인 gt.audioLanes 포함). 렌더·추가·삭제와 같아야 한다 — 이 값이
       // 드래그 중의 세로 클램프와 오디오 영역 높이를 정하므로, 다르면 빈 레인으로 못 옮기고 영역 높이가 출렁인다.
       const laneCount = gengaAudioLaneCount(gt);
@@ -104339,7 +104349,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       document.querySelectorAll('#gengaStage .genga-audio-clip.selected').forEach(function(x) { x.classList.remove('selected'); });
       el.classList.add('selected');
       gengaSelectAudioLane(Math.max(0, clip.track || 0));
-      gengaAudioDrag = { id: id, el: el, rect: content.getBoundingClientRect(), grabOffset: gengaCellsAtClientX(ev.clientX, content.getBoundingClientRect().left) - (clip.startFrame - 1), start: clip.startFrame, to: clip.startFrame, moved: false,
+      gengaAudioDrag = { project: project, timeline: gt, clip: clip, duration: clip.durationSec, id: id, el: el, rect: content.getBoundingClientRect(), grabOffset: gengaCellsAtClientX(ev.clientX, content.getBoundingClientRect().left) - (clip.startFrame - 1), start: clip.startFrame, to: clip.startFrame, moved: false,
         startY: ev.clientY, baseTrack: baseTrack, toTrack: baseTrack, laneCount: laneCount,
         durSec: Math.max(0.05, clip.durationSec) };
       // Thin spec on beginDragStrand (capture:true — the genga trios listen on document in the capture phase on
@@ -104451,7 +104461,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (sc) sc.style.height = hpx;
         if (heads) heads.style.height = hpx;
       }
-      if (canceled) { gengaResetAudioClipDragPreview(d); return; } // discard only the live move preview, no full timeline rebuild
+      const gt = d.timeline, clip = d.clip;
+      if (canceled || state.project !== d.project || d.project.gengaTimeline !== gt ||
+          !(gt.audioClips || []).includes(clip) || clip.startFrame !== d.start ||
+          Math.max(0, clip.track || 0) !== d.baseTrack || clip.durationSec !== d.duration) {
+        gengaResetAudioClipDragPreview(d); return; // Discard the old preview without a command/Undo.
+      }
       const frameMoved = d.moved && d.to !== d.start;
       // 미리보기가 보인 레인이 곧 착지 레인이다(겹치면 빈 레인·새 레인, landTrack == laneCount → 새 레인).
       if (d.landTrack != null) d.toTrack = d.landTrack;
@@ -104460,10 +104475,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         gengaResetAudioClipDragPreview(d);
         return;
       }
-      runCommand('音声移動', function(proj) {
-        const c = (proj.gengaTimeline.audioClips || []).find(function(x) { return String(x.id) === String(d.id); }); if (!c) return;
-        if (frameMoved) c.startFrame = d.to;
-        if (trackMoved) c.track = d.toTrack;
+      runCommand('音声移動', function() {
+        if (frameMoved) clip.startFrame = d.to;
+        if (trackMoved) clip.track = d.toTrack;
       });
     }
     // ---- genga video export: per-frame camera-view crop → WebCodecs encode (mp4 if available, else webm) +
