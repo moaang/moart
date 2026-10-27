@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3065</title>
+  <title>MoArt ver3066</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24385,6 +24385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3066, items: [{ja: '音量線のドラッグをEscで取り消し、対象変更後の古い操作の適用を防ぎます。', ko: '음량선 드래그의 Esc 취소와 대상 변경 후 오래된 조작 적용을 바로잡습니다.', en: 'Cancel volume-line drags with Esc and prevent stale edits after target changes.', zh: '支持Esc取消音量线拖动，并防止对象变更后应用过期操作。'}] },
       { ver: 3065, items: [{ja: '素材差し替えは最後に選んだファイルを優先し、古い処理の適用と別のリンク先への割り込みを防ぎます。', ko: '소재 교체는 마지막에 고른 파일을 우선하고, 오래된 작업 적용과 다른 연결 짝 침범을 막습니다.', en: 'Prioritize the last chosen replacement file and prevent stale work or link edits from affecting another target.', zh: '素材替换优先采用最后选择的文件，防止过期任务及关联操作影响其他对象。'}] },
       { ver: 3064, items: [{ja: '絵コンテの音声・動画メニューと確認画面が、変更後の別クリップやリンク先に適用される問題を修正しました。', ko: '콘티 오디오·영상 메뉴와 확인창이 교체된 다른 클립·연결 대상에 적용되던 문제를 고쳤습니다.', en: 'Keep conte media menus and confirmations from applying to replacement clips or changed linked partners.', zh: '修复分镜音视频菜单及确认窗口误作用于替换片段或变化后的关联对象的问题。'}] },
       { ver: 3063, items: [{ja: '原画の音声レーン音量が別レーンに適用される問題を修正し、連続キー操作と空レーンのUndoを改善しました。', ko: '원화 오디오 레인 음량이 다른 레인에 적용되던 문제를 고치고 연속 키 조절과 빈 레인의 Undo를 개선했습니다.', en: 'Keep genga lane-volume edits on their original lane and preserve repeated keyboard control and empty-lane Undo.', zh: '修复原画音轨音量误作用于其他轨道的问题，改进连续键盘操作与空轨道撤销。'}] },
@@ -54824,44 +54825,51 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB';
     }
 
+    // Preview only; commit once to the original live clip and volume. Cancellation restores model display.
     function beginAudioClipVolumeDrag(event, clipEl, clip, clipId) {
       if (!pointerDragCanStart('audio-volume', event)) return;
-      clipEl.classList.add('adjusting-volume');
+      const project = state.project;
+      const originalVolume = clampAudioClipVolume(clip.volume);
+      const isCurrent = function() {
+        return state.project === project && audioClipById(project, clipId) === clip
+          && clipEl.isConnected && clampAudioClipVolume(clip.volume) === originalVolume;
+      };
       const lineEl = clipEl.querySelector('[data-audio-volume-line]');
       const labelEl = clipEl.querySelector('.audio-volume-label');
-      const captureTarget = (event.target && event.target.setPointerCapture) ? event.target : clipEl;
-      try { captureTarget.setPointerCapture(event.pointerId); } catch (e) {}
-      const originalVolume = clampAudioClipVolume(clip.volume); // Pre-drag value, kept for the cancel revert
       let liveVolume = originalVolume;
-      // The preview's two display writes live here so the cancel branch below can repaint through the same
-      // painter with the pre-drag value; a hand-copied revert could drift away from the preview.
       const paint = function(volume) {
         if (lineEl) lineEl.style.setProperty('--vol-top', audioVolumeToLineTopPercent(volume).toFixed(2) + '%');
         if (labelEl) labelEl.textContent = audioClipVolumeDbLabel(volume);
       };
+      const restore = function() {
+        const current = audioClipById(state.project, clipId);
+        paint(current ? clampAudioClipVolume(current.volume) : originalVolume);
+      };
       const apply = function(moveEvent) {
+        if (!isCurrent()) {
+          const session = pointerDragSessions.get('audio-volume');
+          if (session) session.cancel();
+          return;
+        }
         const rect = clipEl.getBoundingClientRect();
         if (!rect.height) return;
-        const topPct = Math.max(0, Math.min(100, (uiPointerY(moveEvent.clientY) - rect.top) / rect.height * 100)); // Pointer→rect space
+        const topPct = Math.max(0, Math.min(100, (uiPointerY(moveEvent.clientY) - rect.top) / rect.height * 100));
         liveVolume = audioVolumeLineTopPercentToVolume(topPct);
         paint(liveVolume);
       };
-      const finish = function(ev) {
-        clipEl.classList.remove('adjusting-volume');
-        try { captureTarget.releasePointerCapture(event.pointerId); } catch (e) {}
-        // cancel = drop, never commit. Unlike the drag/trim sites, the cleanup above is not the revert here, so
-        // this site fills in the restore slot: (a) this drag repaints the clip's own dom (--vol-top / the dB
-        // label) instead of a throwaway ghost, so no removeClipDragPreview-style collector reclaims it, and
-        // (b) apply(event) fires once on pointerdown, so even a zero-movement cancel has already overwritten the
-        // display. A bare return would leave the clip showing a volume it does not have. `ev` 는 커널
-        // (`bindOwnedPointerDrag`)이 릴리스 이벤트를 그대로 넘겨 주므로 래퍼도, finish 를 맨몸으로 부르는 자리도 없다.
-        if (ev && ev.type === 'pointercancel') { paint(originalVolume); return; }
-        runAudioClipEditCommand('Adjust audio volume', clipId, function(targetClip) {
-          targetClip.volume = liveVolume;
-        }, { syncCuts: false });
-      };
+      beginDragStrand(event, {
+        key: 'audio-volume', owner: clipEl.closest('#timingDashboard'), el: clipEl,
+        draggingClass: 'adjusting-volume', captureEl: event.target, stopPropagation: false,
+        onMove: apply, onCancel: restore,
+        onCommit: function() {
+          if (!isCurrent()) { restore(); return; }
+          if (Math.abs(liveVolume - originalVolume) < 1e-9) { restore(); return; }
+          runAudioClipEditCommand('Adjust audio volume', clipId, function(targetClip) {
+            targetClip.volume = liveVolume;
+          }, { syncCuts: false });
+        }
+      });
       apply(event);
-      bindOwnedPointerDrag(event, { key: 'audio-volume', target: window, capture: false, move: apply, up: finish });
     }
 
     function dialogAudioEffectSettings(clipOrTags) {
