@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3064</title>
+  <title>MoArt ver3065</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24385,6 +24385,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3065, items: [{ja: '素材差し替えは最後に選んだファイルを優先し、古い処理の適用と別のリンク先への割り込みを防ぎます。', ko: '소재 교체는 마지막에 고른 파일을 우선하고, 오래된 작업 적용과 다른 연결 짝 침범을 막습니다.', en: 'Prioritize the last chosen replacement file and prevent stale work or link edits from affecting another target.', zh: '素材替换优先采用最后选择的文件，防止过期任务及关联操作影响其他对象。'}] },
       { ver: 3064, items: [{ja: '絵コンテの音声・動画メニューと確認画面が、変更後の別クリップやリンク先に適用される問題を修正しました。', ko: '콘티 오디오·영상 메뉴와 확인창이 교체된 다른 클립·연결 대상에 적용되던 문제를 고쳤습니다.', en: 'Keep conte media menus and confirmations from applying to replacement clips or changed linked partners.', zh: '修复分镜音视频菜单及确认窗口误作用于替换片段或变化后的关联对象的问题。'}] },
       { ver: 3063, items: [{ja: '原画の音声レーン音量が別レーンに適用される問題を修正し、連続キー操作と空レーンのUndoを改善しました。', ko: '원화 오디오 레인 음량이 다른 레인에 적용되던 문제를 고치고 연속 키 조절과 빈 레인의 Undo를 개선했습니다.', en: 'Keep genga lane-volume edits on their original lane and preserve repeated keyboard control and empty-lane Undo.', zh: '修复原画音轨音量误作用于其他轨道的问题，改进连续键盘操作与空轨道撤销。'}] },
       { ver: 3062, items: [{ja: '原画の音声メニュー・音量が変更後の別クリップに適用される問題と不要なUndoを修正しました。', ko: '원화 오디오 메뉴·음량이 교체된 다른 클립에 적용되던 문제와 불필요한 Undo를 고쳤습니다.', en: 'Prevent stale genga audio menus and volume edits from affecting replacement clips or adding empty Undo steps.', zh: '修复原画音频菜单与音量操作作用于替换后的片段及产生空撤销记录的问题。'}] },
@@ -40298,7 +40299,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         (function() {   // Linked V1 pair
           const linkedVideo = audioClipLinkedVideoClip(state.project, clip);
           const candidate = !linkedVideo && clip.sourceVideoClipId ? videoMediaClipById(state.project, clip.sourceVideoClipId) : null;
-          if (!linkedVideo && !candidate) return null;
+          const candidateAudio = candidate && videoMediaLinkedAudioClip(project, candidate);
+          if ((!linkedVideo && !candidate) || (candidateAudio && candidateAudio !== clip)) return null;
           const target = linkedVideo || candidate, targetLink = target.linkedAudioClipId;
           return { label: linkedVideo ? t('menu.audio.unlinkVideo') : t('menu.audio.relinkVideo'), action: function() {
             if (audioClipLinkedVideoClip(project, clip) !== linkedVideo || videoMediaClipById(project, target.id) !== target || target.linkedAudioClipId !== targetLink) return;
@@ -53481,9 +53483,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function videoMediaLinkedAudioClip(project, clip) { const id = clip && clip.linkedAudioClipId; return id ? audioClipById(project, id) : null; }
     function audioClipLinkedVideoClip(project, clip) { const id = clip && clip.linkedVideoClipId; return id ? videoMediaClipById(project, id) : null; }
+    // Linking never steals another peer; unlinking clears only the selected pair's matching edges.
     function videoMediaSetLink(project, videoClip, audioClip, on) {
-      if (videoClip) videoClip.linkedAudioClipId = on && audioClip ? audioClip.id : '';
-      if (audioClip) audioClip.linkedVideoClipId = on && videoClip ? videoClip.id : '';
+      if (on && videoClip && audioClip) {
+        const audio = videoMediaLinkedAudioClip(project, videoClip), video = audioClipLinkedVideoClip(project, audioClip);
+        if ((audio && audio !== audioClip) || (video && video !== videoClip)) return;
+      }
+      if (videoClip && (on || !audioClip || videoClip.linkedAudioClipId === audioClip.id)) videoClip.linkedAudioClipId = on && audioClip ? audioClip.id : '';
+      if (audioClip && (on || !videoClip || audioClip.linkedVideoClipId === videoClip.id)) audioClip.linkedVideoClipId = on && videoClip ? videoClip.id : '';
     }
     // Source interpretation/replacement preserves timeline boxes and FX timing. Generic retimeAudioClip
     // changes their duration; only the linked source speed changes here, just as the video box stays put.
@@ -53580,40 +53587,63 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 素材を差し替え: the clip keeps its frames, in-point (seconds), interpretation, FX and link; only the bytes and the
     // source facts change. A shorter source is flagged, never stretched; the cut is not moved. A linked audio clip
     // follows to the same bytes.
+    // Only the last file chosen for a clip may publish; weak keys do not retain closed projects.
+    const videoMediaSourceReplaceRequests = new WeakMap();
     function replaceVideoMediaClipSource(clipId) {
+      const owner = projectIoOwner(), clip = videoMediaClipById(owner.project, clipId);
+      if (!clip || clip.sourceType !== 'video') return;
       openFilePicker('video/mp4,video/quicktime,video/webm,video/*', function(files) {
         const file = files[0];
-        if (!file || isImageFile(file)) return;
-        replaceVideoMediaClipSourceWithFile(clipId, file).catch(function(error) { alert(t('msg.err.v1MediaLoad', (error && error.message ? error.message : error))); });
+        if (!file || isImageFile(file) || !projectIoOwnerCurrent(owner) || videoMediaClipById(owner.project, clipId) !== clip) return;
+        replaceVideoMediaClipSourceWithFile(clipId, file).catch(function(error) {
+          if (projectIoOwnerCurrent(owner) && videoMediaClipById(owner.project, clipId) === clip) alert(t('msg.err.v1MediaLoad', (error && error.message ? error.message : error)));
+        });
       });
     }
-    // The replacement itself (the picker above and tests call it). Resolves {fallback, short} or null when the clip is gone.
+    // The replacement itself (the picker above and tests call it). Resolves {fallback, short}, or null when its clip/source/pair/request is no longer current.
     async function replaceVideoMediaClipSourceWithFile(clipId, file) {
-      const owner = projectIoOwner();
+      const owner = projectIoOwner(), before = videoMediaClipById(owner.project, clipId);
+      if (!before || before.sourceType !== 'video') return null;
+      const request = {}, pictureUrls = state.workspaceObjectUrls.pictures;
+      videoMediaSourceReplaceRequests.set(before, request);
+      const linkedBefore = videoMediaLinkedAudioClip(owner.project, before);
+      const storageJson = JSON.stringify(before.mediaStorage || null), sourceUrl = before.mediaDataUrl, sourceName = before.mediaFileName;
+      const audioStorageJson = linkedBefore && JSON.stringify(linkedBefore.audioStorage || null);
+      const audioUrl = linkedBefore && linkedBefore.audioDataUrl, audioName = linkedBefore && linkedBefore.audioFileName;
+      const audioLink = linkedBefore && linkedBefore.linkedVideoClipId;
+      const isCurrent = function() {
+        return projectIoOwnerCurrent(owner) && videoMediaSourceReplaceRequests.get(before) === request &&
+          videoMediaClipById(owner.project, clipId) === before && before.sourceType === 'video' &&
+          before.mediaDataUrl === sourceUrl && before.mediaFileName === sourceName && JSON.stringify(before.mediaStorage || null) === storageJson &&
+          videoMediaLinkedAudioClip(owner.project, before) === linkedBefore && (!linkedBefore ||
+            (linkedBefore.linkedVideoClipId === audioLink && linkedBefore.audioDataUrl === audioUrl && linkedBefore.audioFileName === audioName &&
+              JSON.stringify(linkedBefore.audioStorage || null) === audioStorageJson));
+      };
+      let publishing = false, storedUrlKey = '', storedUrl = '';
       try {
-        const before = videoMediaClipById(state.project, clipId);
-        if (!before || before.sourceType !== 'video') return null;
-        const meta = await probeVideoMediaFile(file); assertProjectIoOwner(owner);
-        const container = await probeVideoMediaContainer(file); assertProjectIoOwner(owner);
-        if (!videoMediaClipById(state.project, clipId)) return null;   // deleted while the file was probed: nothing is stored
+        const meta = await probeVideoMediaFile(file); if (!isCurrent()) return null;
+        const container = await probeVideoMediaContainer(file); if (!isCurrent()) return null;
         const mime = file.type || 'video/mp4';
         // A new source is a new stored copy (its own folder file / record and registry entry), never the clip id's:
         // Undo snapshots, split pieces and sound clips still use the previous bytes and URL.
-        const stored = await storeVideoMediaBlob(owner, newVideoClipId(clipId), file, mime, file.name || ''); assertProjectIoOwner(owner);
-        const linkedBefore = videoMediaLinkedAudioClip(state.project, before);
+        const sourceId = newVideoClipId(clipId);
+        const stored = await storeVideoMediaBlob(owner, sourceId, file, mime, file.name || '');
+        storedUrlKey = videoClipPlaybackKey(Object.assign({ id: sourceId }, stored));
+        storedUrl = pictureUrls[storedUrlKey] || '';
+        if (!isCurrent()) return null;
         let audioPatch = null;
         if (linkedBefore) {
           const probe = Object.assign({}, linkedBefore, videoMediaAudioStorageFor(Object.assign({}, before, stored), file, mime), { audioDurationFrames: 0 });
-          if (meta.durationSec <= VIDEO_MEDIA_SILENCE_CHECK_MAX_SEC) { await analyzeAudioBlobForClip(probe, file).catch(function(error) { warnOnce('audioAnalyzeReplace', '[audio] Replacement analysis failed; using media duration', error); }); assertProjectIoOwner(owner); }
-          audioPatch = { audioFileName: probe.audioFileName, audioDataUrl: probe.audioDataUrl, audioStorage: probe.audioStorage, audioMime: mime, audioDurationFrames: probe.audioDurationFrames || Math.max(1, Math.round(meta.durationSec * mediaFpsForProject(state.project))) };
+          if (meta.durationSec <= VIDEO_MEDIA_SILENCE_CHECK_MAX_SEC) { await analyzeAudioBlobForClip(probe, file).catch(function(error) { if (isCurrent()) warnOnce('audioAnalyzeReplace', '[audio] Replacement analysis failed; using media duration', error); }); if (!isCurrent()) return null; }
+          audioPatch = { audioFileName: probe.audioFileName, audioDataUrl: probe.audioDataUrl, audioStorage: probe.audioStorage, audioMime: mime, audioDurationFrames: probe.audioDurationFrames || Math.max(1, Math.round(meta.durationSec * mediaFpsForProject(owner.project))) };
         }
-        // Deleted during the store / analysis: the unused copy stays unreferenced; no URL swap, no history step, no toast.
-        if (!videoMediaClipById(state.project, clipId)) return null;
+        // An abandoned stored copy stays unreferenced; only this request's unused playback URL is reclaimed.
+        if (!isCurrent()) return null;
         if (linkedBefore) replaceWorkspaceObjectUrl('audio', linkedBefore.id, file);
         let fallback = false, short = null;
+        publishing = true;
         runCommand('素材差し替え', function(project) {
-          const clip = videoMediaClipById(project, clipId);
-          if (!clip) return;
+          const clip = before;
           releaseVideoMediaElement(clipId);
           clip.mediaFileName = stored.mediaFileName; clip.mediaDataUrl = stored.mediaDataUrl; clip.mediaMime = mime; clip.mediaStorage = stored.mediaStorage;
           clip.sourceDurationSec = meta && meta.durationSec > 0 ? meta.durationSec : 0;
@@ -53636,8 +53666,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         else showToast(t('msg.video.replaced', name));
         return { fallback: fallback, short: short };
       } catch (error) {
-        releaseVideoMediaElement(clipId);   // a half-done swap must not leave the old element on a new URL
+        if (!projectIoOwnerCurrent(owner) || videoMediaSourceReplaceRequests.get(before) !== request ||
+            videoMediaClipById(owner.project, clipId) !== before || (!publishing && !isCurrent())) return null;
+        if (publishing) releaseVideoMediaElement(clipId); // A probe failure never owns the existing display element.
         throw error;
+      } finally {
+        if (!publishing && storedUrl && pictureUrls[storedUrlKey] === storedUrl) {
+          delete pictureUrls[storedUrlKey];
+          releaseWorkspaceMediaUrl('pictures', storedUrl, { pictures: pictureUrls });
+        }
+        if (videoMediaSourceReplaceRequests.get(before) === request) videoMediaSourceReplaceRequests.delete(before);
       }
     }
     // 時間の解釈: real time ↔ frame-mapped, with a declared source rate when the container did not give one.
