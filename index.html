@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3078</title>
+  <title>MoArt ver3079</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24306,6 +24306,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3079, items: [{ja: '用紙メモの曲線調整で既存の全ストロークを毎回描き直さず、一時キャンバスも再利用します。', ko: '용지 메모의 곡률 조절 때 기존 획 전체를 반복 렌더하지 않고 임시 캔버스를 재사용합니다.', en: 'Reuse temporary canvases and avoid redrawing all existing memo strokes while bending curves.', zh: '调整纸面备忘曲线时不再反复绘制所有已有笔画，并复用临时画布。'}] },
       { ver: 3078, items: [{ja: '用紙メモの編集中、コマを選択し直してもメモを元に戻せるように修正しました。', ko: '용지 메모 편집 중 컷 레이어를 다시 선택해도 메모 Undo/Redo가 동작하도록 수정했습니다.', en: 'Fixed memo Undo/Redo after reselecting a conte layer while editing a paper memo.', zh: '修复编辑纸面备忘时重新选择分镜图层后无法撤销或重做备忘的问题。'}] },
       { ver: 3077, items: [{ja: '絵コンテ用紙の「メモする」の表示方式を変更し、書き込み中に紙が黒くなる現象の対策をしました。', ko: '콘티 용지 메모의 표시 방식을 바꿔 필기 중 용지가 검게 번쩍이는 현상에 대응했습니다.', en: 'Changed conte paper memo presentation to address black flashes while writing.', zh: '调整分镜纸备忘的显示方式，处理书写时纸面闪黑的问题。'}] },
       { ver: 3069, items: [{ja: '開くボタンの読み上げ名と初期ツールチップを実際の操作に合わせました。', ko: '열기 버튼의 스크린리더 이름과 초기 툴팁을 실제 동작에 맞췄습니다.', en: 'Match the Open button accessible name and initial tooltip to its actual behavior.', zh: '让打开按钮的无障碍名称和初始提示与实际操作一致。'}] },
@@ -79822,9 +79823,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       else ctx.drawImage(buf, 0, 0);
       ctx.restore();
     }
-    function renderMemoPageToContext(ctx, pageNo, width, height) {
+    function renderMemoPageToContext(ctx, pageNo, width, height, excludedStroke) {
       memoPageHistory(pageNo).forEach(function(stroke) {
-        paintRenderPageStrokeInto(ctx, stroke, width, height);
+        if (stroke !== excludedStroke) paintRenderPageStrokeInto(ctx, stroke, width, height);
       });
     }
 
@@ -81195,7 +81196,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintStrokeBufferPool[key] = canvas;
       }
       delete owner.strokeBuffers;
-      owner.modeBaseCanvas = null; owner.shapeBase = null; owner.shapeBuf = null; owner.shapeBaseTiles = null;
+      owner.modeBaseCanvas = null; owner.shapeBase = null; owner.shapeBuf = null; owner.shapeBaseTiles = null; owner.pageLiveBase = null;
     }
     function paintClearStrokeBufferPool() {
       for (const key of ['base', 'stroke']) {
@@ -89206,17 +89207,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         shapeMoved: false,
         pageStrokes: page.strokes
       };
-      // Snapshot the page canvas now (pre-stroke pixels) so the live redraw is restore + one stroke, not every
-      // stroke on the page.
-      // 언제나 뜬다. whole-path 획일 때만 뜨면 나머지 획에서 redrawMemoCanvas 가 증분 경로를 못 타 포인터가
-      // 움직일 때마다 페이지의 모든 획을 다시 그린다(O(N) per frame). 用紙에는 팁·종이결이 없어 그 조건이 거의
-      // 늘 거짓이고, 2値化 버퍼까지 얹히면 못 그릴 만큼 무겁다. 비용은 획 시작 1회의 캔버스 사본이다(콘티
-      // 레이어의 modeBaseCanvas 와 같다).
+      // 공용 획 버퍼에 입력 전 메모를 한 번 복사한다. 라이브 렌더는 이 밑그림과 현재 획만 합성한다.
+      // 종료·취소 때 paintReleaseStrokeBuffers가 반납하므로 연속 필기에서 같은 크기의 표면을 재사용한다.
       const pageCanvas = document.getElementById('memoCanvas');
       if (pageCanvas && pageCanvas.width && pageCanvas.height) {
-        const snap = document.createElement('canvas');
-        snap.width = pageCanvas.width;
-        snap.height = pageCanvas.height;
+        const snap = paintBorrowStrokeCanvas(state.paintRasterOp, 'base', pageCanvas.width, pageCanvas.height);
         snap.getContext('2d').drawImage(pageCanvas, 0, 0);
         state.paintRasterOp.pageLiveBase = snap;
       }
@@ -89276,6 +89271,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             pixelW: pendingPage.pixelW, pixelH: pendingPage.pixelH,
             shapeMoved: true, pageStrokes: pendingPage.pageStrokes
           };
+          // 현을 제외한 밑그림을 이 제스처에서 한 번 준비한다. 곡률 조절 중에는 현재 곡선만 다시 그린다.
+          const base = paintBorrowStrokeCanvas(state.paintRasterOp, 'base', canvas.width, canvas.height);
+          renderMemoPageToContext(base.getContext('2d'), state.project.currentPage, base.width, base.height, pendingPage.stroke);
+          state.paintRasterOp.pageLiveBase = base;
           state.paintCurrentStroke = pendingPage.stroke;
           state.paintPointerId = event.pointerId;
           state.paintCurrentLayerRect = null;
