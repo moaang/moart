@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3081</title>
+  <title>MoArt ver3082</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -11529,6 +11529,7 @@
             <div id="footerDuration" class="page-footer">( : )</div>
             <div id="cutBottomDropZone" class="cut-bottom-drop-zone" aria-label="Move cut marker to next page"></div>
             <canvas id="memoCanvas" class="memo-overlay-canvas" aria-label="Memo layer"></canvas>
+            <canvas id="memoEditOverlay" class="memo-overlay-canvas" aria-hidden="true" width="0" height="0"></canvas>
           </div>
           </div>
           <div id="conteVideoStage" class="conte-video-stage" hidden></div>
@@ -19272,7 +19273,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
 
     function snapshotMemoPages() {
-      return fastClone(state.project.memoPages || {});
+      const refs = Object.keys(state.project.layerDrawings || {}).filter(function(ref) { return /^memo-page-\d+$/.test(ref); });
+      return { pages: fastClone(state.project.memoPages || {}), drawings: captureLayerDrawingEditState(state.project, refs) };
     }
 
     function captureTimelineSelectionState() {
@@ -19733,7 +19735,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (command.histSeq == null) command.histSeq = paintNextHistorySeq();
       // Existing drawing contexts also identify the edit location. Other commands capture a
       // runtime-only location here; do not mark them as drawings (recording reads that distinction).
-      if (!(options && options.historyTraversal) && !command.memoPageEdit && !command.drawingContext && !command.gengaDrawingContext) {
+      if (!(options && options.historyTraversal) && !command.memoPageEdit && !command.pageNo && !command.drawingContext && !command.gengaDrawingContext) {
         command.historyLocation = state.project && state.project.kind === 'genga'
           ? { layerId: state.gengaSelectedLayerId, frame: gengaCurrentFrame() }
           : Object.assign({ videoPlayheadFrames: Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0)) }, captureTimelineSelectionState());
@@ -20235,7 +20237,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       loadEditorUiState();
       if (historyViewport && historyViewport.enabled) setTimelineScrollLeftState(historyViewport.scrollLeft);
       if (memoPagesOverride) {
-        state.project.memoPages = memoPagesOverride;
+        state.project.memoPages = memoPagesOverride.pages;
+        const drawings = ensureLayerDrawings(state.project), current = memoPagesOverride.drawings;
+        Object.keys(drawings).forEach(function(ref) { if (/^memo-page-\d+$/.test(ref) && !Object.prototype.hasOwnProperty.call(current, ref)) delete drawings[ref]; });
+        applyLayerDrawingEditState(state.project, current);
         normalizeProject(state.project);
       }
       clampCurrentPage();
@@ -21510,7 +21515,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     };
     function pushSelectionEditCommand(engineId, label, before, after, snapshotsEq) {
       if (snapshotsEq(before, after)) return; // no-op step (e.g. Clear with nothing selected) → no history entry
-      pushUndoCommand({ name: label, selectionEdit: true, engineId: engineId, before: before, after: after });
+      const command = { name: label, selectionEdit: true, engineId: engineId, before: before, after: after };
+      if (engineId === 'paintSelection' && paintTargetIsMemoPage()) command.pageNo = state.project.currentPage;
+      pushUndoCommand(command);
       state.redoStack = [];
     }
 
@@ -21565,7 +21572,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // First input away from the edit reveals its current result. At that location the same
     // command remains on top, so the next input applies it without a separate armed state.
     function revealHistoryCommand(command, restoreTimelineSelection) {
-      if (command.memoPageEdit) {
+      if (command.memoPageEdit || (command.selectionEdit && command.pageNo)) {
         const page = clampInt(command.pageNo, 1, totalPages(), 1);
         if (state.project.currentPage === page) return false;
         state.project.currentPage = page;
@@ -21625,6 +21632,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const page = ensureMemoPageData(command.pageNo);
         page.strokes = (payload && Array.isArray(payload.strokes)) ? fastClone(payload.strokes) : [];
         page.redo = (payload && Array.isArray(payload.redo)) ? fastClone(payload.redo) : [];
+        if (payload && payload.drawings) applyLayerDrawingEditState(state.project, payload.drawings);
         redrawMemoCanvas();
         updatePaintUndoRedoButtonsOnly();
         scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
@@ -24306,6 +24314,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3082, items: [{ja: '用紙メモを投げ縄で部分消去・移動・変形できるようになりました。', ko: '용지 메모를 올가미로 골라 일부 지우기·이동·변형할 수 있습니다.', en: 'Select paper memo ink with the lasso to erase, move, and transform it.', zh: '可使用套索选择纸面备忘笔迹并局部擦除、移动或变形。'}] },
       { ver: 3081, items: [{ja: 'フォルダ保存前の画像変換を非同期化し、予約変換との重複を減らしました。', ko: '폴더 저장 전 그림 변환을 비동기로 바꾸고 예약 변환과의 중복을 줄였습니다.', en: 'Made drawing preparation for folder saves asynchronous and shared pending encodes with background preparation.', zh: '将文件夹保存前的图像转换改为异步，并复用后台正在进行的转换。'}] },
       { ver: 3080, items: [{ja: '用紙メモ中の1px移動が背後のコマを動かす不具合と、変形対象の混同を修正しました。', ko: '용지 메모 중 1px 이동이 뒤쪽 컷 그림을 움직이던 문제와 변형 대상 혼선을 수정했습니다.', en: 'Fixed 1px moves targeting the underlying conte layer while editing a paper memo, and separated transform targets.', zh: '修复纸面备忘编辑时1像素移动误操作背后分镜图层及变形目标混淆的问题。'}] },
       { ver: 3079, items: [{ja: '用紙メモの曲線調整で既存の全ストロークを毎回描き直さず、一時キャンバスも再利用します。', ko: '용지 메모의 곡률 조절 때 기존 획 전체를 반복 렌더하지 않고 임시 캔버스를 재사용합니다.', en: 'Reuse temporary canvases and avoid redrawing all existing memo strokes while bending curves.', zh: '调整纸面备忘曲线时不再反复绘制所有已有笔画，并复用临时画布。'}] },
@@ -52210,6 +52219,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const pageEl = document.getElementById('contePaperStage');
       const bodyEl = document.getElementById('contePaperBody');
       const paper = defaultPaperSpec();
+      const op = state.paintRasterOp;
+      if (op && op.target && op.target.type === 'memo-page' && op.target.pageNo !== state.project.currentPage) {
+        cancelActivePaintRasterStroke(new PointerEvent('pointercancel', { pointerId: state.paintPointerId }));
+      }
+      const pageRef = memoPageDrawingRef(state.project.currentPage);
+      const selection = state.paintSelection, box = state.paintTransformBox;
+      if (selection && String(selection.drawingRef || '').startsWith('memo-page-') && selection.drawingRef !== pageRef) state.paintSelection = null;
+      if (box && String(box.drawingRef || '').startsWith('memo-page-') && box.drawingRef !== pageRef) {
+        state.paintTransformBox = null; state.paintTransformPreview = null;
+      }
       pageEl.style.aspectRatio = paper.width + ' / ' + paper.height;
       pageEl.style.setProperty('--rows-per-page', ROWS_PER_PAGE);
       document.getElementById('paperPageBox').textContent = state.project.currentPage + '/' + totalPages();
@@ -65820,13 +65839,76 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return page;
     }
 
+    // Memo pages use the existing drawing asset format; page identity matches memoPages (not a cut).
+    function memoPageDrawingRef(pageNo) { return 'memo-page-' + memoPageKey(pageNo); }
+    function memoPageDrawing(pageNo) {
+      return state.project.layerDrawings && state.project.layerDrawings[memoPageDrawingRef(pageNo)] || null;
+    }
+    function memoPageHasInk(pageNo) {
+      return memoPageHistory(pageNo).length > 0 || layerDrawingHasInk(memoPageDrawing(pageNo));
+    }
+    function memoPageGeometry() {
+      const spec = defaultPaperSpec();
+      return { paper: { x: 0, y: 0, w: spec.width, h: spec.height } };
+    }
+    function memoPageBitmap(pageNo) {
+      const drawing = memoPageDrawing(pageNo);
+      if (!drawing) return null;
+      const ref = memoPageDrawingRef(pageNo);
+      return layerLiveBitmapFor(ref) || cachedLayerPreviewImage(layerDrawingContentKey(ref, drawing));
+    }
+    function prepareMemoPageBitmap(pageNo) {
+      const drawing = memoPageDrawing(pageNo);
+      if (!drawing || !drawing.bitmapDataUrl || memoPageBitmap(pageNo)) return null;
+      const project = state.project, ref = memoPageDrawingRef(pageNo);
+      const key = layerDrawingContentKey(ref, drawing);
+      const decode = layerPreviewDecode(ref, drawing, key), entry = decode.entry;
+      const canvas = document.getElementById('memoCanvas');
+      entry.waiters.set(canvas, { key: key, ref: ref,
+        current: function() { return state.project === project && memoPageDrawing(pageNo) === drawing &&
+          memoPageKey(state.project.currentPage) === memoPageKey(pageNo); },
+        paint: function() { redrawMemoCanvas(); updatePaintEditOverlays(ref); }
+      });
+      if (decode.start) entry.image.src = drawing.bitmapDataUrl;
+      return entry.done;
+    }
+    function captureMemoPageEditState(pageNo) {
+      return { strokes: fastClone(memoPageHistory(pageNo)), redo: fastClone(memoPageHistory(pageNo, 'redo')),
+        drawings: captureLayerDrawingEditState(state.project, [memoPageDrawingRef(pageNo)]) };
+    }
+    // Only a confirmed edit bakes vector notes. Opening, selecting and previewing never migrate them.
+    function commitMemoPageBitmap(canvas, options) {
+      const pageNo = state.project.currentPage, ref = memoPageDrawingRef(pageNo);
+      const before = captureMemoPageEditState(pageNo);
+      if (!setLayerDrawingBitmapFromCanvas(ref, canvas, false, Object.assign({}, options, { skipMemoRedraw: true }))) return false;
+      const page = ensureMemoPageData(pageNo);
+      page.strokes = []; page.redo = [];
+      const command = { name: 'Edit memo drawing', memoPageEdit: true, pageNo: pageNo,
+        before: before, after: captureMemoPageEditState(pageNo) };
+      if (options && options.selectionHistory) attachSelectionRider(command, Object.assign({ engineId: 'paintSelection' }, options.selectionHistory));
+      pushUndoCommand(command); state.redoStack = [];
+      redrawMemoCanvas(); updatePaintUndoRedoButtonsOnly();
+      return true;
+    }
+    function prepareMemoPageRasterTarget(target) {
+      if (!target || target.type !== 'memo-page' || target.pageNo !== state.project.currentPage) return null;
+      if (prepareMemoPageBitmap(target.pageNo)) return null;
+      const geometry = memoPageGeometry(), canvas = document.createElement('canvas');
+      canvas.width = geometry.paper.w; canvas.height = geometry.paper.h;
+      if (!renderMemoPageToContext(canvas.getContext('2d'), target.pageNo, canvas.width, canvas.height)) return null;
+      return { target: target, drawing: target.drawing, drawingRef: target.drawingRef, geometry: geometry,
+        selection: ensurePaintSelectionForDrawingRef(target.drawingRef), inputFx: null, canvas: canvas,
+        bitmapX: 0, bitmapY: 0, bitmapWidth: canvas.width, bitmapHeight: canvas.height,
+        layerCanvasOffsetX: 0, layerCanvasOffsetY: 0 };
+    }
+
     function updateMemoCanvasSize() {
       const canvas = document.getElementById('memoCanvas');
       if (!canvas) return false;
       const paperStageEl = document.getElementById('contePaperStage');
-      // Stored strokes remain visible without arming; empty, unarmed paper owns no display surface.
+      // Stored ink remains visible without arming; empty, unarmed paper owns no display surface.
       const needed = paperStageEl && !paperStageEl.hidden && state.project && state.project.kind !== 'genga' &&
-        (paintTargetIsMemoPage() || memoPageHistory(state.project.currentPage).length > 0);
+        (paintTargetIsMemoPage() || memoPageHasInk(state.project.currentPage));
       canvas.hidden = !needed;
       const paper = needed ? defaultPaperSpec() : null;
       const width = paper ? Math.max(1, paper.width) : 0;
@@ -79826,9 +79908,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.restore();
     }
     function renderMemoPageToContext(ctx, pageNo, width, height, excludedStroke) {
+      const drawing = memoPageDrawing(pageNo), bitmap = memoPageBitmap(pageNo);
+      if (drawing && drawing.bitmapDataUrl && !bitmap) return false;
+      if (bitmap) {
+        const rect = layerDrawingBitmapRect(drawing), paper = defaultPaperSpec();
+        ctx.drawImage(bitmap, rect.x * width / paper.width, rect.y * height / paper.height,
+          rect.w * width / paper.width, rect.h * height / paper.height);
+      }
       memoPageHistory(pageNo).forEach(function(stroke) {
         if (stroke !== excludedStroke) paintRenderPageStrokeInto(ctx, stroke, width, height);
       });
+      return true;
     }
 
 
@@ -80111,6 +80201,48 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return entry.complete && entry.naturalWidth ? entry : null;
     }
 
+    function layerPreviewDecode(ref, drawing, contentKey) {
+      const rect = layerDrawingBitmapRect(drawing);
+      const pendingDecodes = layerPreviewPendingDecodeMap();
+      let decodeEntry = pendingDecodes.get(contentKey);
+      const startDecode = !decodeEntry;
+      if (startDecode) {
+        const image = new Image();
+        decodeEntry = { image: image, waiters: new Map() };
+        decodeEntry.done = new Promise(function(resolve) { decodeEntry.finish = resolve; });
+        pendingDecodes.set(contentKey, decodeEntry);
+        image.onload = function() {
+          if (pendingDecodes.get(contentKey) !== decodeEntry) { decodeEntry.finish(false); return; }
+          pendingDecodes.delete(contentKey);
+          image.onload = image.onerror = null;
+          // This preview read reports natural-size/placement-rect mismatches without rebaking the source image
+          // or changing persisted data (there is no read-time rebake). An earlier bitmap incident is not a ban on
+          // all recovery paths, and this diagnostic is not permission to edit data: investigate the current input
+          // and contract first. Compatibility fixes, migration and ending legacy support require the user's
+          // explicit decision (docs/engineering_scope.md).
+          if (image.naturalWidth !== rect.w || image.naturalHeight !== rect.h) {
+            console.warn('[invariant] layer bitmap natural ' + image.naturalWidth + 'x' + image.naturalHeight +
+              ' != rect ' + rect.w + 'x' + rect.h + ' for ' + ref + ' — fix the DATA; the runtime does not correct this.');
+          }
+          cacheLayerPreviewImage(contentKey, image);
+          try { decodeEntry.waiters.forEach(function(w, targetCanvas) {
+            if (w.current ? !w.current() : !targetCanvas.isConnected) return;
+            w.paint(image);
+            // A delayed decode must wake bounds derived from this surface, including Undo/Redo.
+            if (targetCanvas.isConnected && targetCanvas.dataset.layerPreviewDrawKey === w.key) schedulePaintEditOverlaysRedraw(w.ref);
+          }); } finally { decodeEntry.waiters.clear(); decodeEntry.finish(true); }
+        };
+        image.onerror = function() {
+          if (pendingDecodes.get(contentKey) !== decodeEntry) { decodeEntry.finish(false); return; }
+          pendingDecodes.delete(contentKey);
+          image.onload = image.onerror = null;
+          decodeEntry.waiters.clear();
+          decodeEntry.finish(false);
+        };
+      }
+      return { entry: decodeEntry, start: startDecode };
+    }
+
     // A freshly committed bitmap is painted from its live canvas (layerLiveBitmapFor) — no decode and no cache
     // entry. Registering that canvas in the content cache too would never be read (every reader takes the live
     // canvas first, and the key takes the dataUrl form once the live entry is gone); it would only fill the
@@ -80176,43 +80308,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         canvas.dataset.layerPreviewPainted = '';
         // 기존 완성 픽셀·기하를 유지하고 새 비트맵이 준비되면 함께 확정한다.
         // Share decoding; each canvas retains only its latest paint request.
-        const pendingDecodes = layerPreviewPendingDecodeMap();
-        let decodeEntry = pendingDecodes.get(contentKey);
-        const startDecode = !decodeEntry;
-        if (startDecode) {
-          const image = new Image();
-          decodeEntry = { image: image, waiters: new Map() };
-          decodeEntry.done = new Promise(function(resolve) { decodeEntry.finish = resolve; });
-          pendingDecodes.set(contentKey, decodeEntry);
-          image.onload = function() {
-            if (pendingDecodes.get(contentKey) !== decodeEntry) { decodeEntry.finish(false); return; }
-            pendingDecodes.delete(contentKey);
-            image.onload = image.onerror = null;
-            // This preview read reports natural-size/placement-rect mismatches without rebaking the source image
-            // or changing persisted data (there is no read-time rebake). An earlier bitmap incident is not a ban on
-            // all recovery paths, and this diagnostic is not permission to edit data: investigate the current input
-            // and contract first. Compatibility fixes, migration and ending legacy support require the user's
-            // explicit decision (docs/engineering_scope.md).
-            if (image.naturalWidth !== rect.w || image.naturalHeight !== rect.h) {
-              console.warn('[invariant] layer bitmap natural ' + image.naturalWidth + 'x' + image.naturalHeight +
-                ' != rect ' + rect.w + 'x' + rect.h + ' for ' + ref + ' — fix the DATA; the runtime does not correct this.');
-            }
-            cacheLayerPreviewImage(contentKey, image);
-            try { decodeEntry.waiters.forEach(function(w, targetCanvas) {
-              if (w.current ? !w.current() : !targetCanvas.isConnected) return;
-              w.paint(image);
-              // A delayed decode must wake bounds derived from this surface, including Undo/Redo.
-              if (targetCanvas.isConnected && targetCanvas.dataset.layerPreviewDrawKey === w.key) schedulePaintEditOverlaysRedraw(w.ref);
-            }); } finally { decodeEntry.waiters.clear(); decodeEntry.finish(true); }
-          };
-          image.onerror = function() {
-            if (pendingDecodes.get(contentKey) !== decodeEntry) { decodeEntry.finish(false); return; }
-            pendingDecodes.delete(contentKey);
-            image.onload = image.onerror = null;
-            decodeEntry.waiters.clear();
-            decodeEntry.finish(false);
-          };
-        }
+        const decode = layerPreviewDecode(ref, drawing, contentKey);
+        const decodeEntry = decode.entry;
+        const startDecode = decode.start;
         decodeEntry.waiters.set(canvas, { key: key, ref: ref, paint: paint, current: requestCurrent });
         if (startDecode) decodeEntry.image.src = drawing.bitmapDataUrl;
         return decodeEntry.done;
@@ -82709,6 +82807,9 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       if (!canvas) return;
       updateMemoCanvasSize();
       if (!canvas.width || !canvas.height) return;
+      const pending = prepareMemoPageBitmap(state.project.currentPage);
+      canvas.style.visibility = pending ? 'hidden' : '';
+      if (pending) return; // Never snapshot an undecoded page as a blank editing source.
       const surface = paintScratchCanvas(canvas, 'preview', canvas.width, canvas.height);
       const ctx = surface.getContext('2d');
       // While a pressure-outline page stroke is live, restore the pre-stroke snapshot and render only the
@@ -82733,7 +82834,13 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         paintPresentCanvas(canvas, surface);
         return;
       }
-      renderMemoPageToContext(ctx, state.project.currentPage, canvas.width, canvas.height);
+      const preview = state.paintTransformPreview;
+      const rendered = preview && preview.drawingRef === memoPageDrawingRef(state.project.currentPage) && paintTransformUiRefValid(preview.drawingRef)
+        ? paintTransformPreviewBitmap(preview) : null;
+      if (rendered) {
+        const rect = layerDrawingBitmapRect(rendered.drawing);
+        ctx.drawImage(rendered.canvas, rect.x, rect.y, rect.w, rect.h);
+      } else renderMemoPageToContext(ctx, state.project.currentPage, canvas.width, canvas.height);
       paintPresentCanvas(canvas, surface);
     }
 
@@ -83244,8 +83351,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const host = document.getElementById('selectionLauncher');
       if (!host) return;
       const inGenga = Boolean(state.project && state.project.kind === 'genga');
-      // 콘티의 선택 연산은 영상 편집 전용이다(prepareRasterSelectionTarget 의 가드와 같은 조건) —
-      // 용지 모드에서 띄우면 눌러도 할 일이 없는 버튼이 된다.
+      // Both Conte surfaces share selection actions; genga owns its separate selection engine.
       host.hidden = !(paintSelectionAliveForLauncher() && (inGenga || state.videoEditMode));
       if (host.hidden) return;
       const btn = document.getElementById('selectionLauncherClear');
@@ -83267,8 +83373,18 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const r = localRect(canvas);
       if (!(r.width > 0) || !(r.height > 0)) { host.classList.remove('is-anchored'); host.style.left = ''; host.style.top = ''; return; }
       const sx = r.width / canvas.width, sy = r.height / canvas.height; // 백킹 px → 로컬 px
-      const right = r.left + box.r * sx;
-      const bottom = r.top + box.b * sy;
+      let right = r.left + box.r * sx;
+      let bottom = r.top + box.b * sy;
+      if (canvas.id === 'memoEditOverlay') {
+        const rot = paperRotationEff(), c = Math.cos(rot), sn = Math.sin(rot), flip = paperViewFlipSign();
+        const w = canvas.offsetWidth * paperZoomValue(), h = canvas.offsetHeight * paperZoomValue();
+        const corners = [[box.l, box.t], [box.r, box.t], [box.r, box.b], [box.l, box.b]].map(function(p) {
+          const x = (p[0] / canvas.width - 0.5) * w, y = (p[1] / canvas.height - 0.5) * h;
+          return { x: r.left + r.width / 2 + flip * (x * c - y * sn), y: r.top + r.height / 2 + x * sn + y * c };
+        });
+        right = Math.max.apply(null, corners.map(function(p) { return p.x; }));
+        bottom = Math.max.apply(null, corners.map(function(p) { return p.y; }));
+      }
       host.classList.add('is-anchored');
       const GAP = 6, PAD = 6;
       const w = host.offsetWidth || 0, h = host.offsetHeight || 0;
@@ -83321,6 +83437,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         if (refFilter && ref !== refFilter) return;
         image.style.visibility = previewRef && previewRef === ref ? 'hidden' : '';
       });
+      if (paintTargetIsMemoPage()) redrawMemoCanvas();
       drawPaintStageOverlay(); // 선택 상태가 바뀌는 경로는 전부 여기를 지난다 — 이 래퍼가 updateSelectionUi 까지 부른다
     }
 
@@ -84976,8 +85093,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       updateSelectionUi();
     }
     function drawPaintStageOverlayInner() {
-      const geometry = contePaperGeom(state.project);
-      const canvas = ensureVideoStageOverlayCanvas();
+      const memo = paintTargetIsMemoPage();
+      const geometry = memo ? memoPageGeometry() : contePaperGeom(state.project);
+      const canvas = memo ? document.getElementById('memoEditOverlay') : ensureVideoStageOverlayCanvas();
+      const inactiveOverlay = memo ? ensureVideoStageOverlayCanvas() : document.getElementById('memoEditOverlay');
+      if (inactiveOverlay && inactiveOverlay.width) { inactiveOverlay.width = 0; inactiveOverlay.height = 0; }
       if (!canvas) { paintMarqueeBoxBegin(null); return; }
       paintMarqueeBoxBegin(canvas); // 이번 프레임의 확정 마퀴 상자를 여기서부터 모은다
       const clearAll = function() {
@@ -84999,14 +85119,15 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // The paper (.conte-paper) is the layer→screen anchor (norm 0/1 = paper edges,
       // layer px = paper px); it carries the pan/zoom, so its gBCR already reflects both. (Anchored off
       // .conte-paper directly — the camera-target child has the same rect but can carry the camera transform.)
-      const paperEl = document.querySelector('#conteVideoStage .conte-paper');
+      const paperEl = memo ? document.getElementById('memoCanvas') : document.querySelector('#conteVideoStage .conte-paper');
       const oRect = canvas.getBoundingClientRect();
       const paperRect = paperEl ? paperEl.getBoundingClientRect() : null;
       if (!paperRect || !(oRect.width > 0) || !(oRect.height > 0) || !(paperRect.width > 0) || !(paperRect.height > 0)) { clearAll(); return; }
       const dprCap = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
       const CAP = 4096;
-      const backW = Math.min(CAP, Math.max(1, Math.round(oRect.width * dprCap)));
-      const backH = Math.min(CAP, Math.max(1, Math.round(oRect.height * dprCap)));
+      const memoZoom = memo ? (uiReadScale() || 1) * paperZoomValue() : 1;
+      const backW = Math.min(CAP, Math.max(1, Math.round((memo ? canvas.offsetWidth * memoZoom : oRect.width) * dprCap)));
+      const backH = Math.min(CAP, Math.max(1, Math.round((memo ? canvas.offsetHeight * memoZoom : oRect.height) * dprCap)));
       if (canvas.width !== backW) canvas.width = backW;
       if (canvas.height !== backH) canvas.height = backH;
       const ctx = canvas.getContext('2d');
@@ -85018,9 +85139,10 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 회전이 걸리면 gBCR 은 회전 bbox 라 종이보다 크다 — 그 폭·위치로 좌표계를 세우면
       // 오버레이(선택 앤츠·변형 박스·스탬프 프리뷰)가 그림에서 벗어난다. 회전해도 중심은 안 움직이므로
       // 중심은 gBCR 에서 그대로 쓰고, 크기만 레이아웃(offsetWidth/Height — transform 면역)에서 가져온다.
-      const vrot = videoViewRotEff();
+      const vrot = memo ? paperRotationEff() : videoViewRotEff();
       const uzo = uiReadScale() || 1;
-      const fpw = (paperEl.offsetWidth || paperRect.width / uzo) * uzo, fph = (paperEl.offsetHeight || paperRect.height / uzo) * uzo;
+      const viewZoom = memo ? paperZoomValue() : 1;
+      const fpw = (paperEl.offsetWidth || paperRect.width / uzo) * uzo * viewZoom, fph = (paperEl.offsetHeight || paperRect.height / uzo) * uzo * viewZoom;
       const fcx = paperRect.left + paperRect.width / 2, fcy = paperRect.top + paperRect.height / 2;
       // Canonical normalized-to-paper mapping: norm 0/1 are the paper edges. The f*-prefixed locals hold
       // paper values; their anchor is .conte-paper, not the camera frame.
@@ -85037,20 +85159,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // The backing ratio (sx, sy) is applied outermost: CSS rotates the paper in display px, and the two axes
       // are rounded/capped separately, so sx can differ from sy — scaling inside the rotation would shear the
       // overlay off the rotated paper. With sx === sy this is the same matrix.
-      ctx.setTransform(sx, 0, 0, sy, 0, 0);
-      ctx.translate(fcx - oRect.left, fcy - oRect.top);
-      if (videoViewFlipSign() < 0) ctx.scale(-1, 1); // 미러가 바깥 (포인터 역변환과 같은 순서)
-      if (vrot) ctx.rotate(vrot);
-      ctx.translate(-fpw / 2, -fph / 2);
-      ctx.scale(scaleX, scaleY);
-      ctx.translate(-fx0, -fy0);
-      paintFillDrawInspection(ctx);
+      if (memo) {
+        // The memo overlay inherits the sheet's CSS rotation/mirror; its backing is already in the paper plane.
+        ctx.setTransform(backW / geometry.paper.w, 0, 0, backH / geometry.paper.h, 0, 0);
+      } else {
+        ctx.setTransform(sx, 0, 0, sy, 0, 0);
+        ctx.translate(fcx - oRect.left, fcy - oRect.top);
+        if (videoViewFlipSign() < 0) ctx.scale(-1, 1);
+        if (vrot) ctx.rotate(vrot);
+        ctx.translate(-fpw / 2, -fph / 2);
+        ctx.scale(scaleX, scaleY);
+        ctx.translate(-fx0, -fy0);
+        paintFillDrawInspection(ctx);
+      }
       const dispScale = fpw / flw; // 회전 bbox 가 아니라 종이 실폭 기준 (핸들 크기가 각도에 따라 커지면 안 된다)
       const inputFx = contePaintInputFx(currentPaintTransformLayerTarget());
       const mstyle = paintMarqueeStyle(dispScale * (inputFx ? inputFx.e.scale : 1));
       const rawPreview = state.paintTransformPreview;
       const transformPreview = rawPreview && paintTransformUiRefValid(rawPreview.drawingRef) ? rawPreview : null;
-      const selection = transformPreview && transformPreview.source && inputFx ? transformPreview.source.selection : state.paintSelection;
+      const selection = transformPreview && transformPreview.source && inputFx ? transformPreview.source.selection
+        : ensurePaintSelectionForDrawingRef(currentPaintSelectionRef());
       // 변형 프리뷰 중에도 선택 앤츠를 보인다 — 숨기면 드래그 중 "지금 뭘 옮기는 중인지"가 화면에서 사라진다.
       // 순수 이동이면 마스크 모양은 그대로고 위치만 델타만큼 밀면 되므로 원본 마스크를 옮긴 자리에 그린다(새
       // 캔버스도 추가 스캔도 없다). 스케일/회전/퍼스펙티브는 drawPaintTransformedSelectionOutline으로 변형된
@@ -85771,6 +85899,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function paintRasterOpTargetFromLayerTarget(layerTarget, options) {
+      if (layerTarget && layerTarget.type === 'memo-page') return prepareMemoPageRasterTarget(layerTarget);
       const geometry = contePaperGeom(state.project);
       options = options || {};
       setActiveLayerCanvasTargets(layerTarget);
@@ -86101,6 +86230,26 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     function paintSelectionModeFor(event) {
       return event && event.altKey ? 'sub' : (event && event.shiftKey ? 'add' : state.paintSelectionMode);
     }
+    function continuePaintLassoOp(op, event, pointFromEvent) {
+      let lassoAdded = false;
+      const lassoSamples = coalescedDrawEvents(event);
+      for (let i = 0; i < lassoSamples.length; i++) {
+        const sp = pointFromEvent(lassoSamples[i]);
+        if (!shouldAppendPaintPoint({ points: op.points, size: 1 }, sp)) continue;
+        op.points.push(sp);
+        ensurePaintRasterOpBounds(op, paintLayerPointsBounds([sp], 2, op.geometry.paper));
+        lassoAdded = true;
+      }
+      if (lassoAdded) {
+        state.paintLassoPreview = {
+          drawingRef: op.drawingRef,
+          points: op.points.map(function(item) { return { x: Number(item.x) || 0, y: Number(item.y) || 0 }; }),
+          closed: false
+        };
+        schedulePaintEditOverlaysRedraw(op.drawingRef); // 프레임당 1회
+      }
+    }
+
     function beginPaintLassoOp(event, canvas, layerTarget, localPoint) {
       const opTarget = paintRasterOpTargetFromLayerTarget(layerTarget);
       if (!opTarget) return false;
@@ -86238,7 +86387,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const geometry = contePaperGeom(state.project);
       let selection = state.paintSelection;
       if (!selection || !selection.maskCanvas || !selection.bounds) return null;
-      if (!state.videoEditMode || paintTargetIsMemoPage()) return null; // 컷 선택은 메모 표면의 편집 대상이 아니다.
+      if (paintTargetIsMemoPage()) return prepareMemoPageRasterTarget(currentPaintTransformLayerTarget());
+      if (!state.videoEditMode) return null;
       // 대상은 지금 선택된 레이어다. 선택이 태어난 레이어로 삼으면 레이어를 옮긴 뒤의 선택 조작(1px 이동 등)이
       // 옛 레이어에 적용된다.
       const found = findConteLayerById(state.project, state.selectedConteLayerId);
@@ -86279,7 +86429,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function currentPaintTransformLayerTarget() {
-      if (state.videoEditMode && !paintTargetIsMemoPage()) {
+      if (paintTargetIsMemoPage()) {
+        const pageNo = state.project.currentPage;
+        return { type: 'memo-page', pageNo: pageNo, drawingRef: memoPageDrawingRef(pageNo),
+          drawing: memoPageDrawing(pageNo), rect: { x: 0, y: 0, w: 1, h: 1 } };
+      }
+      if (state.videoEditMode) {
         const slot = videoSlotAtFrame(state.project, state.videoPlayheadFrames);
         const cutId = slot && slot.cut && slot.cut.id || '';
         // The transform target ignores the panel selection: it is the koma under the playhead.
@@ -86294,7 +86449,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           drawing: ensureLayerDrawingData(state.project, entry.layer.drawingRef)
         };
       }
-      // 메모 도구의 페이지 대상은 컷 선택과 독립이다. 컷 변형 대상으로 대신 연결하지 않는다.
       return null;
     }
 
@@ -86305,7 +86459,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const selection = state.paintSelection;
       if (!selection || !selection.maskCanvas || !selection.bounds) return null;
       const ref = String(drawingRef || '');
-      if (ref && String(selection.drawingRef || '') !== ref) selection.drawingRef = ref;
+      const previous = String(selection.drawingRef || '');
+      if ((ref.startsWith('memo-page-') || previous.startsWith('memo-page-')) && previous !== ref) return null;
+      if (ref && previous !== ref) selection.drawingRef = ref;
       return selection;
     }
     // 선택을 다시 그릴 대상 = 지금 편집 중인 레이어. 선택이 기억하는 옛 ref를 쓰면 레이어를 옮긴 뒤의 해제가
@@ -86363,6 +86519,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     function prepareLayerRasterTarget(layerTarget) {
+      if (layerTarget && layerTarget.type === 'memo-page') return prepareMemoPageRasterTarget(layerTarget);
       const geometry = contePaperGeom(state.project);
       if (!layerTarget || !layerTarget.drawingRef) return null;
       setActiveLayerCanvasTargets(layerTarget);
@@ -86498,7 +86655,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
            Math.round(Number(d.bitmapHeight) || 0)].join(',')
         : '';
       const fx = contePaintInputFx(target && (target.target || target));
-      return selPart + '|' + inkPart + (fx ? '|' + [fx.x, fx.y, fx.e.tx, fx.e.ty, fx.e.rot, fx.e.scale].join(',') : '');
+      const owner = target && (target.target || target);
+      const memoInk = owner && owner.type === 'memo-page' ? memoPageHistory(owner.pageNo).map(function(stroke) { return stroke.histSeq || stroke.id; }).join(',') : '';
+      return selPart + '|' + inkPart + '|' + memoInk + (fx ? '|' + [fx.x, fx.y, fx.e.tx, fx.e.ty, fx.e.rot, fx.e.scale].join(',') : '');
     }
 
     function paintTransformPaperQuad(quad, box) {
@@ -87331,7 +87490,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // the timeline slots; with one koma it is the playhead's slot. 'layer' keeps the current lane, 'selected' the lanes of
     // the selected komas, 'all' every lane. Locked komas stay untouched and a drawing shared by komas is baked once.
     function conteTransformTargetRefs() {
-      const target = currentPaintTransformLayerTarget(); if (!target) return [];
+      const target = currentPaintTransformLayerTarget(); if (!target || target.type === 'memo-page') return [];
       const project = state.project, komas = [];
       (project.cuts || []).forEach(function(cut) { (cut.conteLayers || []).forEach(function(k) { komas.push({ koma: k, range: layerSlotIndexRange(project, k, cut) }); }); });
       const primary = komas.find(function(e) { return String(e.koma.id) === String(target.layerId); }); if (!primary) return [];
@@ -87478,8 +87637,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // drawn is the knob probed. The overlay and the gizmo menu take it from the paper's layout width: a captured
       // gBCR is the rotated bounding box once the view turns, which would move the probed knob and resize the
       // 12/14px tolerances. One layout read per press (an event handler, not a per-frame path).
-      const pe = videoPaperEl();
-      const dispScale = (pe && pe.offsetWidth > 0 ? (pe.offsetWidth * (uiReadScale() || 1)) / contePaperGeom(state.project).paper.w : 1) * (target.inputFx ? target.inputFx.e.scale : 1);
+      const pe = layerTarget.type === 'memo-page' ? document.getElementById('memoCanvas') : videoPaperEl();
+      const dispScale = (pe && pe.offsetWidth > 0 ? (pe.offsetWidth * (uiReadScale() || 1)) / target.geometry.paper.w : 1)
+        * (layerTarget.type === 'memo-page' ? paperZoomValue() : 1) * (target.inputFx ? target.inputFx.e.scale : 1);
       const hit = paintTransformHitTest(box, pointPx, dispScale);
       if (!hit) {
         updatePaintEditOverlays(target.drawingRef);
@@ -87649,7 +87809,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
       }
       const ref = String(preview.drawingRef || '');
-      ensureLayerDrawingData(state.project, ref);
+      const memoTarget = paintTargetIsMemoPage();
       const result = paintTransformResultCanvas(preview);
       if (!result || !result.canvas || !result.bounds) return false;
       const selectionBefore = snapshotPaintSelection(); // 그림과 같은 undo 스텝에 실을 값
@@ -87664,7 +87824,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const refs = [ref].concat(extras.map(function(e) { return e.ref; }));
       const beforeAll = extras.length ? captureLayerDrawingEditState(state.project, refs) : null;
       const selectionHistory = { before: selectionBefore, after: snapshotPaintSelection() };
-      setLayerDrawingBitmapFromCanvas(ref, result.canvas, true, {
+      const writeBitmap = memoTarget ? function(_ref, canvas, _history, options) { return commitMemoPageBitmap(canvas, options); } : setLayerDrawingBitmapFromCanvas;
+      writeBitmap(ref, result.canvas, true, {
         bitmapX: result.bounds.x - offsetX,
         bitmapY: result.bounds.y - offsetY,
         bitmapWidth: result.bounds.w,
@@ -87739,11 +87900,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const target = prepareRasterSelectionTarget();
       if (!target || !target.canvas || !target.selection || !target.selection.maskCanvas) return false;
       const ref = String(target.drawingRef || '');
-      const drawing = target.drawing || ensureLayerDrawingData(state.project, ref);
-      if (!ref || !drawing) return false;
+      const memoTarget = target.target && target.target.type === 'memo-page';
+      const drawing = target.drawing;
+      if (!ref || (!drawing && !memoTarget)) return false;
       // The selection still scopes the key when the target layer has no ink: false would mean "no selection" to
       // the caller, which then wipes every selected layer whole, ink outside the selection included.
-      if (!layerDrawingHasInk(drawing)) return true;
+      if (memoTarget ? !memoPageHasInk(target.target.pageNo) : !layerDrawingHasInk(drawing)) return true;
       const canvas = target.canvas;
       const sel = target.selection;
       const offsetX = Math.round(Number(target.layerCanvasOffsetX) || 0);
@@ -87753,7 +87915,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       ctx.globalCompositeOperation = 'destination-out';
       ctx.drawImage(sel.maskCanvas, paintSelectionPlaneX(sel) + offsetX, paintSelectionPlaneY(sel) + offsetY);
       ctx.restore();
-      setLayerDrawingBitmapFromCanvas(ref, canvas, true, {
+      const writeBitmap = memoTarget ? function(_ref, source, _history, options) { return commitMemoPageBitmap(source, options); } : setLayerDrawingBitmapFromCanvas;
+      writeBitmap(ref, canvas, true, {
         bitmapX: target.bitmapX,
         bitmapY: target.bitmapY,
         bitmapWidth: canvas.width,
@@ -87847,7 +88010,22 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         clearActiveLayerCanvasTargets();
         return;
       }
-      if (!paintTargetIsMemoPage() || !memoPageHistory(state.project.currentPage).length) return;
+      if (!paintTargetIsMemoPage() || !memoPageHasInk(state.project.currentPage)) return;
+      if (memoPageDrawing(state.project.currentPage) || state.paintSelection) {
+        const target = prepareMemoPageRasterTarget(currentPaintTransformLayerTarget());
+        if (!target) return;
+        let output = target.canvas;
+        if (target.selection) {
+          const mask = createReadbackCanvas(); mask.width = output.width; mask.height = output.height;
+          mask.getContext('2d').drawImage(target.selection.maskCanvas, paintSelectionPlaneX(target.selection), paintSelectionPlaneY(target.selection));
+          paintBinarizeCanvasAlpha(mask);
+          output = onePxShiftThroughMask(output, mask, Math.round(dx), Math.round(dy));
+          paintReleaseCanvas(mask);
+        }
+        commitMemoPageBitmap(output, { bitmapX: target.selection ? 0 : Math.round(dx), bitmapY: target.selection ? 0 : Math.round(dy), trimAlpha: true });
+        clearPaintPixelDerivedEditState(target.drawingRef); updatePaintEditOverlays(target.drawingRef);
+        return;
+      }
       const pageNo = state.project.currentPage;
       const page = ensureMemoPageData(pageNo);
       const before = fastClone({ strokes: page.strokes, redo: page.redo });
@@ -88193,6 +88371,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (host) host.style.setProperty('--paper-zoom', paperZoomValue());
       const label = document.getElementById('paperZoomResetBtn');
       if (label) label.textContent = Math.round(paperZoomValue() * 100) + '%';
+      if (paintTargetIsMemoPage()) schedulePaintEditOverlaysRedraw();
     }
 
     // ── 用紙 rotation (iPad pinch-twist) ──────────────────────────────────────────────────
@@ -88677,6 +88856,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       const stage = paperScrollHostEl(); // 포인터가 실제로 닿는 스크롤 표면
       if (!stage || stage.dataset.paperZoomBound === 'true') return;
       stage.dataset.paperZoomBound = 'true';
+      stage.addEventListener('scroll', function() { if (paintTargetIsMemoPage() && stage === paperScrollHostEl()) schedulePaintEditOverlaysRedraw(); }, { passive: true });
       // ── pinch = zoom + twist, on pointer events ──────────────────────────────────────────
       // Not TouchEvent listeners: once the first finger starts a stroke the canvas calls setPointerCapture, and iOS
       // stops delivering that touch to other listeners, so a TouchEvent pinch handler is dead exactly when a user
@@ -89129,6 +89309,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 없다: paintInteractionActive()(= videoEditMode)로 이미 막혀 있고 원화는 그것이 false 라 오지 못하므로, 도달하는
       // 호출은 전부 콘티이고 콘티는 videoEditMode 가 항상 true 다.
       if (event.target.closest && event.target.closest('#memoCanvas, #conteVideoStage')) return false;
+      if (paintTargetIsMemoPage()) return false;
       const canvas = document.getElementById('conteVideoStage');
       if (!canvas) return false;
       const layerTarget = currentPaintTransformLayerTarget();
@@ -89217,9 +89398,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // the memo overlay without changing picture cells or layer drawings. Paper export includes
       // the memo through renderMemoPageToContext; it is not part of the video image.
       const page = ensureMemoPageData(state.project.currentPage);
-      // The free memo has no "current layer"; drop any conte-layer selection so the memo undo/redo and
-      // toolbar act on the page memo, not on a leftover-selected picture layer.
-      if (state.selectedConteLayerId) setSelectedConteLayers([], '');
+      // Page history owns this edit independently of the cut selected behind the paper.
+      if (state.paintSelection) clearPaintSelection();
       const shapeKind = paintShapeToolKind(); // Shapes on the page memo are vector strokes too
       const stroke = {
         id: 'memopage-' + Date.now().toString(36),
@@ -89327,17 +89507,17 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         cancelPendingCurvePage();
       }
-      // Paper mode never touches conte layers (사용자 판정: no layer access from the paper surface). The paper
-      // memo surface is only the page-wide note (ト書き): no bucket fill, lasso cut/select, transform/perspective,
-      // raster-draw fallthrough, or implicit layer-koma creation under the pointer from here. Those are
-      // video-edit-mode tools; in paper mode they only report where they work.
+      // The memo target is a page, never the cut behind the paper window.
       if (state.paintTool === 'bucket' && !state.paintEditTool) {
         state.paintPointerCanvasRect = null;
         state.timelineStatus = t('status.paintMode.bucketVideoOnly');
         return;
       }
-      if (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective' ||
-          state.paintEditTool === 'text-stamp' || state.paintEditTool === 'lasso-stamp' || state.paintEditTool === 'lasso-select') {
+      if (prepareMemoPageBitmap(state.project.currentPage)) return;
+      const target = currentPaintTransformLayerTarget();
+      if (state.paintEditTool === 'lasso-select') { beginPaintLassoOp(event, canvas, target, rawPoint); return; }
+      if (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective') { beginPaintTransformOp(event, canvas, target, rawPoint); return; }
+      if (state.paintEditTool === 'text-stamp' || state.paintEditTool === 'lasso-stamp') {
         state.paintPointerCanvasRect = null;
         state.timelineStatus = t('status.paintMode.transformVideoOnly');
         return;
@@ -89430,17 +89610,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (pageOutlineDirty) scheduleMemoCanvasRedraw();
         return;
       }
-      // (사용자 판정) 레이어 op 은 이 표면에 오지 않는다. 이 함수는 #memoCanvas 에만 묶이고, 레이어 op('draw' ·
-      // 'lasso-select' · 'lasso-stamp' · 'stamp')을 만드는 beginPaintRasterDraw · beginPaintLassoOp ·
-      // beginPaintStampOp 는 beginVideoPaintStroke 에서만 불리며 그쪽 캡처 대상은 #conteVideoStage 다.
-      // 짝은 continueVideoPaintStroke 다.
-      // 도달 불가 경로라도 소리 나게 남긴다. safePaintSetPointerCapture 가 실패를 삼키므로 캡처 없이 포인터가 이
-      // 캔버스로 올 수 있고, 그때 레이어 op 을 그리면 좌표계가 틀어진 그림이 조용히 남는다. 그래서 콘솔에 한 번만
-      // 남긴다(포인터 이동마다 쏟아지면 못 쓴다).
+      if (op.type === 'lasso-select' && op.target && op.target.type === 'memo-page') { continuePaintLassoOp(op, event, getPaintPointFromEventRaw); return; }
+      // Cut-only operations must not consume memo coordinates after a lost capture. Page lasso is handled above.
       if (op.type === 'draw' || op.type === 'stamp' || op.type === 'lasso-select' || op.type === 'lasso-stamp') {
         if (!paintMemoSurfaceLayerOpWarned) {
           paintMemoSurfaceLayerOpWarned = true;
-          console.warn('[paint] 레이어 op 이 메모 표면에 도달했다 — 도달 불가로 판정하고 지운 경로다(파리티 P3-1). op.type =', op.type);
+          console.warn('[paint] Cut operation reached the memo surface:', op.type);
         }
         return;
       }
@@ -89864,28 +90039,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         }
         return;
       }
-      if (op.type === 'lasso-stamp' || op.type === 'lasso-select') {
-        // Coalesced samples → a fast iPad lasso keeps its real shape (parity with the video
-        // freehand loop 44598 + genga lasso). coalescedDrawEvents falls back to [event] → zero regression.
-        let lassoAdded = false;
-        const lassoSamples = coalescedDrawEvents(event);
-        for (let i = 0; i < lassoSamples.length; i++) {
-          const sp = getVideoPaintPointFromEventRaw(lassoSamples[i]);
-          if (!shouldAppendPaintPoint({ points: op.points, size: 1 }, sp)) continue;
-          op.points.push(sp);
-          ensurePaintRasterOpBounds(op, paintLayerPointsBounds([sp], 2, op.geometry.paper));
-          lassoAdded = true;
-        }
-        if (lassoAdded) {
-          state.paintLassoPreview = {
-            drawingRef: op.drawingRef,
-            points: op.points.map(function(item) { return { x: Number(item.x) || 0, y: Number(item.y) || 0 }; }),
-            closed: false
-          };
-          schedulePaintEditOverlaysRedraw(op.drawingRef); // 프레임당 1회
-        }
-        return;
-      }
+      if (op.type === 'lasso-stamp' || op.type === 'lasso-select') { continuePaintLassoOp(op, event, getVideoPaintPointFromEventRaw); return; }
       if (op.type === 'stamp') {
         if (op.textStamp) return;
         const points = paintStampPathPoints(op, { x: conteNormToPlaneX(rawPoint.x, op.geometry.paper), y: conteNormToPlaneY(rawPoint.y, op.geometry.paper) }, state.paintStamp);
@@ -90036,6 +90190,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           updatePaintUndoRedoButtonsOnly();
           return true;
         }
+        if (op.target && op.target.type === 'memo-page') {
+          // Page changes and OS cancellation discard an unfinished selection/transform, never finish it on another page.
+          const canvas = document.getElementById('memoCanvas');
+          state.paintRasterOp = null; state.paintPointerId = null; state.paintPointerCanvasRect = null;
+          state.paintCurrentLayerRect = null; state.paintLassoPreview = null;
+          if (op.type === 'transform-edit') { state.paintTransformBox = null; state.paintTransformPreview = null; }
+          if (canvas && canvas.releasePointerCapture && event.type !== 'lostpointercapture') {
+            try { canvas.releasePointerCapture(event.pointerId); } catch (error) {}
+          }
+          updatePaintEditOverlays(op.drawingRef);
+          return true;
+        }
         if (op.type !== 'draw' && op.type !== 'stamp') return endActivePaintRasterStrokeFromDocument(event);
         if (event.cancelable) event.preventDefault();
         event.stopPropagation();
@@ -90133,21 +90299,23 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 메모하기가 켜져 있으면 전체 지우기도 페이지에 적용한다.
       if (clearBtn) {
         clearBtn.disabled = paintTargetIsMemoPage()
-          ? memoStrokes.length === 0
+          ? !memoPageHasInk(state.project.currentPage)
           : !selectedLayer;
       }
     }
 
-    // 페이지 전체 지우기는 한 명령으로 복원한다. 제거한 획 배열을 보관하고 복원 시 사본을 만든다.
+    // Memo erase owns the selection, or the whole page when unselected; one command restores vector and bitmap ink.
     function clearMemoPageDrawing() {
       const pageNo = state.project.currentPage;
-      if (!memoPageHistory(pageNo).length) return false;
+      if (!memoPageHasInk(pageNo)) return false;
+      if (ensurePaintSelectionForDrawingRef(memoPageDrawingRef(pageNo))) return clearPaintSelectionRegionIfAny();
       const page = ensureMemoPageData(pageNo);
-      const before = { strokes: page.strokes.slice(), redo: page.redo.slice() };
+      const before = captureMemoPageEditState(pageNo);
+      applyLayerDrawingEditState(state.project, { [memoPageDrawingRef(pageNo)]: null });
       page.strokes = [];
       page.redo = [];
       pushUndoCommand({ name: 'メモ消去', memoPageEdit: true, pageNo: pageNo,
-                        before: before, after: { strokes: [], redo: [] } });
+                        before: before, after: captureMemoPageEditState(pageNo) });
       state.redoStack = [];
       redrawMemoCanvas();
       updatePaintUndoRedoButtonsOnly();
@@ -90208,6 +90376,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     function applyContePaperMemoArmed(enabled) {
       const nextEnabled = Boolean(enabled);
+      if (nextEnabled !== state.contePaperMemoArmed) state.paintSelection = null;
       // State and gesture cleanup only; callers publish paint UI after their final presentation changes.
       state.contePaperMemoArmed = nextEnabled;
       if (!paintInteractionActive()) {
@@ -90220,7 +90389,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         state.cameraFrameDrag = null;
         clearPaintStampPreview();
         clearActiveLayerCanvasTargets();
-        if (transformRef) updatePaintEditOverlays(transformRef);
+        updatePaintEditOverlays(transformRef);
         updatePaintSpacePanCursorClass();
       }
     }
@@ -99567,6 +99736,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       drawWhiteBackgroundLayer(backgroundCanvas.getContext('2d'), width, height);
       drawPaperLayer(paperCanvas.getContext('2d'), width, height, metrics, cuts, boundsByCut, project);
       drawTextLayer(textCanvas.getContext('2d'), width, height, metrics, cuts, boundsByCut, project);
+      await prepareMemoPageBitmap(pageNo);
+      if (state.project !== project) throw new DOMException('Export project changed', 'AbortError');
+      if (memoPageDrawing(pageNo) && memoPageDrawing(pageNo).bitmapDataUrl && !memoPageBitmap(pageNo)) throw new Error('Memo bitmap could not be decoded');
       drawMemoLayer(memoCanvas.getContext('2d'), width, height, pageNo);
       await drawPictureLayer(pictureCanvas.getContext('2d'), metrics, cuts, boundsByCut, project);
 
