@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3080</title>
+  <title>MoArt ver3081</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24306,6 +24306,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3081, items: [{ja: 'フォルダ保存前の画像変換を非同期化し、予約変換との重複を減らしました。', ko: '폴더 저장 전 그림 변환을 비동기로 바꾸고 예약 변환과의 중복을 줄였습니다.', en: 'Made drawing preparation for folder saves asynchronous and shared pending encodes with background preparation.', zh: '将文件夹保存前的图像转换改为异步，并复用后台正在进行的转换。'}] },
       { ver: 3080, items: [{ja: '用紙メモ中の1px移動が背後のコマを動かす不具合と、変形対象の混同を修正しました。', ko: '용지 메모 중 1px 이동이 뒤쪽 컷 그림을 움직이던 문제와 변형 대상 혼선을 수정했습니다.', en: 'Fixed 1px moves targeting the underlying conte layer while editing a paper memo, and separated transform targets.', zh: '修复纸面备忘编辑时1像素移动误操作背后分镜图层及变形目标混淆的问题。'}] },
       { ver: 3079, items: [{ja: '用紙メモの曲線調整で既存の全ストロークを毎回描き直さず、一時キャンバスも再利用します。', ko: '용지 메모의 곡률 조절 때 기존 획 전체를 반복 렌더하지 않고 임시 캔버스를 재사용합니다.', en: 'Reuse temporary canvases and avoid redrawing all existing memo strokes while bending curves.', zh: '调整纸面备忘曲线时不再反复绘制所有已有笔画，并复用临时画布。'}] },
       { ver: 3078, items: [{ja: '用紙メモの編集中、コマを選択し直してもメモを元に戻せるように修正しました。', ko: '용지 메모 편집 중 컷 레이어를 다시 선택해도 메모 Undo/Redo가 동작하도록 수정했습니다.', en: 'Fixed memo Undo/Redo after reselecting a conte layer while editing a paper memo.', zh: '修复编辑纸面备忘时重新选择分镜图层后无法撤销或重做备忘的问题。'}] },
@@ -64656,7 +64657,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return false;
         }
         assertProjectIoOwner(owner);
-        flushLayerLiveBitmapsForSave();
+        await prepareLayerLiveBitmapsForWorkspaceSave(owner);
         await ensureWorkspaceStructure(owner);
         await externalizeVideoMediaToWorkspace(owner);
         await prepareWorkspaceLayerDrawings(owner, prepared);
@@ -79948,12 +79949,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       pending.clear();
     }
-    // Materialize the PNG string on demand. Every persistence/export reader calls this before reading
-    // drawing.bitmapDataUrl, so the lazy canvas is encoded once, off the draw hot path.
-    // "On failure stay dirty so a later flush retries" suits a temporary encode failure, not a permanent one
-    // (tainted canvas / OOM). Without a give-up rule the four callers (eviction, flushAllLayerLiveBitmaps, the
-    // display reader, the idle encoder) would retry the doomed encode forever, each costing a toDataURL and a
-    // console error — the display reader fires per render. The policy lives in flush so all four inherit it.
+    // Synchronous readers materialize the PNG before reading drawing.bitmapDataUrl. Folder saves and idle
+    // preparation use the shared asynchronous encoder below; exit/export keeps this immediate fallback.
+    // Failed pixels stay dirty. Automatic display/eviction/idle preparation stops after three failures;
+    // an explicit save may try again. Both encoders count failures on the same live entry.
     const LAYER_BITMAP_FLUSH_MAX_ATTEMPTS = 3;
     // The one success test for a layer PNG encode. toDataURL reports some failures (zero-size or oversized
     // canvas, exhausted memory) by returning '' or the 'data:,' sentinel instead of throwing; storing that and
@@ -79989,6 +79988,47 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function flushAllLayerLiveBitmaps() {
       layerLiveBitmapMap().forEach(function(entry, ref) { if (entry && entry.dirty) flushLayerLiveBitmapDataUrl(ref, null); });
     }
+    // 저장과 idle 준비가 같은 불변 스냅샷의 PNG 변환을 공유한다. 진행 중 Promise는 엔트리 수명에만 속한다.
+    function prepareLayerLiveBitmapDataUrl(ref) {
+      const live = layerLiveBitmapMap(), entry = live.get(ref), project = state.project;
+      if (!entry || !entry.dirty || !entry.canvas) return Promise.resolve();
+      if (entry.encodePromise) return entry.encodePromise;
+      const drawing = project.layerDrawings && project.layerDrawings[ref];
+      if (!drawing) return Promise.reject(new Error('Drawing source unavailable: ' + ref));
+      entry.encodePromise = (async function() {
+        try {
+          const blob = await canvasToBlob(entry.canvas, 'image/png');
+          const url = await blobToDataUrl(blob);
+          if (state.project !== project || live.get(ref) !== entry || project.layerDrawings[ref] !== drawing) {
+            throw new DOMException('Drawing changed during encoding', 'AbortError');
+          }
+          // 종료·내보내기의 동기 fallback이 먼저 끝났다면 이미 게시된 저장 위치를 보존한다.
+          if (!entry.dirty) return;
+          drawing.bitmapDataUrl = url;
+          drawing.bitmapStorage = null;
+          entry.dirty = false;
+          entry.flushFailures = 0;
+        } catch (error) {
+          if (error.name !== 'AbortError') entry.flushFailures = (entry.flushFailures || 0) + 1;
+          throw error;
+        } finally {
+          delete entry.encodePromise;
+        }
+      })();
+      return entry.encodePromise;
+    }
+    // 폴더 저장은 동기 PNG 압축을 기다리지 않는다. 준비 실패·새 편집은 파일 쓰기 전에 검출한다.
+    async function prepareLayerLiveBitmapsForWorkspaceSave(owner) {
+      assertProjectIoOwner(owner);
+      for (const [ref, entry] of Array.from(layerLiveBitmapMap())) {
+        if (!entry || !entry.dirty) continue;
+        await prepareLayerLiveBitmapDataUrl(ref);
+        assertProjectIoOwner(owner);
+      }
+      if (Array.from(layerLiveBitmapMap().values()).some(function(entry) { return entry && entry.dirty; })) {
+        throw new Error('Drawing changed during save');
+      }
+    }
     // The save/export flush. A dirty live canvas that still cannot be encoded holds the only copy of
     // its pixels, and the stored bitmapDataUrl is the pre-edit PNG — publishing it would report a stale drawing as
     // saved. Throw before anything is written, so the last good file/slot stays and the canvas stays dirty for the
@@ -80020,8 +80060,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       flushLayerLiveBitmapDataUrl(ref, target);
       return target && target.bitmapDataUrl || '';
     }
-    // Proactive async encode so a save that fires soon usually finds the dataUrl already materialized
-    // (keeps the belt-and-suspenders sync flush at serialize a no-op in the common case). Idempotent.
+    // Prepare committed pixels during idle time; a folder save reuses the same pending encode.
     function scheduleLayerBitmapEncode(ref) {
       const key = String(ref || '');
       const scheduledEntry = layerLiveBitmapMap().get(key);
@@ -80030,7 +80069,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         : function(fn) { setTimeout(fn, 0); };
       idle(function() {
         const entry = layerLiveBitmapMap().get(key);
-        if (entry && entry === scheduledEntry && entry.dirty) flushLayerLiveBitmapDataUrl(key, null);
+        if (entry && entry === scheduledEntry && entry.dirty && (entry.flushFailures || 0) < LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) {
+          prepareLayerLiveBitmapDataUrl(key).catch(function(error) {
+            if (error.name !== 'AbortError') console.error('[layerBitmapEncode] keeping the live canvas dirty', error);
+          });
+        }
       });
     }
 
