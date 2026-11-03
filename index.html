@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3158</title>
+  <title>MoArt ver3159</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -24459,6 +24459,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3159, items: [{ja: 'コンテの動画書き出しで、書き出す範囲の絵だけを先に読み込み、カメラが動くカットの絵をコマごとに読み直さないようにしました。大きなプロジェクトや範囲を絞った書き出しが速くなります。', ko: '콘티 동영상 출력에서 출력 범위의 그림만 먼저 읽고, 카메라가 움직이는 컷의 그림을 코마마다 다시 읽지 않게 했습니다. 큰 프로젝트나 범위를 좁힌 출력이 빨라집니다.', en: 'Conte video export now preloads only the drawings in the export range and no longer re-reads drawings on every frame of a cut with a camera move, so large projects and partial exports finish faster.', zh: '分镜视频导出现在只预先读取导出范围内的画，镜头移动的镜头不再逐帧重新读取画，大型项目和缩小范围的导出会更快。'}] },
       { ver: 3157, items: [{ja: '作画用紙シートのフォルダ取り込みで、確認が要る件数を完了通知に出し、「詳しく」でセルごとの絵が無い番号・シートに無い絵・読めない形式（tif・psd・tga）の一覧を開けるようにしました（コピーできます）。シートが無く CLIP STUDIO PAINT・TVPaint ファイルだけのフォルダや ZIP は、そのファイルを開きます。', ko: '작화 용지 시트 폴더 가져오기에서 확인할 건수를 완료 알림에 내고, 「자세히」로 셀별 그림 없는 번호·시트에 없는 그림·읽을 수 없는 형식(tif·psd·tga) 목록을 열 수 있게 했습니다(복사할 수 있습니다). 시트 없이 CLIP STUDIO PAINT·TVPaint 파일만 있는 폴더나 ZIP은 그 파일을 엽니다.', en: 'Sheet folder import now shows how many items need checking, and Details opens a per-cel list of numbers without a drawing, drawings not on the sheet and unreadable formats (tif, psd, tga) that you can copy. A folder or ZIP with no sheet but a CLIP STUDIO PAINT or TVPaint file opens that file.', zh: '作画用纸表文件夹导入现在会在完成提示中显示需确认的数量，点“详情”可打开按赛璐珞列出的无画编号、表上没有的画和无法读取格式（tif・psd・tga）的列表（可复制）。没有表、只有 CLIP STUDIO PAINT・TVPaint 文件的文件夹或 ZIP 会打开该文件。'},
         {ja: 'CLIP STUDIO PAINT ファイルの読み込みで、キーが3つ以上ある「滑らか」の位置の動きを CLIP STUDIO PAINT と同じ曲線で再現するようにしました。', ko: 'CLIP STUDIO PAINT 파일 가져오기에서 키가 셋 이상인 「滑らか」 위치 움직임을 CLIP STUDIO PAINT와 같은 곡선으로 재현하게 했습니다.', en: 'CLIP STUDIO PAINT import now reproduces Smooth position motion with three or more keys on the same curve as CLIP STUDIO PAINT.', zh: '导入 CLIP STUDIO PAINT 文件时，三个以上关键帧的“平滑”位置运动现在会以与 CLIP STUDIO PAINT 相同的曲线重现。'}] },
       { ver: 3156, items: [
@@ -82431,7 +82432,7 @@ function drawingRecordingAnimationSource(project) {
   return {fps, frames: end - start + 1, start, end,
     prepare: async function drawingRecordingPrepareAnimation(check, onStatus) {
       check();
-      if (!genga) cache = await preloadVideoExportBitmaps(project, onStatus);
+      if (!genga) cache = await preloadVideoExportBitmaps(project, onStatus, start, end + 1);
       check();
       if (!clips.length) return null;
       if (typeof AudioEncoder === 'undefined' || typeof AudioData === 'undefined') throw new Error(t('msg.export.noAudioVideoEncoder'));
@@ -100966,6 +100967,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N	`;
               // pixels is an unavailable asset; strict output must not turn it into a blank frame.
               if (!src && !opts.strict) continue;
               img = await loadImageForExport(src, opts.strict ? layer.drawingRef : ''); // 예열 미스는 그 자리 디코드
+              // 출력 캐시에 넣어 같은 그림을 다음 프레임에 다시 해독하지 않는다(카메라·FX 가 움직이는 컷은 프레임마다
+              // 이 루프를 돈다). 예산을 넘기면 먼저 들어간 것(지난 컷)부터 버린다.
+              if (img && opts.cache) budgetedMapSet(opts.cache, layer.drawingRef, img, Infinity, 'image');
             }
             const rect = layerDrawingBitmapRect(drawing);
             if (img && layerEffectIsAnimatedOrActive(layer)) {
@@ -101322,9 +101326,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N	`;
       });
     }
 
-    // Preload every conte-layer bitmap into an in-memory Image cache so the real-time record loop can
-    // draw each frame synchronously (no per-frame async load -> no stalls / dropped frames).
-    async function preloadVideoExportBitmaps(project, onStatus) {
+    // Preload the conte-layer bitmaps that frames [startFrame, endFrame) draw into an in-memory Image cache so the
+    // real-time record loop can draw each frame synchronously (no per-frame async load -> no stalls / dropped frames).
+    async function preloadVideoExportBitmaps(project, onStatus, startFrame, endFrame) {
       // Re-hydrate layer bitmaps persisted to the working folder whose in-memory bitmapDataUrl was dropped this
       // session (e.g. a per-panel 中割 variation saved to file, whose inline data is then cleared); hydration otherwise
       // runs only on open/restore. Without it the render loop's `if (!src) continue` guard skips that layer, so it
@@ -101332,17 +101336,26 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N	`;
       if (typeof hydrateWorkspaceLayerDrawingRefs === 'function') {
         await hydrateWorkspaceLayerDrawingRefs(project);
       }
-      // Prewarming also sees hidden/out-of-range drawings. Required-image validation belongs to
-      // the render loop's actual entries, so unused unavailable assets cannot block an export.
+      // 출력 구간이 그리는 그림(렌더 루프와 같은 layerDrawingEntriesForCut)만 타임라인 순서로 예열한다 — 프로젝트의
+      // 모든 그림을 키 순서로 담으면 구간 밖·숨김·다른 中割 변형이 예산을 먹고 정작 그릴 그림이 밀린다. 예산('image'
+      // 몫)까지만 담고, 넘친 그림은 렌더 루프의 미스가 디코드해 이 캐시에 넣는다(지난 컷부터 밀린다). 예열 밖에 남긴
+      // 장수는 콘솔에 남긴다. 라이브 캔버스는 렌더 루프가 직접 그리므로 인코딩·해독하지 않고, 용지 창이 이미 해독한
+      // 그림은 그대로 담는다. 필수 그림 검증은 렌더 루프가 실제 항목으로 한다.
       const cache = new Map();
-      const drawings = project && project.layerDrawings ? project.layerDrawings : {};
-      const refs = Object.keys(drawings);
+      const refs = [];
+      if (!videoTrackIsHidden(project)) {
+        const seen = new Set();
+        const from = Math.max(0, Math.round(Number(startFrame) || 0)), to = endFrame == null ? Infinity : endFrame;
+        (buildVideoTimelineCached(project).slots || []).forEach(function(slot) {
+          if (!slot.cut || slot.endFrame <= from || slot.startFrame >= to) return;
+          layerDrawingEntriesForCut(project, slot.cut.id).forEach(function(en) {
+            const ref = en.layer && en.layer.drawingRef;
+            if (ref && !seen.has(ref)) { seen.add(ref); refs.push(ref); }
+          });
+        });
+      }
       let loaded = 0;
       let missing = 0;
-      // 예산('image' 몫)까지만 예열한다 — 전량을 담으면 상한이 없다. 넘친 그림은 렌더 루프의 항목별 폴백
-      // (`cache.get(ref) || await loadImageForExport(src)`)이 그 자리에서 디코드해 출력은 안 빠진다. 예열 밖에
-      // 남긴 장수는 콘솔에 남긴다. 라이브 캔버스는 렌더 루프가 직접 그리므로 인코딩·해독하지 않고, 용지 창이
-      // 이미 해독한 그림은 그대로 담는다.
       const budget = bitmapCacheShareBytes('image');
       let bytes = 0;
       let skipped = 0;
@@ -101494,7 +101507,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N	`;
       await dialogueEnsureVoicePeaks(project, startFrame, endFrame);   // 볼드·자막의 무음 꼬리 판정이 화면과 같게
       const audioClips = opts.audio === false ? [] : audioExportClipsInSpans(project, spans);
       const frameCrop = opts.frameCrop !== false;
-      const cache = await preloadVideoExportBitmaps(project, onStatus);
+      const cache = await preloadVideoExportBitmaps(project, onStatus, startFrame, endFrame);
       const renderOpts = { outWidth: outWidth, outHeight: opts.outHeight, frameCrop: frameCrop, showCameraFrame: opts.showCameraFrame, cache: cache, videoMedia: opts.videoMedia !== false, videoMediaSeek: true, strict: true, subtitle: opts.subtitle !== false, bold: opts.bold !== false, cutInfo: opts.cutInfo !== false };
 
       // Decode required clips before recording; schedule only after recorder.start.
@@ -101979,7 +101992,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N	`;
           return mixAudioForExportOffline(project, startFrame, endFrame, fps, sampleRate, {strict: true, control: control, window: window});
         },
         prepareFrames: async function() {
-          const cache = await preloadVideoExportBitmaps(project, onStatus);
+          const cache = await preloadVideoExportBitmaps(project, onStatus, startFrame, endFrame);
           renderOpts = { outWidth: outW, outHeight: outH, frameCrop: frameCrop, showCameraFrame: showCameraFrame, cache: cache, videoMedia: opts.videoMedia !== false, videoMediaSeek: true, subtitle: opts.subtitle !== false, bold: opts.bold !== false, cutInfo: opts.cutInfo !== false, cacheFrames: true, strict: true };
         },
         recFrames: recFrames,
