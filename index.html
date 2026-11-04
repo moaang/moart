@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3166</title>
+  <title>MoArt ver3168</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -97548,8 +97548,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       return null;
     }
-    // True when exportDrawLayer would return without drawing anything (same early returns, no throw cases).
+    // True when a TVPP sample has no pixels to draw; a derived O.L group must still be rendered.
     function exportSampleIsBlank(session, layer) {
+      if (layer.olComposite) return false;
       if (layer.folderMembers) return layer.folderMembers.every(function(m) { return exportSampleIsBlank(session, m); });
       const drawing = layer.drawing;
       if (layer.folder) return true;
@@ -97784,6 +97785,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
 
     // TVPP exports drawing tracks, not an editable MoArt project. Engine adapters own time/ref semantics;
     // the codec below only receives pixels, track headers and encoded frame chunks.
+    // Conte O.L spans replace visible source pixels with a per-frame composite; the project and hidden sources stay intact.
     function exportTimelineTracks(session, includePaper) {
       if (session.timelineTracks && session.timelinePaper === includePaper) return session.timelineTracks;
       const project = session.project;
@@ -97803,7 +97805,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         });
       } else {
         const video = buildVideoTimelineCached(project), byId = new Map();
-        const segments = video.primarySegments && video.primarySegments.length ? video.primarySegments : video.slots.map(function(slot) { return { startFrame: slot.startFrame, endFrame: slot.endFrame, slot: slot }; });
+        const overlaps = video.overlaps || [];
+        const segments = !overlaps.length && video.primarySegments && video.primarySegments.length ? video.primarySegments : video.slots.map(function(slot) { return { startFrame: slot.startFrame, endFrame: slot.endFrame, slot: slot }; });
         segments.forEach(function(segment) {
           const cutId = segment.slot.cut.id, owner = conteLayerOwnerCut(project, cutId);
           conteExportFrameLayers(session, cutId).forEach(function(layer) {
@@ -97819,6 +97822,30 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           });
         });
         tracks = Array.from(byId.values()).sort(function(a, b) { return a.owner - b.owner || b.order - a.order; });
+        // Only visible source spans give way to the output-only dissolve. Hidden originals keep their pixels.
+        if (overlaps.length) {
+          tracks.forEach(function(track) {
+            if (track.layer.effectiveVisible === false) return;
+            let oi = 0;
+            track.segments = track.segments.flatMap(function(segment) {
+              const pieces = [];
+              let start = segment.startFrame;
+              while (oi < overlaps.length && overlaps[oi].endFrame <= start) oi++;
+              for (let j = oi; j < overlaps.length && overlaps[j].startFrame < segment.endFrame; j++) {
+                const ol = overlaps[j];
+                if (ol.startFrame > start) pieces.push(Object.assign({}, segment, { startFrame: start, endFrame: ol.startFrame }));
+                start = Math.max(start, ol.endFrame);
+              }
+              if (start < segment.endFrame) pieces.push(Object.assign({}, segment, { startFrame: start }));
+              return pieces;
+            });
+          });
+          tracks = overlaps.map(function(ol, i) {
+            return { layer: { id: '__export_ol_' + i, name: 'O.L ' + (i + 1), opacity: 1, blend: 'source-over', effectiveVisible: true },
+              segments: [], startFrame: ol.startFrame, endFrame: ol.endFrame, preBehavior: 'none', postBehavior: 'none',
+              olComposite: { startFrame: ol.startFrame, endFrame: ol.endFrame, outSlots: video.slotsByGroup[ol.prevGroupIndex], inSlots: video.slotsByGroup[ol.groupIndex] } };
+          }).concat(tracks);
+        }
       }
       // TVPaint needs at least one image layer even when every MoArt track is blank.
       // Hidden layers are kept with their pixels and written hidden (LRHD[7]), so a round trip loses no drawing.
@@ -97866,7 +97893,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // Preview can lie outside a layer's physical images; each track samples its native boundary behavior once.
         // Opacity is the 8-bit value the file stores. Clipping groups composite as on screen (TVPaint merges them).
         const samples = tracks.map(function(track) {
-          return Object.assign(exportTimelineSample(session, track, previewIndex), { opacity: Math.round(track.layer.opacity * 255) / 255,
+          return Object.assign(session.engine === 'conte' ? exportTvppGroupSample(session, track, previewIndex) : exportTimelineSample(session, track, previewIndex), { opacity: Math.round(track.layer.opacity * 255) / 255,
             blend: track.layer.blend, effectiveVisible: track.layer.effectiveVisible !== false, clipBaseId: track.layer.clipBaseId || '', folderId: track.layer.folderId || '' });
         });
         // 폴더 행은 트랙이 아니어서 빠져 있다. 격리 폴더(gengaFolderIsolation)를 화면처럼 합성하도록 그 폴더 행 표본만 첫 자식 앞에
@@ -97882,7 +97909,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           }
         }
         await exportCompositeItems(ctx, samples, plan.width, plan.height,
-          async function(sample, canvas) { await exportDrawLayer(session, sample, canvas); if (!current()) throw new Error('Export cancelled'); },
+          async function(sample, canvas) {
+            if (session.engine === 'conte') await exportDrawTvppSample(session, sample, canvas, false, current);
+            else await exportDrawLayer(session, sample, canvas);
+            if (!current()) throw new Error('Export cancelled');
+          },
           function(sample) { return sample.effectiveVisible; });
         const previewBlob = await canvasToBlob(composite, 'image/png');
         if (!previewBlob) throw new Error(t('export.err.encode'));
@@ -97938,6 +97969,18 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return out;
     }
     function exportTvppGroupSample(session, track, index) {
+      if (track.olComposite) {
+        const ol = track.olComposite;
+        // RangeTracks may extend this track for a media tail; the original O.L bounds never extend with it.
+        const sample = Object.assign({}, track.layer, { drawing: null, ref: null, exposureKey: '', isGap: true });
+        if (index < ol.startFrame || index >= ol.endFrame) return sample;
+        const outgoing = frameSpanBinarySearch(ol.outSlots, index), incoming = frameSpanBinarySearch(ol.inSlots, index);
+        sample.olComposite = { outCutId: outgoing && outgoing.cut.id, inCutId: incoming && incoming.cut.id,
+          t: (index - ol.startFrame) / (ol.endFrame - ol.startFrame) };
+        sample.exposureKey = JSON.stringify([track.layer.id, index]);
+        sample.isGap = false;
+        return sample;
+      }
       if (track.folderGroup) {
         // Members draw with their own blend and opacity; their own eye (the folder's eye is the merged layer's).
         const members = track.folderGroup.members.filter(function(m) { return m.layer.visible !== false; }).map(function(m) {
@@ -97962,8 +98005,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return sample;
     }
     // Image reuse key: a merged group is the same picture only when every member is (string identities only; a vector
-    // member gives a key that never matches, so that frame is drawn).
+    // member gives a key that never matches, so that frame is drawn). O.L samples have a unique track/frame key.
     function exportTvppImageIdentity(sample, plan) {
+      if (sample.olComposite) return sample.exposureKey;
       if (sample.folderMembers) {
         const parts = sample.folderMembers.map(function(m) { return exportTvppImageIdentity(m, plan); });
         if (!parts.every(function(part) { return typeof part === 'string' || part === null; })) return {};
@@ -97976,8 +98020,38 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!parts.every(function(part) { return typeof part === 'string' || part === null; })) return {};
       return JSON.stringify(parts.concat(sample.clips.map(function(clip) { return [clip.blend || 'source-over', clip.opacity]; })));
     }
-    // The base neutral, then each clipping sample inside its alpha (as exportCompositeItems draws a group).
-    async function exportDrawTvppSample(session, sample, canvas, bounds) {
+    // O.L mixes completed transparent cut groups, not individual layer alphas. No background or camera is baked in.
+    // Temporary canvases belong to this call; captured sources and cancellation belong to the export session.
+    // Clipping samples keep their base neutral, as exportCompositeItems draws a group.
+    async function exportDrawTvppSample(session, sample, canvas, bounds, current) {
+      if (sample.olComposite) {
+        const ol = sample.olComposite, ctx = canvas.getContext('2d');
+        const outgoing = exportCanvas(canvas.width, canvas.height), incoming = exportCanvas(canvas.width, canvas.height);
+        const check = function() { if (current && !current()) throw new Error('Export cancelled'); };
+        const drawCut = async function(cutId, target) {
+          if (!cutId) return;
+          const layers = conteExportFrameLayers(session, cutId).map(function(layer) {
+            return Object.assign({}, layer, { opacity: Math.round(layer.opacity * 255) / 255 });
+          });
+          await exportCompositeItems(target.getContext('2d'), layers, canvas.width, canvas.height,
+            async function(layer, scratch) { await exportDrawLayer(session, layer, scratch); check(); },
+            function(layer) { return layer.effectiveVisible; });
+          check();
+        };
+        try {
+          check();
+          await drawCut(ol.outCutId, outgoing); check();
+          await drawCut(ol.inCutId, incoming); check();
+          ctx.save();
+          try {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.globalAlpha = 1 - ol.t; ctx.drawImage(outgoing, 0, 0);
+            ctx.globalAlpha = ol.t; ctx.drawImage(incoming, 0, 0);
+          } finally { ctx.restore(); }
+        } finally { outgoing.width = outgoing.height = incoming.width = incoming.height = 1; }
+        return null;
+      }
       if (sample.folderMembers) {
         // Bottom to top on transparency, each member (and its clipping group) neutral in a scratch, then with its blend/opacity.
         const scratch = exportCanvas(canvas.width, canvas.height), sc = scratch.getContext('2d'), ctx = canvas.getContext('2d');
@@ -97986,7 +98060,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             const m = sample.folderMembers[k];
             if (exportSampleIsBlank(session, m)) continue;
             sc.clearRect(0, 0, scratch.width, scratch.height);
-            await exportDrawTvppSample(session, m, scratch);
+            await exportDrawTvppSample(session, m, scratch, false, current);
             ctx.save(); ctx.globalAlpha = m.opacity == null ? 1 : m.opacity; ctx.globalCompositeOperation = m.blend || 'source-over'; ctx.drawImage(scratch, 0, 0); ctx.restore();
           }
         } finally { scratch.width = scratch.height = 1; }
@@ -98052,7 +98126,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
               else if (localIndex > 0 && exportSampleIsBlank(session, sample)) image = blank;
               else {
                 sc.clearRect(0, 0, plan.width, plan.height);
-                let box = await exportDrawTvppSample(session, sample, scratch, true);
+                let box = await exportDrawTvppSample(session, sample, scratch, true, current);
                 if (!current()) throw new Error('Export cancelled');
                 // Only placed, unscaled rasters report their actual source bounds. Everything else reads the full paper.
                 if (box) {
@@ -98287,6 +98361,20 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       const moving = poses.some(function(p) { return p.some(function(v, k) { return Math.abs(v - poses[0][k]) > 1e-9; }); });
       if (moving && !gt) throw new Error(t('export.tvpp.conteCamera'));
+      if (!gt) (tracks || exportTimelineTracks(session, plan.includePaper)).forEach(function(track) {
+        const ol = track.olComposite;
+        if (!ol) return;
+        for (let i = ol.startFrame; i < ol.endFrame; i++) {
+          [ol.outSlots, ol.inSlots].forEach(function(slots) {
+            const slot = frameSpanBinarySearch(slots, i);
+            if (!slot) return;
+            const r = cameraLegacyToPaperRect(cameraTransformForCutAtFrame(project, slot.cut.id, i), cp);
+            if (!r || !(r.w > 0 && r.h > 0) || Math.abs(r.w / outW - r.h / outH) > 1e-6) throw new Error(t('export.tvpp.cameraAspect'));
+            const p = [r.x + r.w / 2, r.y + r.h / 2, -(r.rotation || 0) * 180 / Math.PI, r.w / outW];
+            if (p.some(function(v, k) { return !Number.isFinite(v) || Math.abs(v - poses[0][k]) > 1e-9; })) throw new Error(t('export.tvpp.conteCamera'));
+          });
+        }
+      });
       if (!moving) return { outW: outW, outH: outH, path: null, pose: poses[0] };
       const origin = gengaTvppFrameOrigin(gt);
       // TVPaint's default clock uses participating image-layer ends, not audio/camera tails or the clip's First.
