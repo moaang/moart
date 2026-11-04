@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3170</title>
+  <title>MoArt ver3171</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -13043,6 +13043,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'msg.genga.merge.folderIsolation': { ja: '合成モードが「通過」でないフォルダの中と外のレイヤーは結合できません', ko: '합성 모드가 「통과」가 아닌 폴더의 안과 밖 레이어는 합칠 수 없습니다', en: 'Layers inside and outside a folder whose blend mode is not Pass through cannot be merged', zh: '无法合并混合模式不是「穿透」的文件夹内外的图层' },
         'blend.overlay': { ja: 'オーバーレイ', ko: '오버레이', en: 'Overlay', zh: '叠加' },
         'blend.screen': { ja: 'スクリーン', ko: '스크린', en: 'Screen', zh: '滤色' },
+        'blend.tvpMultiply': { ja: '乗算 (TVPaint)', ko: '곱하기 (TVPaint)', en: 'Multiply (TVPaint)', zh: '正片叠底 (TVPaint)' },
+        'blend.tvpDarken': { ja: '比較(暗) (TVPaint)', ko: '비교(어둡게) (TVPaint)', en: 'Darken (TVPaint)', zh: '变暗 (TVPaint)' },
+        'blend.tvpLighten': { ja: '比較(明) (TVPaint)', ko: '비교(밝게) (TVPaint)', en: 'Lighten (TVPaint)', zh: '变亮 (TVPaint)' },
         'blend.tvpScreen': { ja: 'スクリーン (TVPaint)', ko: '스크린 (TVPaint)', en: 'Screen (TVPaint)', zh: '滤色 (TVPaint)' },
         'blend.tvpOverlay': { ja: 'オーバーレイ (TVPaint)', ko: '오버레이 (TVPaint)', en: 'Overlay (TVPaint)', zh: '叠加 (TVPaint)' },
         'blend.tvpLight2': { ja: '覆い焼き (TVPaint)', ko: '닷지 (TVPaint)', en: 'Dodge (TVPaint)', zh: '减淡 (TVPaint)' },
@@ -97655,8 +97658,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     async function exportPrepareResult(session, plan, current, progress, onPreview) {
       if (plan.format === 'tvpp') return exportPrepareTimeline(session, plan, current, progress, onPreview);
       if (plan.format === 'clip') return exportPrepareClip(session, plan, current, progress, onPreview);
-      const layers = session.engine === 'genga' ? gengaExportFrameLayers(session.project, session.frame, plan.includePaper) : conteExportFrameLayers(session);
-      if (plan.format === 'psd') exportPsdValidateLayers(layers);
+      let layers = session.engine === 'genga' ? gengaExportFrameLayers(session.project, session.frame, plan.includePaper) : conteExportFrameLayers(session);
+      if (plan.format === 'psd') { layers = layers.map(exportNameBlendStyle); exportPsdValidateLayers(layers); }
       const composite = exportCanvas(plan.width, plan.height), scratch = exportCanvas(plan.width, plan.height);
       const ctx = composite.getContext('2d'), sc = scratch.getContext('2d'), encoded = new Map();
       let bytes = plan.width * plan.height * 4;
@@ -97900,7 +97903,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const samples = tracks.map(function(track) {
           return Object.assign(session.engine === 'conte' ? exportTvppGroupSample(session, track, previewIndex) : exportTimelineSample(session, track, previewIndex), { opacity: Math.round(track.layer.opacity * 255) / 255,
             blend: track.layer.blend, blendModel: track.layer.blendModel || '', effectiveVisible: track.layer.effectiveVisible !== false, clipBaseId: track.layer.clipBaseId || '', folderId: track.layer.folderId || '' });
-        });
+        }).map(plan.format === 'clip' ? exportNameBlendStyle : function(sample) { return sample; });
         // 폴더 행은 트랙이 아니어서 빠져 있다. 격리 폴더(gengaFolderIsolation)를 화면처럼 합성하도록 그 폴더 행 표본만 첫 자식 앞에
         // 되돌려 넣는다(자식은 연속이다).
         if (session.engine === 'genga') {
@@ -100495,7 +100498,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const tracks = new Map(exportTimelineTracks(session, plan.includePaper).map(function(track) { return [track.layer.id, track]; }));
       const roots = [], folders = new Map();
       let folder = '';
-      gengaExportFrameLayers(session.project, 1, plan.includePaper).forEach(function(item) {
+      gengaExportFrameLayers(session.project, 1, plan.includePaper).map(exportNameBlendStyle).forEach(function(item) {
         if (item.folder) {
           if (item.folderId) throw new Error(t('export.clip.structure', item.name));
           if (item.folderBlend && exportClipComposite(item.folderBlend.blend) == null) throw new Error(t('export.clip.blend', item.name, item.folderBlend.blend));
@@ -109707,14 +109710,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
              Math.abs((a.w || 0) - (b.w || 0)) < eps && Math.abs((a.h || 0) - (b.h || 0)) < eps &&
              Math.abs((Number(a.rotation) || 0) - (Number(b.rotation) || 0)) < 0.003;
     }
-    // TVPaint 11 Screen·Overlay·Light2 (blendModel 'tvpaint11', set only on TVPP import or by choosing it; user decision). Unlike the
-    // Canvas modes, the result keeps the backdrop's alpha (nothing lands on transparency) and each channel is b + a·(mode(b, s) − b),
-    // a = source alpha × opacity, with Screen taking s·a. Fitted to TVPaint 11.5.3 native renders; other modes and versions are not
-    // implied. `blend` keeps its Canvas value, so every "not source-over" boundary (no folding, no merging) still applies.
+    // TVPaint 11 Multiply·Darken·Lighten·Screen·Overlay·Light2 (blendModel 'tvpaint11', set only on TVPP import or by choosing it;
+    // user decision). Unlike the Canvas modes, the result keeps the backdrop's alpha (nothing lands on transparency) and each channel
+    // is b + a·(mode(b, s) − b), a = source alpha × opacity, with Screen taking s·a. Fitted to TVPaint 11.5.3 native renders; Add is
+    // the Canvas 'lighter' already, other modes and versions are not implied. `blend` keeps its Canvas value, so every "not
+    // source-over" boundary (no folding, no merging) still applies.
+    // The value is what PSD and CLIP (which carry a mode name only) get. 'name': equal to the Canvas mode wherever the backdrop is
+    // opaque, so the layer is written and previewed as that mode (exportNameBlendStyle). 'refuse': differs even there.
     const TVPAINT_BLEND_MODEL = 'tvpaint11';
-    const TVPAINT_BLENDS = { screen: true, overlay: true, 'color-dodge': true };
+    const TVPAINT_BLENDS = { multiply: 'name', darken: 'name', lighten: 'name', screen: 'refuse', overlay: 'refuse', 'color-dodge': 'refuse' };
     function tvpaintBlendOf(style) {
       return style && style.blendModel === TVPAINT_BLEND_MODEL && TVPAINT_BLENDS[style.blend] ? style.blend : '';
+    }
+    function exportNameBlendStyle(item) {
+      return TVPAINT_BLENDS[tvpaintBlendOf(item)] === 'name' ? Object.assign({}, item, { blendModel: '' }) : item;
     }
     // Reads and writes the whole target in device pixels: a clip region or transform on target does not limit it. `source` is
     // placed at device (0, 0) like drawImage(source, 0, 0) under an identity transform; its alpha is scaled by opacity.
@@ -109728,13 +109737,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       try {
         const sd = src.getContext('2d').getImageData(0, 0, w, h).data;
-        const img = target.getImageData(0, 0, w, h), d = img.data, mode = blend === 'screen' ? 0 : blend === 'overlay' ? 1 : 2;
+        const img = target.getImageData(0, 0, w, h), d = img.data;
+        const mode = ['screen', 'overlay', 'color-dodge', 'multiply', 'darken', 'lighten'].indexOf(blend);
         for (let i = 0; i < d.length; i += 4) {
           if (!d[i + 3] || !sd[i + 3]) continue;
           const a = sd[i + 3] / 255 * op;
           for (let c = i; c < i + 3; c++) {
             const b = d[c], v = sd[c];
-            const m = mode === 0 ? b + (255 - b) * v * a / 255 : mode === 1 ? b + (2 * v / 255 - 1) * b * (1 - b / 255) : Math.min(255, b * 256 / (256 - v));
+            const m = mode === 0 ? b + (255 - b) * v * a / 255 : mode === 1 ? b + (2 * v / 255 - 1) * b * (1 - b / 255)
+              : mode === 2 ? Math.min(255, b * 256 / (256 - v)) : mode === 3 ? b * v / 255 : mode === 4 ? Math.min(b, v) : Math.max(b, v);
             d[c] = b + a * (m - b);
           }
         }
@@ -120612,7 +120623,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             tvppRange: { start: L.start - first + 1, end: L.end - first + 1 },
             preBehavior: L.preBehavior || 'none', postBehavior: L.postBehavior || 'none'
           });
-          if (TVPAINT_BLENDS[built[built.length - 1].blend]) built[built.length - 1].blendModel = TVPAINT_BLEND_MODEL;   // codes 10/17/18 only
+          if (TVPAINT_BLENDS[built[built.length - 1].blend]) built[built.length - 1].blendModel = TVPAINT_BLEND_MODEL;   // codes 9/10/17/18/25/26
         }
       } catch (error) {
         if (signal && signal.aborted) return null;
@@ -120896,8 +120907,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         drawing: gengaIngestDrawing(exp.drawing) // externalize legacy inline base64 → {ref,w,h} on load
       };
     }
-    // TVPaint Screen·Overlay·Light2 kept apart from the Canvas modes of the same name (tvpaintBlendOf). Folders and the paper never offer them.
+    // TVPaint modes kept apart from the Canvas modes of the same name (tvpaintBlendOf). Folders and the paper never offer them.
     const GENGA_TVPAINT_BLEND_MODES = [
+      { v: TVPAINT_BLEND_MODEL + ':multiply', blend: 'multiply', labelKey: 'blend.tvpMultiply' },
+      { v: TVPAINT_BLEND_MODEL + ':darken', blend: 'darken', labelKey: 'blend.tvpDarken' },
+      { v: TVPAINT_BLEND_MODEL + ':lighten', blend: 'lighten', labelKey: 'blend.tvpLighten' },
       { v: TVPAINT_BLEND_MODEL + ':screen', blend: 'screen', labelKey: 'blend.tvpScreen' },
       { v: TVPAINT_BLEND_MODEL + ':overlay', blend: 'overlay', labelKey: 'blend.tvpOverlay' },
       { v: TVPAINT_BLEND_MODEL + ':color-dodge', blend: 'color-dodge', labelKey: 'blend.tvpLight2' }
