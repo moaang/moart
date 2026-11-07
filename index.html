@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3184</title>
+  <title>MoArt ver3185</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -112923,8 +112923,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const step = GENGA_DLG_CHAR_KOMA, glyphs = [];
       heads.forEach(function(h, p) {
         const end = p + 1 < heads.length ? heads[p + 1] : n;
-        let g = base + 1 + step * Math.max(0, Math.round((want[p] - base - 1) / step));
-        for (let i = h; i < end; i++, g += step) glyphs.push(g);
+        for (let i = h, g = gengaDialogueAlignSnap(want[p], base); i < end; i++, g += step) glyphs.push(g);
       });
       return gengaDialogueAlignCheck(glyphs, base, to);
     }
@@ -116271,9 +116270,32 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { placement: placement, subs: subs, entries: want.entries.length, sig: gengaLipsyncBakeSignature(gt, sec, sp, settings, sectionSettings, want.entries) };
     }
     // 입 열림 어긋남(사용자 판정 2026-11-02). 음성 덩어리(「文字を合わせる」와 같은 분석·자동 문턱·쉼 잇기)와 입 덩어리(열린 입
-    // 코마를 같은 쉼 잇기로 묶음)를 순서대로 짝짓고(수가 다르면 아직 안 쓴 입 덩어리 중 음성 시작에 가장 가까운 것), 입이 「음성 시작 1코마 앞」
-    // 에서 GENGA_LIPSYNC_ONSET_TOL 코마 이상 벗어나면 알린다. 격자에 붙이며 생기는 ±2코마는 정상이다. 분석 중이면 { pending }.
+    // 코마를 같은 쉼 잇기로 묶음)를 짝짓고(gengaLipsyncPairRuns), 입이 「음성 시작 1코마 앞」에서 GENGA_LIPSYNC_ONSET_TOL 코마
+    // 이상 벗어나면 알린다. 격자에 붙이며 생기는 ±2코마는 정상이다. 분석 중이면 { pending }.
     const GENGA_LIPSYNC_ONSET_TOL = 3;
+    // 수가 같으면 차례대로. 다르면 순서를 지키며 짝을 가능한 한 많이 짓고(적은 쪽은 모두 짝이 있다 — 큰 어긋남도 알린다),
+    // 그 가운데 시작 차이의 합이 가장 작은 짝을 고른다. 덩어리마다 가장 가까운 것을 앞에서부터 고르면 짝 없는 음성 하나(숨·감탄)가
+    // 뒤 짝을 모두 한 칸씩 밀었다(G07 c172 둘째 대사: 사용자 OK 판에 15·40·26코마 헛알림).
+    function gengaLipsyncPairRuns(runs, mouth) {
+      if (runs.length === mouth.length) return runs.map(function(r, i) { return [r, mouth[i]]; });
+      const cost = [], back = [], more = runs.length > mouth.length;   // 많은 쪽만 짝 없이 넘긴다
+      for (let i = 0; i <= runs.length; i++) { cost.push(new Array(mouth.length + 1).fill(Infinity)); back.push([]); }
+      cost[0][0] = 0;
+      for (let i = 0; i <= runs.length; i++) for (let j = 0; j <= mouth.length; j++) {
+        const c = cost[i][j];
+        const go = function(a, b, add) { if (c + add < cost[a][b]) { cost[a][b] = c + add; back[a][b] = [i, j]; } };
+        if (more && i < runs.length) go(i + 1, j, 0);
+        if (!more && j < mouth.length) go(i, j + 1, 0);
+        if (i < runs.length && j < mouth.length) go(i + 1, j + 1, Math.abs(mouth[j][0] - runs[i][0] + 1));
+      }
+      const pairs = [];
+      for (let i = runs.length, j = mouth.length; back[i][j];) {
+        const p = back[i][j];
+        if (p[0] < i && p[1] < j) pairs.unshift([runs[p[0]], mouth[p[1]]]);
+        i = p[0]; j = p[1];
+      }
+      return pairs;
+    }
     function gengaLipsyncOnsetCheck(gt, entry, actual) {
       const clip = gengaDialogueAlignClips(gt, entry)[0];
       if (!clip) return null;
@@ -116289,14 +116311,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (joinable && last && f - last[1] - 1 <= GENGA_DLG_ALIGN_GAP) last[1] = f; else mouth.push([f, f]);
         joinable = true;
       });
-      const items = [], used = new Set();
-      runs.forEach(function(r, i) {
-        const want = r[0] - 1;
-        const m = mouth.length === runs.length ? mouth[i]
-          : mouth.reduce(function(a, c) { return used.has(c) ? a : !a || Math.abs(c[0] - want) < Math.abs(a[0] - want) ? c : a; }, null);
-        if (!m) return;   // 짝 없는 음성 덩어리는 다른 항목(말하는데 닫힘 등)이 본다
-        used.add(m);
-        if (Math.abs(m[0] - want) >= GENGA_LIPSYNC_ONSET_TOL) items.push({ kind: 'onset', voice: r[0], open: m[0], n: Math.abs(m[0] - want), late: m[0] > want });
+      const items = [];
+      // 짝 없는 음성 덩어리는 다른 항목(말하는데 닫힘 등)이 본다
+      gengaLipsyncPairRuns(runs, mouth).forEach(function(p) {
+        const want = p[0][0] - 1, open = p[1][0];
+        if (Math.abs(open - want) >= GENGA_LIPSYNC_ONSET_TOL) items.push({ kind: 'onset', voice: p[0][0], open: open, n: Math.abs(open - want), late: open > want });
       });
       return { runs: runs, items: items };
     }
@@ -116367,7 +116386,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (unset.length) items.push({ kind: 'unassigned', tokens: unset });
       const ov = gengaLipsyncLayerTextTrack(gt, layer, entry.from, entry.to, settings, pair.explicit ? null : entry).overlap;
       if (ov.length) items.push({ kind: 'overlap', from: ov[0], to: ov[ov.length - 1] });
-      gengaLipsyncSectionsWithSpans(layer).forEach(function(x) {
+      sections.forEach(function(x) {
         if (!x.sec.bakedFrom || x.sp.end < entry.from || x.sp.start > entry.to) return;
         const ts = gengaLipsyncSectionSettings(settings, x.sec), w = gengaLipsyncLayerTextTrack(gt, layer, x.sp.start, x.sp.end, ts);
         if (gengaLipsyncBakeSignature(gt, x.sec, x.sp, settings, ts, w.entries) !== x.sec.bakedFrom.sig) items.push({ kind: 'stale', from: x.sp.start, to: x.sp.end });
