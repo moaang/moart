@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3205</title>
+  <title>MoArt ver3206</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -97696,7 +97696,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (session.running || session.delivering) {
         session.refreshPending = true;
         const busyUi = exportResultControls(dialog);
-        if (busyUi.run) busyUi.run.disabled = !(session.engine === 'genga' && gengaBatchImgRunning && busyUi.kind === 'layers');
+        if (busyUi.run) busyUi.run.disabled = !(session.engine === 'genga' && gengaBatchImgRunning);   // 일괄·재시도의 中止
         return;
       }
       session.refreshPending = false;
@@ -109539,7 +109539,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const kindEl = document.querySelector('input[name="gengaExportKind"]:checked');
       const kind = kindEl ? kindEl.value : 'image';
       if (session.running) {
-        if (gengaBatchImgRunning && kind === 'layers') await runGengaBatchImageExportFromDialog();
+        if (gengaBatchImgRunning) await runGengaBatchImageExportFromDialog();   // 일괄·재시도 중의 「中止」(종류 라디오와 무관)
         return;
       }
       const owner = projectIoOwner(), fileBase = owner.project.title || 'genga';
@@ -109727,7 +109727,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           if (used.get(cand) === it.identity) return; // already emitted under the suffixed name
           used.set(cand, it.identity); name = cand; collisions.push(base + '→' + cand);
         }
-        plan.push({ name: name, startFrame: it.startFrame, members: it.members, revisionKey: it.revisionKey || '' });
+        plan.push({ name: name, identity: it.identity, startFrame: it.startFrame, members: it.members, revisionKey: it.revisionKey || '' });
       });
       const warnings = built.warnings.slice();
       if (collisions.length) warnings.push('名前衝突を回避（別名で保存）: ' + collisions.slice(0, 5).join(' / ') + (collisions.length > 5 ? ' ほか' : ''));
@@ -109799,20 +109799,43 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return false;
       }
     }
+    // The resolved 用紙 ({dr, blend, opacity, side}) with its own blend and opacity. Callers place it by paper.side.
+    function gengaDrawExportPaper(ctx, paper, pw, ph) {
+      ctx.save();
+      ctx.globalCompositeOperation = paper.blend || 'source-over';
+      ctx.globalAlpha = paper.opacity != null ? paper.opacity : 1;
+      gengaDrawInstrPaper(ctx, paper.dr, pw, ph);
+      ctx.restore();
+    }
 
     // Raw artwork compositing is shared by image output and grouped-art instruction previews.
-    async function gengaCompositeExportMembers(ctx, members, frame, pw, ph) {
+    // strict: a member that fails to decode throws instead of leaving that layer out — a cel file must not be
+    // written (and counted) with a layer silently missing; the batch files it as a failure that can be retried.
+    async function gengaCompositeExportMembers(ctx, members, frame, pw, ph, strict) {
       const draws = [];
       members.forEach(function(m) {
         const e = gengaExposureAt(m, frame), dr = e ? gengaExposureDrawing(m, e) : null;
         if (gengaDrawingHasArt(dr)) draws.push({ m: m, dr: dr });
       });
-      await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr) : Promise.resolve(true); }));
+      // Stored drawings (tile sets, deltas, evicted refs) are made ready the way the single-image export does
+      // (gengaExportEnsureRef): a tile set that is not decoded yet paints nothing and only starts its decode.
+      for (const d of draws) {
+        if (!d.dr.ref || d.dr.strokes) continue;
+        try { await gengaExportEnsureRef(d.dr.ref, new Set()); } catch (error) { if (strict) throw error; }
+        d.dr = gengaResolveDrawing(d.dr) || d.dr;
+      }
+      const decoded = await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr) : Promise.resolve(true); }));
+      const missing = decoded.filter(function(ok) { return !ok; }).length;
+      if (strict && missing) throw new Error(t('msg.export.missingImages', missing, draws.length));
       const byLayer = new Map(draws.map(function(d) { return [d.m, d]; }));
+      // A decoded drawing can still fail to paint (gengaDrawDrawingInto returns false, e.g. tiles not ready); strict
+      // makes that and any draw exception a failure instead of a missing layer.
       compositeDrawItems(ctx, gengaClipDrawItems(state.project && state.project.gengaTimeline, members.slice().reverse(), function(m) {
         const d = byLayer.get(m);
-        return d ? { blend: m.blend, blendModel: m.blendModel, opacity: m.opacity, draw: function(c) { gengaDrawDrawingInto(c, d.dr, pw, ph); } } : null;
-      }));
+        return d ? { blend: m.blend, blendModel: m.blendModel, opacity: m.opacity, draw: function(c) {
+          if (gengaDrawDrawingInto(c, d.dr, pw, ph) === false && strict) throw new Error(t('msg.export.missingImages', 1, draws.length));
+        } } : null;
+      }), strict ? { throwOnError: true } : undefined);
       return draws.length;
     }
     function gengaInstructionArtMembers(gt, layer) {
@@ -109832,15 +109855,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 用紙 의 그림 판정도 커널(gengaDrawingHasArt)로 — 해석기만 고치고 이 소비처를 놓치면 벡터 用紙 가 여기서
       // 다시 걸러져 종이만 안 찍힌다.
       const paper = opts.paper && gengaDrawingHasArt(opts.paper.dr) ? opts.paper : null;
-      const drawPaper = function() {
-        ctx.globalCompositeOperation = paper.blend || 'source-over';
-        ctx.globalAlpha = (paper.opacity != null ? paper.opacity : 1);
-        gengaDrawInstrPaper(ctx, paper.dr, opts.pw, opts.ph);
-        ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
-      };
-      if (paper && paper.side === 'bottom') drawPaper(); // frame under the cell
-      await gengaCompositeExportMembers(ctx, item.members, item.startFrame, opts.pw, opts.ph);
-      if (paper && paper.side !== 'bottom') drawPaper(); // frame over the cell (最前面, default)
+      if (paper && paper.side === 'bottom') gengaDrawExportPaper(ctx, paper, opts.pw, opts.ph); // frame under the cell
+      await gengaCompositeExportMembers(ctx, item.members, item.startFrame, opts.pw, opts.ph, true);
+      if (paper && paper.side !== 'bottom') gengaDrawExportPaper(ctx, paper, opts.pw, opts.ph); // frame over the cell (最前面, default)
       const mime = opts.format === 'jpeg' ? 'image/jpeg' : 'image/png';
       return await canvasToBlob(canvas, mime, opts.format === 'jpeg' ? opts.quality : undefined);
     }
@@ -110537,6 +110554,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       return { keys: keys, corners: pureMove };
     }
+    // 지시 종이의 글자·선 배율(세계 단위). 출력 픽셀로 정하고 마지막에 fit 으로 나눈다(줄인 캔버스는 그만큼 키운다).
+    // 용지 짧은 변 900px 당 1 에 더해, 출력 종이가 길면(大判 BG·긴 PAN) 긴 변 2080px 당 1 — 단, 짧은 변 600px 당 1 을
+    // 넘지 않는다(가늘고 긴 종이에서 글자가 종이 밖으로 나가지 않게). 표준 용지(1920×1080 + 여백 = 2496×1404)는
+    // 1.2 로 지금까지와 같다.
+    const GENGA_INSTR_TEXT_LONG_SIDE = 2080, GENGA_INSTR_TEXT_SHORT_SIDE = 600;
+    function gengaInstrTextScale(pw, ph, worldW, worldH, fit) {
+      const outW = worldW * fit, outH = worldH * fit;
+      const long = Math.min(Math.max(outW, outH) / GENGA_INSTR_TEXT_LONG_SIDE, Math.min(outW, outH) / GENGA_INSTR_TEXT_SHORT_SIDE);
+      return Math.max(1, Math.min(pw, ph) / 900, long) / fit;
+    }
     async function gengaRenderCameraInstructionBlob(gt, opts) {
       const pw = Math.max(1, Math.round(opts.pw)), ph = Math.max(1, Math.round(opts.ph));
       const std = (gt && gt.camera) ? { x: gt.camera.x, y: gt.camera.y, w: gt.camera.w, h: gt.camera.h, rotation: 0 } : null;
@@ -110545,7 +110572,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const base = (gt.cameraWork && Number(gt.cameraWork.w) > 0)
         ? { x: gt.cameraWork.x, y: gt.cameraWork.y, w: gt.cameraWork.w, h: gt.cameraWork.h, rotation: Number(gt.cameraWork.rotation) || 0 }
         : std;
-      const moving = keys.length >= 2;
+      // Keys that all sit on one rect are a static frame, not a move (same rule as gengaFxMovedStates for layers).
+      const moving = keys.length >= 2 && keys.some(function(k) { return !cameraRectsNear(k, keys[0]); });
       // Nothing worth an image: no keys and the pose is the standard 100Fr frame.
       const shown = moving ? keys.map(function(k) { return { frame: k.frame, x: k.x, y: k.y, w: k.w, h: k.h, rotation: Number(k.rotation) || 0 }; })
                            : [Object.assign({ frame: keys.length ? keys[0].frame : 1 }, keys.length ? { x: keys[0].x, y: keys[0].y, w: keys[0].w, h: keys[0].h, rotation: Number(keys[0].rotation) || 0 } : base)];
@@ -110556,17 +110584,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // gengaInstrCanvas budget clamp, ctx already translated to the grown origin.
       const made = instrCanvasCoveringRects(shown.concat([std]), pw, ph);
       const canvas = made.canvas, ctx = made.ctx, instrFit = made.fit;
-      await gengaCompositeArtInto(ctx, gt, shown[0].frame || 1, pw, ph);
       // 用紙 의 그림 판정도 커널(gengaDrawingHasArt)로 — 해석기만 고치고 이 소비처를 놓치면 벡터 用紙 가 여기서
-      // 다시 걸러져 종이만 안 찍힌다.
+      // 다시 걸러져 종이만 안 찍힌다. 놓는 쪽(side)·합성은 셀 이미지와 같다.
       const paper = opts.paper && gengaDrawingHasArt(opts.paper.dr) ? opts.paper : null;
-      if (paper) {
-        ctx.globalAlpha = (paper.opacity != null ? paper.opacity : 1);
-        gengaDrawInstrPaper(ctx, paper.dr, pw, ph);
-        ctx.globalAlpha = 1;
-      }
+      if (paper && paper.side === 'bottom') gengaDrawExportPaper(ctx, paper, pw, ph);
+      await gengaCompositeArtInto(ctx, gt, shown[0].frame || 1, pw, ph);
+      if (paper && paper.side !== 'bottom') gengaDrawExportPaper(ctx, paper, pw, ph);
       drawCameraInstruction(ctx, { shown: shown, std: std, pw: pw, ph: ph, fit: instrFit,
-        rectAt: function(f) { return gengaCameraWorkAt(gt, f); }, runs: gengaCamWorkRuns(gt).runs, frameTicks: opts.frameTicks });
+        rectAt: function(f) { return gengaCameraWorkAt(gt, f); }, textScale: gengaInstrTextScale(pw, ph, canvas.width / instrFit, canvas.height / instrFit, instrFit), runs: gengaCamWorkRuns(gt).runs, frameTicks: opts.frameTicks });
       return await gengaInstrBlob(canvas); // null 이면 던진다
     }
     // Everything after the artwork is one implementation for genga and conte camera images. The engines
@@ -110575,7 +110600,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function drawCameraInstruction(ctx, o) {
       // 캔버스를 줄였으면 선·글자는 그만큼 키운다 — 출력에서 보이는 크기가 그대로여야 지시가 읽힌다. lw 는
       // 출력에서 max(fit, min(pw,ph)/900) px — 1px 밑으로 사라지지 않는다.
-      const scale = Math.max(1, Math.min(o.pw, o.ph) / 900) / o.fit;
+      const scale = o.textScale || Math.max(1, Math.min(o.pw, o.ph) / 900) / o.fit;   // 원화는 gengaInstrTextScale 을 준다
       const lw = Math.max(1, scale), fs = Math.max(16, 18 * scale);
       const noteFont = '700 ' + Math.max(11, Math.round(fs * 0.68)) + 'px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
       ctx.font = '700 ' + Math.round(fs) + 'px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
@@ -110900,6 +110925,24 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       return placed;
     }
+    // Motion words when the sheet has no run text (number-only key style): what changes over ALL keys, not the
+    // first against the last — a slide that returns to its start still slid.
+    function gengaInstrMotionFallback(states, scalePrefix) {
+      return '  ' + gengaInstrMotionWords(states, scalePrefix).join('  ');
+    }
+    function gengaInstrMotionWords(states, scalePrefix) {
+      const g = states[0].fx, fx = states.map(function(s) { return s.fx; }), last = fx[fx.length - 1];
+      const words = [];
+      if (fx.some(function(f) { return Math.hypot(f.x - g.x, f.y - g.y) > 0.5; })) words.push('SL');
+      if (fx.some(function(f) { return Math.abs(f.scale - g.scale) > 0.005; })) {
+        const peak = fx.reduce(function(a, f) { return Math.abs(f.scale - g.scale) > Math.abs(a - g.scale) ? f.scale : a; }, g.scale);
+        const back = Math.abs(last.scale - g.scale) <= 0.005, dir = back ? peak : last.scale;   // 돌아오는 줌은 꼭짓점까지 적는다
+        words.push(scalePrefix + (dir > g.scale ? 'T.U' : 'T.B') + '  ' + Math.round(g.scale * 100) + '% → ' +
+          (back ? Math.round(peak * 100) + '% → ' : '') + Math.round(last.scale * 100) + '%');
+      }
+      if (fx.some(function(f) { return Math.abs(f.rot - g.rot) > 0.3; })) words.push('回転');
+      return words;
+    }
     async function gengaRenderCelMoveInstructionBlob(gt, layer, subject, opts) {
       // 부르는 쪽이 방식 판정을 하며 이미 계획을 세웠으면 그것을 그대로 쓴다(그림 준비를 두 번 하지 않는다).
       const plan = (opts && opts.plan) || await gengaCelMoveInstrPlan(layer, Object.assign({}, opts, { gt: gt, duration: gengaShakuFrames(gt) }));
@@ -110912,11 +110955,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 用紙 의 그림 판정도 커널(gengaDrawingHasArt)로 — 해석기만 고치고 이 소비처를 놓치면 벡터 用紙 가 여기서
       // 다시 걸러져 종이만 안 찍힌다.
       const paper = opts.paper && gengaDrawingHasArt(opts.paper.dr) ? opts.paper : null;
-      if (paper) { ctx.save(); ctx.globalAlpha = paper.opacity; gengaDrawInstrPaper(ctx, paper.dr, pw, ph); ctx.restore(); }
+      if (paper && paper.side === 'bottom') gengaDrawExportPaper(ctx, paper, pw, ph);
       const std = (gt && gt.camera) ? { x: gt.camera.x, y: gt.camera.y, w: gt.camera.w, h: gt.camera.h, rotation: 0 } : null;
-      const scale = 1 / instrFit, lw = scale, fs = 14 * scale;
+      // 선·눈금은 출력 1px(scale), 글자는 카메라 지시 종이와 같은 배율(ts) — 大判처럼 긴 종이에서도 읽히게.
+      const scale = 1 / instrFit, lw = scale, ts = gengaInstrTextScale(pw, ph, plan.w, plan.h, instrFit), fs = Math.max(16, 18 * ts);
       if (std) strokePoly(ctx, cameraRectCorners(std), '#111111', lw);
       gengaDrawCelInstructionArt(ctx, plan, instrFit);
+      if (paper && paper.side !== 'bottom') gengaDrawExportPaper(ctx, paper, pw, ph);   // 셀 이미지와 같은 쪽, 지시선·글자 아래
       // Exact trajectory and its perpendicular timing ticks; direction is already written in the A→B memo.
       // The point the 目盛り is measured from. satsuma p18 asks for a clear feature — 「髪の先や鼻など明確な
       // ポイントに矢印をつけると良い」 — which the drawn box's centre usually is not, so the cell can carry its
@@ -110935,7 +110980,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 対象物のセル名 + the lowercase boundary letters this cel's sheet lines use
       ctx.save();
       ctx.font = '400 ' + fs + 'px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
-      ctx.textBaseline = 'alphabetic'; ctx.lineWidth = 2 * scale; ctx.strokeStyle = '#ffffff';
+      ctx.textBaseline = 'alphabetic'; ctx.lineWidth = Math.max(2 * scale, 3 * ts); ctx.strokeStyle = '#ffffff';
       const work = gengaLayerFxWorkEntries(gt).find(function(entry) { return String(entry.layer.id) === String(layer.id); });
       const labelsByFrame = {};
       (work ? work.runs : []).forEach(function(run) {
@@ -110945,7 +110990,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const tangent = instrTangent(path, Math.max(0, Math.min(path.length - 1, s.frame - firstFrame)));
         return { anchor: centreOf(s.fx), normal: tangent.length ? { x: -tangent.y / tangent.length, y: tangent.x / tangent.length } : { x: 0, y: 1 }, text: cameraInstructionLabelText(labelsByFrame[s.frame]),
           color: celMoveColor(i, states.length) };
-      }), { x: plan.ox, y: plan.oy, w: plan.w, h: plan.h }, fs, 24 * scale);
+      }), { x: plan.ox, y: plan.oy, w: plan.w, h: plan.h }, fs, 24 * ts);
       labels.forEach(function(label) {
         // The leader starts clear of the 4px half key tick, so the tick stays whole and the two never merge.
         const dx = label.tip.x - label.anchor.x, dy = label.tip.y - label.anchor.y, len = Math.hypot(dx, dy), gap = 10 * scale;
@@ -110954,14 +110999,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         ctx.strokeText(label.text, label.x, label.y + fs * .82);
         ctx.fillText(label.text, label.x, label.y + fs * .82);
       });
-      const first = states[0].fx, last = states[states.length - 1].fx;
-      const label = (work && work.group.motionMemo) || subject + (Math.abs(last.scale - first.scale) > 0.005
-        ? ('  レイヤー' + (last.scale > first.scale ? 'T.U' : 'T.B') + '  ' + Math.round(first.scale * 100) + '% → ' + Math.round(last.scale * 100) + '%')
-        : (Math.hypot(last.x - first.x, last.y - first.y) > 0.5 ? '  SL' : '  回転'));
+      const motion = work && work.group.motionText;
+      const label = subject + (motion ? ' ' + motion : gengaInstrMotionFallback(states, 'レイヤー'));
       ctx.fillStyle = CAMERA_RED;
       const mid = centreOf(states[Math.floor(states.length / 2)].fx);
       gengaDrawInstructionText(ctx, label, { x: plan.ox, y: plan.oy, w: plan.w, h: plan.h },
-        { x: mid.x + 12 * scale, y: Math.max(mid.y + 8 * scale, ...labels.map(p => p.y + p.h + 5 * scale)) }, fs);
+        { x: mid.x + 12 * ts, y: Math.max(mid.y + 8 * ts, ...labels.map(p => p.y + p.h + 5 * ts)) }, fs);
       ctx.restore();
       return await gengaInstrBlob(canvas); // null 이면 던진다
     }
@@ -111008,13 +111051,17 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       // 네 변 모두 여백을 준다. 카메라 지시 종이는 用紙 라는 기준 변이 있어서 「밖으로 나간 쪽만」 늘렸지만,
       // 여기 바탕은 소재의 그린 영역 그 자체라 기준으로 삼을 변이 없고 라벨·지시문이 사방으로 나간다.
-      const ox = Math.floor(l - GENGA_CAM_IMG_PAD), oy = Math.floor(t - GENGA_CAM_IMG_PAD);
+      // 지시문 2줄은 그림 위 자기 띠에 둔다 — 그림 안 왼쪽 위에 두면 키 라벨(nk)과 겹친다. 띠 높이는 줄이지 않은
+      // 캔버스 기준 글자 크기로 잡는다(줄이면 글자도 그만큼 커지므로 비율이 같다).
+      const bandW = r - l + GENGA_CAM_IMG_PAD * 2, bandH0 = b - t + GENGA_CAM_IMG_PAD * 2;
+      const band = Math.ceil(2 * 1.45 * Math.max(16, 18 * gengaInstrTextScale(pw, ph, bandW, bandH0, 1)) + GENGA_CAM_IMG_PAD / 2);
+      const ox = Math.floor(l - GENGA_CAM_IMG_PAD), oy = Math.floor(t - GENGA_CAM_IMG_PAD - band);
       const made = gengaInstrCanvas(Math.ceil(r + GENGA_CAM_IMG_PAD) - ox, Math.ceil(b + GENGA_CAM_IMG_PAD) - oy);
       const canvas = made.canvas, ctx = made.ctx, instrFit = made.fit;
       ctx.translate(-ox, -oy);
       ctx.drawImage(art, 0, 0, pw, ph);                       // 소재 단독, 변환 없이 제자리에 한 번
       // 카메라 지시와 같은 규칙 — 캔버스를 줄였으면 선·글자는 그만큼 키운다.
-      const scale = Math.max(1, Math.min(pw, ph) / 900) / instrFit;
+      const scale = gengaInstrTextScale(pw, ph, canvas.width / instrFit, canvas.height / instrFit, instrFit);
       const lw = Math.max(1, scale), fs = Math.max(16, 18 * scale); // 카메라 지시와 같은 1px 급 — 근거는 그쪽 주석
       const fsNote = Math.max(11, Math.round(fs * 0.68));
       const noteFont = '700 ' + fsNote + 'px "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif';
@@ -111046,25 +111093,29 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         corners: tpPureMove, noteFont: noteFont
       });
       // 지시문 2줄. 한글은 쓰지 않는다 — 일본 현장으로 나가는 산출물은 일본어/영숫자만.
-      const first = states[0].fx, last = states[states.length - 1].fx;
       // 수식어 `レイヤー` 는 붙이지 않는다(사용자 판정). 이 종이는 프레임을 도장 찍는 형식이라 레이어 배율이라는
       // 개념이 앉을 자리가 없다. 숫자의 100% 는 프로젝트를 만들 때 정한 카메라 프레임(gt.camera)이지 첫 키가 아니다.
       // BG 가 612% 로 그려져 있으면 카메라 배율이 612% 다 — 첫 키 기준 상대 표기면 항상 100% → n% 가 된다. 그래서
       // 카메라 지시 이미지의 Fr(gengaSheetCameraFr, 표준 프레임 = 100Fr)과 기준점이 같아 두 지시 이미지의 어법이
       // 맞는다. 방향 판정: 조여들면 T.U / 벌어지면 T.B.
-      const zoom = Math.abs(last.scale - first.scale) > 0.005
-        ? ('　' + (last.scale > first.scale ? 'T.U' : 'T.B') + ' ' + Math.round(first.scale * 100) + '% → ' + Math.round(last.scale * 100) + '%')
-        : '';
+      // 모든 키를 본다(돌아오는 줌은 꼭짓점까지). PAN 은 이 종이의 정의라 SL 은 적지 않는다.
+      const zoomWords = gengaInstrMotionWords(states, '').filter(function(w) { return w !== 'SL'; });
+      const zoom = zoomWords.length ? '　' + zoomWords.join('　') : '';
       ctx.save();
       ctx.fillStyle = CAMERA_RED; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(3, 4 * scale);
       const tx = ox + Math.round(12 * scale);
       const work = gengaLayerFxWorkEntries(gt).find(function(entry) { return String(entry.layer.id) === String(layer.id); });
-      gengaDrawInstructionText(ctx, [work && work.group.motionMemo || subject + 'のみPAN', '目盛りPAN' + zoom].join('\n'),
-        { x: ox, y: oy, w: canvas.width / instrFit, h: canvas.height / instrFit }, { x: tx, y: oy + 12 * scale }, fs);
+      // 시트의 구간 글(レイヤーT.U 등)은 이 종이의 어법이 아니다 — 대상과 のみPAN, 다음 줄에 目盛りPAN 과 줌·회전.
+      gengaDrawInstructionText(ctx, [subject + 'のみPAN', '目盛りPAN' + zoom].join('\n'),
+        { x: ox, y: oy, w: canvas.width / instrFit, h: band }, { x: tx, y: oy + 4 * scale }, fs);
       ctx.restore();
       return await gengaInstrBlob(canvas); // null 이면 던진다
     }
     // Drive the whole batch: enumerate → render → write into the chosen folder. Honors state.videoExportCancel.
+    // 재시도가 들고 가는 것은 레이어 객체가 아니라 이 둘이다(레이어 객체는 편집마다 새로 만들어진다).
+    // owners = 합성 멤버 레이어 id. 셀을 지우고 같은 태그·번호로 다시 만들면 이름·정체 문자열은 같아도 다른 셀이다.
+    function gengaBatchRetryItem(it) { return { name: it.name, identity: it.identity, owners: (it.members || []).map(function(m) { return String(m.id); }).join(',') }; }
+    function gengaBatchRetryKey(it) { return it.name + '\u0000' + it.identity + '\u0000' + it.owners; }
     async function runGengaBatchImageExport(dirHandle, opts, onStatus) {
       const owner = opts.owner || projectIoOwner();
       assertProjectIoOwner(owner);
@@ -111077,10 +111128,19 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!gt) throw new Error(t('msg.genga.noProject'));
       const pw = Math.max(1, Math.round(gt.paper.w)), ph = Math.max(1, Math.round(gt.paper.h));
       const built = gengaBatchExportPlan(gt, opts.padding);
-      // 재시도는 지난번에 실패한 셀만 다시 쓴다 — 이미 나온 장수를 다시 인코딩하지 않는다.
-      // 시트·카메라·무버는 호출부가 옵션으로 꺼서 이 경로에 안 들어온다.
-      const plan = (opts.retryItems && opts.retryItems.length) ? opts.retryItems : built.plan;
-      if (!plan.length) throw new Error(t('msg.genga.export.noTargets'));
+      // 재시도는 지난번에 실패한 셀만 다시 쓴다 — 이미 나온 장수를 다시 인코딩하지 않는다. 항목은 파일 이름으로 들고
+      // 지금의 타임라인에서 다시 세운다: 레이어 객체는 편집마다 새로 만들어지므로(normalizeGengaTimeline) 지난 계획의
+      // 항목을 그대로 그리면 편집 전 그림이 나간다. 그사이 없어진 이름은 경고로 알린다.
+      // 시트·카메라·무버는 지난번에 못 낸 단계(pending)만 호출부가 켠다. 단계 단위다 — 시트 그림 한 장만 실패했어도
+      // 그 단계의 파일(JSON·모든 시트 그림)을 같은 이름으로 다시 쓴다.
+      // 이름만으로 찾지 않는다: 이름 충돌의 -2 접미사는 계획 순서로 붙으므로, 그사이 항목이 지워지거나 순서가 바뀌면
+      // 같은 이름을 다른 그림이 차지할 수 있다. 그림 정체(identity)와 멤버 레이어까지 같은 항목만 다시 쓰고, 나머지는 알린다.
+      const retryKeys = opts.retryItems ? new Set(opts.retryItems.map(gengaBatchRetryKey)) : null;
+      const plan = retryKeys ? built.plan.filter(function(it) { return retryKeys.has(gengaBatchRetryKey(gengaBatchRetryItem(it))); }) : built.plan;
+      const kept = new Set(plan.map(function(it) { return gengaBatchRetryKey(gengaBatchRetryItem(it)); }));
+      const goneNames = retryKeys ? opts.retryItems.filter(function(r) { return !kept.has(gengaBatchRetryKey(r)); }).map(function(r) { return r.name; }) : [];
+      if (!plan.length && !retryKeys) throw new Error(t('msg.genga.export.noTargets'));
+      const sheetWanted = opts.includeSheet !== false, cameraWanted = opts.includeCameraImage !== false;
       // 영상·GIF 처럼 일괄 이미지도 이 선행 디코드를 밟는다. 결손의 대가는 여기서 가장 크다: 영상은 한 파일 안의
       // 결손이라 알리면 끝이지만, 이미지는 빈 그림이 파일로 폴더에 남아 정상 파일과 섞여 작화 데이터로 넘어간다.
       // 그래서 여기서는 알리는 데 그치지 않고 묻는다. 기본은 중단이다.
@@ -111090,8 +111150,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const goOn = await askConfirm(t('msg.genga.export.decodeFailConfirm', pre.failed, pre.total));
         assertProjectIoOwner(owner);
         if (!goOn) {
-          return { written: 0, total: plan.length, failures: [], failedItems: plan.slice(), warnings: [t('msg.export.missingImages', pre.failed, pre.total)],
-                   sheetName: '', cameraImageName: '', cameraNames: [], canceled: true };
+          return { written: 0, total: plan.length, failures: [], failedItems: plan.map(gengaBatchRetryItem), warnings: [t('msg.export.missingImages', pre.failed, pre.total)],
+                   pending: { sheet: sheetWanted, camera: cameraWanted }, sheetName: '', cameraImageName: '', cameraNames: [], canceled: true };
         }
       }
       const paper = opts.includePaper ? await gengaResolvePaperForExport(gt) : null; // decoded once, composited into every cell
@@ -111103,16 +111163,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 어떤 파일이 비었는지 모르면 조용한 실패와 같다.
       const preWarnings = (pre && pre.failed > 0) ? [t('msg.export.missingImages', pre.failed, pre.total)] : [];
       if (!timesheetFpsSupported(gt)) preWarnings.push(t('export.sheet.unsupported'));
-      // 실패는 사람이 읽을 문구(failures)와 다시 돌릴 수 있는 항목(failedItems) 둘로 남긴다 — 콘티
+      goneNames.forEach(function(n) { preWarnings.push(n + '（' + t('msg.genga.export.noTargets') + '）'); });
+      // 실패는 사람이 읽을 문구(failures)와 다시 돌릴 수 있는 항목(failedItems: 이름+그림 정체) 둘로 남긴다 — 콘티
       // 배치가 failures/failedGroups 로 하는 것과 같은 모양이다. 문구만 남기면 재시도할 방법이 없다.
       let written = 0; const failures = []; const failedItems = [];
+      let sheetDone = false, cameraDone = false;   // 끝까지 실패 없이 낸 단계 — 아니면 재시도가 다시 낸다(pending)
       // 시트·지시 이미지에 필요한 해석은 파일 쓰기 전에 확정한다. 그림만 재시도할 때는 필요 없다.
-      if ((opts.includeSheet !== false || opts.includeCameraImage !== false) && !state.videoExportCancel) {
+      if ((sheetWanted || cameraWanted) && !state.videoExportCancel) {
         if (!await gengaPrepareInstrModes(gt)) throw new Error(t('msg.genga.export.instrInputsChanged'));
       }
       for (let i = 0; i < plan.length; i += 1) {
         assertProjectIoOwner(owner);
-        if (state.videoExportCancel) { failedItems.push(...plan.slice(i)); break; }
+        if (state.videoExportCancel) { failedItems.push(...plan.slice(i).map(gengaBatchRetryItem)); break; }
         const it = plan[i];
         const fileName = it.name + '.' + ext;
         if (onStatus) onStatus(t('msg.batchExport.layerImage', i + 1, plan.length, fileName), i + 1, plan.length, fileName); // Numbers ride along for the motion overlay
@@ -111121,7 +111183,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           assertProjectIoOwner(owner);
           await writeBlobToDirectory(dirHandle, fileName, blob);
           written += 1;
-        } catch (e) { assertProjectIoOwner(owner); failures.push(fileName + '（' + (e && e.message ? e.message : e) + '）'); failedItems.push(it); }
+        } catch (e) { assertProjectIoOwner(owner); failures.push(fileName + '（' + (e && e.message ? e.message : e) + '）'); failedItems.push(gengaBatchRetryItem(it)); }
         if ((i & 7) === 0) await new Promise(function(r) { setTimeout(r, 0); });
       }
       assertProjectIoOwner(owner);   // the last cell's write and yield
@@ -111130,7 +111192,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // dropped straight back into conte (or opened on the Auto Sheet site).
       let sheetName = '';
       const sheetImageNames = []; // 시트 그림(여러 장일 수 있다)
-      if (opts.includeSheet !== false && !state.videoExportCancel) {
+      if (sheetWanted && !state.videoExportCancel) {
+        const failedBefore = failures.length;
         try {
           sheetName = gengaSheetJsonFileName(project);
           if (onStatus) onStatus(t('msg.batchExport.sheetConfig', sheetName), null, 0, sheetName); // Name only — bar holds
@@ -111157,13 +111220,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             sheetImageNames.push(imgName);
           } catch (e) { assertProjectIoOwner(owner); failures.push(imgName + '（' + (e && e.message ? e.message : e) + '）'); }
         }
+        sheetDone = failures.length === failedBefore && !state.videoExportCancel;
       }
       // The camera-frame 撮影指示 image. It goes in a "_camera" subfolder on purpose — the folder-drop
       // importer matches cel images by filename, and a frame image sitting beside them would be read as a cel.
       // Names starting with "_" are already skipped by that scanner, so the round trip stays intact.
       let cameraImageName = '';
       assertProjectIoOwner(owner);
-      if (opts.includeCameraImage !== false && !state.videoExportCancel) {
+      const cameraFailedBefore = failures.length;
+      if (cameraWanted && !state.videoExportCancel) {
         try {
           const camBlob = await gengaRenderCameraInstructionBlob(gt, { pw: pw, ph: ph, paper: paper, frameTicks: opts.frameTicks });
           assertProjectIoOwner(owner);
@@ -111178,7 +111243,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         } catch (e) { assertProjectIoOwner(owner); failures.push((cameraImageName || '_camera') + '（' + (e && e.message ? e.message : e) + '）'); cameraImageName = ''; }
       }
       // One instruction image per shared motion group; material image output above remains individual.
-      if (opts.includeCameraImage !== false && !state.videoExportCancel) {
+      if (cameraWanted && !state.videoExportCancel) {
         const base = gengaSheetJsonFileName(project).replace(/^sheet_/, '').replace(/\.json$/i, '');
         // 대상 목록은 gengaInstrTargetLayers 에서 나온다 — 다이얼로그의 줄과 여기서 종이가 나오는 레이어가 같은
         // 술어를 쓴다. 방식은 레이어가 들고 있으므로 전역 옵션이 없다.
@@ -111194,20 +111259,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           try {
             // 셀 이동식이라면 종이가 얼마가 되는지를 먼저 잰다. 이 계획은 그대로 렌더러에 넘어가므로
             // 재는 값과 그리는 값이 어긋날 수 없다(그림 준비도 한 번만 한다).
-            const inputSig = gengaInstrModeSig(gt, l);
-            const plan = await gengaCelMoveInstrPlan(l, { gt: gt, pw: pw, ph: ph, duration: gengaShakuFrames(gt) });
-            assertProjectIoOwner(owner);   // before the mode is remembered on the layer
-            if (!plan) continue;
-            const over = gengaInstrOverBudget(plan.w, plan.h);
+            const inputSig = gengaInstrModeSig(gt, l, group);
             // 방식은 이 레이어 자신의 선택이다. 'auto' 는 셀 이동식으로 원래 해상도로 못 그리는 시트만
             // 츠케팬(目盛りPAN)으로 넘긴다. 해석은 다이얼로그와 같은 함수로 한다 — 갈리면 옵션에 뜬 값과 종이로 나간 값이 갈린다.
+            // 츠케팬을 직접 고른 레이어는 셀 이동식 상자를 잴 일이 없다(그 계획은 그림 합성·알파 경계를 키마다 한다).
             const want = gengaLayerInstrMode(l);
+            const plan = want === 'tsukepan' ? null : await gengaCelMoveInstrPlan(l, { gt: gt, pw: pw, ph: ph, duration: gengaShakuFrames(gt) });
+            assertProjectIoOwner(owner);   // before the mode is remembered on the layer
+            if (!plan && want !== 'tsukepan') continue;
             const mode = gengaRememberInstrMode(gt, l, gengaInstrModeFromPlan(l, plan), inputSig);
             if (mode === null) throw new Error(t('msg.genga.export.instrInputsChanged'));
             // 사용자 요구: 임계를 숫자로 정하기 전에 실기에서 어떤 시트가 어디로 갔는지 눈으로 본다.
-            console.log('[instr] ' + label + ' → ' + mode + ' (opt=' + want + ')  celBox=' + plan.w + '×' + plan.h +
+            if (plan) console.log('[instr] ' + label + ' → ' + mode + ' (opt=' + want + ')  celBox=' + plan.w + '×' + plan.h +
               ' (' + (plan.w * plan.h / 1e6).toFixed(1) + 'Mpx)  budget=' + (GENGA_INSTR_MAX_AREA * GENGA_INSTR_TSUKEPAN_AT / 1e6).toFixed(0) +
-              'Mpx / ' + (GENGA_INSTR_MAX_SIDE * GENGA_INSTR_TSUKEPAN_AT) + 'px per side  overBudget=' + over);
+              'Mpx / ' + (GENGA_INSTR_MAX_SIDE * GENGA_INSTR_TSUKEPAN_AT) + 'px per side  overBudget=' + gengaInstrOverBudget(plan.w, plan.h));
             const blob = mode === 'tsukepan'
               ? await gengaRenderTsukePanInstructionBlob(gt, l, subject, { pw: pw, ph: ph, frameTicks: opts.frameTicks })
               : await gengaRenderCelMoveInstructionBlob(gt, l, subject, { pw: pw, ph: ph, paper: paper, plan: plan, frameTicks: opts.frameTicks });
@@ -111221,11 +111286,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             cameraNames.push(name);
           } catch (e) { assertProjectIoOwner(owner); failures.push((name || label) + '（' + (e && e.message ? e.message : e) + '）'); }
         }
+        cameraDone = failures.length === cameraFailedBefore && !state.videoExportCancel;
       }
       // 선행 디코드에서 나온 누락을 계획 단계 경고와 합쳐서 낸다 — 「계속」을 고른 실행의
       // 완료 문구에 그 사실이 없으면, 폴더를 나중에 연 사람에게는 조용한 실패와 같다.
       assertProjectIoOwner(owner);   // the last sheet/camera/mover write — no result for a project that is gone
-      return { written: written, total: plan.length, failures: failures, failedItems: failedItems, warnings: preWarnings.concat(built.warnings), sheetName: sheetName, sheetImageNames: sheetImageNames, cameraImageName: cameraImageName, cameraNames: cameraNames, canceled: Boolean(state.videoExportCancel) };
+      return { written: written, total: plan.length, failures: failures, failedItems: failedItems, warnings: preWarnings.concat(built.warnings),
+               pending: { sheet: sheetWanted && !sheetDone, camera: cameraWanted && !cameraDone },
+               sheetName: sheetName, sheetImageNames: sheetImageNames, cameraImageName: cameraImageName, cameraNames: cameraNames, canceled: Boolean(state.videoExportCancel) };
     }
     // Standalone: write only the Auto Sheet settings JSON (no images). Uses the save picker so it can go anywhere.
     async function gengaExportSheetJsonOnly(onStatus) {
@@ -111297,36 +111365,66 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const btn = document.getElementById('gengaExportRetryFailedBtn');
       if (!btn) return;
       const retry = state.lastGengaBatchRetry;
-      btn.hidden = !(retry && projectIoOwnerCurrent(retry.owner) && retry.items && retry.items.length);
+      btn.hidden = !(retry && projectIoOwnerCurrent(retry.owner));
     }
-    // 지난 일괄에서 실패한 셀만 같은 폴더·같은 설정으로 다시 쓴다. 시트·카메라·무버는
-    // 끄고 들어간다 — 그것들은 이 재시도의 대상이 아니고, 이미 나온 것을 덮어쓸 이유도 없다.
-    // 여기 실패는 대개 파일 쓰기 경합(동기·백신이 갓 만든 파일을 건드리는 등)이라 그냥 다시 하면 된다.
+    // 남은 일(실패·취소된 셀, 못 낸 시트·카메라)이 있을 때만 재시도 상태를 둔다. opts 는 그때의 출력 설정이다.
+    function gengaBatchRetryState(owner, dirHandle, r, opts) {
+      const items = r.failedItems || [], pending = r.pending || {};
+      return (items.length || pending.sheet || pending.camera)
+        ? { owner: owner, dirHandle: dirHandle, items: items, pending: { sheet: !!pending.sheet, camera: !!pending.camera }, opts: opts }
+        : null;
+    }
+    // 일괄과 재시도가 같은 결과 문구를 쓴다 — 한쪽만 경고를 빠뜨리면 「계속」으로 빈 레이어가 나간 사실이 사라진다.
+    // 지시 이미지는 _camera 하위 폴더에 들어가 눈에 안 띄므로 이름을 싣는다(3개까지 이름, 그 뒤로는 개수).
+    function gengaBatchResultLine(r) {
+      const tail = r.failures.length ? t('msg.genga.export.failuresTail', r.failures.length, r.failures.slice(0, 3).join(' / ')) : '';
+      const warn = r.warnings.length ? t('msg.genga.export.warningsTail', r.warnings.join(' / ')) : '';
+      const sheet = r.sheetName ? ('  +' + r.sheetName) : '';
+      const camList = r.cameraNames || [];
+      const cam = camList.length
+        ? t('msg.genga.export.cameraTail', camList.length <= 3 ? camList.join(' / ') : (camList.slice(0, 3).join(' / ') + ' +' + (camList.length - 3)))
+        : '';
+      return (r.canceled ? t('ui.abort') : t('ui.done')) + ' ' + t('msg.genga.export.countLine', r.written, r.total) + sheet + cam + tail + warn;
+    }
+    // 지난 일괄에서 남은 것만 같은 폴더·같은 설정으로 다시 쓴다: 실패·취소된 셀과, 취소·실패로 못 낸 시트·카메라·무버.
+    // 다 나온 단계는 끄고 들어간다 — 이미 나온 것을 덮어쓸 이유가 없다.
+    // 셀 실패는 대개 파일 쓰기 경합(동기·백신이 갓 만든 파일을 건드리는 등)이라 그냥 다시 하면 된다.
+    // 실행 중에는 대화상자의 실행 단추가 「中止」가 되어 이 재시도를 멈춘다(일괄 본실행과 같은 세션 규칙).
     async function retryFailedGengaBatchExport() {
       const retry = state.lastGengaBatchRetry;
-      if (!retry || !retry.items || !retry.items.length) return;
+      if (!retry) return;
       if (!projectIoOwnerCurrent(retry.owner)) { state.lastGengaBatchRetry = null; updateGengaExportRetryButtonVisibility(); return; }
+      const dialog = document.getElementById('gengaExportDialog'), session = exportSessions.get(dialog);
+      if (!session || gengaBatchImgRunning || session.running || session.delivering) return;
       const status = document.getElementById('gengaExportStatus');
-      if (gengaBatchImgRunning) return;
-      if (!await ensureWorkspacePermission(retry.dirHandle, true)) { alert(t('export.video.err.retryPermission')); return; }
-      if (!projectIoOwnerCurrent(retry.owner)) { state.lastGengaBatchRetry = null; updateGengaExportRetryButtonVisibility(); return; }
+      const runBtn = document.getElementById('gengaExportRunBtn');
+      // 첫 await(권한 창) 전에 세션과 일괄 자리를 잡는다 — 기다리는 사이 다른 출력·재시도가 시작하지 못하게.
+      // 해제는 일반 실행과 같다: 창이 열려 있으면 결과 칸을 다시 그리고, 닫혔으면 세션을 회수한다.
+      const orig = runBtn ? runBtn.textContent : '';
       gengaBatchImgRunning = true;
+      session.running = true;
       state.videoExportCancel = false;
       try {
-        const opts = Object.assign({}, retry.opts, { owner: retry.owner, retryItems: retry.items, includeSheet: false, includeCameraImage: false });
+        if (!await ensureWorkspacePermission(retry.dirHandle, true)) { alert(t('export.video.err.retryPermission')); return; }
+        if (!projectIoOwnerCurrent(retry.owner)) { state.lastGengaBatchRetry = null; updateGengaExportRetryButtonVisibility(); return; }
+        if (!dialog.open || session.closed) return;
+        if (runBtn) { runBtn.disabled = false; runBtn.textContent = t('ui.abort'); }
+        const includeSheet = retry.pending.sheet && timesheetFpsSupported(retry.owner.project.gengaTimeline);
+        const opts = Object.assign({}, retry.opts, { owner: retry.owner, retryItems: retry.items, includeSheet: includeSheet, includeCameraImage: retry.pending.camera });
         // 진행·결과는 이 owner 가 아직 현재일 때만 게시한다 — 전환 뒤의 화면은 새 프로젝트의 것이다.
         const r = await runGengaBatchImageExport(retry.dirHandle, opts, function(msg) { if (status && projectIoOwnerCurrent(retry.owner)) status.textContent = msg; });
         if (!projectIoOwnerCurrent(retry.owner)) return;
-        state.lastGengaBatchRetry = (r.failedItems && r.failedItems.length)
-          ? { owner: retry.owner, dirHandle: retry.dirHandle, items: r.failedItems, opts: retry.opts }
-          : null;
+        state.lastGengaBatchRetry = gengaBatchRetryState(retry.owner, retry.dirHandle, r, retry.opts);
         updateGengaExportRetryButtonVisibility();
-        const tail = r.failures.length ? t('msg.genga.export.failuresTail', r.failures.length, r.failures.slice(0, 3).join(' / ')) : '';
-        if (status) status.textContent = (r.canceled ? t('ui.abort') : t('ui.done')) + ' ' + t('msg.genga.export.countLine', r.written, r.total) + tail;
+        if (status) status.textContent = gengaBatchResultLine(r);
       } catch (error) {
         if (status && projectIoOwnerCurrent(retry.owner)) status.textContent = t('msg.genga.export.layerImageExportFailed', error && error.message ? error.message : error);
       } finally {
         gengaBatchImgRunning = false;
+        state.videoExportCancel = false;
+        if (runBtn) runBtn.textContent = orig;
+        session.running = false;
+        if (dialog.open) exportRefreshResult(dialog); else exportCloseSession(dialog);
       }
     }
     async function runGengaBatchImageExportFromDialog() {
@@ -111369,25 +111467,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         assertProjectIoOwner(owner);   // the folder picker awaited
         const includeSheet = timesheetFpsSupported(owner.project.gengaTimeline); // unsupported sheets are excluded; images remain available
         gengaBatchMotionShow(); // Cut-bag motion overlay rides the run
-        const r = await runGengaBatchImageExport(dir, { owner: owner, format: format, whiteBg: whiteBg, padding: padding, quality: 0.92, includePaper: includePaper, includeSheet: includeSheet, revisionPaperBg: revisionPaperBg, frameTicks: frameTicks }, function(msg, done, total, fileName) { if (!projectIoOwnerCurrent(owner)) return; if (status) status.textContent = msg; gengaBatchMotionUpdate(done, total, fileName); });
+        const runOpts = { format: format, whiteBg: whiteBg, padding: padding, quality: 0.92, includePaper: includePaper, revisionPaperBg: revisionPaperBg, frameTicks: frameTicks };
+        const r = await runGengaBatchImageExport(dir, Object.assign({ owner: owner, includeSheet: includeSheet }, runOpts), function(msg, done, total, fileName) { if (!projectIoOwnerCurrent(owner)) return; if (status) status.textContent = msg; gengaBatchMotionUpdate(done, total, fileName); });
         if (!projectIoOwnerCurrent(owner)) { gengaBatchMotionFinish(false); return; } // 전환된 화면에 결과를 게시하지 않는다
-        // 콘티 배치와 같은 모양 — 실패한 셀과 그때의 폴더·옵션을 남겨 두면 그 셋만 다시 쓸 수 있다.
+        // 콘티 배치와 같은 모양 — 남은 일과 그때의 폴더·옵션을 남겨 두면 그것만 다시 쓸 수 있다.
         // revisionPaperBg 도 싣는다 — 소비처가 `!== false` 로 읽으므로 빠지면 `undefined` 가 「켜짐」이 되어, 사용자가
-        // 끈 수정용지 배경이 재시도에서 켜진다. (includeSheet 는 재시도가 false 로 덮는다.)
-        state.lastGengaBatchRetry = (r.failedItems && r.failedItems.length)
-          ? { owner: owner, dirHandle: dir, items: r.failedItems, opts: { format: format, whiteBg: whiteBg, padding: padding, quality: 0.92, includePaper: includePaper, revisionPaperBg: revisionPaperBg } }
-          : null;
+        // 끈 수정용지 배경이 재시도에서 켜진다. (시트·카메라는 재시도가 pending 으로 정한다.)
+        state.lastGengaBatchRetry = gengaBatchRetryState(owner, dir, r, runOpts);
         updateGengaExportRetryButtonVisibility();
-        const tail = r.failures.length ? t('msg.genga.export.failuresTail', r.failures.length, r.failures.slice(0, 3).join(' / ')) : '';
-        const warn = r.warnings.length ? t('msg.genga.export.warningsTail', r.warnings.join(' / ')) : '';
-        const sheet = r.sheetName ? ('  +' + r.sheetName) : '';
-        // 지시 이미지는 _camera 하위 폴더에 들어가므로 눈에 안 띈다. 이름을 그대로 실어
-        // "어디에 무엇이 나왔는지" 를 문구만 보고 알 수 있게 한다(3개까지 이름, 그 뒤로는 개수).
-        const camList = (r.cameraNames || []);
-        const cam = camList.length
-          ? t('msg.genga.export.cameraTail', camList.length <= 3 ? camList.join(' / ') : (camList.slice(0, 3).join(' / ') + ' +' + (camList.length - 3)))
-          : '';
-        if (status) status.textContent = (r.canceled ? t('ui.abort') : t('ui.done')) + ' ' + t('msg.genga.export.countLine', r.written, r.total) + sheet + cam + tail + warn;
+        if (status) status.textContent = gengaBatchResultLine(r);
         gengaBatchMotionFinish(!r.canceled && !r.failures.length);
       } catch (error) {
         gengaBatchMotionFinish(false);
@@ -112675,11 +112763,19 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         group.subjects.push(subject); group.subjectIds.push(String(layer.id));
         plan.entries.push({ layer: layer, label: label, runs: group.runs, group: group });
       });
+      const runText = function(run) {
+        return cameraInstructionLabelText(run.startLabel) + '→' + cameraInstructionLabelText(run.endLabel) + ' ' + run.text +
+          (run.pctStart == null ? '' : ' ' + run.pctStart + '%→' + run.pctEnd + '%');
+      };
       plan.groups.forEach(function(group) {
         group.subject = group.subjects.join('・');
         const run = group.fullcut && group.runs[0];
-        group.motionMemo = run ? group.subject + ' ' + cameraInstructionLabelText(run.startLabel) + '→' + cameraInstructionLabelText(run.endLabel) + ' ' + run.text +
-          (run.pctStart == null ? '' : ' ' + run.pctStart + '%→' + run.pctEnd + '%') + ' 全尺' : '';
+        // fullcutText / motionText = the motion without its subject. The sheet memo prefixes every subject of the group; an
+        // instruction image prefixes only the visible cels it draws (gengaInstrTargetLayers). Every run is listed
+        // so a move that comes back (SL out and in) or chains (SL then T.U) reads as the sheet column does.
+        group.fullcutText = run ? runText(run) + ' 全尺' : '';
+        group.motionText = group.fullcutText || group.runs.filter(function(r) { return r.text; }).map(runText).join('  ');
+        group.motionMemo = run ? group.subject + ' ' + group.fullcutText : '';
       });
       gengaFxPlanManual(gt, plan);
       plan.memos = gengaFxPlanMemos(gt, plan);
