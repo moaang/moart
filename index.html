@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3210</title>
+  <title>MoArt ver3211</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -101947,7 +101947,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           continue;
         }
         if (bytes >= budget) { skipped += 1; continue; }
-        const img = cachedLayerPreviewImage(layerDrawingContentKey(refs[i], drawing)) || await loadImageForExport(src);
+        // 재생 컴포지터가 이미 해독한 같은 그림도 그대로 담는다(읽기만 — 그 캐시의 키·예산은 재생 몫이다).
+        const played = state.videoPreloadedLayerImages.get(videoLayerBitmapPreloadKey(refs[i], drawing));
+        const img = cachedLayerPreviewImage(layerDrawingContentKey(refs[i], drawing))
+          || (played && played.complete && played.naturalWidth ? played : null) || await loadImageForExport(src);
         if (img) { cache.set(refs[i], img); bytes += bitmapEntryBytes(img); }
         loaded += 1;
         if (onStatus && loaded % 25 === 0) onStatus(t('msg.export.loadingLayers', loaded));
@@ -108801,40 +108804,81 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // ---- genga video export: per-frame camera-view crop → WebCodecs encode (mp4 if available, else webm) +
     // genga audio mix. The encode spine is the shared runWebCodecsExport kernel (next to exportConteVideoFast);
     // only the camera-crop renderer, image preload and audio mixer live here. ----
-    async function gengaPreloadExportImages(onStatus) {
+    // 프레임 하나가 합성에 쓸 래스터 소스(노출 그림·구간이 그릴 입 그림·実루엣 짝의 다음 그림). 예열과 렌더 직전 보장이
+    // 같은 목록을 쓴다 — 갈리면 예열한 그림이 렌더에 안 쓰이거나 렌더가 예열 밖 그림을 기다린다.
+    function gengaForEachFrameRasterSource(gt, frame, playback, visit) {
+      (gt.layers || []).forEach(function(l) {
+        if (!gengaLayerDrawsInComposite(l)) return;
+        const rs = gengaResolveExposureSample(l, frame, playback);
+        const e = rs.exp; if (!e) return;
+        visit(gengaExposureDrawing(l, e), l, e);
+        const sDr = e.serifuId ? gengaSerifuResolveDrawing(l, e, rs.localFrame, gt) : undefined;   // 구간이 이 프레임에 그릴 입 그림
+        if (sDr) visit(sDr, l, e);
+        if (gengaDougaFillActive() && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) visit(gengaDougaNextDrawing(l, e).dr, l, e);
+      });
+    }
+    // 출력 예열: 출력이 그릴 프레임(frames, 오름차순)에 실제로 쓰이는 그림만 프레임 순서로 디코드한다. 디코드 캐시는
+    // 예산(개수·바이트)을 지키므로 다 담지 못하는 컷에서 전량을 미리 디코드하면 앞부분이 밀려나 렌더 때 한 번 더
+    // 디코드된다. 그래서 예열한 그림이 밀려나기 시작하면 멈추고, 나머지는 프레임별 보장(gengaEnsureFrameImagesDecoded)이
+    // 그 프레임 직전에 한 번 디코드한다. 숨긴 레이어·구간 밖 그림은 출력에 없으니 디코드하지 않는다.
+    async function gengaPreloadExportImages(onStatus, frames, playback) {
       gengaFlushPendingDrawingEncodes(); // Export decodes by URL — settle stragglers first (no-op when idle)
       const gt = state.project && state.project.gengaTimeline; if (!gt) return;
-      const byKey = new Map();   // 중복 판정을 캐시 키로 — 디코드 한 번이 캐시 한 칸이다
-      const addDrawing = function(d) { const k = gengaRasterCacheKey(d); if (k) byKey.set(k, d); };
-      // 자리 기반 순회(gengaForEachProjectDrawing)가 노출과 공유풀 그림을 함께 담는다 — 링크 노출의 그림도
-      // sharedDrawings 자리로 같은 키에 온다.
-      gengaForEachProjectDrawing(gt, function(d) { addDrawing(gengaResolveDrawing(d)); });
+      const byKey = new Map(), silhouettes = new Set();   // 중복 판정을 캐시 키로 — 디코드 한 번이 캐시 한 칸이다
+      (frames || []).forEach(function(f) {
+        gengaForEachFrameRasterSource(gt, f, !!playback, function(d, l, e) {
+          const k = d && d.dataUrl ? gengaRasterCacheKey(d) : null;   // 칸·벡터·인코드 대기는 픽셀을 이미 든다
+          if (k && !byKey.has(k)) byKey.set(k, d);
+          if (gengaDougaFillActive() && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) silhouettes.add(e);
+        });
+      });
       // A decode failure is counted, not treated as loaded — an undecodable drawing must not drop silently out
-      // of the export (conte's preloadVideoExportBitmaps counts+warns for the equivalent gap). onStatus threads
-      // from exportGengaVideoFast. 디코드는 공용 gengaDecodeIntoCache 가 하고 성공/실패를 돌려준다 — 세는 자리와
-      // 디코드하는 자리가 갈리면 반환값이 버려진다. `img.complete` 만으로 성공을 세지 않는다: 이전에 실패해 캐시에
+      // of the export (conte's preloadVideoExportBitmaps counts+warns for the equivalent gap). 디코드는 공용
+      // gengaDecodeIntoCache 가 하고 성공/실패를 돌려준다. `img.complete` 만으로 성공을 세지 않는다: 이전에 실패해 캐시에
       // 남은 이미지(complete=true, naturalWidth=0)도 complete 이고, 공용 디코더는 그것을 실패로 센다.
-      const decoded = await Promise.all(Array.from(byKey.values()).map(function(d) { return gengaDecodeIntoCache(d); }));
-      let failed = decoded.filter(function(ok) { return !ok; }).length;
-      // With every drawing decoded, build the in-between silhouettes now if this export wants them. 이 함수는
-      // 예열이다. 디코드 캐시가 예산을 지키므로 큰 프로젝트에선 여기서 채운 앞부분이 뒤에서 밀려날 수 있고, 결정론은
-      // 프레임별 보장(gengaEnsureFrameImagesDecoded — 렌더 직전에 그 프레임 소스와 実루엣 짝을 도로 채운다)이 만든다.
-      // 실루엣 캐시('douga')에서 밀려난 것도 그 보장 위에서 재생성된다.
-      if (gengaDougaFillActive()) {
+      // 캐시(개수 상한·바이트 몫)에 다 들어갈 만큼만 담는다. 넘겨서 앞 프레임 그림이 밀려나면 렌더가 그것을 다시 디코드하며
+      // 다음 그림을 밀어내는 연쇄가 생겨 거의 전부를 두 번 디코드한다(합성 컷 200장 실측). 들어간 만큼은 렌더가 앞에서부터
+      // 쓰고 지나가므로 그 뒤의 디코드는 이미 쓴 그림부터 밀어낸다.
+      // 크기는 디코드해야 알므로 첫 장은 혼자 재고, 그 뒤 묶음은 지금까지 본 가장 큰 그림으로 남은 몫을 나눠 정한다.
+      const list = Array.from(byKey.entries()), done = [], size = new Map(), budget = bitmapCacheShareBytes('image');
+      let failed = 0, tried = 0, bytes = 0, biggest = 0;
+      const BATCH = 8;   // 동시 디코드 수
+      while (tried < list.length) {
+        const room = Math.min(BATCH, GENGA_IMAGE_CACHE_MAX - 1 - done.length, biggest ? Math.floor((budget - bytes) / biggest) : 1);
+        if (room <= 0) break;
+        const part = list.slice(tried, tried + room);
+        const ok = await Promise.all(part.map(function(kv) { return gengaDecodeIntoCache(kv[1]); }));
+        part.forEach(function(kv, j) {
+          tried++;
+          if (!ok[j]) { failed++; return; }
+          const b = bitmapEntryBytes(gengaImageCache.get(kv[0]));
+          done.push(kv[0]); size.set(kv[0], b); bytes += b; biggest = Math.max(biggest, b);
+        });
+        if (done.some(function(k) { return !gengaImageCache.has(k); })) break;
+      }
+      // 그래도(더 큰 그림이 늦게 와서) 앞 그림이 밀려났으면, 밀려난 만큼 맨 뒤에 담은 그림을 캐시에서 뺀다. 그래야 렌더가
+      // 밀려난 앞 그림을 다시 디코드할 때 빈 자리에 들어가 아직 안 쓴 그림을 밀어내는 연쇄가 시작되지 않는다.
+      const lost = done.filter(function(k) { return !gengaImageCache.has(k); });
+      let free = lost.reduce(function(s, k) { return s + size.get(k); }, 0), removed = 0;   // 바이트와 개수 상한 둘 다
+      for (let i = done.length - 1; i >= 0 && (free > 0 || removed < lost.length); i--) {
+        if (!gengaImageCache.has(done[i])) continue;
+        free -= size.get(done[i]); removed++; gengaImageCache.delete(done[i]);
+      }
+      const evicted = tried < list.length || lost.length > 0;   // 남은·뺀 그림은 렌더 직전 보장이 디코드한다
+      // 実루엣은 예열이 끝까지 간 경우에만 미리 만든다(소스가 캐시에 있다). 밀려났으면 렌더 직전 보장 위에서 만들어진다.
+      if (!evicted && silhouettes.size) {
         const pw = Math.max(1, Math.round(gt.paper.w)), ph = Math.max(1, Math.round(gt.paper.h));
         (gt.layers || []).forEach(function(l) {
           (l.exposures || []).forEach(function(e) {
-            if (!Array.isArray(e.dougaOffsets)) return;
+            if (!silhouettes.has(e)) return;
             for (let k = 0; k < e.dougaOffsets.length; k++) gengaDougaSilhouetteFor(l, e, k, pw, ph, null);
           });
         });
       }
       if (failed > 0) {
-        console.warn('[gengaExport] ' + failed + '/' + byKey.size + ' image(s) failed to decode — those drawings are missing from the export');
-        if (onStatus) onStatus(t('msg.export.missingImages', failed, byKey.size));
+        console.warn('[gengaExport] ' + failed + '/' + tried + ' image(s) failed to decode — those drawings are missing from the export');
+        if (onStatus) onStatus(t('msg.export.missingImages', failed, tried));
       }
-      // 세어 놓고 돌려준다(안 돌려주면 호출부가 판단할 수 없다). 영상·GIF 는 한 파일 안의 결손이라 경고만 하고
-      // 진행한다. 일괄 이미지는 다르다(아래 runGengaBatchImageExport 참고).
       return { failed: failed, total: byKey.size };
     }
     // 이 프레임이 합성에 쓸 래스터를 렌더 직전에 보장한다. 디코드 캐시가 예산을 지키므로 큰 프로젝트에서는 전량
@@ -108852,17 +108896,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (img && img.complete && img.naturalWidth) return;
         jobs.push(gengaDecodeIntoCache(d));
       };
-      (gt.layers || []).forEach(function(l) {
-        if (!gengaLayerDrawsInComposite(l)) return;
-        const rs = gengaResolveExposureSample(l, frame, playback);
-        const e = rs.exp; if (!e) return;
-        need(gengaExposureDrawing(l, e));
-        const sDr = e.serifuId ? gengaSerifuResolveDrawing(l, e, rs.localFrame, gt) : undefined;   // 구간이 이 프레임에 그릴 입 그림
-        if (sDr) need(sDr);
-        if (gengaDougaFillActive() && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) {
-          need(gengaDougaNextDrawing(l, e).dr);
-        }
-      });
+      gengaForEachFrameRasterSource(gt, frame, playback, need);
       if (!jobs.length) return 0;
       const done = await Promise.all(jobs);
       const failed = done.filter(function(ok) { return !ok; }).length;
@@ -109012,7 +109046,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 실패가 한 장이라도 있으면 커널의 `if (onStatus) onStatus(...)` 가 TypeError 를 던져 진짜 원인(그림
       // 디코드 실패)을 가린 채 「映像の書き出しに失敗: TypeError」로 보인다.
       gengaExportDecodeMisses = 0;
-      await gengaPreloadExportImages(onStatus);
+      await gengaPreloadExportImages(onStatus, Array.from({ length: endFrame - startFrame + 1 }, function(_, i) { return startFrame + i; }), false);
       const res = await runRealtimeRecordExport({
         fps: Number(opts.outFps) || fps, sourceFps: fps, startFrame: startFrame, endFrame: endFrame + 1, // 커널은 end 를 제외로 받는다(고속은 포함 계산이라 +1)
         renderFrame: function(canvas, frame) { return gengaRenderExportFrame(canvas, frame, outW, outH); },
@@ -109100,7 +109134,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         onPrepared: function() { if (onStatus) onStatus(t('msg.export.preparing')); },
         // OnStatus threads into the mixer so a partial clip loss reaches the user, not just a total failure
         mixAudio: function(control, window) { return gengaMixAudioOffline(startFrame, endFrame, fps, 48000, onStatus, {strict: true, clips: clips, control: control, window: window}); },
-        prepareFrames: function() { return gengaPreloadExportImages(onStatus); },
+        prepareFrames: function() {
+          const frames = [];
+          for (let i = 0; i < recFrames; i++) { const f = startFrame + timing.sourceFrame(i); if (frames[frames.length - 1] !== f) frames.push(f); }
+          return gengaPreloadExportImages(onStatus, frames, false);
+        },
         recFrames: recFrames,
         shouldCancel: function() { return Boolean(state.videoExportCancel); },
         renderFrame: function(canvas, i) { return gengaRenderExportFrame(canvas, startFrame + timing.sourceFrame(i), outW, outH); }, // 커널이 await 한다 — return 이 없으면 렌더가 끝나기 전의 캔버스가 캡처된다
@@ -109253,7 +109291,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const timing = gifFrameTiming(recFrames, fps);
       if (onStatus) onStatus(t('msg.export.preparing'));
       gengaExportDecodeMisses = 0;
-      await gengaPreloadExportImages(onStatus);
+      await gengaPreloadExportImages(onStatus, timing.map(function(x) { return startFrame + x.frame; }), true);
       const canvas = document.createElement('canvas'); canvas.width = outW; canvas.height = outH;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       const frames = [];
@@ -112567,6 +112605,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       return out;
     }
+    // 中セリフ 의 Auto Sheet 쪽 표기 overrides.dotNotes(사용자 지시 2026-11-09): 키는 위 markerOverrides 와 같은 칸 키,
+    // 값은 시트 미리보기가 점 옆에 적는 글자 그대로. 시트 명령의 dot 토큰 코마만 보낸다 — Auto Sheet 는 점이 있는 칸에만 그린다.
+    function gengaSheetDotNotesJson(gt) {
+      const labels = gengaSheetRowLabels(gt), total = Math.max(1, Math.round(gt.totalFrames || 1));
+      const pageFrames = timesheetPageFramesFor(gt, labels), notes = gengaSheetNakaSerifuNotes(gt), out = {};
+      labels.order.forEach(function(l, line) {
+        const byFrame = notes.get(String(l.id)); if (!byFrame) return;
+        (gengaLayerSheetTokens(l, total) || []).forEach(function(tk, i) {
+          const v = String(tk || '').toLowerCase() === 'dot' ? byFrame.get(i + 1) : null;
+          if (v) out[Math.floor(i / pageFrames) + '-' + (i + 1) + '-text-' + line] = v;
+        });
+      });
+      return out;
+    }
     // 시트 번호 토큰(○ 를 그리는 글리프) — renderTimesheetKernel 의 글리프 가지와 같은 가름.
     function gengaSheetIsNumberToken(tk) {
       if (tk == null) return false;
@@ -113472,7 +113524,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // gengaSheetLayerFxEndpointPercent for why they never collide). cameraSeries = カメラ欄の系列（行番号 →
         // まとまりと名前）。1k 表記では指示語が空で、受け取る側は「どの縦線が誰のワークか」を文字列から復元できない —
         // Fr/% と同じく作る側が渡す。
-        overrides: { cameraPreviewStyles: gengaSheetCameraPreviewStyles(cameraManual), cameraEndpointFr: view.endpointFr, cameraSeries: camSeriesOut.series, bookNames: bookNames, markerOverrides: gengaSheetMarkerOverridesJson(gt) },
+        overrides: { cameraPreviewStyles: gengaSheetCameraPreviewStyles(cameraManual), cameraEndpointFr: view.endpointFr, cameraSeries: camSeriesOut.series, bookNames: bookNames, markerOverrides: gengaSheetMarkerOverridesJson(gt), dotNotes: gengaSheetDotNotesJson(gt) },
         // Shared projected FX and fixed imported blur notes have no geometry; Auto Sheet lays them out. The
         // srcKey namespace is "fx-", kept clear of the "cam-" keys Auto Sheet regenerates from the camera
         // column, so its own auto-memo cleanup never sweeps these away.
