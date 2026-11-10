@@ -28,8 +28,9 @@ function shellStamp(res) {
   return res.headers.get('etag') || res.headers.get('last-modified') || '';
 }
 function isShellRequest(url) {
-  // Only these document aliases may populate the shared shell or announce its readiness.
-  return SHELL.some(function (path) { return new URL(path, self.location.href).href === url.href; });
+  // Only these document aliases may populate the shared shell or announce its readiness. The query is
+  // ignored: a link such as ./?utm=... opens the same document and must not store another full shell copy.
+  return SHELL.some(function (path) { return new URL(path, self.location.href).pathname === url.pathname; });
 }
 function notifyShellUpdated() {
   return self.clients.matchAll({ includeUncontrolled: true, type: 'window' }).then(function (cs) {
@@ -37,18 +38,15 @@ function notifyShellUpdated() {
   });
 }
 
-// Cache.put commits only after the whole body is read, so two refreshes of one key can finish in the
+// Cache.put commits only after the whole body is read, so two shell refreshes can finish in the
 // reverse order they started: a slow OLD body would overwrite the NEW one already stored and announced.
-// Every writer of a key (install, one-time purge, fetch refresh) therefore runs as one queued task, from
+// Every shell writer (install, one-time purge, fetch refresh) therefore runs as one queued task, from
 // its network response to its last put, in the order the tasks were started. A failed task never blocks
-// the next one. Both shell aliases share one key.
-const cacheWriteQueues = new Map();
-function cacheWriteKey(url) { return isShellRequest(url) ? 'shell' : url.href; }
-function queueCacheWrite(key, task) {
-  const run = (cacheWriteQueues.get(key) || Promise.resolve()).then(task);
-  const tail = run.catch(function () {});
-  cacheWriteQueues.set(key, tail);
-  tail.then(function () { if (cacheWriteQueues.get(key) === tail) cacheWriteQueues.delete(key); });
+// the next one.
+let cacheWriteTail = Promise.resolve();
+function queueCacheWrite(task) {
+  const run = cacheWriteTail.then(task);
+  cacheWriteTail = run.catch(function () {});
   return run;
 }
 
@@ -73,7 +71,7 @@ function runOneTimeShellPurge() {
     return c.match(tokenUrl).then(function (rec) {
       return (rec ? rec.text() : Promise.resolve('')).then(function (seen) {
         if (seen === PURGE_TOKEN) return;                       // this client already did it
-        return queueCacheWrite('shell', function () { return replaceShellFromNetwork(c); })
+        return queueCacheWrite(function () { return replaceShellFromNetwork(c); })
           .then(function () { return c.put(tokenUrl, new Response(PURGE_TOKEN)); })
           .then(notifyShellUpdated);   // an old shell without the update listener cannot hear this — its NEXT launch is fresh anyway
       });
@@ -94,15 +92,27 @@ function ensureShellPurge() {
   return shellPurgeRun;
 }
 
+// Older workers stored every same-origin GET (query variants of the shell, the local server's /voicevox
+// answers) under its own URL. Only the shell aliases and the purge token belong in this cache.
+function dropNonShellEntries() {
+  const keep = SHELL.map(function (p) { return new URL(p, self.location.href).href; }).concat(new URL(PURGE_KEY, self.location.href).href);
+  return caches.open(CACHE).then(function (c) {
+    return c.keys().then(function (reqs) {
+      return Promise.all(reqs.filter(function (r) { return keep.indexOf(r.url) < 0; }).map(function (r) { return c.delete(r); }));
+    });
+  }).catch(function (err) { console.error('[sw] non-shell cache cleanup failed', err); });
+}
+
 self.addEventListener('install', function (e) {
   self.skipWaiting();
-  e.waitUntil(queueCacheWrite('shell', function () { return caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }); }));
+  e.waitUntil(queueCacheWrite(function () { return caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }); }));
 });
 
 self.addEventListener('activate', function (e) {
   e.waitUntil(
     caches.keys()
       .then(function (keys) { return Promise.all(keys.filter(isOldMoArtCache).map(function (k) { return caches.delete(k); })); })
+      .then(dropNonShellEntries)
       .then(function () { return self.clients.claim(); })
       .then(function () { ensureShellPurge(); })   // started, not awaited: see ensureShellPurge
   );
@@ -114,6 +124,9 @@ self.addEventListener('fetch', function (e) {
   // same-origin only — GoatCounter (gc.zgo.at) and any other third party must pass straight through, so it
   // simply fails silently offline instead of being cached or retried.
   if (url.origin !== self.location.origin) return;
+  // Only the app shell is cached. Other same-origin GETs (the local server's /voicevox proxy, anything else)
+  // go straight to the network: answering them from a cache would serve stale data.
+  if (!isShellRequest(url)) return;
   // **The background half of stale-while-revalidate is HELD OPEN.** The put is inside this chain and waitUntil
   // keeps the worker alive until the chain settles. Otherwise the cached copy answers respondWith, the worker
   // goes idle and the browser may kill it mid-download of the large shell: the put never lands, so every later
@@ -124,44 +137,40 @@ self.addEventListener('fetch', function (e) {
   // A shell request waits for a pending one-time purge before it fetches AND before it joins the write queue.
   // Fetching first could race an old body over the purged one; queueing first deadlocks, because the purge
   // enters the same queue only after its async token read. The cached copy still answers at once below — only a
-  // shell cache MISS waits. Shell requests waiting on one purge enter the queue in the order they arrived;
-  // every other request is queued synchronously.
-  const shell = isShellRequest(url);
-  const purge = shell ? ensureShellPurge() : null;
-  const net = (purge ? purge.then(function () { return fetch(e.request); }) : fetch(e.request)).then(function (res) {
+  // shell cache MISS waits. Shell requests waiting on one purge enter the queue in the order they arrived.
+  const purge = ensureShellPurge();
+  const net = purge.then(function () { return fetch(e.request); }).then(function (res) {
     return { res: res, copy: res && res.ok ? res.clone() : null };
   });
-  // queued in request-start order, so writes for one key commit in that order (see queueCacheWrite)
+  // queued in request-start order, so shell writes commit in that order (see queueCacheWrite)
   const write = function () { return net.then(function (got) {
     const copy = got.copy;
     if (!copy) return;
     const fresh = shellStamp(copy);
     return caches.open(CACHE).then(function (c) {
       // read the OLD entry before overwriting it — that is the copy the user is looking at right now
-      return c.match(e.request).then(function (old) {
+      return c.match(e.request, { ignoreSearch: true }).then(function (old) {
         const stale = shellStamp(old);
-        const storedAliases = shell ? putShellResponse(c, copy) : c.put(e.request, copy);
+        const storedAliases = putShellResponse(c, copy);
         return storedAliases.then(function () {
           // Both aliases must finish before any window is told the shell is ready.
           // no old entry = first visit, missing stamp = no grounds to judge -> stay quiet either way
           // (a false "new version" banner would be worse than the delay it is fixing).
-          if (shell && old && fresh && stale && fresh !== stale) return notifyShellUpdated();
+          if (old && fresh && stale && fresh !== stale) return notifyShellUpdated();
         });
       });
     });
   }); };
-  const key = cacheWriteKey(url);
-  const stored = (purge ? purge.then(function () { return queueCacheWrite(key, write); }) : queueCacheWrite(key, write)).catch(function (err) {
+  const stored = purge.then(function () { return queueCacheWrite(write); }).catch(function (err) {
     // never silent: a failed cache write means the NEXT launch is still stale and nobody would know
     console.error('[sw] shell cache update failed', err);
   });
   e.waitUntil(stored);   // MUST be called synchronously, while the event is still dispatching
   e.respondWith(
-    caches.match(e.request).then(function (hit) {
+    caches.match(e.request, { ignoreSearch: true }).then(function (hit) {
       if (hit) return hit;
       // A cache MISS that also fails the network must still resolve to a Response — respondWith(undefined)
-      // throws a TypeError and takes the whole request down with it. Hits the first-ever visit made offline,
-      // and any same-origin asset outside SHELL requested while offline.
+      // throws a TypeError and takes the whole request down with it. Hits the first-ever visit made offline.
       return net.then(function (got) { return got.res; }, function () { return Response.error(); });
     })
   );
