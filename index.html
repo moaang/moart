@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3255</title>
+  <title>MoArt ver3256</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -36141,25 +36141,30 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { ok: !conflicts.length, conflicts: conflicts, moves: moves, empty: false };
     }
 
-    function deleteAudioTrack(project, trackId) {
-      if (trackId === 'dialog-main') return false;   // 잠긴 내부 트랙 — writeTimelineTracks 가 늘 다시 만든다
-      const plan = audioTrackDeletionPlan(project, trackId);
+    // 오디오 트랙 삭제의 유일한 진입(메뉴·삭제 버튼·Delete 키). 계획은 한 번만 세운다: 겹침이 생기면 트랙을 그대로 두고
+    // Undo 없이 막으며, 아니면 클립을 계획대로 위 트랙으로 옮기고 지운다. afterDelete 는 같은 Undo 명령 안의 진입별 선택 정리다.
+    function deleteAudioTrackCommand(trackId, afterDelete) {
+      if (!trackId || trackId === 'dialog-main') return false;   // 잠긴 내부 트랙 — writeTimelineTracks 가 늘 다시 만든다
+      const plan = audioTrackDeletionPlan(state.project, trackId);
       if (!plan.ok) {
         state.audioConflictClipIds = new Set(plan.conflicts || []);
         state.timelineStatus = t('status.audioTrack.deleteBlockedOverlap');
+        guardedRender('timing', renderTimingDashboard);
+        guardedRender('chrome', updateChromeControls);
         return false;
       }
-      normalizeAudioClips(project);
-      (plan.moves || []).forEach(function(move) {
-        const clip = project.audio.clips.find(function(item) { return item.id === move.clipId; });
-        if (clip) {
-          clip.trackId = move.trackId;
-        }
+      runAudioTimelineCommand('Delete audio track', function(project) {
+        normalizeAudioClips(project);
+        plan.moves.forEach(function(move) {
+          const clip = project.audio.clips.find(function(item) { return item.id === move.clipId; });
+          if (clip) clip.trackId = move.trackId;
+        });
+        removeAudioTrackRecord(project, trackId);
+        if (state.selectedAudioTrackId === trackId) state.selectedAudioTrackId = '';
+        state.audioConflictClipIds = new Set();
+        state.timelineStatus = t('status.audioTrack.deleted', plan.empty);
+        if (afterDelete) afterDelete(project);
       });
-      removeAudioTrackRecord(project, trackId);
-      if (state.selectedAudioTrackId === trackId) state.selectedAudioTrackId = '';
-      state.audioConflictClipIds = new Set();
-      state.timelineStatus = t('status.audioTrack.deleted', plan.empty);
       return true;
     }
 
@@ -40906,16 +40911,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         { label: t('menu.audio.recordStart'), disabled: Boolean(reason), title: reason || '',
           action: function() { startAudioRecordingForTrack(id, event.clientX, event.clientY); } },
         audioInputSettingsMenuItem(),
-        { label: t('menu.audio.deleteAudioTrack'), hidden: id === 'dialog-main', action: function() {
-          const plan = audioTrackDeletionPlan(state.project, id);
-          if (!plan.ok) {
-            state.audioConflictClipIds = new Set(plan.conflicts || []);
-            state.timelineStatus = t('status.audioTrack.deleteBlockedOverlap');
-            guardedRender('timing', renderTimingDashboard);
-            return;
-          }
-          runAudioTimelineCommand('Delete audio track', function(project) { deleteAudioTrack(project, id); });
-        } }
+        { label: t('menu.audio.deleteAudioTrack'), hidden: id === 'dialog-main', action: function() { deleteAudioTrackCommand(id); } }
       ], { width: 220 });
     }
 
@@ -45686,18 +45682,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         button.addEventListener('click', function(event) {
           event.preventDefault();
           event.stopPropagation();
-          const trackId = button.dataset.trackDelete || '';
-          if (!trackId) return;
-          const plan = audioTrackDeletionPlan(state.project, trackId);
-          if (!plan.ok) {
-            state.audioConflictClipIds = new Set(plan.conflicts || []);
-            state.timelineStatus = t('status.audioTrack.deleteBlockedOverlap');
-            guardedRender('timing', renderTimingDashboard);
-            return;
-          }
-          runAudioTimelineCommand('Delete audio track', function(project) {
-            deleteAudioTrack(project, trackId);
-          });
+          deleteAudioTrackCommand(button.dataset.trackDelete || '');
         });
       });
       root.querySelectorAll('[data-video-track-delete]').forEach(function(button) {
@@ -97360,7 +97345,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
 
     // 선택된 오디오 클립 → V1 클립 → 오디오 트랙 삭제(kind 가 'audio'/'video' 면 그 종류만). 선택 종류 갈래와 마지막 갈래가
-    // 같은 몸을 쓴다. 링크(영상·대사)는 확인 후 쌍으로, 트랙은 겹침이 생기면 막는다(deleteAudioTrack 이 상태 문구를 쓴다).
+    // 같은 몸을 쓴다. 링크(영상·대사)는 확인 후 쌍으로, 트랙은 겹침이 생기면 막는다(deleteAudioTrackCommand 가 상태 문구를 쓴다).
     function deleteSelectedTimelineMedia(kind) {
       if (!state.videoEditMode) return false;
       if (kind !== 'video' && state.selectedAudioClipId) { confirmDeleteAudioClip(state.selectedAudioClipId); return true; }
@@ -97375,16 +97360,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       const trackId = state.selectedAudioTrackId;
       if (kind === 'video' || !trackId || trackId === 'dialog-main') return false;
-      const plan = audioTrackDeletionPlan(state.project, trackId);
-      if (!plan.ok) {
-        state.audioConflictClipIds = new Set(plan.conflicts || []);
-        state.timelineStatus = t('status.audioTrack.deleteBlockedOverlap');
-        guardedRender('timing', renderTimingDashboard);
-        guardedRender('chrome', updateChromeControls);
-        return true;
-      }
-      runAudioTimelineCommand('Delete audio track', function(project) {
-        deleteAudioTrack(project, trackId);   // 선택 id 와 「삭제됨」 문구는 deleteAudioTrack 이 정리한다
+      deleteAudioTrackCommand(trackId, function(project) {   // 선택 id 와 「삭제됨」 문구는 deleteAudioTrackCommand 가 정리한다
         state.activeConteSelectionType = '';
         ensureConteLayerActiveFallback(project, currentPicturePanelId());
       });
