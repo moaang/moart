@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3256</title>
+  <title>MoArt ver3257</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -42444,8 +42444,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return items.length - 1;
     }
 
-    function remapTimelineMediaForOl(project, oldItems, oldStartByOwner, newStartByOwner) {
-      if (!oldItems.length) return;
+    // OL 값을 바꾼 직후(명령 mutator 안)에 부른다. oldItems 는 바꾸기 전 배치다. 바뀐 배치를 다시 읽어 컷 묶음 시작이
+    // 움직인 만큼 오디오·영상 클립 시작을 옮기고, 오디오 겹침을 다시 푼다.
+    function remapTimelineMediaForOl(project, oldItems) {
+      invalidateVideoTimelineCache();
+      const startByOwner = function(items) {
+        const out = {};
+        items.forEach(function(it) { const o = it.group.cuts[0]; if (o) out[o.id] = it.startFrame; });
+        return out;
+      };
+      const newStartByOwner = startByOwner(cutGroupTimelineItems(project));
+      const oldStartByOwner = startByOwner(oldItems);
+      if (oldItems.length) shiftTimelineMediaForOl(project, oldItems, oldStartByOwner, newStartByOwner);
+      rearrangeAudioAfterOl(project);
+    }
+
+    function shiftTimelineMediaForOl(project, oldItems, oldStartByOwner, newStartByOwner) {
       const deltaForFrame = function(frame) {
         const gi = olGroupIndexAtFrame(oldItems, frame);
         const owner = oldItems[gi] && oldItems[gi].group.cuts[0];
@@ -42495,17 +42509,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         draft.active = false;
         invalidateVideoTimelineCache();
         const oldItems = cutGroupTimelineItems(state.project);
-        const oldStartByOwner = {};
-        oldItems.forEach(function(it) { const o = it.group.cuts[0]; if (o) oldStartByOwner[o.id] = it.startFrame; });
         runTimelineStructureCommand('Apply OL', function(project) {
           commandEntered = true;
           olCommitDraftToProject(project, frames);
-          invalidateVideoTimelineCache();
-          const newItems = cutGroupTimelineItems(project);
-          const newStartByOwner = {};
-          newItems.forEach(function(it) { const o = it.group.cuts[0]; if (o) newStartByOwner[o.id] = it.startFrame; });
-          remapTimelineMediaForOl(project, oldItems, oldStartByOwner, newStartByOwner);
-          rearrangeAudioAfterOl(project);
+          remapTimelineMediaForOl(project, oldItems);
         }, { partialTimeline: false });
       } catch (error) {
         console.error('Apply OL failed', error);
@@ -42525,19 +42532,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try {
         invalidateVideoTimelineCache();
         const oldItems = cutGroupTimelineItems(state.project);
-        const oldStartByOwner = {};
-        oldItems.forEach(function(it) { const o = it.group.cuts[0]; if (o) oldStartByOwner[o.id] = it.startFrame; });
         runTimelineStructureCommand('Release OL', function(project) {
           commandEntered = true;
           const found = collectCutTimingGroups(project).find(function(g) { return g.cuts[0] && g.cuts[0].id === ownerId; });
           const owner = found && found.cuts[0];
           if (owner && owner.meta) delete owner.meta.olPrevFrames;
-          invalidateVideoTimelineCache();
-          const newItems = cutGroupTimelineItems(project);
-          const newStartByOwner = {};
-          newItems.forEach(function(it) { const o = it.group.cuts[0]; if (o) newStartByOwner[o.id] = it.startFrame; });
-          remapTimelineMediaForOl(project, oldItems, oldStartByOwner, newStartByOwner);
-          rearrangeAudioAfterOl(project);
+          remapTimelineMediaForOl(project, oldItems);
         }, { partialTimeline: false });
       } catch (error) {
         console.error('Release OL failed', error);
@@ -91035,7 +91035,11 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
     }
 
+    // 메모 표면(用紙 획, 用紙의 올가미·변형)의 끝. 컷 레이어 작업은 메모 위에서 손을 떼도 영상 쪽 끝이 확정한다
+    // (endActivePaintRasterStrokeFromDocument 와 같은 나눔) — 닫힌 칠·곡선 1단계·FX 원점은 그쪽에만 있다.
     function endPaintStroke(event) {
+      const pending = state.paintRasterOp;
+      if (pending && pending.target && pending.target.type === 'video-conte-layer' && state.paintPointerId === event.pointerId) { endVideoPaintStroke(event); return; }
       if (paintInputDeferEvent(event, endPaintStroke, paintPresentQueuedInput, state.paintPointerId === event.pointerId ? state.paintRasterOp : null)) return;
       const endingStroke = state.paintRasterOp;
       try {
@@ -91072,47 +91076,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           updatePaintUndoRedoButtonsOnly();
           return;
         }
-        if (op.type === 'draw' && op.shapeKind && !op.shapeMoved) {
-          // Shape tap without a drag — nothing was previewed or baked, skip the commit entirely
-        } else if (op.type === 'draw') {
-          // Blend/hard-edge strokes → clean composite over the pre-stroke base (shapes use the same composite).
-          paintRecompositeStrokeForMode(op);
-          const merged = mergedPaintFixedDrawCanvas(op);
-          const saveCanvas = merged && merged.canvas || op.canvas;
-          const saveRect = merged && merged.rect || paintRasterOpRect(op);
-          setLayerDrawingBitmapFromCanvas(op.drawingRef, saveCanvas, op.recordHistory === true, {
-            bitmapX: saveRect.x,
-            bitmapY: saveRect.y,
-            bitmapWidth: saveRect.w,
-            bitmapHeight: saveRect.h,
-            preserveActiveCanvas: true,
-            preserveActiveCanvasRect: op.fixedVisibleCanvas ? paintRasterOpRect(op) : null,
-            skipMemoRedraw: true,
-            skipThumbnails: true,
-            autosaveDelay: INDEXED_DB_AUTOSAVE_DRAW_DELAY_MS
-          });
-        } else if (op.type === 'stamp') {
-          if (op.stampChanged) setLayerDrawingBitmapFromCanvas(op.drawingRef, op.canvas, op.recordHistory === true, {
-            preserveFxOrigin: Boolean(op.inputFx),
-            bitmapX: op.bitmapX,
-            bitmapY: op.bitmapY,
-            bitmapWidth: op.canvas.width,
-            bitmapHeight: op.canvas.height,
-            trimAlpha: true,
-            preserveActiveCanvas: true,
-            skipMemoRedraw: true,
-            skipThumbnails: true
-          });
-          clearPaintStampPreview();
-          imageBrushFinishStampRun(op, true);
-        } else if (op.type === 'transform-edit') {
+        if (op.type === 'transform-edit') {
           finishPaintTransformOp(op);
-        } else if (op.type === 'lasso-stamp') {
-          if (!finishPaintLassoStamp(op)) {
-            state.paintLassoPreview = null;
-            updatePaintEditOverlays(op.drawingRef);
-          }
-          redrawActiveLayerCanvasTargets(op.drawingRef);
         } else if (op.type === 'lasso-select') {
           if (!finishPaintLassoSelect(op)) {
             state.paintLassoPreview = null;
@@ -91137,13 +91102,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           }
           scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
         }
-        if (op.type === 'draw' && op.shapeKind === 'lasso-fill' && state.paintLassoPreview) { // Drop the overlay marquee once baked
-          state.paintLassoPreview = null;
-          updatePaintEditOverlays(op.drawingRef);
-        }
         state.paintCurrentLayerRect = null;
         clearActiveLayerCanvasTargets();
-        updateAfterAutoCreatedLayerKomaDraw(op);
         updatePaintUndoRedoButtonsOnly();
       } finally {
         if (endingStroke && state.paintRasterOp !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
@@ -103030,16 +102990,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { written: written, total: groups.length, failures: failures, failedGroups: failedGroups, canceled: Boolean(state.videoExportCancel) };
     }
 
-    // Per-cut batch: render each content cut to its own mp4 and write it into the chosen folder as
-    // 作品名_話数_カット番号(3桁)_C テイク.mp4 (per 線撮注意事項). Output rate is selected in the dialog; source duration is preserved.
-    async function runConteExportCutsBatch(dirHandle, onStatus, project) {
+    // 컷 영상·CT 소재 출력이 함께 쓰는 대상 컷 묶음. 번호 범위는 빈칸이면 그쪽 제한이 없고, "118_B" 같은 서브 컷은
+    // 앞 번호(118)로 친다 — parseInt 가 첫 비숫자에서 멈춘다. 묶음 객체는 복사하지 않고 거른다(fileParts 가 객체를 키로 쓴다).
+    function conteExportCutGroupsInRange(project, rangeStartRaw, rangeEndRaw) {
       let groups = contentCutGroupsForExport(project);
       if (!groups.length) throw new Error(t('export.video.err.noExportableCuts'));
-      const sanitize = function(v) { return String(v || '').replace(/[\\/:*?"<>|\s]/g, ''); };
-      const val = function(id) { const el = document.getElementById(id); return el ? String(el.value || '').trim() : ''; };
-      // Cut-number range (blank = no limit on that side). Sub-cuts like "118_B" belong to their leading
-      // number (118) for range purposes — parseInt stops at the first non-digit.
-      const rangeStartRaw = val('cutExportRangeStart'), rangeEndRaw = val('cutExportRangeEnd');
       const rangeStart = rangeStartRaw ? parseInt(rangeStartRaw, 10) : null;
       const rangeEnd = rangeEndRaw ? parseInt(rangeEndRaw, 10) : null;
       if ((rangeStart != null && Number.isFinite(rangeStart)) || (rangeEnd != null && Number.isFinite(rangeEnd))) {
@@ -103052,6 +103007,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         });
         if (!groups.length) throw new Error(t('export.video.err.noCutsInRange'));
       }
+      return groups;
+    }
+
+    // Per-cut batch: render each content cut to its own mp4 and write it into the chosen folder as
+    // 作品名_話数_カット番号(3桁)_C テイク.mp4 (per 線撮注意事項). Output rate is selected in the dialog; source duration is preserved.
+    async function runConteExportCutsBatch(dirHandle, onStatus, project) {
+      const sanitize = function(v) { return String(v || '').replace(/[\\/:*?"<>|\s]/g, ''); };
+      const val = function(id) { const el = document.getElementById(id); return el ? String(el.value || '').trim() : ''; };
+      const groups = conteExportCutGroupsInRange(project, val('cutExportRangeStart'), val('cutExportRangeEnd'));
       const areaEl = document.querySelector('input[name="videoExportArea"]:checked');
       const opts = {
         title: sanitize(val('cutExportTitle')) || 'CUT',
@@ -103705,22 +103669,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Dialog-driven CT-material batch: reads ctExportRangeStart/End the same way
     // runConteExportCutsBatch reads cutExportRangeStart/End.
     async function runConteExportCtBatch(dirHandle, onStatus) {
-      let groups = contentCutGroupsForExport(state.project);
-      if (!groups.length) throw new Error(t('export.video.err.noExportableCuts'));
       const val = function(id) { const el = document.getElementById(id); return el ? String(el.value || '').trim() : ''; };
-      const rangeStartRaw = val('ctExportRangeStart'), rangeEndRaw = val('ctExportRangeEnd');
-      const rangeStart = rangeStartRaw ? parseInt(rangeStartRaw, 10) : null;
-      const rangeEnd = rangeEndRaw ? parseInt(rangeEndRaw, 10) : null;
-      if ((rangeStart != null && Number.isFinite(rangeStart)) || (rangeEnd != null && Number.isFinite(rangeEnd))) {
-        groups = groups.filter(function(g) {
-          const n = parseInt(g.cutNo, 10);
-          if (!Number.isFinite(n)) return false;
-          if (rangeStart != null && Number.isFinite(rangeStart) && n < rangeStart) return false;
-          if (rangeEnd != null && Number.isFinite(rangeEnd) && n > rangeEnd) return false;
-          return true;
-        });
-        if (!groups.length) throw new Error(t('export.video.err.noCutsInRange'));
-      }
+      const groups = conteExportCutGroupsInRange(state.project, val('ctExportRangeStart'), val('ctExportRangeEnd'));
       const fileParts = assignCutExportFileParts(groups, cutExportCtFilePart);
       const result = await writeCtMaterialExportGroups(state.project, groups, dirHandle, onStatus, fileParts);
       state.lastCtExportRetry = result.failedGroups.length ? { dirHandle: dirHandle, groups: result.failedGroups, fileParts: fileParts } : null;
@@ -115816,6 +115766,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           memoObstacles.push({ x: box.x - 6, y: box.y - 6, w: box.w + 12, h: box.h + 12 });
         });
       };
+      // 계열 전체의 범위(블록에 자르기 전). 이름을 쓸 블록이 여기서 정해진다 — 블록에 잘린 범위로 중점을 내면
+      // 페이지마다 중점이 생겨 이름이 반복된다. 블록과 무관해 한 번만 모은다.
+      const groupWhole = {};
+      camSpans.forEach(function(s) {
+        if (!gengaSheetSegIsFrameLabelled(s)) return;
+        const key = String(s.group == null ? '' : s.group);
+        const cur = groupWhole[key];
+        if (!cur) groupWhole[key] = { from: s.from, to: s.to };
+        else { cur.from = Math.min(cur.from, s.from); cur.to = Math.max(cur.to, s.to); }
+      });
       // blocks
       blocks.forEach(function(blk) {
         const bx = blk.x, bw = blk.w, start = blk.start, bBottom = TOP + NAMEH + BODYH, blockEnd = start + 71;
@@ -116069,16 +116029,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           } else if (label) { textPlate(laneX + bow, midY, label, SHEET_CAMERA_TEXT_SIZE, 'middle', true); textCompact(laneX + bow, midY, label, SHEET_CAMERA_TEXT_SIZE, '#111'); } // Plate first
         };
         const groupSpan = {};
-        // 계열 전체의 범위(블록에 자르기 전). 이름을 쓸 블록이 여기서 정해진다 — 블록에 잘린 범위로 중점을 내면
-        // 페이지마다 중점이 생겨 이름이 반복된다. 블록과 무관한 값이다.
-        const groupWhole = {};
-        camSpans.forEach(function(s) {
-          if (!gengaSheetSegIsFrameLabelled(s)) return;
-          const key = String(s.group == null ? '' : s.group);
-          const cur = groupWhole[key];
-          if (!cur) groupWhole[key] = { from: s.from, to: s.to };
-          else { cur.from = Math.min(cur.from, s.from); cur.to = Math.max(cur.to, s.to); }
-        });
         camSpans.forEach(function(s) {
           if (s.to < start || s.from > blockEnd) return;
           if (!gengaSheetSegIsFrameLabelled(s)) return;   // 알파벳 표기는 지시어가 이미 말해 준다
@@ -129021,13 +128971,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const rs = sampleOf(l);
         return rs.exp ? sampleDrawing(l, rs) : null;
       };
+      // 합성 모드·불투명도를 뺀 같은 레이어(스크래치에 그린 뒤 그 값으로 얹을 때)
+      const neutral = function(l) { return Object.assign({}, l, { blend: 'source-over', opacity: 1 }); };
       const drawLayer = function(target, l, fx, batch) {
         if (!fx) { drawLayerContent(target, l); return; }
         if (batch && batch.length > 1) {
           const src = gengaFxSourceRect(batch.map(fxDrawingOf), pw, ph);
           const s = gengaFxScratch(src.w, src.h);
           if (src.x || src.y) s.ctx.setTransform(1, 0, 0, 1, -src.x, -src.y);
-          batch.forEach(function(b) { drawLayerContent(s.ctx, Object.assign({}, b, { blend: 'source-over', opacity: 1 })); });
+          batch.forEach(function(b) { drawLayerContent(s.ctx, neutral(b)); });
           applyLayerFx(target, s.cv, {
             pivot: { x: pw / 2, y: ph / 2 }, translate: { x: fx.x, y: fx.y },
             rotDeg: fx.rot, scale: fx.scale,
@@ -129054,13 +129006,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           && (!l.blend || l.blend === 'source-over')
           && Math.abs(Number(fx.opacity) - 1) < 1e-6;
         const fxVectorPaint = (!(fx.blur > 0) && Number(fx.scale) > 1.05 && fxNeutral && gengaLayerDrawsVector(l))
-          ? function(ctx) { drawLayerContent(ctx, Object.assign({}, l, { blend: 'source-over', opacity: 1 })); }
+          ? function(ctx) { drawLayerContent(ctx, neutral(l)); }
           : null;
         const missingBeforeFx = missingArt;
         const src = fxVectorPaint ? { x: 0, y: 0, w: pw, h: ph } : gengaFxSourceRect([fxDrawingOf(l)], pw, ph);
         const s = fxVectorPaint ? null : gengaFxScratch(src.w, src.h);
         if (s && (src.x || src.y)) s.ctx.setTransform(1, 0, 0, 1, -src.x, -src.y);
-        if (s) drawLayerContent(s.ctx, Object.assign({}, l, { blend: 'source-over', opacity: 1 }));
+        if (s) drawLayerContent(s.ctx, neutral(l));
         const blurType = gengaFxStatics(l).blurType;
         // Only bitmap blur consumes a content key; native filter and transform-only draws do not.
         const ck = fx.blur > 0 && (blurType === 'bokeh' || !CANVAS_FILTER_SUPPORTED) ? gengaFxBlurPreviewKey(l, frame) : null;
@@ -129082,7 +129034,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // (own FX, blend, opacity) only inside the base's alpha, then the group with the base's blend and opacity. A normal
       // clipping layer is exact (source-atop). Another blend is masked by the group's alpha and blended on it; that matches
       // where the base is opaque or empty and adds a little alpha on half-transparent base pixels.
-      const neutral = function(l) { return Object.assign({}, l, { blend: 'source-over', opacity: 1 }); };
       const neutralFx = function(fx) { return fx ? Object.assign({}, fx, { opacity: 1 }) : fx; };
       const fxAlpha = function(fx) { return fx ? Math.max(0, Math.min(1, fx.opacity)) : 1; };
       const drawClipGroup = function(target, b) {
@@ -140722,14 +140673,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
               let to = run.end;
               if (rep) to = Math.min(to, gengaRepeatEndFrame(l, rep.startFrame, gt.totalFrames, rep.endFrame));
               else (l.repeats || []).forEach(function(r) { if (r.startFrame > from && r.startFrame <= to) to = r.startFrame - 1; });
-              midRuns.push({ start: from, end: to });
+              midRuns.push({ start: from, end: to, repeat: rep });
               from = to + 1;
             }
           });
           midRuns.forEach(function(run) {
-            const gs = run.start, ge = run.end;
+            const gs = run.start, ge = run.end, rep = run.repeat;
             const gc = ge - gs + 1;
-            const rep = gengaRepeatAt(l, gs);
             let inner, title;
             if (rep) {
               const cyc = gengaRepeatCycle(l, gs);
