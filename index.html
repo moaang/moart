@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3265</title>
+  <title>MoArt ver3266</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -6891,46 +6891,35 @@
       height: var(--pt-top, 3.5%);
     }
 
-    /* 카메라 그림이 걸치는 패널의 글자칸: 그림 위에 투명하게 얹는다. */
-    .content-cell.camera-work-text-cell {
+    /* 그림이 걸치는 패널의 글자칸: 그림 위에 투명하게 얹는다. */
+    .content-cell.paper-across-text-cell {
       background: transparent;
       z-index: 7;
     }
 
     .picture-cell {
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      display: block;
+      overflow: visible;
       padding: 0;
       background: rgba(255, 255, 255, 0.98);
     }
 
-    .picture-cell.camera-work-cell {
-      display: block;
-      overflow: visible;
+    .picture-cell.camera-work-cell,
+    .picture-cell.paper-across-cell {
       background: transparent;
       z-index: 6;
     }
 
+    /* 그림틀 자리는 배치(paperCellDomLayout)의 사각형 — 출력과 같다. */
     .picture-frame {
-      position: relative;
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      max-height: 100%;
+      position: absolute;
+      left: var(--frame-left, 0%);
+      top: var(--frame-top, 0%);
+      width: var(--frame-width, 100%);
+      height: var(--frame-height, 100%);
       border: 2px solid #111;
       background: #fbfbf8;
       overflow: hidden;
-    }
-
-    .picture-frame.camera-work {
-      position: absolute;
-      left: var(--camera-work-frame-left, 0%);
-      top: var(--camera-work-frame-top, 0%);
-      width: var(--camera-work-frame-width, 100%);
-      height: var(--camera-work-frame-height, auto);
-      max-width: none;
-      max-height: none;
-      aspect-ratio: auto;
     }
 
     /* 회색은 「팬 범위 중 카메라 밖」이라는 뜻이고 「カメラ外を暗く」(cameraDim)일 때만 깐다. 카메라가 지나간 자리는
@@ -21260,6 +21249,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const before = snapshotProject();
       invalidateVideoTimelineCache();
       mutator(state.project);
+      finishCommand(name, before, refreshOptions);
+    }
+    // runCommand 의 mutator 뒤 전부(정규화·맞추기·이력·다시 그리기). before = 편집 전 프로젝트 스냅숏.
+    function finishCommand(name, before, refreshOptions) {
       updateGengaCelGroupsAfterEdit(before, state.project);
       gengaUpdateTvppRangesAfterEdit(before.gengaTimeline && before.gengaTimeline.layers, state.project.gengaTimeline && state.project.gengaTimeline.layers);
       normalizeProject(state.project);
@@ -21290,7 +21283,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function gengaReconcileFxInstrAfter(before, project) {
       const a = before && before.gengaTimeline, b = project && project.gengaTimeline;
       if (!a || !b) return false;
-      return gengaFxInstrInputKey(a) !== gengaFxInstrInputKey(b) && gengaReconcileFxInstr(b);
+      const groups = gengaInstrTargetLayers(b).groups;
+      return gengaFxInstrInputKey(a) !== gengaFxInstrInputKey(b, groups) && gengaReconcileFxInstr(b, groups);
     }
     function captureCameraTimelineState(project) {
       return {
@@ -21350,21 +21344,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       updateCameraTimelineEdit();
     }
 
-    // Reflow only when a panel's row span changes; open-paper publication is independent. Same function as the layout.
-    function cameraRowSpanSignature(project) {
-      try {
-        const keysByOwnerCut = project.cuts.some(function(cut) { return cut && cut.id; }) ? cameraKeyframesByOwnerCut(project) : null;
-        const metrics = contePaperMetrics();
-        return project.cuts.map(function(cut) { return contePanelRowSpan(project, cut, cameraWorkPaperBounds(project, cut, keysByOwnerCut), metrics); }).join(',');
-      } catch (error) { return 'x'; }
-    }
+    // Reflow only when a panel's row span changes; open-paper publication is independent. Same spans as the layout.
+    function cameraRowSpans(project) { try { return contePanelRowSpans(project); } catch (error) { return null; } }
     function runCameraTimelineCommand(name, mutator) {
       const before = captureCameraTimelineState(state.project);
-      const spanBefore = cameraRowSpanSignature(state.project);
+      const spansBefore = cameraRowSpans(state.project);
       mutator(state.project);
       normalizeCameraTrack(state.project);
-      const layoutChanged = cameraRowSpanSignature(state.project) !== spanBefore;
-      if (layoutChanged) relayoutProject(state.project); // reflow only when a 用紙 cell height changes
+      const spans = cameraRowSpans(state.project);
+      if (String(spans) !== String(spansBefore)) relayoutProject(state.project, spans); // reflow only when a 用紙 cell height changes
       const after = captureCameraTimelineState(state.project);
       // A command that changed nothing (a marker drag that stayed on its frame) records no undo step -- the audio
       // twin runAudioTimelineCommand compares the same way.
@@ -24218,10 +24206,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return inCol.w >= wide.w * CONTE_PAPER.columnPrefer ? column : wide;
     }
     function contePanelMaxRows(picture) { return picture.across ? CONTE_PAPER.acrossMaxRows : ROWS_PER_PAGE; }
+    // 패널 그림의 비율: 카메라워크 범위, 없으면 표준 프레임.
+    function contePanelAspect(project, bounds) { const frame = contePaperGeom(project).frame; return bounds ? bounds.aspect : frame.w / frame.h; }
     // 그림 줄 수. 横을 2·3 으로 고정했으면 그림이 그 열까지 닿는 가장 적은 줄 수(걸침 상한까지). 그 밖에 움직이는 카메라 그림은 칸 수 상한
     // 안에서 표준 프레임이 보통 그림칸 그림의 「カメラの絵」 비율 이상 보이는 가장 적은 줄 수 — 어떤 줄 수로도 닿지 않으면(가로로 긴 팬은
     // 칸 폭에서 막힌다) 닿을 수 있는 가장 큰 크기 기준이라 아래로 더 늘리지 않는다. 보통 그림·멈춘 카메라 그림은 1줄.
-    function paperPictureRows(metrics, project, bounds, aspect, cols) {
+    function paperPictureRows(metrics, project, cut, bounds) {
+      const cols = conteFixedPaperCols(cut), aspect = contePanelAspect(project, bounds);
       if (cols === 2 || cols === 3) {
         for (let rows = 1; rows < CONTE_PAPER.acrossMaxRows; rows += 1) if (paperPictureBox(metrics, 0, rows, aspect, cols).cols >= cols) return rows;
         return CONTE_PAPER.acrossMaxRows;
@@ -24229,7 +24220,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!bounds || bounds.still) return 1;
       const sizes = [];
       for (let rows = 1; rows <= ROWS_PER_PAGE; rows += 1) {
-        const box = paperPictureBox(metrics, 0, rows, bounds.aspect, cols || 0);
+        const box = paperPictureBox(metrics, 0, rows, aspect, cols);
         if (rows > contePanelMaxRows(box)) break;
         sizes.push(box.w * bounds.frame.w / bounds.w);
       }
@@ -24265,15 +24256,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
     // 패널 하나의 칸 배치. rowIndex·rowSpan 을 주면 그 자리로(칸 수를 정할 때), 없으면 패널의 지금 자리. display 는 용지 표시(ACTION 첫 줄 카메라워크).
-    // → { row, bounds, picture{x,y,w,h,across}, action, dialog({x,y,w,h,fs,fits,overflow?}), fits }
+    // → { row, bounds, picture{x,y,w,h,across,cols}, action, dialog({x,y,w,h,fs,fits,overflow?}), fits }
     function contePanelLayout(metrics, project, cut, bounds, display, rowIndex, rowSpan) {
       if (rowIndex == null) rowIndex = clampInt(cut.startRow, 1, ROWS_PER_PAGE, 1) - 1;
       if (rowSpan == null) rowSpan = clampInt(cut.rowSpan, 1, ROWS_PER_PAGE, 1);
-      const row = paperRowRect(metrics, rowIndex, rowSpan), base = contePaperTextBase(metrics), frame = contePaperGeom(project).frame;
-      const actionText = [display && display.actionCameraWork ? cameraWorkActionText(bounds) : '', cut.actionText || ''].filter(Boolean).join('\n');
+      const row = paperRowRect(metrics, rowIndex, rowSpan), base = contePaperTextBase(metrics);
+      const cameraText = display && display.actionCameraWork ? cameraWorkActionText(bounds) : '';
+      const actionText = [cameraText, cut.actionText || ''].filter(Boolean).join('\n');
       // 그림은 그림 줄 수만큼(넘는 칸은 글자 자리). 横 고정값이 있으면 그 열 수, 없으면 움직이는 카메라 그림만 자동, 나머지는 그림 열.
-      const cols = conteFixedPaperCols(cut), aspect = bounds ? bounds.aspect : frame.w / frame.h;
-      let picture = paperPictureBox(metrics, rowIndex, Math.min(rowSpan, paperPictureRows(metrics, project, bounds, aspect, cols)), aspect,
+      const cols = conteFixedPaperCols(cut);
+      let picture = paperPictureBox(metrics, rowIndex, Math.min(rowSpan, paperPictureRows(metrics, project, cut, bounds)), contePanelAspect(project, bounds),
         cols || (bounds && !bounds.still ? 0 : 1));
       let action, dialog;
       const place = function(shrinkPast) {
@@ -24295,7 +24287,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (!(action.fits && dialog.fits)) place(true);
       }
-      return { row: row, bounds: bounds, picture: picture, action: action, dialog: dialog, fits: action.fits && dialog.fits };
+      return { row: row, bounds: bounds, picture: picture, cameraText: cameraText, action: action, dialog: dialog, fits: action.fits && dialog.fits };
     }
     // 용지 칸 수(사용자 확정 2026-11-13): 縦 고정값(1~5)이 있으면 그것. 자동은 그림 줄 수에서 시작해 글자가 최소 크기로 들어갈 때까지 한 칸씩
     // (칸 수 상한까지), 「自動＋1」(paperRowsExtra)이면 하나 더. 배치(relayoutProject)와 카메라 명령의 변경 감지가 이 함수 하나를 쓴다.
@@ -24304,8 +24296,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (fixed) return fixed;
       metrics = metrics || contePaperMetrics();
       const display = contePaperDisplay(project);
-      const frame = contePaperGeom(project).frame;
-      let rows = paperPictureRows(metrics, project, bounds, bounds ? bounds.aspect : frame.w / frame.h, conteFixedPaperCols(cut));
+      let rows = paperPictureRows(metrics, project, cut, bounds);
       for (;;) {
         const L = contePanelLayout(metrics, project, cut, bounds, display, 0, rows);
         if (L.fits || rows >= contePanelMaxRows(L.picture)) break;   // 상한에서도 안 들어가면 contePanelLayout 이 그림부터 줄인다
@@ -24322,7 +24313,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           fontSize: (rect.fs / metrics.width * 100).toFixed(4) + 'cqw', overflow: Boolean(rect.overflow) };
       };
       return { across: L.picture.across, frameLeft: pct(L.picture.x - host.x, host.w), frameTop: pct(L.picture.y - L.row.y, L.row.h),
-        frameWidth: pct(L.picture.w, host.w), frameHeight: pct(L.picture.h, L.row.h),
+        frameWidth: pct(L.picture.w, host.w), frameHeight: pct(L.picture.h, L.row.h), cameraText: L.cameraText,
         action: text(L.action, metrics.cols[2]), dialog: text(L.dialog, metrics.cols[3]) };
     }
     function applyPaperTextPlacement(cell, place) {
@@ -25353,6 +25344,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3266, items: [{ja: 'コンテ用紙：カメラワークのないパネルで「横」を2・3に固定したとき、画面の絵も出力と同じくACTION・DIALOGの列までかかるようにしました。原画：レイヤーFXの2つめのキーを打つ・消すと、FX指示レイヤーがすぐ出る・消えるようにしました（これまでは別の編集があるまで変わりませんでした）。', ko: '콘티 용지: 카메라워크가 없는 패널에서 「가로」를 2·3으로 고정하면 화면의 그림도 출력처럼 ACTION·DIALOG 열까지 걸치게 했습니다. 원화: 레이어 FX의 두 번째 키를 찍거나 지우면 FX 지시 레이어가 바로 생기거나 사라지게 했습니다(지금까지는 다른 편집이 있을 때까지 바뀌지 않았습니다).', en: 'Conte paper: when "Across" is fixed at 2 or 3 on a panel without camera work, the picture on screen now spans into the ACTION and DIALOG columns, as in the export. Genga: setting or deleting a layer\'s second FX key now adds or removes its FX instruction layer right away (before, it waited for another edit).', zh: '分镜用纸：没有运镜的分格把「横」固定为2或3时，画面上的图也像输出一样延伸到ACTION・DIALOG列。原画：打上或删除图层FX的第二个关键帧时，FX指示图层会立即出现或消失（之前要等到其他编辑时才变化）。'}] },
       { ver: 3265, items: [{ja: 'コンテ用紙：パネルが使うコマを「横（絵がかかる列：1 PICTURE・2 ACTIONまで・3 DIALOGまで）」と「縦（コマ数）」で表示し、変えられるようにしました。カット詳細の「Paper」と、絵のコマの右クリック（iPadは長押し）で出る小さな窓に今の自動の値が出て、矢印・ドラッグで変えるとそのパネルに固定、「自動に戻す」で戻ります。', ko: '콘티 용지: 패널이 쓰는 칸을 「가로(그림이 덮는 열: 1 PICTURE·2 ACTION 까지·3 DIALOG 까지)」와 「세로(칸 수)」로 보이고 바꿀 수 있게 했습니다. 컷 상세의 「Paper」와 그림 칸 우클릭(iPad는 길게 누르기)으로 뜨는 작은 창에 지금 자동 값이 나오고, 화살표·끌기로 바꾸면 그 패널에 고정되며 「자동으로」로 되돌립니다.', en: 'Conte paper: a panel\'s space is now shown and editable as "Across" (columns the picture covers: 1 PICTURE, 2 up to ACTION, 3 up to DIALOG) and "Down" (rows). The Cut details "Paper" section and a small window from right-clicking a picture cell (long-press on iPad) show the current automatic values; arrows or dragging fix them for that panel, and "Back to auto" restores them.', zh: '分镜用纸：分格占用的格子以「横（画面覆盖的列：1 PICTURE・2 到 ACTION・3 到 DIALOG）」和「纵（格数）」显示并可修改。镜头详情的「Paper」和画面格右键（iPad 长按）弹出的小窗口显示当前自动值，用箭头或拖动修改后固定到该分格，「恢复自动」可恢复。'}] },
       { ver: 3264, items: [{ja: 'コンテ用紙のコマ割りを整理しました。カメラワークの絵は横に長ければACTION・DIALOGの上にかかり、縦に長ければ絵の列に収まります。文字は絵のかかっていない場所に、幅に合わせて折り返し、入らなければ小さくし、それでも入らなければそのパネルのコマを1つ増やします（増やせないときは赤い「…」で知らせます）。横1フレームのPANは文字があれば2コマ、縦1フレームのPANも2コマになります。ACTION・DIALOGにかかる絵は3コマまでで、文字が入らなければ絵を小さくします（縦に長い絵は5コマまで）。絵のコマの右クリック「使用コマ数」に「自動＋1コマ」、用紙ウィンドウの⚙に「カメラの絵（小・中・大）」を追加しました。', ko: '콘티 용지 칸 배치를 정리했습니다. 카메라워크 그림은 가로로 길면 ACTION·DIALOG 위에 걸치고, 세로로 길면 그림 열에 들어갑니다. 글자는 그림이 덮지 않은 곳에 폭에 맞춰 줄바꿈하고, 안 들어가면 작게 줄이고, 그래도 안 들어가면 그 패널 칸을 하나 늘립니다(늘릴 수 없으면 빨간 「…」로 알립니다). 가로 1프레임 PAN 은 글자가 있으면 2칸, 세로 1프레임 PAN 도 2칸이 됩니다. ACTION·DIALOG 에 걸치는 그림은 3칸까지이고 글자가 안 들어가면 그림을 줄입니다(세로로 긴 그림은 5칸까지). 그림 칸 우클릭 「사용 칸 수」에 「자동＋1칸」, 용지 창 ⚙ 에 「카메라 그림(작게·보통·크게)」을 더했습니다.', en: 'Conte paper layout tidied up. A camera-work picture that is wide now spans over ACTION/DIALOG, and a tall one stays in the picture column. Text goes where the picture does not cover, wraps to the width, shrinks if needed and, if it still does not fit, the panel gets one more row (a red "…" marks text that still cannot fit). A one-frame horizontal PAN takes 2 rows when it has text, and a one-frame vertical PAN 2 rows. A picture spanning ACTION/DIALOG uses at most 3 rows and shrinks to make room for text (tall pictures may use up to 5). "Rows used" (right-click a picture cell) gains "Auto + 1 row", and the paper window ⚙ gains "Camera picture (Small/Medium/Large)".', zh: '整理了分镜用纸的格子排版。镜头运动画面横长时跨到 ACTION・DIALOG 上方，竖长时留在画面列内。文字放在画面未覆盖的位置，按宽度换行，放不下就缩小，仍放不下则该分格增加 1 格（无法增加时以红色「…」提示）。横向 1 帧 PAN 有文字时为 2 格，纵向 1 帧 PAN 为 2 格。跨到 ACTION・DIALOG 的画面最多 3 格，文字放不下时缩小画面（竖长画面最多 5 格）。画面格右键「使用格数」新增「自动＋1格」，用纸窗口 ⚙ 新增「镜头画面（小・中・大）」。'}] },
       { ver: 3263, items: [{ja: 'コンテ用紙：カメラワーク（PANなど）のコマで、カメラが通る範囲が白く表示されるようになりました（標準フレーム以外のA・Bがグレーになっていた問題）。「カメラ外を暗く」をオフにするとグレーもなくなります。PANの後にカメラが止まっているパネルは、その1フレームだけを1コマで置きます。絵のコマを右クリック（iPadは長押し）の「使用コマ数」で、パネルごとに自動・1・2・3コマを選べます。', ko: '콘티 용지: 카메라워크(PAN 등) 칸에서 카메라가 지나가는 범위가 흰색으로 보입니다(표준 프레임이 아닌 A·B가 회색이던 문제). 「카메라 밖 어둡게」를 끄면 회색도 없어집니다. PAN 뒤에 카메라가 멈춘 패널은 그 한 프레임만 1칸에 놓습니다. 그림 칸 우클릭(iPad는 길게 누르기) 「사용 칸 수」로 패널마다 자동·1·2·3칸을 고를 수 있습니다.', en: 'Conte paper: in camera-work (PAN etc.) panels the range the camera passes is now white (A/B frames other than the standard frame used to show grey). Turning off "Dim outside camera" removes the grey too. A panel where the camera holds after a PAN now takes one row showing just that frame. Right-click a picture cell (long-press on iPad) and choose "Rows used" to set Auto, 1, 2 or 3 rows per panel.', zh: '分镜用纸：镜头运动（PAN 等）格中镜头经过的范围显示为白色（标准画框以外的 A・B 曾显示为灰色）。关闭「镜头外变暗」后灰色也会消失。PAN 之后镜头停住的分格只以那一帧占 1 格。右键单击画面格（iPad 长按）的「使用格数」可按分格选择自动・1・2・3 格。'}] },
@@ -35504,14 +35496,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Math.min(project.cuts.length, Math.max(0, index + 1));
     }
 
-    function relayoutProject(project) {
-      // One layout pass shares normalized camera keys; page/row placement does not change them.
+    // 패널마다 칸 수(컷 순서). 카메라 키는 한 번 모아 나눈다 — 쪽·줄 배치는 키를 바꾸지 않는다.
+    function contePanelRowSpans(project) {
       const keysByOwnerCut = project.cuts.some(function(cut) { return cut && cut.id; }) ? cameraKeyframesByOwnerCut(project) : null;
-      const pages = [], metrics = contePaperMetrics();
+      const metrics = contePaperMetrics();
+      return project.cuts.map(function(cut) { return clampInt(contePanelRowSpan(project, cut, cameraWorkPaperBounds(project, cut, keysByOwnerCut), metrics), 1, ROWS_PER_PAGE, 1); });
+    }
+    // rowSpans = 같은 프로젝트로 이미 잰 contePanelRowSpans(카메라 명령의 변경 감지), 없으면 여기서 잰다.
+    function relayoutProject(project, rowSpans) {
+      rowSpans = rowSpans || contePanelRowSpans(project);
+      const pages = [];
       let pageNo = 1;
       let row = 1;
-      project.cuts.forEach(function(cut) {
-        const rowSpan = clampInt(contePanelRowSpan(project, cut, cameraWorkPaperBounds(project, cut, keysByOwnerCut), metrics), 1, ROWS_PER_PAGE, 1);
+      project.cuts.forEach(function(cut, index) {
+        const rowSpan = rowSpans[index];
         if (row + rowSpan - 1 > ROWS_PER_PAGE) {
           pageNo += 1;
           row = 1;
@@ -53659,7 +53657,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gridRow = rowSpan > 1 ? row + ' / span ' + rowSpan : String(row);
       const cameraBounds = cameraWorkPaperBounds(state.project, cut);
       const cellLayout = paperCellDomLayout(cut, cameraBounds, display);
-      const across = Boolean(cameraBounds) && cellLayout.across;   // 카메라 그림이 ACTION·DIALOG 열까지 걸친다
+      const across = cellLayout.across;   // 그림이 ACTION·DIALOG 열까지 걸친다
       const isLastRow = row + rowSpan - 1 >= ROWS_PER_PAGE;
       const cutIndex = cutIndexById(state.project, cut.id);
       const inheritedDisplay = isInheritedCutNoDisplay(state.project, cutIndex);
@@ -53697,7 +53695,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       pictureCell.style.gridRow = gridRow;
       pictureCell.dataset.cutId = cut.id;
       if (cameraBounds) pictureCell.classList.add('camera-work-cell');
-      else pictureCell.style.alignItems = 'flex-start';   // 그림의 세로 자리는 cellLayout.frameTop 이 정한다
+      if (across) pictureCell.classList.add('paper-across-cell');
       if (isLastRow) pictureCell.classList.add('last-row');
       pictureCell.appendChild(createPictureFrame(cut, cameraBounds, cellLayout, display));
       const cellsMenu = function(event) { openContePaperCellsPopover(event, cut.id, pictureCell); };
@@ -53707,7 +53705,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       bodyEl.appendChild(pictureCell);
 
       const actionCell = createCell('content-cell action-cell', cut.actionText);
-      const actionCameraText = display.actionCameraWork ? cameraWorkActionText(cameraBounds) : '';
+      const actionCameraText = cellLayout.cameraText;
       if (actionCameraText) {
         const line = document.createElement('span');
         line.className = 'action-camera-work';
@@ -53719,7 +53717,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       actionCell.dataset.cutId = cut.id;
       actionCell.dataset.field = 'actionText';
       applyPaperTextPlacement(actionCell, cellLayout.action);
-      if (across) actionCell.classList.add('camera-work-text-cell');
+      if (across) actionCell.classList.add('paper-across-text-cell');
       if (isLastRow) actionCell.classList.add('last-row');
       bindFieldDragAndDrop(actionCell, cut, 'actionText');
       bodyEl.appendChild(actionCell);
@@ -53730,7 +53728,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       dialogCell.dataset.cutId = cut.id;
       dialogCell.dataset.field = 'dialogText';
       applyPaperTextPlacement(dialogCell, cellLayout.dialog);
-      if (across) dialogCell.classList.add('camera-work-text-cell');
+      if (across) dialogCell.classList.add('paper-across-text-cell');
       if (isLastRow) dialogCell.classList.add('last-row');
       bindFieldDragAndDrop(dialogCell, cut, 'dialogText');
       bodyEl.appendChild(dialogCell);
@@ -53922,8 +53920,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「使用コマ」(사용자 판정 2026-11-13): 横(그림이 덮는 열 수)·縦(칸 수)를 지금 배치 값으로 보이고 숫자 스크럽으로 바꾼다. 바꾼 값은 그
     // 패널에 고정, 「自動に戻す」는 둘 다 자동. 컷 상세 「Paper」 묶음과 그림칸 우클릭 작은 창(タップ穴の位置 창과 같은 양식)이 같은 칸이다.
     const PAPER_CELL_FIELDS = [
-      { field: 'cols', labelKey: 'paper.cells.cols', unitKey: 'paper.cells.colsUnit', step: 1, min: 1, max: 3 },
-      { field: 'rows', labelKey: 'paper.cells.rows', unitKey: 'paper.cells.rowsUnit', step: 1, min: 1, max: ROWS_PER_PAGE }
+      { field: 'cols', labelKey: 'paper.cells.cols', unitKey: 'paper.cells.colsUnit', min: 1, max: 3 },
+      { field: 'rows', labelKey: 'paper.cells.rows', unitKey: 'paper.cells.rowsUnit', min: 1, max: ROWS_PER_PAGE }
     ];
     function paperCellValues(cut) {
       const L = contePanelLayout(contePaperMetrics(), state.project, cut, cameraWorkPaperBounds(state.project, cut), contePaperDisplay(state.project));
@@ -54038,20 +54036,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return String(Math.round(Number(frame) || 0)) + 'K';
     }
 
-    // 用紙 카메라워크 그림칸: 칸 비율(카메라 궤적 bounds)과 칸 안 프레임 위치·원래 화면 위치를 CSS 변수로 싣는다.
+    // 用紙 카메라워크 그림틀: 틀 안의 원래 화면 위치(카메라 궤적 bounds 기준)를 CSS 변수로 싣는다.
     // (키 색은 여기서 다루지 않는다 — cameraKeyframeUnitRects 가 cameraKeyColor(index, count) 로 정한다.)
-    function applyCameraWorkPictureFrameStyle(frame, bounds, layout) {
+    function applyCameraWorkPictureFrameStyle(frame, bounds) {
       if (!frame || !bounds) return;
       const baseW = bounds.frame.w;
       const baseH = bounds.frame.h;
       frame.classList.add('camera-work');
-      frame.style.aspectRatio = bounds.w.toFixed(3) + ' / ' + bounds.h.toFixed(3);
-      if (layout) {
-        frame.style.setProperty('--camera-work-frame-left', layout.frameLeft);
-        frame.style.setProperty('--camera-work-frame-top', layout.frameTop);
-        frame.style.setProperty('--camera-work-frame-width', layout.frameWidth);
-        frame.style.setProperty('--camera-work-frame-height', layout.frameHeight);
-      }
       frame.style.setProperty('--camera-content-x', cameraPaperPercent(0 - bounds.minX, bounds.w));
       frame.style.setProperty('--camera-content-y', cameraPaperPercent(0 - bounds.minY, bounds.h));
       frame.style.setProperty('--camera-content-w', cameraPaperPercent(baseW, bounds.w));
@@ -54265,13 +54256,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function createPictureFrame(cut, cameraBounds, cellLayout, display) {
       const frame = document.createElement('div');
       const layerEntries = layerDrawingEntriesForCut(state.project, cut && cut.id);
-      frame.style.aspectRatio = contePaperGeom(state.project).frame.w + ' / ' + contePaperGeom(state.project).frame.h;
       frame.className = 'picture-frame' + (layerEntries.length ? '' : ' empty');
-      if (cameraBounds) applyCameraWorkPictureFrameStyle(frame, cameraBounds, cellLayout);
-      else if (cellLayout) {   // 보통 그림도 출력과 같은 사각형(여러 칸이면 첫 줄) — 그림칸은 flex-start
-        frame.style.width = cellLayout.frameWidth; frame.style.height = cellLayout.frameHeight;
-        frame.style.top = cellLayout.frameTop; frame.style.maxHeight = 'none';
-      }
+      ['Left', 'Top', 'Width', 'Height'].forEach(function(k) { frame.style.setProperty('--frame-' + k.toLowerCase(), cellLayout['frame' + k]); });
+      if (cameraBounds) applyCameraWorkPictureFrameStyle(frame, cameraBounds);
       if (layerEntries.length) {
         const stack = document.createElement('div');
         stack.className = 'picture-layer-stack';
@@ -104735,15 +104722,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       drawCenteredText(ctx, pageBox.pageNumber, pageBox.x + pageBox.padX + pageBox.labelW + pageBox.gap, pageBox.y, pageBox.numberW, pageBox.h, pageBox.fontPx);
       ctx.restore();
       cuts.forEach(function(cut) {
-        const rowIndex = cut.startRow - 1;
-        const row = paperRowRect(metrics, rowIndex, cut.rowSpan);
-        const L = layoutByCut.get(cut), cameraBounds = L.bounds;   // 화면과 같은 글자 상자·크기
+        const L = layoutByCut.get(cut), row = L.row;   // 화면과 같은 칸·글자 상자·크기
         const cutCol = metrics.cols[0];
         const timeCol = metrics.cols[4];
         drawCenteredText(ctx, cut.cutNo || '', cutCol.x, row.y + row.h * 0.04, cutCol.w, row.h * 0.18, Math.max(20, width * 0.0215), '700');
-        const cameraText = display.actionCameraWork ? cameraWorkActionText(cameraBounds) : '';
         const A = L.action, D = L.dialog;
-        const actionTop = drawWrappedText(ctx, cameraText, A.x, A.y, A.w, A.h, A.fs, CAMERA_RED);
+        const actionTop = drawWrappedText(ctx, L.cameraText, A.x, A.y, A.w, A.h, A.fs, CAMERA_RED);
         drawWrappedText(ctx, cut.actionText || '', A.x, actionTop, A.w, Math.max(0, A.h - (actionTop - A.y)), A.fs);
         drawWrappedText(ctx, cut.dialogText || '', D.x, D.y, D.w, D.h, D.fs);
         const pictureFrameText = framesToTime(allocatedPictureFrames(cut));
@@ -111478,7 +111462,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const pw = Math.max(1, Math.round(opts.pw)), ph = Math.max(1, Math.round(opts.ph));
       const cam = gengaCameraInstrShown(gt);
       const layer = opts.layer || null;
-      const hand = layer ? gengaExposureDrawing(layer, gengaResolveExposureSample(layer, 1).exp) : null;
+      const hand = layer ? gengaInstrSheetDrawing(layer) : null;
       const hasHand = gengaDrawingHasArt(hand);
       if (!cam && !hasHand) return null;
       const std = cam ? cam.std : { x: gt.camera.x, y: gt.camera.y, w: gt.camera.w, h: gt.camera.h, rotation: 0 }, shown = cam ? cam.shown : [];
@@ -111488,17 +111472,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // gengaInstrCanvas budget clamp, ctx already translated to the grown origin.
       const made = instrCanvasCoveringRects(shown.concat([std]), pw, ph);
       const canvas = made.canvas, ctx = made.ctx, instrFit = made.fit;
-      if (opts.stagePaper) {   // 수정 공정이면 그 공정 색을 종이 전체에 깐다(셀 수정 이미지의 revisionPaperBg 와 같은 뜻)
-        ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = opts.stagePaper.hex; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.restore();
-      }
+      gengaFillInstrStage(canvas, ctx, opts.stagePaper);
       // 用紙 의 그림 판정도 커널(gengaDrawingHasArt)로 — 해석기만 고치고 이 소비처를 놓치면 벡터 用紙 가 여기서
       // 다시 걸러져 종이만 안 찍힌다. 위·아래 어느 쪽 용지든 지시 아래에 둔다(화면과 같은 순서).
       const paper = opts.paper && gengaDrawingHasArt(opts.paper.dr) ? opts.paper : null;
       if (paper) gengaDrawExportPaper(ctx, paper, pw, ph);
-      if (hasHand) {
-        if (!await gengaDecodeIntoCache(hand)) throw new Error(t('msg.export.missingImages', 1, 1));
-        ctx.save(); ctx.globalAlpha = layer.opacity != null ? layer.opacity : 1; gengaDrawDrawingInto(ctx, hand, pw, ph); ctx.restore();
-      }
+      if (hasHand) await gengaDrawInstrHand(ctx, layer, hand, pw, ph);
       if (cam) drawCameraInstruction(ctx, { shown: shown, std: std, pw: pw, ph: ph, fit: instrFit,
         rectAt: function(f) { return gengaCameraWorkAt(gt, f); }, textScale: gengaInstrTextScale(pw, ph, canvas.width / instrFit, canvas.height / instrFit, instrFit), runs: gengaCamWorkRuns(gt).runs, frameTicks: opts.frameTicks });
       return await gengaInstrBlob(canvas); // null 이면 던진다
@@ -111507,12 +111486,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     async function gengaRenderManualInstrBlob(layer, dr, opts) {
       const pw = Math.max(1, Math.round(opts.pw)), ph = Math.max(1, Math.round(opts.ph));
       const made = gengaInstrCanvas(pw, ph), ctx = made.ctx;
-      if (opts.stagePaper) { ctx.fillStyle = opts.stagePaper.hex; ctx.fillRect(0, 0, pw, ph); }
+      if (opts.stagePaper) { ctx.fillStyle = opts.stagePaper.hex; ctx.fillRect(0, 0, pw, ph); }   // gengaInstrCanvas 의 흰 바탕과 같은 영역(축소 때 가장자리 포함)
       const paper = opts.paper && gengaDrawingHasArt(opts.paper.dr) ? opts.paper : null;
       if (paper) gengaDrawExportPaper(ctx, paper, pw, ph);
+      await gengaDrawInstrHand(ctx, layer, dr, pw, ph);
+      return await gengaInstrBlob(made.canvas);
+    }
+    // 지시 그림 한 장을 디코드해 그 레이어 불투명도로(FX 없음) 그린다 — 카메라·수동 지시 출력 공용.
+    async function gengaDrawInstrHand(ctx, layer, dr, pw, ph) {
       if (!await gengaDecodeIntoCache(dr)) throw new Error(t('msg.export.missingImages', 1, 1));
       ctx.save(); ctx.globalAlpha = layer.opacity != null ? layer.opacity : 1; gengaDrawDrawingInto(ctx, dr, pw, ph); ctx.restore();
-      return await gengaInstrBlob(made.canvas);
     }
     // Everything after the artwork is one implementation for genga and conte camera images. The engines
     // differ only in canvas units, artwork and in-between interpolation (`rectAt`), which callers supply.
@@ -112240,7 +112223,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 덧그림 준비(디코드) → { pts: 종이 좌표의 덧그림 모서리, draw(ctx) } 또는 null(덧그림 없음).
     async function gengaFxInstrHandPrep(row, mode, layer, gt, pw, ph) {
       if (!row) return null;
-      const dr = gengaExposureDrawing(row, gengaResolveExposureSample(row, 1).exp);
+      const dr = gengaInstrSheetDrawing(row);
       if (!gengaDrawingHasArt(dr)) return null;
       if (!await gengaDecodeIntoCache(dr)) throw new Error(t('msg.export.missingImages', 1, 1));
       const states = gengaFxMovedStates(layer, gengaShakuFrames(gt));
@@ -112433,6 +112416,24 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       assertProjectIoOwner(owner);
       const cameraFailedBefore = failures.length;
       const autoInstrWanted = opts.autoInstr !== false;
+      // 지시 이미지(카메라·FX·수동)는 같은 이름 바탕·공정 서픽스·_camera 폴더에 쓴다. 행 이름으로 짓는 손 지시는 겹치면 번호만 덧붙인다
+      // (노출 번호·공정 서픽스는 남긴다).
+      const instrBase = gengaSheetJsonFileName(project).replace(/^sheet_/, '').replace(/\.json$/i, '');
+      const instrSuffixes = normalizeGengaRevisionSuffixes(project.settings && project.settings.gengaRevisionSuffixDefaults);
+      const stageSuffix = function(stage) { return stage ? '_' + instrSuffixes[stage] : ''; };
+      const usedInstrNames = new Set();
+      const handInstrName = function(stem) {
+        let name = stem;
+        for (let n = 2; usedInstrNames.has(name + '.png'); n += 1) name = stem + '-' + n;
+        usedInstrNames.add(name + '.png');
+        return name + '.png';
+      };
+      const writeInstr = async function(name, blob) {
+        const camDir = await dirHandle.getDirectoryHandle('_camera', { create: true });
+        assertProjectIoOwner(owner);
+        await writeBlobToDirectory(camDir, name, blob);
+        cameraNames.push(name); usedInstrNames.add(name);
+      };
       if (cameraWanted && autoInstrWanted && !state.videoExportCancel) {
         try {
           // 카메라 지시 레이어가 있으면 그 레이어(숨겼으면 내지 않음, 수정 공정이면 그 색·서픽스), 없으면 기본 표시 상태와 같은 결과.
@@ -112440,16 +112441,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const stage = instrLayer && gengaRevisionStageCode(instrLayer.instrStage);
           const camBlob = instrLayer && !gengaLayerEffVisible(instrLayer, gt) ? null
             : await gengaRenderCameraInstructionBlob(gt, { pw: pw, ph: ph, paper: paper, frameTicks: opts.frameTicks, layer: instrLayer,
-              stagePaper: stage ? gengaRevisionPaperColor(project, stage) : null });
+              stagePaper: gengaRevisionPaperColor(project, stage) });
           assertProjectIoOwner(owner);
           if (camBlob) {
-            const stageSuffix = stage ? normalizeGengaRevisionSuffixes(project.settings && project.settings.gengaRevisionSuffixDefaults)[stage] : '';
-            cameraImageName = gengaSheetJsonFileName(project).replace(/^sheet_/, '').replace(/\.json$/i, '') + '_CAM' + (stageSuffix ? '_' + stageSuffix : '') + '.png';
+            cameraImageName = instrBase + '_CAM' + stageSuffix(stage) + '.png';
             if (onStatus) onStatus(t('msg.batchExport.layerImage', plan.length, plan.length, cameraImageName), plan.length, plan.length, cameraImageName);
-            const camDir = await dirHandle.getDirectoryHandle('_camera', { create: true });
-            assertProjectIoOwner(owner);
-            await writeBlobToDirectory(camDir, cameraImageName, camBlob);
-            cameraNames.push(cameraImageName);
+            await writeInstr(cameraImageName, camBlob);
           }
         } catch (e) { assertProjectIoOwner(owner); failures.push((cameraImageName || '_camera') + '（' + (e && e.message ? e.message : e) + '）'); cameraImageName = ''; }
       }
@@ -112457,12 +112454,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // FX 지시 행(docs/instruction_layer_design.md F5): 행을 숨겼으면 내지 않고, 수정 공정이면 그 색·서픽스, 덧그림을 얹는다.
       // 행이 없는 묶음(FX 를 고치지 않은 옛 프로젝트)은 지금처럼 낸다.
       if (cameraWanted && autoInstrWanted && !state.videoExportCancel) {
-        const base = gengaSheetJsonFileName(project).replace(/^sheet_/, '').replace(/\.json$/i, '');
         // 대상 목록은 gengaInstrTargetLayers 에서 나온다 — 다이얼로그의 줄과 여기서 종이가 나오는 레이어가 같은
         // 술어를 쓴다. 방식은 레이어가 들고 있으므로 전역 옵션이 없다.
-        const fxRows = gengaFxInstrPairs(gt, gengaInstrTargetLayers(gt).groups);
-        const suffixes = normalizeGengaRevisionSuffixes(project.settings && project.settings.gengaRevisionSuffixDefaults);
-        const camDirFor = async function() { return dirHandle.getDirectoryHandle('_camera', { create: true }); };
+        const fxRows = gengaFxInstrPairs(gt);
         const movers = fxRows.pairs;
         for (let i = 0; i < movers.length; i += 1) {
           assertProjectIoOwner(owner);
@@ -112474,7 +112468,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           let name = '';
           try {
             const done = await gengaRenderFxGroupInstr(gt, group, { pw: pw, ph: ph, paper: paper, frameTicks: opts.frameTicks, owner: owner, row: row,
-              stagePaper: stage ? gengaRevisionPaperColor(project, stage) : null });
+              stagePaper: gengaRevisionPaperColor(project, stage) });
             assertProjectIoOwner(owner);
             if (!done) continue;
             const plan = done.plan, mode = done.mode, want = gengaLayerInstrMode(l);
@@ -112482,59 +112476,41 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             if (plan) console.log('[instr] ' + label + ' → ' + mode + ' (opt=' + want + ')  celBox=' + plan.w + '×' + plan.h +
               ' (' + (plan.w * plan.h / 1e6).toFixed(1) + 'Mpx)  budget=' + (GENGA_INSTR_MAX_AREA * GENGA_INSTR_TSUKEPAN_AT / 1e6).toFixed(0) +
               'Mpx / ' + (GENGA_INSTR_MAX_SIDE * GENGA_INSTR_TSUKEPAN_AT) + 'px per side  overBudget=' + gengaInstrOverBudget(plan.w, plan.h));
-            name = base + '_' + label + (mode === 'tsukepan' ? '_pan' : '_move') + (stage ? '_' + suffixes[stage] : '') + '.png';
+            name = instrBase + '_' + label + (mode === 'tsukepan' ? '_pan' : '_move') + stageSuffix(stage) + '.png';
             if (onStatus) onStatus(t('msg.batchExport.layerImage', i + 1, movers.length, name), null, 0, name); // Name only — the bar tracks the main plan
-            const camDir = await camDirFor();
-            assertProjectIoOwner(owner);
-            await writeBlobToDirectory(camDir, name, done.result);
-            cameraNames.push(name);
+            await writeInstr(name, done.result);
           } catch (e) { assertProjectIoOwner(owner); failures.push((name || label) + '（' + (e && e.message ? e.message : e) + '）'); }
         }
-        // 묶음을 잃은 손댄 행(설계 F2): 덧그림만 낸다(카메라 키를 다 지운 카메라 행과 같다). 이름이 겹치면 수동 지시와 같은 -n.
-        const used = new Set(cameraNames);
+        // 묶음을 잃은 손댄 행(설계 F2): 덧그림만 낸다(카메라 키를 다 지운 카메라 행과 같다).
         for (const row of fxRows.orphans) {
           assertProjectIoOwner(owner);
           if (state.videoExportCancel) break;
           if (!gengaLayerEffVisible(row, gt)) continue;
-          const dr = gengaExposureDrawing(row, gengaResolveExposureSample(row, 1).exp);
+          const dr = gengaInstrSheetDrawing(row);
           if (!gengaDrawingHasArt(dr)) continue;
           const stage = gengaRevisionStageCode(row.instrStage);
-          const full = base + '_' + (String(row.name || 'instr').replace(/[\\/:*?"<>|\s]+/g, '_') || 'instr') + (stage ? '_' + suffixes[stage] : '');
-          let name = full;
-          for (let n = 2; used.has(name + '.png'); n += 1) name = full + '-' + n;
-          name += '.png'; used.add(name);
+          const name = handInstrName(instrBase + '_' + gengaInstrFileStem(row) + stageSuffix(stage));
           try {
-            const blob = await gengaRenderManualInstrBlob(row, dr, { pw: pw, ph: ph, paper: paper, stagePaper: stage ? gengaRevisionPaperColor(project, stage) : null });
+            const blob = await gengaRenderManualInstrBlob(row, dr, { pw: pw, ph: ph, paper: paper, stagePaper: gengaRevisionPaperColor(project, stage) });
             assertProjectIoOwner(owner);
-            await writeBlobToDirectory(await camDirFor(), name, blob);
-            cameraNames.push(name);
+            await writeInstr(name, blob);
           } catch (e) { assertProjectIoOwner(owner); failures.push(name + '（' + (e && e.message ? e.message : e) + '）'); }
         }
       }
       if (cameraWanted && opts.manualInstr !== false && !state.videoExportCancel) {
-        const base = gengaSheetJsonFileName(project).replace(/^sheet_/, '').replace(/\.json$/i, '');
-        const used = new Set(cameraNames);
-        const suffixes = normalizeGengaRevisionSuffixes(project.settings && project.settings.gengaRevisionSuffixDefaults);
         for (const l of (gt.layers || []).filter(function(x) { return x.instrManual && gengaLayerEffVisible(x, gt); })) {
           assertProjectIoOwner(owner);
           if (state.videoExportCancel) break;
           const stage = gengaRevisionStageCode(l.instrStage);
-          const stem = base + '_' + (String(l.name || 'instr').replace(/[\\/:*?"<>|\s]+/g, '_') || 'instr');
           const drawn = gengaSortedExposures(l).map(function(e) { return gengaExposureDrawing(l, e); }).filter(gengaDrawingHasArt);
           for (let k = 0; k < drawn.length; k += 1) {
             if (state.videoExportCancel) break;
-            const full = stem + (drawn.length > 1 ? '_' + (k + 1) : '') + (stage ? '_' + suffixes[stage] : '');
-            let name = full;
-            for (let n = 2; used.has(name + '.png'); n += 1) name = full + '-' + n;   // 겹치면 번호만 덧붙인다(노출 번호·공정 서픽스는 남긴다)
-            name += '.png'; used.add(name);
+            const name = handInstrName(instrBase + '_' + gengaInstrFileStem(l) + (drawn.length > 1 ? '_' + (k + 1) : '') + stageSuffix(stage));
             try {
-              const blob = await gengaRenderManualInstrBlob(l, drawn[k], { pw: pw, ph: ph, paper: paper, stagePaper: stage ? gengaRevisionPaperColor(project, stage) : null });
+              const blob = await gengaRenderManualInstrBlob(l, drawn[k], { pw: pw, ph: ph, paper: paper, stagePaper: gengaRevisionPaperColor(project, stage) });
               assertProjectIoOwner(owner);
               if (state.videoExportCancel) break;
-              const camDir = await dirHandle.getDirectoryHandle('_camera', { create: true });
-              assertProjectIoOwner(owner);
-              await writeBlobToDirectory(camDir, name, blob);
-              cameraNames.push(name);
+              await writeInstr(name, blob);
             } catch (e) { assertProjectIoOwner(owner); failures.push(name + '（' + (e && e.message ? e.message : e) + '）'); }
           }
         }
@@ -122960,6 +122936,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaLayerRole(l) { return (l && GENGA_LAYER_ROLES[l.role]) || GENGA_LAYER_ROLES.cel; }
     function gengaLayerIsPaper(l) { return !!(l && l.role === 'paper'); }
     function gengaLayerIsInstr(l) { return !!(l && l.role === 'instr'); }
+    function gengaLayerIsFxInstr(l) { return gengaLayerIsInstr(l) && l.instrSource === 'fx'; }
     function gengaLayerIsFixedRow(l) { return !!l && gengaLayerRole(l).kind === 'fixed'; }
     function gengaLayerInPictures(l) { return gengaLayerRole(l).picture; }
     // 美術グループ applies to BG/BOOK layers and the members of an existing art group, never to a cel.
@@ -123875,10 +123852,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // 수동 지시(docs/instruction_layer_design.md C): 손으로 그렸거나 들여온 지시 그림. 역할은 그대로 cel 이고 일괄 출력에서 셀 대신
         // _camera 로 나간다. 자격(gengaCanBeManualInstr)이 깨지면 정규화가 떼어 낸다. instrStage = 수정 공정(카메라 지시와 같은 뜻).
         instrManual: Boolean(layer.instrManual) && (layer.role || 'cel') === 'cel' && Boolean(layer.tagOff) && !layer.cellGroupId || undefined,
-        instrStage: (layer.instrManual || layer.role === 'instr') && gengaRevisionStageCode(layer.instrStage) || undefined,
+        instrStage: (layer.instrManual || gengaLayerIsInstr(layer)) && gengaRevisionStageCode(layer.instrStage) || undefined,
         // FX 지시 행(instrSource 'fx', 설계 F1·F4): 지시하는 움직임 묶음의 레이어 id 전부, 덧그림이 소재(BG)에 붙는가.
-        instrTargets: layer.role === 'instr' && layer.instrSource === 'fx' && Array.isArray(layer.instrTargets) ? layer.instrTargets.map(String) : undefined,
-        instrOnLayer: layer.role === 'instr' && layer.instrSource === 'fx' && layer.instrOnLayer === true || undefined,
+        instrTargets: gengaLayerIsFxInstr(layer) && Array.isArray(layer.instrTargets) ? layer.instrTargets.map(String) : undefined,
+        instrOnLayer: gengaLayerIsFxInstr(layer) && layer.instrOnLayer === true || undefined,
         // セルサブレイヤー group: layers sharing this id mirror each other's koma (exposure) timing and FX
         // (kept identical by updateGengaCelGroupsAfterEdit, run centrally in runCommand) but keep independent
         // drawings/onion/alpha-lock/eye/lock — see addGengaCelSubLayer.
@@ -123954,27 +123931,22 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       const range = layer.tvppRange;
       if (gengaLayerRole(out).kind === 'content' && range && Number.isSafeInteger(range.start) && range.start >= 1 && Number.isSafeInteger(range.end) && range.end >= range.start) out.tvppRange = { start: range.start, end: range.end };
-      // 지시 레이어(docs/instruction_layer_design.md): 고정 특수 행. 출처(카메라·FX)와 수정 공정(FX 는 대상·덧그림 자리도)만 제 필드다. 용지처럼 한 노출을
-      // 앞뒤 hold 로 모든 코마에 보이고 태그·그룹·폴더·FX·口パク 이 없다. 출처를 모르는 지시 행은 보통 레이어로 되돌린다(지시는 출처가 그린다).
-      if (out.role === 'instr') {
-        if (layer.instrSource !== 'camera' && layer.instrSource !== 'fx') out.role = 'cel';
-        else {
-          out.instrSource = layer.instrSource;
-          out.instrStage = gengaRevisionStageCode(layer.instrStage);
-          out.onion = false; out.alphaLock = false; out.clip = false; out.fxEnabled = false; out.tagOff = true; out.cellGroupId = '';
-          out.folderId = ''; out.collapsed = false; out.revisionKey = ''; out.revisionCustom = false; out.revisionSuffix = '';
-          out.serifuSections = []; out.exposures.forEach(function(e) { e.serifuId = ''; });
-          out.postBehavior = 'hold'; out.preBehavior = 'hold';
-        }
-      }
-      // 用紙 layer: fixed name, no fx/onion/alpha/tag/group; carry its top/bottom side. It shows on every frame
-      // through pre/postBehavior='hold' (set by gengaMakePaperLayerObject, re-asserted here for old files).
-      if (out.role === 'paper') {
-        out.paperSide = (layer.paperSide === 'bottom') ? 'bottom' : 'top';
-        out.onion = false; out.alphaLock = false; out.clip = false; out.fxEnabled = false; out.tagOff = false; out.cellGroupId = '';
-        out.folderId = ''; out.collapsed = false;   // 用紙 는 맨 위/아래에 고정이라 폴더에 못 들어간다
-        out.serifuSections = []; out.exposures.forEach(function(e) { e.serifuId = ''; }); // 用紙 has no timeline → no セリフ区間
+      // 고정 특수 행(用紙·지시): 한 노출을 앞뒤 hold 로 모든 코마에 보이고(用紙 는 gengaMakePaperLayerObject 가 정한 값을 옛 파일에도 다시
+      // 맞춘다) FX·onion·alpha·클립·그룹·폴더(맨 위에 고정)·口パク 이 없다. 지시 레이어(docs/instruction_layer_design.md)는 출처(카메라·FX)와
+      // 수정 공정(FX 는 대상·덧그림 자리도)만 제 필드고 태그가 없다. 출처를 모르는 지시 행은 보통 레이어로 되돌린다(지시는 출처가 그린다).
+      if (out.role === 'instr' && layer.instrSource !== 'camera' && layer.instrSource !== 'fx') out.role = 'cel';
+      if (gengaLayerIsFixedRow(out)) {
+        out.onion = false; out.alphaLock = false; out.clip = false; out.fxEnabled = false; out.cellGroupId = ''; out.folderId = ''; out.collapsed = false;
+        out.serifuSections = []; out.exposures.forEach(function(e) { e.serifuId = ''; });
         out.postBehavior = 'hold'; out.preBehavior = 'hold';
+      }
+      if (gengaLayerIsInstr(out)) {
+        out.instrSource = layer.instrSource; out.instrStage = gengaRevisionStageCode(layer.instrStage); out.tagOff = true;
+        out.revisionKey = ''; out.revisionCustom = false; out.revisionSuffix = '';
+      }
+      if (gengaLayerIsPaper(out)) {
+        out.paperSide = (layer.paperSide === 'bottom') ? 'bottom' : 'top';
+        out.tagOff = false;
         if (typeof out.name !== 'string' || !out.name) out.name = '用紙';
       }
       return out;
@@ -125118,7 +125090,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 카메라에 지시가 있으면 카메라를 바꾼 명령 안에서 생기고, 지시가 없어지면 손대지 않은(덧그림·공정 없는) 레이어만 함께 사라진다.
     // 자동 지시 자체는 저장하지 않는다 — 화면(gengaDrawCameraInstrView)과 출력이 지금 키로 그린다. 덧그림만 이 레이어의 그림이다.
     function gengaCameraInstrLayer(gt) {
-      return ((gt && gt.layers) || []).find(function(l) { return l.role === 'instr' && l.instrSource === 'camera'; }) || null;
+      return ((gt && gt.layers) || []).find(function(l) { return gengaLayerIsInstr(l) && l.instrSource === 'camera'; }) || null;
     }
     function gengaMakeCameraInstrLayer() {
       return {
@@ -125134,6 +125106,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // 지시 행의 한 장(앞뒤 hold 한 노출)이 있는 코마 — 그리기 준비·커밋·화면의 그리기 세션 판정이 이 코마로 맞춘다.
     function gengaInstrSheetFrame(l) { const e = (l && l.exposures || [])[0]; return e ? e.startFrame : 1; }
+    // 지시 행(카메라·FX)의 그 한 장 그림 — 출력이 읽는다.
+    function gengaInstrSheetDrawing(l) { return gengaExposureDrawing(l, gengaResolveExposureSample(l, 1).exp); }
+    // 손 지시 이미지(수동·묶음 잃은 FX 행)의 파일 이름 줄기 = 행 이름(파일명에 못 쓰는 글자는 _).
+    function gengaInstrFileStem(l) { return String(l.name || 'instr').replace(/[\\/:*?"<>|\s]+/g, '_') || 'instr'; }
     // 지시 행 묶음의 자리: 맨 위(위쪽 용지가 있으면 그 바로 아래). normalizeGengaTimeline 이 같은 규칙으로 다시 앉힌다.
     function gengaInstrRowIndex(layers) { return layers.length && layers[0].role === 'paper' && layers[0].paperSide !== 'bottom' ? 1 : 0; }
     // 맞춘 결과 레이어를 넣거나 뺐으면 true.
@@ -125157,10 +125133,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // ---- 지시 레이어(FX) — docs/instruction_layer_design.md F1·F2 ----
     // 움직임 묶음(gengaInstrTargetLayers 의 groups) 하나에 행 하나. 행은 묶음 멤버 id 전부(instrTargets)를 들고, 묶음과 행의 짝은
     // gengaFxInstrPairs 하나가 정한다(맞추기·화면·출력 공용). 자동 지시는 저장하지 않는다 — 덧그림만 이 행의 그림이다.
-    function gengaFxInstrRows(gt) { return ((gt && gt.layers) || []).filter(function(l) { return l.role === 'instr' && l.instrSource === 'fx'; }); }
+    function gengaFxInstrRows(gt) { return ((gt && gt.layers) || []).filter(gengaLayerIsFxInstr); }
     function gengaFxInstrName(group) { return t('genga.instr.fxName', group.subject); }
-    function gengaFxInstrInputKey(gt) {
-      return JSON.stringify([gengaShakuFrames(gt), gengaInstrTargetLayers(gt).groups.map(function(g) {
+    function gengaFxInstrInputKey(gt, groups) {
+      return JSON.stringify([gengaShakuFrames(gt), (groups || gengaInstrTargetLayers(gt).groups).map(function(g) {
         return [g.layers.map(function(l) { return String(l.id); }), gengaFxDirectiveKey(gt, g.layer, true), g.subject, g.name];
       })]);
     }
@@ -125187,24 +125163,30 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return Object.assign(gengaMakeCameraInstrLayer(), { name: gengaFxInstrName(group), instrSource: 'fx',
         instrTargets: group.layers.map(function(l) { return String(l.id); }), instrOnLayer: group.layer.role === 'bgbook' || undefined });
     }
-    // 맞춘 결과 행을 넣거나 빼거나 고치거나 옮겼으면 true. 짝 없는 행은 손대지 않았으면 지우고, 손댔으면(덧그림·공정·숨김) 덧그림만 남는
-    // 행으로 둔다. 순서는 카메라 행 다음에 묶음 순서(위→아래), 그 뒤에 짝 없는 행이다(설계 F1).
-    function gengaReconcileFxInstr(gt) {
-      if (!gt || !Array.isArray(gt.layers)) return false;
-      const res = gengaFxInstrPairs(gt), before = gengaFxInstrRows(gt), order = [];
-      let changed = false;
+    // 맞출 일 → null(지금 행이 맞다) 또는 { before, order(행, 새 행이면 그 묶음), fix(대상·이름을 고칠 행) }. 행을 고치지 않으므로 lean 명령도
+    // 미리 묻는다. 순서는 카메라 행 다음에 묶음 순서(위→아래), 그 뒤에 짝 없는 행이다(설계 F1). 짝 없는 행은 손대지 않았으면 지우고,
+    // 손댔으면(덧그림·공정·숨김) 덧그림만 남는 행으로 둔다.
+    function gengaFxInstrPlan(gt, groups) {
+      const res = gengaFxInstrPairs(gt, groups), before = gengaFxInstrRows(gt), order = [], fix = [];
       res.pairs.forEach(function(p) {
         const ids = p.group.layers.map(function(l) { return String(l.id); }), name = gengaFxInstrName(p.group);
-        if (!p.row) { order.push(normalizeGengaLayer(gengaMakeFxInstrLayer(p.group))); changed = true; return; }
-        if (JSON.stringify((p.row.instrTargets || []).map(String)) !== JSON.stringify(ids)) { p.row.instrTargets = ids; changed = true; }
-        if (p.row.name !== name) { p.row.name = name; changed = true; }
+        if (!p.row) { order.push(p.group); return; }
+        if (JSON.stringify((p.row.instrTargets || []).map(String)) !== JSON.stringify(ids) || p.row.name !== name) fix.push({ row: p.row, ids: ids, name: name });
         order.push(p.row);
       });
-      res.orphans.forEach(function(r) { if (gengaInstrLayerTouched(r)) order.push(r); else changed = true; });
-      if (!changed && order.length === before.length && order.every(function(r, k) { return r === before[k]; })) return false;
-      before.forEach(function(r) { gt.layers.splice(gt.layers.indexOf(r), 1); });
+      res.orphans.forEach(function(r) { if (gengaInstrLayerTouched(r)) order.push(r); });
+      return fix.length || order.length !== before.length || order.some(function(r, k) { return r !== before[k]; }) ? { before: before, order: order, fix: fix } : null;
+    }
+    // 맞춘 결과 행을 넣거나 빼거나 고치거나 옮겼으면 true.
+    function gengaReconcileFxInstr(gt, groups) {
+      if (!gt || !Array.isArray(gt.layers)) return false;
+      const plan = gengaFxInstrPlan(gt, groups);
+      if (!plan) return false;
+      plan.fix.forEach(function(f) { f.row.instrTargets = f.ids; f.row.name = f.name; });
+      plan.before.forEach(function(r) { gt.layers.splice(gt.layers.indexOf(r), 1); });
+      const rows = plan.order.map(function(x) { return gengaLayerIsInstr(x) ? x : normalizeGengaLayer(gengaMakeFxInstrLayer(x)); });
       const at = gt.layers.reduce(function(n, l, k) { return gengaLayerIsInstr(l) ? k + 1 : n; }, gengaInstrRowIndex(gt.layers));
-      gt.layers.splice.apply(gt.layers, [at, 0].concat(order));
+      gt.layers.splice.apply(gt.layers, [at, 0].concat(rows));
       return true;
     }
     // 덧그림이 소재에 붙은 행(BG 행)의 소재 — 대상 중 남아 있는 첫 레이어.
@@ -125214,7 +125196,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // 그리기 입력이 따를 FX 의 주인: 소재에 붙은 FX 지시 행이면 그 소재, 아니면 레이어 자신(설계 F4).
     function gengaFxInstrDrawHost(gt, layer) {
-      return (layer && layer.role === 'instr' && layer.instrSource === 'fx' && layer.instrOnLayer && gengaFxInstrHost(gt, layer)) || layer;
+      return (gengaLayerIsFxInstr(layer) && layer.instrOnLayer && gengaFxInstrHost(gt, layer)) || layer;
     }
     // ---- 수정공정 리비전 레이어 ----
     // 그룹 안의 리비전 멤버만(서브레이어와 섞이지 않게 revisionKey/revisionCustom 로 가른다).
@@ -131306,8 +131288,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return { status: composite && composite._complete ? 'ready' : 'pending', canvas: composite };
     }
+    // 지시 행의 덧그림(카메라·FX 공용): 그 행에 그리는 중이면 그리기 세션의 캔버스, 아니면 지금 코마 노출의 그림.
+    function gengaDrawInstrSheetView(ctx, row, frame, pw, ph) {
+      const sess = gengaDrawSession && String(gengaDrawSession.layerId) === String(row.id) && gengaDrawSession.frame === gengaInstrSheetFrame(row) ? gengaDrawSession : null;
+      if (sess) { ctx.drawImage(sess.canvas, 0, 0); return; }
+      const dr = gengaExposureDrawing(row, gengaResolveExposureSample(row, frame).exp);
+      if (gengaDrawingHasArt(dr)) gengaDrawDrawingInto(ctx, dr, pw, ph, scheduleGengaPreviewRedraw);
+    }
     // 카메라 지시 레이어의 화면 표시(docs/instruction_layer_design.md). 합성에 넣지 않고 위쪽 용지 다음에 따로 그린다 — 순서가 화면과
-    // 출력 모두 용지 → 덧그림 → 자동 지시가 되게(위쪽 용지가 덧그림을 가리지 않게). 덧그림은 그리는 중이면 그리기 세션의 캔버스다.
+    // 출력 모두 용지 → 덧그림 → 자동 지시가 되게(위쪽 용지가 덧그림을 가리지 않게).
     // 자동 지시는 매번 지금 키로 그린다(키 몇 개의 틀·궤적·글자라 싸다 — 캐시·무효화가 없다). 끌기 중 값은 시트와 같은 그림자
     // 타임라인(gengaTimesheetLiveGt: 캔버스 끌기·카메라 창 수치 끌기)에서 읽고, 尺 자르기·runs 도 출력과 같은 함수를 지난다.
     // 재생 중에는 그리지 않는다(재생 화면은 촬영 결과다).
@@ -131319,12 +131308,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       try {
         ctx.translate(view.ox, view.oy); ctx.scale(view.dw / pw, view.dh / ph);
         ctx.globalAlpha = layer.opacity != null ? layer.opacity : 1;
-        const sess = gengaDrawSession && String(gengaDrawSession.layerId) === String(layer.id) && gengaDrawSession.frame === gengaInstrSheetFrame(layer) ? gengaDrawSession : null;
-        if (sess) ctx.drawImage(sess.canvas, 0, 0);
-        else {
-          const dr = gengaExposureDrawing(layer, gengaResolveExposureSample(layer, view.frame).exp);
-          if (gengaDrawingHasArt(dr)) gengaDrawDrawingInto(ctx, dr, pw, ph, scheduleGengaPreviewRedraw);
-        }
+        gengaDrawInstrSheetView(ctx, layer, view.frame, pw, ph);
         ctx.globalAlpha = 1;
         const lgt = gengaTimesheetLiveGt(gt), cam = gengaCameraInstrShown(lgt);
         if (cam) drawCameraInstruction(ctx, { shown: cam.shown, std: cam.std, pw: pw, ph: ph, fit: 1,
@@ -131348,15 +131332,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return m;
       }
       const pairs = gengaFxInstrPairs(gt), keys = new Map();
-      pairs.pairs.forEach(function(p) { if (p.row && gengaLayerDrawsInComposite(p.row)) keys.set(String(p.row.id), gengaFxInstrViewKey(gt, p.group)); });
+      let shared = null;   // 모든 묶음에 같은 입력 — 보이는 행이 있을 때 한 번
+      pairs.pairs.forEach(function(p) { if (p.row && gengaLayerDrawsInComposite(p.row)) keys.set(String(p.row.id), gengaFxInstrViewKey(gt, p.group, shared = shared || gengaFxInstrViewShared(gt))); });
       return (gengaFxInstrViewSnap = { gt: gt, at: now, pairs: pairs, keys: keys });
     }
     // 기억 그림의 키 = 렌더 입력 전부: 그림·노출·키·묶음·합성(modeSig) + 방식·표기 + 카메라(기준 틀·츠케팬 사각형) + 대상명·코마 번호 +
     // 시트 라벨·motionText(다른 묶음 변화로도 바뀐다).
-    function gengaFxInstrViewKey(gt, group) {
+    function gengaFxInstrViewShared(gt) { return { works: gengaLayerFxWorkEntries(gt), camera: JSON.stringify([gt.camera, gt.cameraWork]) }; }
+    function gengaFxInstrViewKey(gt, group, shared) {
       const l = group.layer, mode = gengaResolvedInstrMode(gt, l);
-      const work = gengaLayerFxWorkEntries(gt).find(function(e) { return String(e.layer.id) === String(l.id); });
-      return [gengaInstrModeSig(gt, l, group), mode, gengaLayerLabelStyle(gt, l, mode), JSON.stringify([gt.camera, gt.cameraWork]), group.subject, gengaFrameNumber(gt, 1),
+      shared = shared || gengaFxInstrViewShared(gt);
+      const work = shared.works.find(function(e) { return String(e.layer.id) === String(l.id); });
+      return [gengaInstrModeSig(gt, l, group), mode, gengaLayerLabelStyle(gt, l, mode), shared.camera, group.subject, gengaFrameNumber(gt, 1),
         work ? JSON.stringify([work.runs.map(function(r) { return [r.from, r.to, r.startLabel, r.endLabel]; }), work.group.motionText]) : ''].join('|');
     }
     function gengaFxInstrViewEntry(snap, row) {
@@ -131403,12 +131390,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           ctx.save();
           ctx.globalAlpha = row.opacity != null ? row.opacity : 1;
           if (hostFx) gengaApplyFxXform(ctx, hostFx, false, pw, ph);
-          const sess = gengaDrawSession && String(gengaDrawSession.layerId) === String(row.id) && gengaDrawSession.frame === gengaInstrSheetFrame(row) ? gengaDrawSession : null;
-          if (sess) ctx.drawImage(sess.canvas, 0, 0);
-          else {
-            const dr = gengaExposureDrawing(row, gengaResolveExposureSample(row, view.frame).exp);
-            if (gengaDrawingHasArt(dr)) gengaDrawDrawingInto(ctx, dr, pw, ph, scheduleGengaPreviewRedraw);
-          }
+          gengaDrawInstrSheetView(ctx, row, view.frame, pw, ph);
           ctx.restore();
           const c = snap.keys.has(String(row.id)) ? gengaFxInstrViewEntry(snap, row) : null;
           if (c && c.canvas) {
@@ -136908,12 +136890,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function runGengaCameraCommand(name, mutator) {
       const before = captureGengaCameraState(state.project);
       const gtNow = state.project && state.project.gengaTimeline;
-      const instrBefore = gtNow ? gengaCameraInstrSnapshot(gtNow) : null;
+      const instrPrev = gtNow ? gengaCameraInstrLayer(gtNow) : null, instrPrevIndex = instrPrev ? gtNow.layers.indexOf(instrPrev) : -1;
       mutator(state.project);
       const after = captureGengaCameraState(state.project);
-      // 지시 레이어를 만들거나 지운 명령만 그 상태를 싣는다 — 레이어가 그대로면 이력은 지금처럼 cameraWork 뿐이다.
+      // 지시 레이어를 만들거나 지운 명령만 그 상태를 싣는다 — 레이어가 그대로면 이력은 지금처럼 cameraWork 뿐이다. 맞추기는 손대지 않은
+      // 행만 빼므로 명령 전 행 객체가 그대로 before 다(바뀐 명령에서만 복제).
       if (gtNow && gengaReconcileCameraInstr(gtNow)) {
-        before.instr = instrBefore; after.instr = gengaCameraInstrSnapshot(gtNow);
+        before.instr = { index: instrPrevIndex, layer: instrPrev && fastClone(instrPrev) }; after.instr = gengaCameraInstrSnapshot(gtNow);
         gengaFrameStackInvalidate(); gengaDropUnfitSelections();   // 행 구조가 바뀌었다(일반 명령의 정규화·무효화 대신 이 둘만)
       }
       pushUndoCommand({ name: name, before: before, after: after, gengaCameraEdit: true });
@@ -136938,6 +136921,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // its siblings and runs on whole projects inside runCommand.
     // 2. the edit adds/removes a koma: gt.totalFrames is derived by normalizeGengaTimeline, which the lean path
     // deliberately skips. Lean edits only rewrite a layer's own contents.
+    // 3. the edit adds/removes/renames an FX instruction row (a motion group forms or splits): the row structure is
+    // outside the lean history. runGengaLayerPatchCommand detects this itself and records the edit as a full command.
     // gengaLayerPatchScopeOk(layerIds) checks (1); (2) is the caller's own knowledge.
     function gengaLayerPatchScopeOk(layerIds) {
       const gt = state.project && state.project.gengaTimeline;
@@ -137198,13 +137183,22 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function runGengaLayerPatchCommand(name, layerIds, mutator, refreshOptions) {
       const ids = (layerIds || []).map(function(id) { return String(id || ''); }).filter(Boolean);
       const before = captureGengaLayerPatchState(state.project, ids);
+      const gt = state.project.gengaTimeline, isStrokeCommit = Boolean(refreshOptions && refreshOptions.gengaStrokeCommit);
+      const fxInstrKey = isStrokeCommit ? '' : gengaFxInstrInputKey(gt);   // 획은 FX·보임을 바꾸지 않는다
       mutator(state.project);
+      if (fxInstrKey && gengaFxInstrInputKey(gt) !== fxInstrKey && gengaFxInstrPlan(gt)) {   // SCOPE RULE 3
+        // mutator 는 다시 돌리지 않는다(래스터화처럼 자산을 등록하는 편집이 있다) — 지금 상태에 바뀐 레이어만 전 값으로 되돌린 스냅숏이 before.
+        const full = snapshotProject(), byId = new Map(before.layers.map(function(item) { return [item.id, item.layer]; }));
+        full.gengaTimeline.layers = full.gengaTimeline.layers.map(function(l) { return byId.get(String(l.id)) || l; });
+        invalidateVideoTimelineCache();
+        finishCommand(name, full, refreshOptions);
+        return;
+      }
       gengaUpdateTvppRangesAfterEdit(before.layers.map(function(e) { return e.layer; }), state.project.gengaTimeline.layers);
       const after = captureGengaLayerPatchState(state.project, ids);
       // 그리기 커밋(gengaStrokeCommit)이 캐시의 중심 레이어만 바꿀 때만 프레임 캐시가 산다 — 중심 레이어는
       // below/above 어느 캐시에도 없으므로 정의상 유효하고, 연타가 벽 없이 이어진다. 그 밖의 lean 명령
       // (표시·불투명도·blend·FX·노출…)은 보수 원칙(사용자 판정)대로 통째로 버린다.
-      const isStrokeCommit = Boolean(refreshOptions && refreshOptions.gengaStrokeCommit);
       const strokeKeep = isStrokeCommit && gengaFrameStackStrokeKeepOk(ids);
       if (!strokeKeep) gengaFrameStackInvalidate();
       const beforeById = new Map(before.layers.map(function(item) { return [String(item.id), item.layer]; }));
@@ -141453,7 +141447,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             return;
           }
           // 지시 레이어 행: 용지 행처럼 고정 이름·한 장. 표시·잠금 + 수정 공정 칩(있을 때).
-          if (l.role === 'instr') {
+          if (gengaLayerIsInstr(l)) {
             const stage = l.instrStage ? gengaInstrChipHtml(l, '') : '';
             head += '<div class="genga-layer-head genga-paper-head genga-instr-head' + sel + hiddenRow + '" data-genga-layer="' + escapeHtml(l.id) + '">' +
               '<div class="genga-lh-core">' +
