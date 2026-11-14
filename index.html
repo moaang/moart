@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3290</title>
+  <title>MoArt ver3291</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25352,6 +25352,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3291, items: [{ja: '原画で描いた絵を保存用の画像にする処理を裏側で行うようにし、続けて描くときの小さな引っかかりを減らしました。', ko: '원화에서 그린 그림을 저장용 이미지로 만드는 처리를 뒤에서 하도록 해, 이어서 그릴 때의 작은 끊김을 줄였습니다.', en: 'Genga drawings are now converted to saved images in the background, reducing small hitches while you keep drawing.', zh: '原画中所画内容转换为保存用图像的处理改为在后台进行，减少了连续绘画时的小卡顿。'}] },
       { ver: 3290, items: [{ja: 'CLIP STUDIOから読み込んだ「2-ブラシ」や「紙質」付きのブラシで、描くほど重くなる問題を直しました（2-ブラシは新しく描いた所だけ足し、紙質などの計算で描画がCPUに切り替わらないようにしました）。', ko: 'CLIP STUDIO에서 불러온 「2-브러시」나 「종이 질감」 브러시로 그릴수록 무거워지던 문제를 고쳤습니다(2-브러시는 새로 그린 곳만 더하고, 종이 질감 등의 계산 때문에 그리기가 CPU로 바뀌지 않게 했습니다).', en: 'Brushes imported from CLIP STUDIO with a dual brush or paper texture no longer get heavier as you draw (the dual brush adds only the newest marks, and texture calculations no longer push drawing onto the CPU).', zh: '修正了使用从CLIP STUDIO导入的带“双重笔刷”或“纸张质感”的笔刷时越画越卡的问题（双重笔刷只追加新画的部分，纸张质感等计算不再让绘制切换到CPU）。'}] },
       { ver: 3289, items: [{ja: 'CLIP STUDIOから読み込んだ「水彩境界」付きのブラシで、長い線を描くほど引っかかる問題を直しました（描いている間は新しく描いた所のまわりだけ計算します。見た目は同じです）。', ko: 'CLIP STUDIO에서 불러온 「수채 경계」 브러시로 긴 선을 그을수록 끊기던 문제를 고쳤습니다(그리는 동안 새로 그린 곳 주변만 계산합니다. 모양은 같습니다).', en: 'Brushes imported from CLIP STUDIO with watercolor edge no longer stutter more the longer the stroke gets (only the area around the newest marks is recomputed while drawing; the result looks the same).', zh: '修正了使用从CLIP STUDIO导入的带“水彩边界”的笔刷时线画得越长越卡的问题（绘画时只计算新画部分的周围，效果不变）。'}] },
       { ver: 3288, items: [{ja: '大きな用紙で線に囲まれた小さな所を塗りつぶすとき、画面が止まる時間を短くしました（塗る所のまわりだけを計算します）。', ko: '큰 용지에서 선으로 둘러싸인 작은 곳을 채우기할 때 화면이 멈추는 시간을 줄였습니다(칠할 곳 주변만 계산합니다).', en: 'Filling a small enclosed area on a large canvas freezes the screen for much less time (only the area around the fill is computed).', zh: '在大画布上填充被线条围住的小区域时，画面停顿的时间更短了（只计算填充区域周围）。'}] },
@@ -106136,6 +106137,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       //   이유로 돌려준다.
       if (gengaIsTileSet(v)) {
         if (v.pendingBake && !gengaTileSetBakePending(v)) return { ok: false, ref: ref, code: 'encode' };
+        if (!gengaTileCellsAllBlob(v)) {
+          // 칸은 메인 밖에서 굽는다(자동저장 flush 가 시작한 작업이 있으면 그것을 기다린다). 그사이 store 가 바뀌었으면
+          // 지금 값으로 다시 판정하고, 진행 중 쓰기가 생겼으면 그것을 기다린다. 못 구운 칸만 아래에서 동기로 마저 굽는다.
+          await gengaStartTileEncodeJob(ref, v);
+          if (gengaDrawStore.get(ref) !== v) return gengaEnsureDrawingDurable(ref);
+          const writing = gengaPersistJobs.get(ref);
+          if (writing) return (await writing) ? { ok: true, ref: ref, representation: 'gd' } : { ok: false, ref: ref, code: 'write' };
+        }
         gengaEncodeTileCells(v, Infinity);
         if (!gengaTileCellsAllBlob(v)) return { ok: false, ref: ref, code: 'encode' };
         return (await gengaPersistTileSet(ref, v)) ? { ok: true, ref: ref, representation: 'gd' } : { ok: false, ref: ref, code: 'write' };
@@ -107034,6 +107043,121 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (solidBlobs && key != null) solidBlobs.set(key, blob);
       return blob;
     }
+    // ── 칸 PNG 의 메인 밖 인코드 ─────────────────────────────────────────────────────────────
+    // 펌프·자동저장은 칸을 메인에서 toDataURL 로 굽지 않는다: 칸 캔버스(불변)를 ImageBitmap 으로 떠서 워커의
+    // OffscreenCanvas.convertToBlob 으로 굽는다(썸 굽기와 같은 풀 모양 tvppWorkerPool*). 워커가 없으면 캔버스 toBlob,
+    // 그것도 없으면 null — 부르는 쪽이 동기 경로(gengaEncodeTileCells)로 마저 굽는다. 같은 칸을 여러 묶음이 물려받아도
+    // 진행 중 작업(_tileEncoding)과 결과(_tileBlob)는 칸에 하나다. 동기 경로가 먼저 구웠으면 그 Blob 을 쓴다.
+    const GENGA_TILE_ENCODE_WORKERS = 2;
+    let gengaTileEncodePool;              // undefined: 미시도, null: 미지원(이후 toBlob)
+    const gengaTileEncodeQueue = [];      // 빈 워커를 기다리는 { t(칸 캔버스), done } — 비트맵은 워커에 넘길 때만 뜬다
+    let gengaTileEncodeStarting = 0;      // 비트맵을 뜨는 중인 작업 수 — 빈 워커 수를 넘겨 뜨지 않는다
+    // 워커·toBlob 이 답하지 않아도(WebKit 이 오류 없이 멈춘 관측이 있다) 게시 배리어가 끝없이 기다리지 않게 한다. 넘기면
+    // 풀을 닫고(이후 toBlob) 그 칸은 null — 부르는 쪽이 동기로 마저 굽는다.
+    const GENGA_TILE_ENCODE_TIMEOUT_MS = 8000;
+    function gengaTileEncodeWithin(promise, onTimeout) {
+      let timer = 0;
+      return Promise.race([promise, new Promise(function(resolve) {
+        timer = setTimeout(function() { if (onTimeout) onTimeout(); resolve(null); }, GENGA_TILE_ENCODE_TIMEOUT_MS);
+      })]).then(function(v) { clearTimeout(timer); return v; });
+    }
+    function gengaTileEncodePoolEnsure() {
+      if (gengaTileEncodePool === undefined) {
+        const supported = typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
+          && typeof OffscreenCanvas.prototype.convertToBlob === 'function' && typeof createImageBitmap === 'function';
+        gengaTileEncodePool = supported ? tvppWorkerPoolOpen(
+          'onmessage=async function(e){const d=e.data;let c;try{c=new OffscreenCanvas(d.bmp.width,d.bmp.height);'
+          + 'c.getContext("2d").drawImage(d.bmp,0,0);d.bmp.close();'
+          + 'postMessage({id:d.id,blob:await c.convertToBlob({type:"image/png"})});'
+          + '}catch(err){postMessage({id:d.id,error:String(err)});}finally{if(c){c.width=c.height=0;}}};',
+          GENGA_TILE_ENCODE_WORKERS, 'genga tile encode') : null;
+      }
+      return gengaTileEncodePool;
+    }
+    function gengaTileEncodeWorkerPump() {
+      const pool = gengaTileEncodePoolEnsure();
+      if (!pool || pool.dead) {
+        while (gengaTileEncodeQueue.length) gengaTileEncodeQueue.shift().done(null);
+        return;
+      }
+      while (gengaTileEncodeQueue.length && pool.idle.length > gengaTileEncodeStarting) {
+        const job = gengaTileEncodeQueue.shift();
+        gengaTileEncodeStarting += 1;
+        createImageBitmap(job.t).then(function(bmp) {
+          gengaTileEncodeStarting -= 1;
+          if (pool.dead || gengaTileEncodePool !== pool) { bmp.close(); job.done(null); gengaTileEncodeWorkerPump(); return; }
+          tvppWorkerPoolRun(pool, { bmp: bmp }, [bmp]).then(function(m) {
+            gengaTileEncodeWorkerPump();
+            job.done(m && m.blob instanceof Blob ? m.blob : null);
+          }, function() { gengaTileEncodeWorkerPump(); job.done(null); });
+        }, function() { gengaTileEncodeStarting -= 1; job.done(null); gengaTileEncodeWorkerPump(); });
+      }
+    }
+    function gengaTileEncodeCellAsync(t) {
+      if (t._tileBlob) return Promise.resolve(t._tileBlob);
+      if (t._tileEncoding) return t._tileEncoding;
+      const job = (async function() {
+        let blob = null;
+        const pool = gengaTileEncodePoolEnsure();
+        if (pool && !pool.dead) {
+          blob = await gengaTileEncodeWithin(new Promise(function(resolve) { gengaTileEncodeQueue.push({ t: t, done: resolve }); gengaTileEncodeWorkerPump(); }),
+            function() {   // 무응답 — 풀을 닫아 진행 중·대기 작업을 null 로 끝내고 이후는 toBlob 으로
+              if (gengaTileEncodePool === pool) { console.error('[gengaTile] encode worker did not answer - closing the pool'); tvppWorkerPoolClose(pool); gengaTileEncodePool = null; gengaTileEncodeWorkerPump(); }
+            });
+        }
+        if (!blob && !t._tileBlob && typeof t.toBlob === 'function') {
+          blob = await gengaTileEncodeWithin(new Promise(function(resolve) { try { t.toBlob(resolve, 'image/png'); } catch (e) { resolve(null); } }));
+        }
+        if (blob && !t._tileBlob) t._tileBlob = blob;
+        return t._tileBlob || null;
+      })();
+      t._tileEncoding = job;
+      job.then(function() { if (t._tileEncoding === job) t._tileEncoding = null; });
+      return job;
+    }
+    // 묶음의 캔버스 칸을 메인 밖에서 굽고, 그때도 store 에 그 묶음이 있으면 Blob 으로 확정한다(gengaEncodeTileCells 와
+    // 같은 장부 짝). 단색 칸은 묶음 안에서 PNG 하나를 나눠 쓰도록 동기 경로로 굽는다(작고 싸다). → 전부 Blob 인가.
+    function gengaEncodeTileCellsAsync(ref, ts) {
+      const solidBlobs = new Map(), jobs = [];
+      let changed = false;
+      const settle = function(idx, cell, blob) {
+        if (!blob || gengaDrawStore.get(ref) !== ts || ts.cells.get(idx) !== cell) return;
+        ts.cells.set(idx, blob);
+        gengaTileSetCellBlobSettled(ts, blob);
+        changed = true;
+      };
+      ts.cells.forEach(function(cell, idx) {
+        if (!cell || typeof cell.size === 'number') return;
+        if (cell._tileBlob || cell._tileSolidKey != null) {
+          let blob = null;
+          try { blob = gengaTileEncodeCanvas(cell, solidBlobs); } catch (e) { blob = null; }
+          settle(idx, cell, blob);
+          return;
+        }
+        jobs.push(gengaTileEncodeCellAsync(cell).then(function(blob) { settle(idx, cell, blob); }));
+      });
+      return Promise.all(jobs).then(function() {
+        if (changed && gengaDrawStore.get(ref) === ts) gengaDrawStoreReweighValue(ts);
+        return gengaTileCellsAllBlob(ts);
+      });
+    }
+    // 묶음당 진행 중 작업 하나. 끝나면 펌프를 깨워 확정·내구화(gengaPersistTileSet)와 실패 계수를 펌프가 잇는다.
+    function gengaStartTileEncodeJob(ref, ts) {
+      if (ts._encodeJob) return ts._encodeJob;
+      const job = gengaEncodeTileCellsAsync(ref, ts).then(function(ok) {
+        if (ts._encodeJob === job) ts._encodeJob = null;
+        if (!ok && gengaDrawStore.get(ref) === ts) ts.encodeFailures = (Number(ts.encodeFailures) || 0) + 1;
+        gengaKickTileEncodePump();
+        return ok;
+      }, function(e) {
+        if (ts._encodeJob === job) ts._encodeJob = null;
+        console.error('[gengaTile] background encode failed for ' + ref, e);
+        gengaKickTileEncodePump();
+        return false;
+      });
+      ts._encodeJob = job;
+      return job;
+    }
     // 커밋된 통짜 캔버스 → 칸 묶음. `prev` 가 같은 격자의 칸 묶음이면 안 닿은 칸을 그대로 물려받고
     // `scanRect`(잉크의 상위집합)가 덮는 칸만 다시 굽는다. scanRect 가 없으면(변형·붙여넣기·임포트) 전부 다시
     // 굽는다 — 안전한 쪽이다. `deferBake`는 gengaCommitCanvas에서 켠다. 변경 창과 빈 그림 방지 조건을 만족하면
@@ -107585,17 +107709,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); continue; }
         if (gengaIsDrawDelta(ts)) continue;   // 붕괴 전 delta — 인코드할 cells 가 아직 없다(붕괴는 위 선택 로직의 몫)
         if (ts.pendingBake) continue;   // 대기 중인 prev(참조 없음) — 인코드·persist 하지 않는다(획이 빠진 부분 그림이 된다)
-        const r = gengaEncodeTileCells(ts, budget, deadline);   // 시간 예산
-        budget -= Math.max(1, r.done);
-        if (r.failed) {
-          ts.encodeFailures = (Number(ts.encodeFailures) || 0) + r.failed;
-          if (ts.encodeFailures >= LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) {
-            gengaPendingTileEncode.delete(ref);
-            console.error('[gengaTile] giving up background encode for ' + ref + ' - serialize-time fallback remains');
-            continue;
-          }
+        if (gengaTileCellsAllBlob(ts)) { gengaPendingTileEncode.delete(ref); gengaPersistTileSet(ref, ts); continue; }
+        if (ts.encodeFailures >= LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) {
+          gengaPendingTileEncode.delete(ref);
+          console.error('[gengaTile] giving up background encode for ' + ref + ' - serialize-time fallback remains');
+          continue;
         }
-        if (gengaTileCellsAllBlob(ts)) { gengaPendingTileEncode.delete(ref); gengaPersistTileSet(ref, ts); }
+        if (ts._encodeJob) continue;   // 메인 밖에서 굽는 중 — 끝나면 이 펌프를 다시 깨운다
+        gengaStartTileEncodeJob(ref, ts);
+        budget -= 1;
         if (performance.now() >= deadline) break;   // 시간이 다 됐으면 다음 태스크로
       }
       // 참조 없는 대기 prev 만 남았으면 재예약하지 않는다(0ms 재예약 루프가 된다) — undo/redo 가
@@ -107603,7 +107725,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       let more = false;
       gengaPendingTileEncode.forEach(function(ts, ref) {
         if (gengaIsDrawDelta(ts)) { if (gengaDeltaWant.has(ref)) more = true; return; }   // 참조 delta 는 잠잠 타이머가, 고아 delta 는 그물·undo 깨움이 잇는다
-        if (!ts.pendingBake || gengaPendingRefReferenced(ref)) more = true;
+        if (ts.pendingBake ? gengaPendingRefReferenced(ref) : !ts._encodeJob) more = true;   // 굽는 중인 묶음은 작업 끝이 깨운다
       });
       if (more && !gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
       // A delta backing off after a failed collapse wakes the pump when its retry is due.
@@ -107656,6 +107778,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         if (opts && opts.pixelsOnly) {
           gengaScheduleTileEncode(ref, ts); // Keep browser durability work owned by the existing pump.
+          return;
+        }
+        if (opts && opts.deltaAsync && !gengaTileCellsAllBlob(ts)) {
+          // 자동저장은 칸을 메인에서 굽지 않는다 — 메인 밖 인코드를 시작하고 대기에 남긴다. 게시 배리어
+          // (gengaEnsureDrawingDurable)가 그 작업과 gd: 쓰기를 기다린다.
+          gengaPendingTileEncode.set(ref, ts);
+          gengaStartTileEncodeJob(ref, ts);
           return;
         }
         gengaEncodeTileCells(ts, Infinity);
