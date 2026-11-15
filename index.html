@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3335</title>
+  <title>MoArt ver3336</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -22739,6 +22739,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         applyGengaCameraHistoryState(payload);
         return;
       }
+      if (command.gengaDialogueEdit) { // 원화 대사만(dialogue)
+        pushOther(command);
+        applyGengaDialogueHistoryState(payload);
+        return;
+      }
       if (command.gengaKomaCreation) {
         pushOther(command);
         applyGengaExposureCreationHistory(command, undoing);
@@ -25611,6 +25616,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3336, items: [{ja: '原画のセリフ入力の確定を軽くしました。カメラキー操作の後に元に戻す／やり直すボタンが無効のままになる不具合を直しました。', ko: '원화 대사 입력 확정을 가볍게 했습니다. 카메라 키 조작 뒤 실행 취소·다시 실행 버튼이 비활성으로 남던 문제를 고쳤습니다.', en: 'Committing genga dialogue text is lighter. Fixed the undo/redo buttons staying disabled after camera key edits.', zh: '原画台词输入的确认更轻快。修复了相机关键帧操作后撤销/重做按钮保持禁用的问题。'}] },
       { ver: 3335, items: [{ja: '未保存の判定（タブ切替・保存中の確認など）を軽くしました。', ko: '미저장 판정(탭 전환·저장 중 확인 등)을 가볍게 했습니다.', en: 'The unsaved-changes check (tab switches, checks during saving) is lighter.', zh: '未保存判定（切换标签页、保存过程中的确认等）更轻快。'}] },
       { ver: 3334, items: [{ja: '大きな原画タイムシートの再描画を軽くしました（コマごとのイベント登録をレイヤー行ごとに）。', ko: '큰 원화 타임시트의 다시 그리기를 가볍게 했습니다(코마마다 하던 이벤트 등록을 레이어 행마다 한 번으로).', en: 'Redrawing a large genga timesheet is lighter (events are registered once per layer row instead of per koma).', zh: '大型原画摄影表的重绘更轻快（事件改为按图层行注册，而非逐格注册）。'}] },
       { ver: 3333, items: [{ja: 'タブ切替と原画レイヤー追加を軽くしました（使っていないエフェクト窓の再描画を省き、レイヤー追加のプレビュー描画を1回に）。', ko: '탭 전환과 원화 레이어 추가를 가볍게 했습니다(쓰지 않는 효과 창의 다시 그리기를 빼고, 레이어 추가의 미리보기 그리기를 한 번으로).', en: 'Switching tabs and adding genga layers are lighter (no redraw for an unused effect window; one preview draw per layer add).', zh: '切换标签页与添加原画图层更轻快（不再为未使用的效果窗口重绘；添加图层时预览只绘制一次）。'}] },
@@ -117144,6 +117150,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaCommitDialogueText(id, text) {
       const e = gengaDialogueFind(state.project, id);
       if (!e || e.text === text) return;
+      // 칸 길이가 그대로면(음성에 링크됐거나 이미 넉넉함) 글만 바뀐다 — 대사만 이력에 싣는다. 결과는 아래 전체 명령의
+      // 정규화(gengaNormalizeDialogue)가 이 대사에 하는 일과 같다: 글을 정리하고, 지운 글자 배치는 다시 생기지 않는다.
+      if (e.audioClipId || e.to - e.from + 1 >= gengaDialogueNeedLen(text)) {
+        runGengaDialogueCommand('セリフ入力', function(p) {
+          const x = gengaDialogueFind(p, id);
+          if (!x) return;
+          x.text = gengaDialogueCleanText(text);
+          delete x.chars;
+        });
+        return;
+      }
+      // 늘려야 하면 끝·레인·전체 길이가 바뀔 수 있다 — 전체 명령.
       runCommand('セリフ入力', function(p) {
         const gt = p.gengaTimeline, d = gt.dialogue, x = gengaDialogueFind(p, id);
         if (!x) return;
@@ -138977,6 +138995,35 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const instr = gengaCameraInstrLayer(gt);
       return { scope: 'partial', layerIds: instr ? [String(instr.id)] : [], camera: true };
     }
+    // 원화 대사의 가벼운 이력 — 대사(gengaTimeline.dialogue)만 싣는다. 쓰는 명령은 칸 길이·레인·전체 길이를 바꾸지 않는
+    // 편집뿐이다(지금은 글 확정). 미리보기 합성은 대사를 읽지 않으므로 프레임 캐시를 버리지 않고, 다시 그리기는 대사 줄만.
+    function captureGengaDialogueState(project) {
+      const gt = project && project.gengaTimeline;
+      return { dialogue: fastClone(gt && gt.dialogue || { lanes: 1, entries: [] }) };
+    }
+    function gengaDialogueRenderPlan(gt, beforeShape) {
+      return beforeShape === gengaDialogueRowsShape(gt) ? { scope: 'partial', layerIds: [], audio: false, dialogue: true } : { scope: 'all', reason: 'dialogue-rows' };
+    }
+    function runGengaDialogueCommand(name, mutator) {
+      paintInputFlushSync();
+      const gt = state.project && state.project.gengaTimeline;
+      if (!gt) return;
+      const shape = gengaDialogueRowsShape(gt);
+      const before = captureGengaDialogueState(state.project);
+      mutator(state.project);
+      const after = captureGengaDialogueState(state.project);
+      pushUndoCommand({ name: name, before: before, after: after, gengaDialogueEdit: true });
+      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } }
+      state.redoStack = [];
+      refresh({ skipChrome: true, gengaRenderPlan: gengaDialogueRenderPlan(gt, shape) });   // 카메라 명령과 같이 툴바는 그대로
+    }
+    function applyGengaDialogueHistoryState(snapshot) {
+      const gt = state.project && state.project.gengaTimeline;
+      if (!gt || !snapshot) return;
+      const shape = gengaDialogueRowsShape(gt);
+      gt.dialogue = fastClone(snapshot.dialogue);
+      refresh({ skipChrome: true, gengaRenderPlan: gengaDialogueRenderPlan(gt, shape) });
+    }
     function applyGengaCameraHistoryState(snapshot) {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt || !snapshot) return;
@@ -145176,7 +145223,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         // no inspector render: genga has no inspector, so a guardedRender frame for it would be paid on every
         // genga command for a panel that cannot be seen.
+        // skipChrome 은 무거운 툴바 갱신만 건너뛴다. Undo/Redo 버튼은 이력의 결과라 늘 따라간다 — 호출자마다 따로 부르게 두면
+        // 빠지는 자리가 생긴다(카메라·대사 명령에서 버튼이 비활성으로 남았다).
         if (!options.skipChrome) guardedRender('chrome', updateChromeControls);
+        else updatePaintUndoRedoButtonsOnly();
         guardedRender('timesheet', gengaTimesheetUpdate); // Structure changed → rebuild the open timesheet
         return;
       }
@@ -145193,6 +145243,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!options.skipSource) guardedRender('source', renderSource);
       if (!options.skipInspector) guardedRender('inspector', renderInspector);
       if (!options.skipChrome) guardedRender('chrome', updateChromeControls);
+      else updatePaintUndoRedoButtonsOnly();
     }
 
     // handle-only docking (video editors-style) — no mode/side buttons. 'compact' is not a manual mode
