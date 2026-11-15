@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3321</title>
+  <title>MoArt ver3322</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25506,6 +25506,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3322, items: [{ja: '内部の整理を続けました。原画の再生開始で音声デバイスを起こせなかったとき、エラーにならず静かに止まります。', ko: '내부 정리를 이어 했습니다. 원화 재생을 시작할 때 오디오 장치를 깨우지 못하면 오류 없이 조용히 넘어갑니다.', en: 'More internal cleanup. When genga playback cannot wake the audio device, it now stops quietly instead of raising an error.', zh: '继续内部整理。原画播放开始时若无法唤醒音频设备，将安静跳过而不再报错。'}] },
       { ver: 3321, items: [{ja: '口パクの音声分析・PSD用紙の読み込みを作業スレッドで(長い音声や大きなPSDで止まらない)', ko: '口パク 음성 분석·PSD 용지 불러오기를 작업 스레드로(긴 음성·큰 PSD 에서 멈추지 않음)', en: 'Lip-sync voice analysis and PSD paper loading now run in a worker (no freeze on long audio or large PSDs)', zh: '口型语音分析与PSD纸张读取改在工作线程(长音频·大PSD不再卡顿)'}, {ja: 'セル移動指示の書き出しで同じ絵を使う露出の合成を1回に(書き出しが速く)', ko: '셀 이동 지시 출력에서 같은 그림을 쓰는 노출의 합성을 한 번으로(출력이 빨라짐)', en: 'Cel-move instruction export composites a drawing reused by many exposures only once (faster export)', zh: '移动赛璐珞指示导出时，同一画面的多个曝光只合成一次(导出更快)'}] },
       { ver: 3320, items: [{ja: '内部の整理：自動保存で同じ絵を二度書き込まないようにし、画面を隠したときに表示キャッシュをより多く解放します。まれに再生画面が古い絵を表示することがある問題を修正しました。', ko: '내부 정리: 자동 저장이 같은 그림을 두 번 쓰지 않고, 화면을 숨기면 표시 캐시를 더 많이 놓습니다. 드물게 재생 화면이 옛 그림을 보이던 문제를 고쳤습니다.', en: 'Internal cleanup: autosave no longer writes the same drawing twice, and hiding the app frees more display caches. Fixed a rare case where playback could show an outdated drawing.', zh: '内部整理：自动保存不再重复写入同一幅画，隐藏画面时释放更多显示缓存。修复了播放画面偶尔显示旧画的问题。'}] },
       { ver: 3319, items: [{ja: '口パクの吹き出しは焼き付け前もセリフ文字だけで決め、焼き付け結果と同じ口に(無音コマを閉じる違いと「先行コマ」設定を削除)', ko: '口パク 말풍선은 굽기 전에도 대사 글자만으로 정해 구운 결과와 같은 입으로(무음 코마를 닫던 차이와 「선행 코마」 설정 제거)', en: 'Lip-sync bubbles now use only the dialogue text before baking, matching the baked mouths (removed silent-koma closing and the Lead setting)', zh: '口型气泡在烘焙前也只按台词文字决定，与烘焙结果一致(去掉静音格闭口的差异和「提前格数」设置)'}] },
@@ -62743,8 +62744,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // Prepare only the incoming assets. A failed read must not replace the live project/Undo.
-    // Restore reads are bounded to WORKSPACE_DB_BATCH_ITEMS records per transaction; normal readers retain their
-    // metadata and missing-blob behavior. A batch failure uses their existing retry path.
+    // Restore reads use the shared strict batch reader; normal readers retain their metadata and missing-blob
+    // behavior. A failed batch is omitted so each existing reader retries with its original contract.
     async function readWorkspaceDbRestoreRecords(keys, owner) {
       const records = new Map();
       if (!indexedDbAvailable()) return records;
@@ -62752,25 +62753,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < unique.length; i += WORKSPACE_DB_BATCH_ITEMS) {
         assertProjectIoOwner(owner);
         const slice = unique.slice(i, i + WORKSPACE_DB_BATCH_ITEMS);
-        try {
-          const db = await openWorkspaceDb();
-          assertProjectIoOwner(owner);
-          const values = await workspaceDbOp(db, 'restore asset batch', function(resolve, reject) {
-            const tx = db.transaction(WORKSPACE_STORE_NAME, 'readonly'), values = new Map();
-            const store = tx.objectStore(WORKSPACE_STORE_NAME);
-            tx.oncomplete = function() { resolve(values); };
-            tx.onabort = function() { reject(tx.error || new Error('Restore asset batch aborted')); };
-            slice.forEach(function(key) {
-              const request = store.get(key);
-              request.onsuccess = function() { values.set(key, request.result || null); };
-              request.onerror = function() { reject(request.error); };
-            });
-          });
-          values.forEach(function(value, key) { records.set(key, value); });
-        } catch (error) {
-          assertProjectIoOwner(owner);
-          // Omit failed keys so each existing reader retries with its original contract.
-        }
+        let values = null;
+        try { values = await readWorkspaceDbBatch(slice, true, owner); } catch (error) { values = null; }
+        assertProjectIoOwner(owner);
+        if (values) slice.forEach(function(key, j) { records.set(key, values[j]); });
       }
       return records;
     }
@@ -63045,7 +63031,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const roots = liveProjectRoots();
       const storedKeys = new Set(); let storedUnknown = 0;
       try {
-        [state.conteLayerClipboard, tlTut && tlTut.saved].concat(roots.projects, roots.stacks).forEach(function(value) { storedAssetKeysFrom(value, storedKeys); });
+        liveProjectRootValues(roots).forEach(function(value) { storedAssetKeysFrom(value, storedKeys); });
         brushMaterialReferencedKeys().forEach(function(key) { storedKeys.add(key); });
         storedAssetSaveLeases.forEach(function(_n, key) { storedKeys.add(key); });
       } catch (error) { storedUnknown += 1; console.error('[storage] asset roots unreadable', error); }
@@ -64438,7 +64424,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       layerBlobUrlSaveLeases.forEach(function(_n, url) { referenced.add(url); });
       const roots = liveProjectRoots();
       roots.projects.forEach(function(project) { scanDrawingMap(project.layerDrawings); });
-      const clipboard = state.conteLayerClipboard;
+      const clipboard = roots.conteClipboard;
       (clipboard && clipboard.snapshots || []).forEach(function(snapshot) {
         if (!snapshot) return;
         scanDrawingMap({ copied: snapshot.drawing });
@@ -66545,7 +66531,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               try {
                 // Disk-backed File/object URLs stop working after deletion. Preserve live history
                 // and clipboard roots without copying image bytes; later manual saves can reclaim them.
-                observe([state.project, state.undoStack, state.redoStack, state.conteLayerClipboard, tlTut && tlTut.saved].concat(projectTabHistoryStacks()));
+                observe(liveProjectRootValues(liveProjectRoots()));
                 // Read known roots first; if they protect every candidate, no directory inventory is needed.
                 await inspectJson({ dir: '', fileName: projectFileName });
                 const seenJson = new Set([currentKey]);
@@ -109440,15 +109426,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       paintReleaseCanvas(t); // 위 PNG 가지와 같은 이유
       return lossy;
     }
-    // One bounded readonly transaction per batch. Ordinary reads retain per-key nulls;
-    // restore preparation rejects failed reads before replacing the active project.
-    const DB_READ_CHUNK = 24;
-    async function readWorkspaceDbBatch(keys, strict) {
+    // One bounded readonly transaction per batch (WORKSPACE_DB_BATCH_ITEMS keys — the write batches' count). Ordinary
+    // reads retain per-key nulls; restore preparation (strict) rejects failed reads before replacing the active project.
+    // owner(선택): DB 를 연 직후(재시도마다) 소유자를 확인한다 — 떠난 요청이 트랜잭션을 열지 않는다.
+    async function readWorkspaceDbBatch(keys, strict, owner) {
       if (!indexedDbAvailable()) return keys.map(function() { return null; });
       for (let attempt = 0; ; attempt++) {
         let db;
         try {
           db = await openWorkspaceDb();
+          if (owner) assertProjectIoOwner(owner);
           return await workspaceDbOp(db, 'read batch', function(resolve, reject) {
             const values = keys.map(function() { return null; });
             const tx = db.transaction(WORKSPACE_STORE_NAME, 'readonly');
@@ -109476,10 +109463,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
       }
     }
+    const GENGA_HYDRATE_BATCH_DRAWINGS = 24;   // 원화 그림 일괄 복원이 한 번에 쥐는 그림 수(읽기 묶음과 다른 몫 — 메모리)
     async function readWorkspaceDbValues(keys, onProgress, strict) {
       const out = new Map();
-      for (let i = 0; i < keys.length; i += DB_READ_CHUNK) {
-        const part = keys.slice(i, i + DB_READ_CHUNK);
+      for (let i = 0; i < keys.length; i += WORKSPACE_DB_BATCH_ITEMS) {
+        const part = keys.slice(i, i + WORKSPACE_DB_BATCH_ITEMS);
         let vals;
         try { vals = await readWorkspaceDbBatch(part, strict); }
         catch (error) {
@@ -109556,11 +109544,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             assertProjectIoOwner(owner); loaded++;
             if (!prepared && !gengaTileSetDecodedComplete(tiles)) gengaNoteDrawingFailure(failureKey, tiles, 'retryable');
           }
-          // Read a small batch, but transform/publish/trim each drawing before the
-          // next one. Neither base64 nor decoded results accumulate in Promise.all.
-          for (let i = 0; i < list.length; i += DB_READ_CHUNK) {
+          // Read a small batch (GENGA_HYDRATE_BATCH_DRAWINGS drawings held at once), but transform/publish/trim each
+          // drawing before the next one. Neither base64 nor decoded results accumulate in Promise.all.
+          for (let i = 0; i < list.length; i += GENGA_HYDRATE_BATCH_DRAWINGS) {
             assertProjectIoOwner(owner);
-            const part = list.slice(i, i + DB_READ_CHUNK);
+            const part = list.slice(i, i + GENGA_HYDRATE_BATCH_DRAWINGS);
             const values = await readWorkspaceDbValues(part.flatMap(function(ref) { return ['gd:' + ref, 'gt:' + ref]; }), null, !!prepared);
             for (const ref of part) {
               assertProjectIoOwner(owner);
@@ -109851,13 +109839,19 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 「아직 쓰이는 것」의 근원. 메모리 회수(gengaPruneRuntimeStores)·디스크 정리(storageLiveRefsScan)·콘티 blob URL
     // 회수(collectReferencedLayerBlobUrls)가 이 목록 하나를 읽는다 — 근원을 더할 때는 여기에만 더한다(한 곳만 빠지면
     // 쓰는 그림을 지우거나 영영 못 지운다). 타임라인 연습 중에는 사용자 프로젝트와 그 이력이 tlTut.saved 에 맡겨져
-    // 있다가 끝나면 그대로 돌아오므로 그것도 근원이다.
+    // 있다가 끝나면 그대로 돌아오므로 그것도 근원이다(맡긴 것 중 project·undo·redo 밖은 화면 상태 값이고, trimNotice 의
+    // stackBottom 은 같은 이력의 명령이라 살아 있으면 undo/redo 가 이미 담는다). 콘티 레이어 클립보드는 프로젝트를 건너 붙여넣는 그림이라 근원이다(원화 클립보드는 gengaAddClipboardRefs).
     function liveProjectRoots() {
       const parked = tlTut && tlTut.saved;
       return {
         projects: [state.project].concat(parked ? [parked.project] : []).filter(Boolean),
-        stacks: [state.undoStack, state.redoStack].concat(projectTabHistoryStacks(), parked ? [parked.undo, parked.redo] : [])
+        stacks: [state.undoStack, state.redoStack].concat(projectTabHistoryStacks(), parked ? [parked.undo, parked.redo] : []),
+        conteClipboard: state.conteLayerClipboard || null
       };
+    }
+    // 이름·키를 값 안에서 찾는 소비자(디스크 자산 키·작업 폴더 보존)가 훑을 근원 값 목록.
+    function liveProjectRootValues(roots) {
+      return [roots.conteClipboard].concat(roots.projects, roots.stacks);
     }
     // 원화 그림·음성 ref 중 지금 쓰이는 것(메모리·디스크 공통): 근원 프로젝트·이력·클립보드와, 어디에도 아직 안
     // 보이지만 곧 필요한 것 — 진행 중 저장이 붙잡은 ref, 붕괴 전 변경분 사슬의 base, 저장 중인 음성.
@@ -109931,7 +109925,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaEnsureAudioCtx(audible) {
       if (!gengaAudioCtx) {
-        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
+        const AC = playbackAudioContextConstructor(); if (!AC) return null;
         gengaAudioCtx = new AC();
         if (audible === false) schedulePlaybackAudioIdle(gengaAudioCtx, 0);
       }
@@ -110072,17 +110066,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const window = gengaAudioWindow(clip, buf, fps, playheadSec);
       const offset = window.offset;
       stopGengaScrubAudioSource();
-      const laneV = (gt.audioLaneVol && gt.audioLaneVol[clip.track || 0] != null) ? gt.audioLaneVol[clip.track || 0] : 1;
-      const vol = (clip.volume != null ? clip.volume : 1) * laneV * (gt.audioVolume != null ? gt.audioVolume : 1);
       const src = ctx.createBufferSource();
       src.buffer = buf;
-      const gain = ctx.createGain();
       // 재생과 같은 엔벨로프를 건다. genga는 트림을 게인으로 구현하므로(gengaScheduleClipGain의 "hard trim →
       // step up/down at the grip") 상수 게인이면 트림을 무시해, 재생에선 무음인 하드트림 구간이 스크럽에선
       // 풀볼륨으로 난다. 재생 경로와 같은 함수로 곡선을 공유한다.
-      gengaScheduleClipGain(gain.gain, ctx.currentTime, offset, window.duration, Math.max(0, Math.min(4, vol)),
-        Math.max(0, Number(clip.trimStartSec) || 0), Boolean(clip.fadeIn),
-        Math.max(0, Number(clip.trimEndSec) || 0), Boolean(clip.fadeOut));
+      const gain = gengaClipGain(ctx, gt, clip, ctx.currentTime, offset, window.duration, 4);
       src.connect(gain); gain.connect(ctx.destination);
       const dur = Math.min(SCRUB_AUDIO_BLIP_SEC, window.remaining);
       if (dur <= 0.005) return;
@@ -110107,11 +110096,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         when: ctx.currentTime + Math.max(0, span.startSec - now), offset: span.sourceOffset, duration: span.remaining, rate: 1,
         current: function() { return state.gengaPlaying && state.project.gengaTimeline === gt && generation === gengaAudioPlayGeneration; },
         connect: function(input, at, remaining, skipped) {
-          gain = ctx.createGain();
-          const lane = gt.audioLaneVol && gt.audioLaneVol[clip.track || 0] != null ? gt.audioLaneVol[clip.track || 0] : 1;
-          const volume = (clip.volume != null ? clip.volume : 1) * lane * (gt.audioVolume != null ? gt.audioVolume : 1);
-          gengaScheduleClipGain(gain.gain, at, span.offset + skipped, span.duration, volume,
-            Math.max(0, Number(clip.trimStartSec) || 0), Boolean(clip.fadeIn), Math.max(0, Number(clip.trimEndSec) || 0), Boolean(clip.fadeOut));
+          gain = gengaClipGain(ctx, gt, clip, at, span.offset + skipped, span.duration);
           input.connect(gain); gain.connect(ctx.destination);
         },
         ended: function() { const i = gengaAudioSources.indexOf(job); if (i >= 0) gengaAudioSources.splice(i, 1); if (gain) gain.disconnect(); job.disconnect(); },
@@ -110127,7 +110112,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const playGeneration = gengaAudioPlayGeneration; // Claim the generation gengaStopAudio just bumped to
       const playStartSec = (startFrame - 1) / fps;
       const startedAt = gengaPlayStartTime; // same performance clock as the visual playhead
-      if (ctx.state === 'suspended' || ctx.state === 'interrupted') await ctx.resume();
+      // 예약 전에 시계를 깨운다 — 유예 장부를 지나고, 거부는 경고로 남긴다. 깨우지 못했으면 예약하지 않는다(멈춘 시계에 걸면
+      // 깨어날 때 그림과 어긋난다 — 옛 판은 거부가 처리되지 않은 채 같은 자리에서 끝났다).
+      await resumeAudioContextIfSuspended(ctx);
+      if (ctx.state !== 'running') return;
       for (const c of (gt.audioClips || [])) {
         // Only a finite modern clip's declared end proves it is already over without reading its source.
         if (c.sourceOffsetSec != null && c.durationSec != null && Number.isFinite(fps) && fps > 0) {
@@ -110156,10 +110144,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!window.remaining) continue;
         const when = ctx.currentTime + Math.max(0, window.startSec - nowSec);
         const src = ctx.createBufferSource(); src.buffer = buf;
-        const g = ctx.createGain();
-        const laneV = (gt.audioLaneVol && gt.audioLaneVol[c.track || 0] != null) ? gt.audioLaneVol[c.track || 0] : 1;
-        const base = (c.volume != null ? c.volume : 1) * laneV * (gt.audioVolume != null ? gt.audioVolume : 1); // clip × lane × legacy master
-        gengaScheduleClipGain(g.gain, when, window.offset, window.duration, base, Math.max(0, Number(c.trimStartSec) || 0), Boolean(c.fadeIn), Math.max(0, Number(c.trimEndSec) || 0), Boolean(c.fadeOut));
+        const g = gengaClipGain(ctx, gt, c, when, window.offset, window.duration);
         src.connect(g); g.connect(ctx.destination);
         try { src.start(when, window.sourceOffset, window.remaining); gengaAudioSources.push(src); } catch (e) {}
       }
@@ -110563,6 +110548,17 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!clip || (clip.volume != null ? clip.volume : 1) === v) return;
       runCommand('音声クリップ音量', function() { clip.volume = v; });
     }
+    // 원화 클립 하나의 게인 노드 — 볼륨(클립 × 레인 × 옛 마스터)과 트림·페이드 엔벨로프. 버퍼 재생·PCM 창 재생·스크럽·출력이
+    // 같이 쓴다(콘티의 wireAudioClipGraph 자리). maxVolume: 스크럽만 상한 4 를 둔다(옛 동작 그대로).
+    function gengaClipGain(ctx, gt, clip, when, offset, dur, maxVolume) {
+      const lane = gt.audioLaneVol && gt.audioLaneVol[clip.track || 0] != null ? gt.audioLaneVol[clip.track || 0] : 1;
+      let volume = (clip.volume != null ? clip.volume : 1) * lane * (gt.audioVolume != null ? gt.audioVolume : 1);
+      if (maxVolume != null) volume = Math.max(0, Math.min(maxVolume, volume));
+      const gain = ctx.createGain();
+      gengaScheduleClipGain(gain.gain, when, offset, dur, volume,
+        Math.max(0, Number(clip.trimStartSec) || 0), Boolean(clip.fadeIn), Math.max(0, Number(clip.trimEndSec) || 0), Boolean(clip.fadeOut));
+      return gain;
+    }
     // trim/FI/FO envelope over the clip's own time axis (p = 0..dur sec), scheduled from ctx time `when` at buffer
     // offset `offset`. Head span [0,tin): FI → ramp 0→base, hard trim → muted then step to base at the grip.
     // Tail span (dur-tout,dur]: FO → ramp base→0, hard trim → step to 0 at the grip.
@@ -110912,11 +110908,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!span.remaining || relative >= durationSec) return false;
       const when = at + relative;
       const source = ctx.createBufferSource(); source.buffer = prepared ? prepared.buffer : buffer;
-      const gain = ctx.createGain();
-      const lane = gt.audioLaneVol && gt.audioLaneVol[clip.track || 0] != null ? gt.audioLaneVol[clip.track || 0] : 1;
-      const volume = (clip.volume != null ? clip.volume : 1) * lane * (gt.audioVolume != null ? gt.audioVolume : 1);
-      gengaScheduleClipGain(gain.gain, when, span.offset, span.duration, volume,
-        Math.max(0, Number(clip.trimStartSec) || 0), Boolean(clip.fadeIn), Math.max(0, Number(clip.trimEndSec) || 0), Boolean(clip.fadeOut));
+      const gain = gengaClipGain(ctx, gt, clip, when, span.offset, span.duration);
       source.connect(gain); gain.connect(destination);
       if (prepared) {
         const elapsed = Math.max(0, startSec - prepared.startSec);
