@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3328</title>
+  <title>MoArt ver3329</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25601,6 +25601,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3329, items: [{ja: '絵を描いた直後にコンテを再生すると、再生の開始が速くなりました（描いた絵をその場でPNGに変換・再読み込みしなくなりました）。', ko: '그림을 그린 직후 콘티를 재생하면 재생 시작이 빨라졌습니다(방금 그린 그림을 그 자리에서 PNG로 바꾸고 다시 읽지 않습니다).', en: 'Conte playback right after drawing now starts faster (the just-drawn picture is no longer converted to PNG and re-decoded on the spot).', zh: '画完后立即播放分镜，播放启动更快（不再当场把刚画的图转为PNG并重新解码）。'}] },
       { ver: 3328, items: [{ja: '新規プロジェクトのタブが約1.6秒遅れて出ていたのを修正、タブの切り替え・閉じるは押した直後に反映(閉じるときに開始画面が一瞬出ない)', ko: '새 프로젝트 탭이 약 1.6초 늦게 나타나던 것 수정, 탭 전환·닫기는 누르자마자 반영(닫을 때 시작 화면이 깜빡이지 않음)', en: 'New project tabs no longer appear ~1.6s late; tab switches and closes show immediately (no start-screen flash on close)', zh: '修复新项目标签约1.6秒后才出现的问题，切换·关闭标签立即反映(关闭时不再闪现开始画面)'}, {ja: '原画のカメラキー編集を軽く、コンテ用紙の文字合わせを軽く', ko: '원화 카메라 키 편집과 콘티 용지 글 맞춤을 가볍게', en: 'Lighter genga camera-key edits and storyboard paper text fitting', zh: '原画摄影机关键帧编辑与分镜纸张文字排版更轻快'}] },
       { ver: 3327, items: [{ja: '内部の整理を続けました。コンテ再生の背景合成キャッシュが、絵が変わったカットだけを作り直すようになりました。', ko: '내부 정리를 이어 했습니다. 콘티 재생의 바탕 합성 캐시가 그림이 바뀐 컷만 다시 만듭니다.', en: 'More internal cleanup. Conte playback\'s base composite cache now rebuilds only the cuts whose drawings changed.', zh: '继续内部整理。分镜播放的底图合成缓存现在只重建画面有变化的镜头。'}] },
       { ver: 3326, items: [{ja: '原画のタイトル・セリフだけの更新でレイヤー全体の計算をしないように、PSDの読み込みは1枚ずつ', ko: '원화 제목·대사만 갱신할 때 레이어 전체 계산을 하지 않게, PSD 불러오기는 한 장씩', en: 'Title/dialogue-only genga updates skip layer-wide work; PSD imports convert one file at a time', zh: '原画仅更新标题·台词时不再计算全部图层，PSD读取逐张进行'}, {ja: '取り消された読み込みのエラーが別のプロジェクトに表示されないように', ko: '밀려난 불러오기의 오류가 다른 프로젝트에 뜨지 않게', en: 'Errors from a superseded import no longer show in another project', zh: '被取代的导入错误不再显示在其他项目中'}] },
@@ -49822,9 +49823,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const layer = entries[i] && entries[i].layer;
           if (!layer || !layer.drawingRef) continue;
           const drawing = ensureLayerDrawingData(state.project, layer.drawingRef);
-          if (!drawing || !layerDrawingDisplayDataUrl(layer.drawingRef, drawing)) continue;   // flush-then-read — 이후의 키·프리로드가 같은 최신 상태를 본다
+          // live 캔버스가 있으면 그것이 곧 해독된 픽셀이다 — 프레임별 cache 에 쥐어(렌더 도중 트림으로 맵에서 빠져도 이 렌더는 그것을
+          // 쓴다) 인코드·해독 없이 준비 완료. 없으면 flush-then-read — 이후의 키·프리로드가 같은 최신 상태를 본다.
+          const live = drawing && layerLiveBitmapFor(layer.drawingRef);
+          if (!drawing || (!live && !layerDrawingDisplayDataUrl(layer.drawingRef, drawing))) continue;
           const key = layerDrawingContentKey(layer.drawingRef, drawing);
           sigParts.push(key);
+          if (live) { cache.set(layer.drawingRef, live); continue; }
           let img = preloaded.get(key);
           if (!img) {
             preloadVideoLayerBitmap(layer.drawingRef, drawing);
@@ -52422,7 +52427,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 스래싱이 난다. 개수 상한은 백스톱으로 남는다.
     const VIDEO_PRELOAD_ITEM_CAP = 140; // 백스톱
     function preloadVideoLayerBitmap(ref, drawing) {
-      const displayUrl = ref && drawing ? layerDrawingDisplayDataUrl(ref, drawing) : ''; // Flush before key+src — a stale PNG must never be cached under the fresh version key
+      if (layerLiveBitmapFor(ref)) return false; // the live canvas is already the decoded pixels — no encode, no <img>
+      const displayUrl = ref && drawing ? layerDrawingDisplayDataUrl(ref, drawing) : ''; // Flush before key+src — a stale PNG must never be cached under the fresh content key
       if (!ref || !drawing || !displayUrl) return false;
       const key = layerDrawingContentKey(ref, drawing);
       if (state.videoPreloadedLayerImages.has(key)) return false;
