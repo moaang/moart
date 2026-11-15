@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3314</title>
+  <title>MoArt ver3315</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -25475,6 +25475,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3315, items: [{ja: 'デュアルブラシ(乗算以外)の描画を変更範囲だけで処理(約2割速く)', ko: '보조 브러시(곱하기 외)의 그리기를 바뀐 범위만 처리(약 20% 빠름)', en: 'Dual brush (non-multiply modes) now processes only the changed area (about 20% faster)', zh: '双重笔刷(非正片叠底)只处理变化区域(约快20%)'}] },
       { ver: 3314, items: [{ja: '保存前の筆跡のあとに別の操作を取り消すと、古い絵で保存されることがあった問題を修正', ko: 'PNG로 바뀌기 전의 획 뒤에 다른 조작을 되돌리면 옛 그림으로 저장될 수 있던 문제 수정', en: 'Fixed a stroke that was not yet encoded being saved as the older drawing after undoing another edit', zh: '修复：在尚未编码的笔画之后撤销其他操作时，可能以旧画面保存的问题'}] },
       { ver: 3313, items: [{ja: '文字合わせの操作でセリフ欄だけを描き直す(48セリフで約2.5倍速く)', ko: '글자 맞추기 조작은 대사 행만 다시 그림(48대사에서 약 2.5배 빠름)', en: 'Character alignment edits redraw only the dialogue rows (about 2.5x faster with 48 lines)', zh: '文字对齐操作只重绘台词行(48条台词约快2.5倍)'}] },
       { ver: 3312, items: [{ja: 'コンテと原画の音声デコードを一つのメモリ予算で管理(iPad 合計128MB)', ko: '콘티·원화 음성 디코드를 한 메모리 예산으로 관리(iPad 합계 128MB)', en: 'Conte and genga decoded audio now share one memory budget (iPad 128MB total)', zh: '分镜与原画的音频解码共用一个内存预算(iPad 合计128MB)'}] },
@@ -79687,24 +79688,57 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 다음 프레임에도 자리가 안 바뀐다)까지의 자국은 용지 크기 버퍼에 한 번만 찍고 이어 걷기 상태를 남긴다.
     // 프레임마다 그 버퍼를 작업 구역에 복사하고(빈 캔버스에 over = 복사) 확정 안 된 꼬리만 덧찍으면, 같은 순서로
     // 전부 다시 찍은 것과 같은 픽셀이다. 긴 획에서 프레임마다 모든 자국을 CPU 로 다시 찍던 일이 꼬리만으로 준다.
-    function paintDualMaskLive(dmCtx, pts, dual, wx, wy, ww, wh, host, s) {
-      const confirmN = s && Number.isInteger(s.confirmN) ? Math.min(s.confirmN, pts.length) : 0;
-      if (!host || !s || confirmN < 1) { paintDualMaskDabs(dmCtx, pts, dual, wx, wy); return; }
-      const key = [s.w, s.h, dual.size, dual.spacing, dual.aa, dual.flow].join('|');
-      let cache = host.dualMaskCache;
+    function paintDualMaskConfirmN(pts, s) { return s && Number.isInteger(s.confirmN) ? Math.min(s.confirmN, pts.length) : 0; }
+    function paintDualMaskKey(dual, s) { return [s.w, s.h, dual.size, dual.spacing, dual.aa, dual.flow].join('|'); }
+    // 그리는 프레임마다 한 번: 확정 자국을 버퍼에 더 찍고, 이번 프레임에 보조 마스크가 바뀔 수 있는 용지 범위를
+    // 돌려준다 — 새로 확정한 자국 ∪ 지난 꼬리 ∪ 지금 꼬리(꼬리는 매 프레임 다시 찍는다). { box: null } = 보조는 그대로.
+    // null = 버퍼를 새로 만들었거나 세션이 없다 — 호출부가 전 구역을 다시 만든다. 범위는 자국 중심의 점 상자에 상수 반경
+    // (보조는 필압과 무관)을 넣은 paintStrokeScratchBox 다(여유 r×1.5+2 가 AA 자국 r+1.5 를 덮는다).
+    function paintDualMaskAdvance(pts, dual, host, s, gbox) {
+      const confirmN = paintDualMaskConfirmN(pts, s);
+      if (!host || !s || confirmN < 1) return null;
+      const key = paintDualMaskKey(dual, s);
+      let cache = host.dualMaskCache, fresh = false;
       if (!cache || cache.owner !== s.scratchOwner || cache.key !== key || cache.n > confirmN) {
         const cv = (cache && cache.canvas) || document.createElement('canvas');
         if (cv.width !== s.w || cv.height !== s.h) { cv.width = s.w; cv.height = s.h; }
         else cv.getContext('2d').clearRect(0, 0, s.w, s.h);
-        cache = host.dualMaskCache = { canvas: cv, owner: s.scratchOwner, key: key, n: 0, walk: {} };
+        cache = host.dualMaskCache = { canvas: cv, owner: s.scratchOwner, key: key, n: 0, walk: {}, tailBox: null };
+        fresh = true;
       }
+      const r = dual.size / 2;
+      const span = function(from, end) { return paintStrokeScratchBox(null, pts, r, s.w, s.h, true, null, Math.max(0, from), end); };
+      let box = null;
       if (confirmN > cache.n) {
+        box = span(cache.n - 1, confirmN);
         const c = cache.canvas.getContext('2d');
         c.globalAlpha = dual.flow / 100; c.fillStyle = '#000000';
         cache.walk.pointLimit = confirmN;
         paintDualMaskDabs(c, pts, dual, 0, 0, cache.walk);
         c.globalAlpha = 1;
         cache.n = confirmN;
+      }
+      const tail = confirmN < pts.length ? span(confirmN - 1, pts.length) : null;
+      box = paintBoxUnion(paintBoxUnion(box, cache.tailBox), tail);
+      cache.tailBox = tail;
+      // 보조만 있는 픽셀(합집합 계열 모드)은 작업 구역(gbox — 주 획 범위)에서 잘려 있다가 gbox 가 자라면 그 띠에
+      // 나타난다. 전 구역 경로와 같은 픽셀이 되게 새로 들어온 띠도 다시 만든다(교집합 계열은 그런 픽셀이 없다).
+      const prev = cache.gbox, fn = paintDualModeFn(dual.mode);
+      if (prev && gbox && fn && fn(0, 1) > 0) {
+        const x1 = gbox.x + gbox.w, y1 = gbox.y + gbox.h, px1 = prev.x + prev.w, py1 = prev.y + prev.h;
+        if (gbox.x < prev.x) box = paintBoxUnion(box, { x: gbox.x, y: gbox.y, w: prev.x - gbox.x, h: gbox.h });
+        if (x1 > px1) box = paintBoxUnion(box, { x: px1, y: gbox.y, w: x1 - px1, h: gbox.h });
+        if (gbox.y < prev.y) box = paintBoxUnion(box, { x: gbox.x, y: gbox.y, w: gbox.w, h: prev.y - gbox.y });
+        if (y1 > py1) box = paintBoxUnion(box, { x: gbox.x, y: py1, w: gbox.w, h: y1 - py1 });
+      }
+      cache.gbox = gbox;
+      return fresh ? null : { box: box };
+    }
+    function paintDualMaskLive(dmCtx, pts, dual, wx, wy, ww, wh, host, s) {
+      const confirmN = paintDualMaskConfirmN(pts, s), cache = host && host.dualMaskCache;
+      // 버퍼는 paintDualMaskAdvance 가 이번 프레임의 확정분까지 채워 두었다. 맞지 않으면(세션 없음 등) 전부 찍는다.
+      if (!cache || !s || confirmN < 1 || cache.owner !== s.scratchOwner || cache.key !== paintDualMaskKey(dual, s) || cache.n !== confirmN) {
+        paintDualMaskDabs(dmCtx, pts, dual, wx, wy); return;
       }
       const ga = dmCtx.globalAlpha;
       dmCtx.globalAlpha = 1;
@@ -79809,8 +79843,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // ── 2-ブラシ 곱하기 ──────────────────────────────────────────────────────────────────────
       // 출력 = round(메인 α × 보조 획 α / 255). 보조 획 = 같은 경로에 보조 크기의 원형 자국(AA 등급은
       // paintDabEllipse 의 CSP 커널)을 보조 자동 간격(크기 × 비율, 1px 하한)으로 over 로 쌓은 띠 — 크기 연동
-      // OFF 라 필압과 무관한 상수 반경, 첫 자국은 누른 점. 마스크는 획 전체의 함수라(보조 반경이 메인보다 크면
-      // 뒤 자국이 앞 픽셀을 덮는다) 증분을 끄고(incOk) 작업 구역 전체를 다시 만든다 — 수채 경계와 같은 이유.
+      // OFF 라 필압과 무관한 상수 반경, 첫 자국은 누른 점. 보조 자국은 주 획의 새 범위 밖(보조 반경이 메인보다 크면
+      // 뒤 자국이 앞 픽셀을 덮는다)도 바꾸므로 증분 창에 보조가 바뀐 범위(paintDualMaskAdvance)를 더한다.
       // 곱은 구역 크기 임시 캔버스에서(destination-in 을 풀용지 스크래치에 걸지 않는다 — 위 그레인 블록의
       // 사유).
       if (dual && ww > 0 && wh > 0 && pts.length) {
@@ -80024,7 +80058,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 읽으면 갱신 사각형 안쪽에 밝은 직선이 남는다 — 아래 edgeIncBox 는 이웃을 edgePre 에서 읽는다.
       // s.clean일 때의 완성 결과 재사용은 아래에서 유지한다.
       const reusableAlpha = s && (!s.inkMode || Boolean(lumFilter) || s.alphaConverted === true);
-      const incOk = Boolean(!opts.waterEdge && !opts.dual && sc.reused && s && s.newBox && reusableAlpha);
+      // 변화 없는 프레임은 같은 소유자의 완성 결과를 얹는다. 평균 알파 fallback은 제외한다.
+      if (s && s.clean && sc.reused && reusableAlpha) {
+        return paintStrokeOutputBlit(ctx, sc.cv, { x: bx, y: by, w: bw, h: bh }, opts.outputHost, s.outputDirty);
+      }
+      // 그리는 프레임에서만 보조 버퍼를 전진한다(꼬리 상자는 실제로 찍은 꼬리여야 한다).
+      const dualStep = opts.dual && pts.length ? paintDualMaskAdvance(pts, opts.dual, opts.liveHost, s, { x: bx, y: by, w: bw, h: bh }) : null;
+      const incOk = Boolean(!opts.waterEdge && (!opts.dual || dualStep) && sc.reused && s && s.newBox && reusableAlpha);
       // CSP 수채 경계의 출력 픽셀은 반경 D(= 읽기 여유 ceil(範囲)+1 + 흐림 반경) 안의 효과 전 알파로만 정해진다.
       // 효과 전 알파(잉크 장 변환·종이결까지 적용한 것)를 세션의 별도 버퍼(edgePre)에 남겨 두면, 이번에 바뀐
       // 범위(newBox)를 D 만큼 넓힌 곳만 다시 만들고 이웃은 sc 의 지난 결과(효과 적용 후)가 아니라 edgePre 에서 읽어
@@ -80039,13 +80079,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const x1 = Math.min(bx + bw, nb.x + nb.w + D), y1 = Math.min(by + bh, nb.y + nb.h + D);
         edgeIncBox = { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
       }
-      const incBox = incOk ? s.newBox : edgeIncBox;
+      // 보조 범위는 gbox 로 자른다 — 전 구역 경로의 작업 구역이 gbox 라 그 밖은 원래도 다시 만들지 않는다.
+      const incBox = incOk ? (dualStep && dualStep.box ? paintBoxIntersect(paintBoxUnion(s.newBox, dualStep.box), { x: bx, y: by, w: bw, h: bh }) : s.newBox) : edgeIncBox;
       let wx = incBox ? incBox.x : bx, wy = incBox ? incBox.y : by;
       let ww = incBox ? incBox.w : bw, wh = incBox ? incBox.h : bh;
-      // 변화 없는 프레임은 같은 소유자의 완성 결과를 얹는다. 평균 알파 fallback은 제외한다.
-      if (s && s.clean && sc.reused && reusableAlpha) {
-        return paintStrokeOutputBlit(ctx, sc.cv, { x: bx, y: by, w: bw, h: bh }, opts.outputHost, s.outputDirty);
-      }
       // 이번 fill의 작업 구역: [종이 x, y, 폭, 높이, 증분 여부] — 위에서 돌아간 변화 없는 프레임은 작업이 없어 안 남긴다.
       // 화면 픽셀과 대조할 때는 줌·팬 좌표를 맞춘다. 경계와 증상의 일치는 조사 단서이며 원인 확정은 아니다.
       // 하네스의 __boxes(newBox/box 객체)와는 다른 진단 출력이다.
@@ -80161,9 +80198,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 흩뿌림은 지름 비율로 중심을 옮긴다. 꼬리 백업에는 그 이동 거리도 포함한다.
         const pad = 1.5 + 2 * Math.max(0, (Number(tip && tip.scatter) || 0) / 100);
         // Optional nonnegative [from, end) avoids copying point/radius arrays just to scan bounds.
+        // A number radii is a constant radius (dual-brush dabs ignore pressure).
         const stop = end == null ? pts.length : Math.min(pts.length, end);
         for (let i = from || 0; i < stop; i += 1) {
-          const r = (Number(radii && radii[i]) || 0) * pad + 2;
+          const r = (Number(typeof radii === 'number' ? radii : radii && radii[i]) || 0) * pad + 2;
           const px = Number(pts[i].x) || 0, py = Number(pts[i].y) || 0;
           if (px - r < x0) x0 = px - r;
           if (py - r < y0) y0 = py - r;
@@ -80332,6 +80370,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 리본은 GPU 묶음 경계가 픽셀 반올림에 영향을 주므로 꼬리 보류 분할을 따로 둔다.
     const PAINT_RIBBON_TAIL_HOLD = 40;
     // 상자 합집합({x,y,w,h} — paintStrokeScratchBox 가 내는 꼴). 한쪽이 없으면 다른 쪽.
+    function paintBoxIntersect(a, b) {
+      const x0 = Math.max(a.x, b.x), y0 = Math.max(a.y, b.y);
+      return { x: x0, y: y0, w: Math.max(0, Math.min(a.x + a.w, b.x + b.w) - x0), h: Math.max(0, Math.min(a.y + a.h, b.y + b.h) - y0) };
+    }
     function paintBoxUnion(a, b) {
       if (!a) return b || null;
       if (!b) return a;
