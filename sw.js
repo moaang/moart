@@ -5,6 +5,9 @@
 // version lag is guaranteed.
 const CACHE = 'conte-shell-v1'; // FIXED on purpose: bumping it per release would force a full re-download every time.
 const SHELL = ['./', './index.html'];
+// Both aliases are the same document, so it is stored ONCE under the first alias and every alias reads that
+// entry. (Older workers stored a full copy per alias — two copies of an ~11 MB shell; activate migrates them.)
+function shellKey() { return new URL(SHELL[0], self.location.href).href; }
 // CacheStorage is shared by every app under this origin, not scoped to this worker: only MoArt's own
 // old shell names may be deleted, never another app's named cache.
 const CACHE_PREFIX = 'conte-shell-';
@@ -51,16 +54,15 @@ function queueCacheWrite(task) {
 }
 
 function putShellResponse(c, res) {
-  return Promise.all(SHELL.map(function (p) {
-    return c.put(new URL(p, self.location.href).href, res.clone());
-  }));
+  return c.put(shellKey(), res);
+}
+function matchShell(c) {
+  return c.match(shellKey());
 }
 
 function replaceShellFromNetwork(c) {
-  const first = new URL(SHELL[0], self.location.href).href;
-  return fetch(first, { cache: 'reload' }).then(function (res) {   // cache:reload — bypass the HTTP cache
+  return fetch(shellKey(), { cache: 'reload' }).then(function (res) {   // cache:reload — bypass the HTTP cache
     if (!res || !res.ok) throw new Error('shell fetch failed: ' + (res && res.status));
-    // both SHELL entries are the same document; clone once per entry rather than downloading twice.
     return putShellResponse(c, res);
   });
 }
@@ -93,19 +95,33 @@ function ensureShellPurge() {
 }
 
 // Older workers stored every same-origin GET (query variants of the shell, the local server's /voicevox
-// answers) under its own URL. Only the shell aliases and the purge token belong in this cache.
+// answers) under its own URL, and a full shell copy per alias. Only the one shell entry and the purge token
+// belong in this cache. An alias copy is moved to the shell key first when that key is missing — deleting it
+// outright would leave an offline client with no app. (Normally install has just stored the shell key, so this
+// move only guards a key removed after install.)
 function dropNonShellEntries() {
-  const keep = SHELL.map(function (p) { return new URL(p, self.location.href).href; }).concat(new URL(PURGE_KEY, self.location.href).href);
+  const keep = [shellKey(), new URL(PURGE_KEY, self.location.href).href];
+  const aliases = SHELL.map(function (p) { return new URL(p, self.location.href).href; });
   return caches.open(CACHE).then(function (c) {
-    return c.keys().then(function (reqs) {
-      return Promise.all(reqs.filter(function (r) { return keep.indexOf(r.url) < 0; }).map(function (r) { return c.delete(r); }));
+    return queueCacheWrite(function () {
+      return matchShell(c).then(function (own) {
+        if (own) return;
+        return c.keys().then(function (reqs) {
+          const alias = reqs.find(function (r) { return aliases.indexOf(r.url) >= 0; });
+          return alias ? c.match(alias).then(function (res) { return res && putShellResponse(c, res); }) : null;
+        });
+      }).then(function () {
+        return c.keys().then(function (reqs) {
+          return Promise.all(reqs.filter(function (r) { return keep.indexOf(r.url) < 0; }).map(function (r) { return c.delete(r); }));
+        });
+      });
     });
   }).catch(function (err) { console.error('[sw] non-shell cache cleanup failed', err); });
 }
 
 self.addEventListener('install', function (e) {
   self.skipWaiting();
-  e.waitUntil(queueCacheWrite(function () { return caches.open(CACHE).then(function (c) { return c.addAll(SHELL); }); }));
+  e.waitUntil(queueCacheWrite(function () { return caches.open(CACHE).then(function (c) { return c.add(shellKey()); }); }));
 });
 
 self.addEventListener('activate', function (e) {
@@ -133,11 +149,12 @@ self.addEventListener('fetch', function (e) {
   // launch stays stale, more certainly on a slow line.
   // The store copy is split off the moment the response arrives, BEFORE a cache miss hands the original to the
   // page: the queued writer may run only after the page has read that body, and cloning a consumed Response
-  // throws. Shell aliases are cloned from this copy too, so the page's body is never touched.
+  // throws. Only this copy is stored, so the page's body is never touched.
   // A shell request waits for a pending one-time purge before it fetches AND before it joins the write queue.
   // Fetching first could race an old body over the purged one; queueing first deadlocks, because the purge
   // enters the same queue only after its async token read. The cached copy still answers at once below — only a
   // shell cache MISS waits. Shell requests waiting on one purge enter the queue in the order they arrived.
+  // Every alias and query variant reads and writes the one shell entry (see shellKey).
   const purge = ensureShellPurge();
   const net = purge.then(function () { return fetch(e.request); }).then(function (res) {
     return { res: res, copy: res && res.ok ? res.clone() : null };
@@ -149,11 +166,10 @@ self.addEventListener('fetch', function (e) {
     const fresh = shellStamp(copy);
     return caches.open(CACHE).then(function (c) {
       // read the OLD entry before overwriting it — that is the copy the user is looking at right now
-      return c.match(e.request, { ignoreSearch: true }).then(function (old) {
+      return matchShell(c).then(function (old) {
         const stale = shellStamp(old);
-        const storedAliases = putShellResponse(c, copy);
-        return storedAliases.then(function () {
-          // Both aliases must finish before any window is told the shell is ready.
+        return putShellResponse(c, copy).then(function () {
+          // The shell must be stored before any window is told it is ready.
           // no old entry = first visit, missing stamp = no grounds to judge -> stay quiet either way
           // (a false "new version" banner would be worse than the delay it is fixing).
           if (old && fresh && stale && fresh !== stale) return notifyShellUpdated();
@@ -167,7 +183,7 @@ self.addEventListener('fetch', function (e) {
   });
   e.waitUntil(stored);   // MUST be called synchronously, while the event is still dispatching
   e.respondWith(
-    caches.match(e.request, { ignoreSearch: true }).then(function (hit) {
+    caches.open(CACHE).then(matchShell).then(function (hit) {
       if (hit) return hit;
       // A cache MISS that also fails the network must still resolve to a Response — respondWith(undefined)
       // throws a TypeError and takes the whole request down with it. Hits the first-ever visit made offline.
