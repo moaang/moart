@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3319</title>
+  <title>MoArt ver3320</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -17708,8 +17708,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function contePlaneSpanPctW(w, basis) {  return ((Number(w) || 0) / basis.w * 100); }
     function contePlaneSpanPctH(h, basis) {  return ((Number(h) || 0) / basis.h * 100); }
     // PICTURE 셀은 FRAME 기준, 비디오 컨테이너는 PAPER 기준 — 호출부가 명시 basis를 전달한다.
-    // 썸네일의 기존 frame 분류는 유지한다. 실제 타임라인 썸네일 픽셀은 별도
-    // drawLayerDrawingThumbnailToCanvas가 잉크 bbox를 고정 480×270 카드 예산에 맞춘다.
+    // 썸네일의 기존 frame 분류는 유지한다. 실제 타임라인 썸네일 픽셀은 별도로
+    // drawLayerDrawingThumbnailToCanvas가 잉크 범위를 잘라 썸 크기(TIMELINE_LAYER_THUMB_WIDTH×HEIGHT)에 그린다.
     function conteLayerElBasisIsFrame(el) {
       return Boolean(el && el.classList && (el.classList.contains('picture-layer-canvas')
         || el.classList.contains('conte-layer-thumbnail-canvas')));
@@ -17759,7 +17759,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       timelineLayerThumbnailRefreshTimer: 0,
       timelineLayerThumbnailObserver: null,
       timelineLayerThumbnailDeferUntil: 0,
-      timelineLayerThumbnailCache: new Map(),
       timelinePlayheadDragging: false,
       timelineScrollbarDragging: false,
       timelineScrollbarRaf: 0,
@@ -19777,7 +19776,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         stopTimelinePlayback(false);
         state.videoPlayheadFrames = clampTimelinePlayheadFrame(entry.startFrame, total);
         updateSelectedPicturePanelToPlayhead(document.getElementById('timingDashboard'), {
-          renderInspector: true, refreshDom: true, thumbnails: true, updateCurrentPage: true
+          renderInspector: true, refreshDom: true, thumbnails: true
         });
         renderVideoPreview(total);
         scheduleEditorUiStateSave(260);
@@ -20421,12 +20420,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           el.dataset.layerBitmapY = String(rect.y);
           if (el.dataset.paperFxCut) applyPaperLayerCanvasStyle(el); // 그 레이어 화살표가 옛 자리에 남지 않게
         });
-        // timeline koma thumbnails bake the position — refresh them off the hot path (async queue)
-        document.querySelectorAll('.conte-layer-thumbnail-canvas[data-layer-drawing-ref]').forEach(function(canvas) {
-          if (String(canvas.dataset.layerDrawingRef || '') !== ref) return;
-          canvas.dataset.layerThumbnailDrawnKey = '';
-          queueTimelineLayerThumbnail(canvas);
-        });
+        invalidateTimelineLayerThumbnailForRef(ref);   // the koma thumbnail's drawn key holds the bitmap rect — redraw it off the hot path (async queue)
       });
       // the memo/edit canvases composite the active layer live — redraw from the (still cached) bitmap
       scheduleMemoCanvasRedraw(); // paper memo only
@@ -20690,7 +20684,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 종류마다 { 기기: [하한 MB, 상한 MB, GB 당 MB] }. deviceMemory 는 거친 GB 힌트이고 Safari 에는 없어 4 로 본다
     // (아이패드는 실기가 8~16GB 여도 4). 오디오는 기기 메모리와 무관한 고정값이다. 한 표에 두는 이유: 예산을 조정할
     // 때 합계(데스크톱 8GB 힌트에서 픽셀 512·그림 256·이력 256·음성 512MB, 약 1.5GB)를 한눈에 보고 한 곳만 고치게 하려는 것이다. 각 소비자의 회수 규칙은
-    // 자기 자리에 있다(픽셀 캐시 share·gengaTrimDrawStore·이력 트림·trimDecodedAudioCaches).
+    // 자기 자리에 있다(픽셀 캐시 share·gengaTrimDrawStore·이력 트림·trimDecodedAudioCaches). 표에서 파생해 합계 밖에 서는 몫:
+    // 이미지 브러시 디코드 = pixel/2(imageBrushDecodedBudgetBytes), 변속 음성 = audio/4, 재생 프리로드 = pixel 의 image share 를
+    // 별도 맵으로 한 번 더(이론 상한 1.30×pixel). 파형 peaks 는 고정 48MB(AUDIO_PEAK_MEMORY_BUDGET).
+    // 하한·상한은 사용자 판정이다 — Chrome 의 deviceMemory 는 상한이 걸린 값이라 도달할 수 없는 클램프를 두지 않고, Safari 폴백(4)이
+    // 덜 아프도록 하한을 올렸다.
     const MEMORY_BUDGET_MB = {
       pixel:   { desktop: [256, 1024, 64], mobile: [128, 384, 48] },   // 픽셀 캐시 전체(PIXEL_CACHE_KINDS 가 share 로 나눈다)
       draw:    { desktop: [96, 512, 32],   mobile: [48, 192, 24] },    // 원화 그림 저장소(gengaDrawStore)
@@ -21162,9 +21160,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         projectSaveBeginEdit(state.project.projectId, options.savedPayload);
       }
       gengaFrameStackInvalidate(); // 프로젝트가 통째로 바뀐다 — 키(frame·레이어 id)가 우연히 맞아도 다른 그림이다 (full undo/redo 도 여기를 지난다)
-      invalidateProjectDataCaches();
-      // project 교체 시 audio cache 무효화
-      bumpAudioCycle();
+      invalidateProjectDataCaches();   // 음성 cycle 증가 포함
       // 단축키는 앱 설정이라 프로젝트 파일의 settings.shortcuts 는 읽지 않는다. 환경 간 이동은 설정 창의
       // 저장/불러오기 파일이 맡는다.
       loadEditorUiState(!options.sameProject);
@@ -24832,11 +24828,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.projectMissingAssetNotices = new Set();
       const versionList = document.getElementById('indexedDbProjectVersions');
       if (versionList) { versionList.projectIoOwner = null; versionList.innerHTML = ''; }
-      state.videoPreloadedLayerImages = new Map();
       state.videoPreloadFrame = -1;
-      // 재생·출력 바탕 합성 캐시(두 장)도 옛 프로젝트 캔버스를 놓는다. 부트 중에는 아직 없는 const 라 위 원화 훅과 같이 감싼다.
       timelineLayerThumbnailCache().clear(); timelineLayerThumbnailBakes().clear(); // 옛 그림의 썸·대기 장부 — 늦은 굽기 답은 버려진다
-      try { videoExportResetFrameCache(); } catch (error) { if (!(error instanceof ReferenceError)) console.warn('[video] 바탕 합성 캐시 비우기 실패', error); }
+      // 다시 만들 수 있는 표시 캐시도 옛 프로젝트 픽셀이다 — 숨김·수동 비우기와 같은 목록. 부트 중에는 아직 없는 const 가 있어 위
+      // 원화 훅과 같이 감싼다.
+      try { dropRebuildableDisplayCaches(); } catch (error) { if (!(error instanceof ReferenceError)) console.warn('[memory] 표시 캐시 비우기 실패 — 옛 프로젝트 픽셀이 예산을 쥘 수 있다', error); }
       state.timelinePlayheadDragging = false;
       // Transient armed/modal input flags a project swap must not carry over (audit F2.1/F5.2). Without this the
       // region-move arm has no swap reset (a touch arm survives into the next project); space-pan/curve-pending are
@@ -25510,6 +25506,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3320, items: [{ja: '内部の整理：自動保存で同じ絵を二度書き込まないようにし、画面を隠したときに表示キャッシュをより多く解放します。まれに再生画面が古い絵を表示することがある問題を修正しました。', ko: '내부 정리: 자동 저장이 같은 그림을 두 번 쓰지 않고, 화면을 숨기면 표시 캐시를 더 많이 놓습니다. 드물게 재생 화면이 옛 그림을 보이던 문제를 고쳤습니다.', en: 'Internal cleanup: autosave no longer writes the same drawing twice, and hiding the app frees more display caches. Fixed a rare case where playback could show an outdated drawing.', zh: '内部整理：自动保存不再重复写入同一幅画，隐藏画面时释放更多显示缓存。修复了播放画面偶尔显示旧画的问题。'}] },
       { ver: 3319, items: [{ja: '口パクの吹き出しは焼き付け前もセリフ文字だけで決め、焼き付け結果と同じ口に(無音コマを閉じる違いと「先行コマ」設定を削除)', ko: '口パク 말풍선은 굽기 전에도 대사 글자만으로 정해 구운 결과와 같은 입으로(무음 코마를 닫던 차이와 「선행 코마」 설정 제거)', en: 'Lip-sync bubbles now use only the dialogue text before baking, matching the baked mouths (removed silent-koma closing and the Lead setting)', zh: '口型气泡在烘焙前也只按台词文字决定，与烘焙结果一致(去掉静音格闭口的差异和「提前格数」设置)'}] },
       { ver: 3318, items: [{ja: '原画の保存待ちの絵の切り分けを作業スレッドで(大きな用紙で約150msの停止をなくす)', ko: '원화의 미룬 칸 굽기·변경분 합치기를 작업 스레드로(큰 용지에서 약 150ms 멈춤 제거)', en: 'Genga deferred tile bakes and delta merges now run in a worker (removes ~150ms stalls on large paper)', zh: '原画的延迟分块与增量合并改在工作线程进行(大纸张消除约150ms卡顿)'}] },
       { ver: 3317, items: [{ja: '原画の一括画像書き出しで、大文字・小文字だけが違うセル番号（1a と 1A など）が同じファイルに上書きされないよう、後の方を「-2」付きの名前で保存するようにしました。', ko: '원화 일괄 이미지 출력에서 대소문자만 다른 셀 번호(1a와 1A 등)가 같은 파일에 덮어써지지 않도록, 뒤쪽을 「-2」를 붙인 이름으로 저장하게 했습니다.', en: 'Genga batch image export no longer overwrites one file with another when cell numbers differ only in case (e.g. 1a and 1A); the later one is saved with a "-2" name.', zh: '原画批量导出图像时，仅大小写不同的格号（如 1a 与 1A）不再覆盖同一文件，后者以带“-2”的名称保存。'}, {ja: 'コンテで、カメラキーの数より短くなるカット尺の変更（尺の入力・端や頭のドラッグ・パネルの削除や移動）は、キーが重なって消えないよう取り消して理由を表示するようにしました。', ko: '콘티에서 카메라 키 수보다 짧아지는 컷 길이 변경(길이 입력·끝이나 머리 끌기·패널 삭제나 이동)은 키가 겹쳐 사라지지 않도록 취소하고 이유를 표시하게 했습니다.', en: 'In conte, a cut-length change that would make a cut shorter than its number of camera keys (time input, end or head drag, panel delete or move) is now refused with the reason, instead of keys collapsing and disappearing.', zh: '分镜中，使镜头时长短于其摄影机关键帧数的更改（输入时长、拖动首尾、删除或移动分格）现在会被取消并显示原因，不再让关键帧重叠丢失。'}] },
@@ -47348,8 +47345,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           renderInspector: true,
           skipUnchangedUi: keepSettledUi,
           refreshDom: true,
-          thumbnails: !timelineLayerThumbnailsSuspended(),
-          updateCurrentPage: true
+          thumbnails: !timelineLayerThumbnailsSuspended()
         });
         scheduleEditorUiStateSave(260); // settle point (click-seek or drag release) -- same debounce as scroll position
       }
@@ -47430,8 +47426,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         updateSelectedPicturePanelToPlayhead(root, {
           renderInspector: false,
           refreshDom: true,
-          thumbnails: false,
-          updateCurrentPage: options && options.updateCurrentPage === false ? false : true
+          thumbnails: false
         });
       }
       updateTimelinePlayheadDom(root, totalFrames);
@@ -48785,9 +48780,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // 프레임 n 은 시계가 n/fps 에 닿을 때부터 보인다(내림) — 출력 영상의 프레임 구간이고, 소리도 같은 연속 시계로
     // 예약한다(playAudioClipPcm 등). 반올림하면 그림이 소리·출력보다 반 프레임 일찍 넘어간다. 원화(gengaBeginPlayback)와 같다.
+    function clockElapsedFrames(startClock, fps, now) {
+      return Math.max(0, Math.floor((now - startClock) / 1000 * fps));
+    }
     function playbackElapsedFrames(fps, now) {
-      const clockNow = Number.isFinite(Number(now)) ? Number(now) : performance.now();
-      return Math.max(0, Math.floor((clockNow - state.videoPlaybackStartClock) / 1000 * fps));
+      return clockElapsedFrames(state.videoPlaybackStartClock, fps, Number.isFinite(Number(now)) ? Number(now) : performance.now());
     }
 
     function currentPlaybackFrameFromClock(fps) {
@@ -49145,8 +49142,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           updateSelectedPicturePanelToPlayhead(document.getElementById('timingDashboard'), {
             renderInspector: true,
             refreshDom: true,
-            thumbnails: false,
-            updateCurrentPage: true
+            thumbnails: false
           });
           updateTimelineRuntimeDom(totalFrames, { lightweight: true, updateTimecode: true });
           renderVideoPreview(totalFrames);
@@ -49394,11 +49390,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       getProjectBlocks(project).forEach(function(block) { if (wanted.has(block.id) && !byId.has(block.id)) byId.set(block.id, block); });
       return ids.map(function(id) { return byId.get(id); }).filter(Boolean);
     }
-
-
-
-
-
 
     // 컷 묶음의 장면 값(장소 locationName·시간대 timeOfDay): 柱(scene_heading)의 값이 먼저, 없으면 값이 있는 첫 블록.
     function groupSceneField(blocks, field) {
@@ -50735,16 +50726,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function videoCutDrawingPreviewKey(cutId) {
       return cutId ? layerDrawingEntriesForCut(state.project, cutId).map(function(entry) {
         const drawing = ensureLayerDrawingData(state.project, entry.layer.drawingRef);
-        return [
-          entry.layer.id || '',
-          entry.layer.drawingRef || '',
-          drawing.version || 0,
-          String(drawing.bitmapDataUrl || '').length || 0,
-          Math.round(Number(drawing.bitmapX) || 0),
-          Math.round(Number(drawing.bitmapY) || 0),
-          Math.max(1, Math.round(Number(drawing.bitmapWidth) || CONTE_PAPER_WIDTH)),
-          Math.max(1, Math.round(Number(drawing.bitmapHeight) || CONTE_PAPER_HEIGHT))
-        ].join(':');
+        return (entry.layer.id || '') + ':' + layerDrawingContentKey(entry.layer.drawingRef || '', drawing);
       }).join(',') : '';
     }
 
@@ -52342,18 +52324,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     wireBoldDrag();
 
-    function videoLayerBitmapPreloadKey(ref, drawing) {
-      const rect = layerDrawingBitmapRect(drawing);
-      return [
-        String(ref || ''),
-        Math.max(0, Math.round(Number(drawing && drawing.version) || 0)),
-        String(drawing && drawing.bitmapDataUrl || '').length,
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h
-      ].join(':');
-    }
+    // 그림 정체는 layerDrawingContentKey 하나가 정한다(live 캔버스 신원·dataUrl 끝·rect — version 은 undo 뒤 다른 픽셀에 다시 나온다).
+    function videoLayerBitmapPreloadKey(ref, drawing) { return layerDrawingContentKey(ref, drawing); }
 
     // 재생 프리로드는 다른 픽셀 캐시와 같은 커널(budgetedMapSet + 바이트 예산 'image')에 태우고, 소비처 히트가
     // 재삽입(LRU 터치)한다. 개수 상한(FIFO)만으로는 바이트가 무통제이고, 재생 중 지금 쓰는 그림부터 버려 되읽는
@@ -61896,8 +61868,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // A browser payload is a recovery copy. External-source tabs reconnect after
     // reload; only snapshots completed in this page may serve an ordinary switch.
     const projectSessionSnapshots = new Map();
-    // 슬롯(백업 본문)이 사라진 프로젝트의 세션 몫을 놓는다. 원본 연결·저장 기준선 JSON·그림 장부(옛 그림 객체)를 쥐고 있어
-    // 페이지 수명 내내 남으면 회수 근원 밖 메모리가 된다. 고정 해제·탭 닫기는 슬롯이 남아 다시 열 수 있으므로 부르지 않는다.
+    // 이 id 의 이 페이지 세션 몫(탭 전환 스냅숏·탭 이력)을 놓는다 — 슬롯이 사라졌거나(삭제·축출) 같은 id 를 파일로 새로 열 때.
+    // 원본 연결·저장 기준선 JSON·그림 장부(옛 그림 객체)를 쥐고 있어 페이지 수명 내내 남으면 회수 근원 밖 메모리가 된다. 고정
+    // 해제·탭 닫기는 슬롯이 남아 다시 열 수 있으므로 부르지 않는다.
     function forgetProjectSession(id) {
       projectSessionSnapshots.delete(String(id)); releaseProjectTabHistory(String(id));
     }
@@ -62487,8 +62460,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (!gengaIsDrawDelta(gengaDrawStore.get(f.ref))) return;
             const collapsed = gengaCollapseDeltaChainSync(f.ref);
             if (!collapsed) return;
-            gengaEncodeTileCells(collapsed, Infinity);
-            if (gengaTileCellsAllBlob(collapsed)) gengaPersistTileSet(f.ref, collapsed, true);
+            gengaPersistTileSetNow(f.ref, collapsed, true);
           });
           failures = await gengaAwaitSnapshotDurability(rootRefs);
         }
@@ -63337,41 +63309,45 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     let storageSweepTimer = 0, storageSweepRequested = false, storageSweepGeneration = 0, storageSweepReason = '';
-    // 요청 폐기(프로젝트 경계가 새 예약을 거는 자리). 진행 중인 sweep 은 canContinue 가 세대 변화를 보고 멈춘다.
-    function cancelStorageSweep() {
-      if (!storageSweepTimer && !storageSweepRunning && !storageSweepRequested) return;
-      clearTimeout(storageSweepTimer);
-      storageSweepTimer = 0;
-      storageSweepRequested = false;
-      storageSweepGeneration += 1;
-    }
-    // 진행 취소(입력·숨김): 지금 도는 것·대기 중인 예약은 멈추되 요청은 버리지 않는다. 보이는 동안은
-    // STORAGE_SWEEP_BUSY_RETRY_MS 뒤에 다시 본다(입력이 이어지면 계속 미뤄져 손을 뗀 뒤에 돈다). 숨김이면 다시 보일 때.
-    // 버리면 다음 열기·전환·닫기·명시 저장까지 무참조 행이 디스크에 남는다.
     const STORAGE_SWEEP_BUSY_RETRY_MS = 15000;
-    function pauseStorageSweep() {
-      if (!storageSweepTimer && !storageSweepRunning && !storageSweepRequested) return;
+    // 요청을 세우고 세대를 올려(진행 중인 sweep 은 canContinue 가 세대 변화를 보고 멈춘다) delayMs 뒤에 다시 건다. 숨김이면
+    // 표식만 — 다시 보일 때(아래 visibilitychange) 건다.
+    function storageSweepRestart(delayMs) {
       clearTimeout(storageSweepTimer);
       storageSweepTimer = 0;
       storageSweepRequested = true;
       storageSweepGeneration += 1;
-      if (!document.hidden) storageSweepArm(STORAGE_SWEEP_BUSY_RETRY_MS);
+      if (!document.hidden) storageSweepArm(delayMs);
     }
+    // 진행 취소(입력·숨김): 지금 도는 것·대기 중인 예약은 멈추되 요청은 버리지 않는다. 보이는 동안은
+    // STORAGE_SWEEP_BUSY_RETRY_MS 뒤에 다시 본다(입력이 이어지면 계속 미뤄져 손을 뗀 뒤에 돈다). 숨김이면 다시 보일 때.
+    // 버리면 다음 열기·전환·닫기·명시 저장까지 무참조 행이 디스크에 남는다.
+    function pauseStorageSweep() {
+      if (!storageSweepTimer && !storageSweepRunning && !storageSweepRequested) return;
+      storageSweepRestart(STORAGE_SWEEP_BUSY_RETRY_MS);
+    }
+    // 숨김은 멈춤(자동 저장 flush 리스너보다 먼저 등록돼 그보다 먼저 돈다), 다시 보이면 걸린 요청을 2초 뒤에.
     document.addEventListener('visibilitychange', function() {
-      if (!document.hidden && storageSweepRequested && !storageSweepTimer) storageSweepArm(2000);
+      if (document.hidden) pauseStorageSweep();
+      else if (storageSweepRequested && !storageSweepTimer) storageSweepArm(2000);
     });
+    // 사용자가 지금 앱을 쓰는 중인가 — 획·재생(시작·원화 예열·재생바 끌기 포함)·녹음. 배경 정리(캐시 비우기·디스크 sweep·
+    // 작업 폴더 보존)가 미루는 공통 핵이고, 각자 자기 몫을 더한다.
+    function userActivityBusy() {
+      return strokeInProgress() || state.videoPlaying || state.videoPlaybackStarting || gengaPlaybackBusy()
+        || Boolean(state.audioRecordingSession) || Boolean(gengaRecSession);
+    }
+    // 시간축·카메라 끌기 중인가 — 디스크 정리 둘(sweep·보존)이 미룬다.
+    function timelineDragActive() {
+      return Boolean(state.cameraFrameDrag || state.audioDrag || state.timelinePlayheadDragging || state.timelineScrollbarDragging);
+    }
     function storageSweepCanRun() {
       const overlay = document.getElementById('projectLoadingOverlay');
-      return !document.hidden && !(overlay && overlay.open) && !strokeInProgress()
-        && !state.videoPlaying && !state.videoPlaybackStarting && !state.gengaPlaying
-        && !state.audioRecordingSession && !gengaRecSession && !state.workspaceAutosaveBusy
-        && !state.cameraFrameDrag && !state.audioDrag && !state.timelinePlayheadDragging
-        && !state.timelineScrollbarDragging;
+      return !document.hidden && !(overlay && overlay.open) && !userActivityBusy() && !state.workspaceAutosaveBusy && !timelineDragActive();
     }
     function scheduleStorageSweep(reason) {
-      cancelStorageSweep();
-      storageSweepRequested = true; storageSweepReason = reason;
-      if (!document.hidden) storageSweepArm(2000);   // 숨김이면 표식만 — 위 visibilitychange 가 건다
+      storageSweepReason = reason;
+      storageSweepRestart(2000);
     }
     // 도는 중에 바빠져 멈췄는데 아무도 새로 걸지 않았으면(같은 세대) 요청을 되살려 다시 본다. 새 세대(전환·닫기·pause)는 자기 예약이 맡는다.
     function storageSweepRevive(generation) {
@@ -63389,10 +63365,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Project opening may still be hydrating. Its overlay completion retries once.
         const overlay = document.getElementById('projectLoadingOverlay');
         if (overlay && overlay.open) return;
-        if (storageSweepRunning || !storageSweepCanRun()) {
-          if (!document.hidden) storageSweepArm(STORAGE_SWEEP_BUSY_RETRY_MS);
-          return;   // 숨김이면 표식이 남아 다시 보일 때 돈다
-        }
+        if (storageSweepRunning || !storageSweepCanRun()) { storageSweepRevive(generation); return; }   // 숨김이면 표식이 남아 다시 보일 때 돈다
         storageSweepRequested = false;
         const canContinue = function() { return generation === storageSweepGeneration && storageSweepCanRun(); };
         try {
@@ -63645,27 +63618,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gengaSel, gengaStampDrag, state.paintFillCache]);
       add('settings.memory.brush', [PAINT_TIP_LIBRARY, imageBrushRuntime.current, paintBrushPreviewCache(),
         paintTipLumCache, Array.from(paintGrainMaskLru.keys()), paintGrainScaledCache, paintGrainTiledCache, paintBinAlphaScratch,
-        paintGrainScratch, paintInkDabScratch, paintInkGrainScratch, paintInkAlphaScratch]);
+        paintGrainScratch, paintInkDabScratch, paintInkGrainScratch, paintInkAlphaScratch, paintPixelReadCanvas]);
       return result;
     }
     function memoryCacheCleanupReady() {
-      return !strokeInProgress() && !state.videoPlaying && !state.videoPlaybackStarting && !state.gengaPlaying && !gengaPlaybackWarm
-        && !state.audioRecordingSession && !gengaRecSession
+      return !userActivityBusy()
         && !gengaDrawSession && !state.paintRasterOp && !state.paintCurrentStroke
         && !state.paintFillWorkerJob && !drawingRecordingWindowBusy
         && !(drawingRecordingRuntime && (drawingRecordingRuntime.running || drawingRecordingRuntime.pending.size));
     }
-    // 다시 만들 수 있는 픽셀 캐시를 놓는다. 버튼과 화면 숨김(아래 visibilitychange)이 같은 본체를 쓴다.
+    // 다시 만들 수 있는 표시 캐시의 소유를 놓는다 — 그림 해독·어니언·콘티 미리보기·벡터 굽기·벡터 썸·동화 파생(채우기·환경·
+    // 마스크·정렬)·재생 프리로드·재생/출력 바탕 합성 두 장. 프로젝트 교체(resetProjectTransientRuntime)·화면 숨김·수동 비우기가
+    // 이 목록 하나를 쓴다 — 캐시를 더하면 여기에 더한다. 맵에서 빼기만 한다: 공유 픽셀 객체를 닫거나 live 그림을 flush 하거나
+    // 이력을 줄이지 않는다(진행 중 출력은 자기 캔버스·자기 프리페치 맵을 쥐고, 다음 요청이 다시 만든다).
+    function dropRebuildableDisplayCaches() {
+      [state.videoPreloadedLayerImages, layerPreviewImageCacheMap(), gengaImageCache, onionGhostCache, gengaVectorBakeCache, gengaVectorThumbCache]
+        .forEach(function(map) { map.clear(); });
+      videoExportResetFrameCache();
+      gengaSilInvalidateCaches();
+    }
+    // 버튼과 화면 숨김(아래 visibilitychange)이 같은 본체를 쓴다. 브러시 종이결 마스크는 프로젝트와 무관해 여기서만 놓는다.
     // ownershipOnly: 맵에서 빼기만 한다 — 합성 작업 캔버스·프레임 스택은 실제로 해제(paintReleaseCanvas)되므로 숨김과 함께
     // 시작되는 자동 저장·진행 중인 내보내기의 비동기 경계와 겹치지 않게 사용자가 누를 때만 놓는다.
     function releaseRebuildableMemoryCaches(ownershipOnly) {
       if (!memoryCacheCleanupReady()) return false;
-      // Drop cache ownership only. Do not close shared pixel objects, flush live art or trim history.
-      [gengaImageCache, onionGhostCache, layerPreviewImageCacheMap(), gengaVectorBakeCache].forEach(function(map) { map.clear(); });
-      gengaSilInvalidateCaches();   // 동화 채우기·환경·마스크·정렬
+      dropRebuildableDisplayCaches();
       paintGrainMaskTrim(Infinity);
-      gengaVectorThumbCache.clear();
-      if (!ownershipOnly) { gengaReleaseCompositeScratch(); gengaFrameStackInvalidate(); gengaPreviewRender.clip = null; }
+      if (!ownershipOnly) { gengaReleaseCompositeScratch(); gengaFrameStackInvalidate(); }
       return true;
     }
     function clearRebuildableMemoryCaches() {
@@ -66327,8 +66306,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const check = function(error) {
         assertProjectIoOwner(owner);
         if (error && error.code === 'WORKSPACE_RETENTION_DEFERRED') throw error;
-        if (cleanupPhase && (cleanupEpoch !== storageRootEpoch || document.hidden || pointerDragSessions && pointerDragSessions.size || gengaRecSession || strokeInProgress() || state.videoPlaying || state.videoPlaybackStarting || state.gengaPlaying
-          || state.audioRecordingSession || state.audioDrag || state.timelinePlayheadDragging || state.timelineScrollbarDragging || state.cameraFrameDrag)) {
+        if (cleanupPhase && (cleanupEpoch !== storageRootEpoch || document.hidden || pointerDragSessions && pointerDragSessions.size
+          || userActivityBusy() || timelineDragActive())) {
           throw Object.assign(new Error('retention-deferred'), { code: 'WORKSPACE_RETENTION_DEFERRED' });
         }
       };
@@ -67627,7 +67606,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         setProjectFileSource(state.project, source);
         owner = request.owner = projectIoOwner(request);
         await rememberProjectSource(owner, source);
-        projectSessionSnapshots.delete(String(state.project.projectId)); releaseProjectTabHistory(state.project.projectId);
+        forgetProjectSession(state.project.projectId);
         if (state.project.kind === 'genga') scheduleGengaSeekWarm();
         markProjectSavedBaseline();
         // Close the modal before mounting the new DOM: closing it afterwards restyles every new node.
@@ -69981,17 +69960,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 빌려주는 함수는 크기·컨텍스트 상태·소유권만 관리한다. clear/clip은 paintFillVariableWidthBody가 맡는다.
     // 다른 획·레이어·썸네일이 사용했거나 크기가 바뀌면 이전 결과를 재사용할 수 없다.
     let paintGrainScratchKey = null;
+    // 이 소유자의 w×h 결과가 아직 남아 있는가 — 빌리면(paintGrainScratchFor) 소유가 바뀌므로 빌리기 전에 엿보는 자리(워커 음영 게시·
+    // 이어 그리기)가 쓴다.
+    function paintGrainScratchOwnedBy(ownerKey, w, h) {
+      return ownerKey != null && paintGrainScratchKey === ownerKey && Boolean(paintGrainScratch)
+        && paintGrainScratch.width === w && paintGrainScratch.height === h;
+    }
     function paintGrainScratchFor(w, h, ownerKey) {
+      const reused = paintGrainScratchOwnedBy(ownerKey, w, h);
       if (!paintGrainScratch) paintGrainScratch = document.createElement('canvas');
-      let resized = false;
-      if (paintGrainScratch.width !== w) { paintGrainScratch.width = w; resized = true; }
-      if (paintGrainScratch.height !== h) { paintGrainScratch.height = h; resized = true; }
+      if (paintGrainScratch.width !== w) paintGrainScratch.width = w;
+      if (paintGrainScratch.height !== h) paintGrainScratch.height = h;
       const c = paintGrainScratch.getContext('2d');
       c.setTransform(1, 0, 0, 1, 0, 0);
       c.globalAlpha = 1;
       c.globalCompositeOperation = 'source-over';
       c.filter = 'none';
-      const reused = ownerKey != null && paintGrainScratchKey === ownerKey && !resized;
       paintGrainScratchKey = (ownerKey == null) ? null : ownerKey;
       // 여기서 비우면 증분 결과가 사라진다. reused여도 전체 재처리가 필요한지는 호출부가 결정한다.
       return { cv: paintGrainScratch, ctx: c, reused: reused };
@@ -75420,7 +75404,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const refsRt = { key: null, tab: '', selected: new Set(), anchor: '', lastTap: null, suppressClick: false, viewerReq: 0,
       locked: false, thumbs: new Map(), thumbJobs: new Map(), observer: null, viewer: null, flip: false, gray: false };
     let refsClipboard = null;   // { name, png: Promise<Blob>, mirror } — OS 클립보드 쓰기가 막혔을 때 붙여넣기가 쓰는 사본
-    let refsWorkerPool, refsWorkerQueue = [];
+    let refsWorkerPool;
     function refsUiLoad() {
       if (state.refsWindowW) return;
       let v = null;
@@ -75553,26 +75537,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // → { ok, w, h, blob(WebP 0.8, 원본보다 작을 때만), thumb } | { ok:false, message }
     function refsDecode(blob, encode) {
-      if (refsWorkerPool === undefined) {
-        const supported = typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
-          && typeof OffscreenCanvas.prototype.convertToBlob === 'function' && typeof createImageBitmap === 'function';
-        refsWorkerPool = supported ? tvppWorkerPoolOpen(refsWorkerSource(), 2, 'refs') : null;
-      }
-      return new Promise(function(resolve) { refsWorkerQueue.push({ blob: blob, encode: encode, resolve: resolve }); refsWorkerPump(); });
-    }
-    function refsWorkerPump() {
-      const pool = refsWorkerPool;
-      if (!pool || pool.dead) {
-        while (refsWorkerQueue.length) { const job = refsWorkerQueue.shift(); refsDecodeMain(job.blob).then(job.resolve); }
-        return;
-      }
-      while (refsWorkerQueue.length && pool.idle.length) {
-        const job = refsWorkerQueue.shift();
-        tvppWorkerPoolRun(pool, { blob: job.blob, encode: job.encode }, []).then(function(m) {
-          refsWorkerPump();
-          if (m) job.resolve(m); else refsDecodeMain(job.blob).then(job.resolve);
-        }, function() { refsWorkerPump(); refsDecodeMain(job.blob).then(job.resolve); });
-      }
+      if (refsWorkerPool === undefined) refsWorkerPool = offscreenWorkerSupported() ? tvppWorkerPoolOpen(refsWorkerSource(), 2, 'refs') : null;
+      return tvppWorkerPoolQueue(refsWorkerPool, { msg: { blob: blob, encode: encode } })
+        .then(function(m) { return m || refsDecodeMain(blob); }, function() { return refsDecodeMain(blob); });
     }
     // 워커가 없을 때: 재인코딩 없이 원본을 보관하고 썸네일만 만든다.
     async function refsDecodeMain(blob) {
@@ -75588,7 +75555,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       finally { if (bmp) bmp.close(); c.width = c.height = 0; }
     }
     function refsCloseWorkersIfIdle() {
-      if (refsWorkerPool && !refsWorkerQueue.length && !refsWorkerPool.jobs.size) { tvppWorkerPoolClose(refsWorkerPool); refsWorkerPool = undefined; }
+      if (refsWorkerPool && !refsWorkerPool.queue.length && !refsWorkerPool.jobs.size) { tvppWorkerPoolClose(refsWorkerPool); refsWorkerPool = undefined; }
     }
 
     // 드롭·선택한 이미지를 픽셀 수 그대로 가볍게(WebP 0.8) 바꿔 현재 분류에 넣는다. IDB 쓰기가 끝난 것만 목록에 오른다.
@@ -78562,8 +78529,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         s.shadedRect = null;
         if (result.shaded) {
-          const owned = s.scratchOwner && paintGrainScratchKey === s.scratchOwner && paintGrainScratch
-            && paintGrainScratch.width === s.w && paintGrainScratch.height === s.h;
+          const owned = Boolean(s.scratchOwner) && paintGrainScratchOwnedBy(s.scratchOwner, s.w, s.h);
           const out = owned ? paintGrainScratchFor(s.w, s.h, s.scratchOwner) : null;
           // A different owner may have reused this cache while the job was running.
           // Only replace the patch when its unchanged prefix still belongs to this stroke.
@@ -79710,22 +79676,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (canvas.width !== cw) canvas.width = cw;
       if (canvas.height !== ch) canvas.height = ch;
     }
-    function paintPixelReader(w, h) {
+    // source 의 (x, y, w, h) → ImageData(구역이 비면 null). 복사·읽기 오류는 그대로 던진다 — 효과를 건너뛸지는
+    // 부르는 쪽이 정한다(수채 경계는 읽기 실패만 건너뛰고, 보조 브러시는 둘 다 건너뛰고, 종이결은 던진다). 읽기 캔버스는
+    // 되얹기(paintWritePixels)가 이어 쓴다 — 읽기·되얹기는 (0,0)~(w,h) 만 쓴다(copy 합성·정확 크기 getImageData).
+    function paintReadPixels(source, x, y, w, h, skipUnreadable) {
+      if (!(w > 0 && h > 0)) return null;
       if (!paintPixelReadCanvas) {
         paintPixelReadCanvas = document.createElement('canvas');
         paintPixelReadCtx = paintPixelReadCanvas.getContext('2d', { willReadFrequently: true });
       }
-      if (!paintPixelReadCtx) return null;
-      paintFitScratchCapacity(paintPixelReadCanvas, w, h);   // 읽기·되얹기는 (0,0)~(w,h) 만 쓴다(copy 합성·정확 크기 getImageData)
       const rc = paintPixelReadCtx;
-      rc.setTransform(1, 0, 0, 1, 0, 0); rc.globalAlpha = 1; rc.filter = 'none'; rc.globalCompositeOperation = 'source-over';
-      return rc;
-    }
-    // source 의 (x, y, w, h) → ImageData(구역이 비면 null). 복사·읽기 오류는 그대로 던진다 — 효과를 건너뛸지는
-    // 부르는 쪽이 정한다(수채 경계는 읽기 실패만 건너뛰고, 보조 브러시는 둘 다 건너뛰고, 종이결은 던진다).
-    function paintReadPixels(source, x, y, w, h, skipUnreadable) {
-      const rc = (w > 0 && h > 0) ? paintPixelReader(w, h) : null;
       if (!rc) return null;
+      paintFitScratchCapacity(paintPixelReadCanvas, w, h);
+      rc.setTransform(1, 0, 0, 1, 0, 0); rc.globalAlpha = 1; rc.filter = 'none';
       rc.globalCompositeOperation = 'copy';
       rc.drawImage(source, x, y, w, h, 0, 0, w, h);
       rc.globalCompositeOperation = 'source-over';
@@ -79867,8 +79830,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 로 되얹는다. 전체 연산이 구역 크기가 되고 sc 는 GPU 경로에 남는다. 패턴 원점은 구역 이동만큼 보정한다(용지
         // 고정 위상 불변 — 픽셀 등가).
         const gmW = Math.max(1, ww), gmH = Math.max(1, wh);
-        const gmTmp = host ? paintScratchCanvas(host, 'grainMaskWork', gmW, gmH)
-          : (function() { const c = document.createElement('canvas'); c.width = gmW; c.height = gmH; return c; })();
+        const gmTmp = paintScratchCanvas(host, 'grainMaskWork', gmW, gmH);
         const gmCtx = gmTmp.getContext('2d');
         gmCtx.drawImage(sc.cv, wx, wy, ww, wh, 0, 0, ww, wh);   // 이번 구역의 모양
         // 배율을 패턴 변환이 아니라 타일에 굽는다(per-dab 경로와 같은 규칙: 반복 주기가 정수여야 위상이 안
@@ -79912,8 +79874,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 곱은 구역 크기 임시 캔버스에서(destination-in 을 풀용지 스크래치에 걸지 않는다 — 위 그레인 블록의
       // 사유).
       if (dual && ww > 0 && wh > 0 && pts.length) {
-        const dmTmp = host ? paintScratchCanvas(host, 'dualMaskWork', ww, wh)
-          : (function() { const c = document.createElement('canvas'); c.width = ww; c.height = wh; return c; })();
+        const dmTmp = paintScratchCanvas(host, 'dualMaskWork', ww, wh);
         const dmCtx = dmTmp.getContext('2d');
         dmCtx.setTransform(1, 0, 0, 1, 0, 0); dmCtx.globalCompositeOperation = 'source-over'; dmCtx.filter = 'none';
         dmCtx.clearRect(0, 0, ww, wh);
@@ -79969,8 +79930,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // CSP mode applies paintWaterEdgeCsp's pixel formula to a padded readback.
       // The non-CSP branch instead saturates alpha, erodes it with eight offset draws, subtracts
       // that mask, colors the boundary and overlays it once with wEdge.fill.
-      // 효과 전 알파를 읽어야 한다 — 종이결·보조 브러시가 걸리면 그것을 적용한 sc 를 전 구역 다시 만들어 읽고(호출부의
-      // incOk 가 막는다), CSP 수채 경계만이면 호출부가 바뀐 범위만 다시 만들며 이웃은 edgeSource(edgePre)에서 읽는다.
+      // 효과 전 알파를 읽어야 한다 — CSP 수채 경계는 호출부가 바뀐 범위만 다시 만들고 이웃은 edgeSource(edgePre — 잉크 변환·
+      // 종이결까지 적용한 것)에서 읽는다. 보조 브러시가 함께 걸리거나 CSP 가 아니면 호출부가 전 구역을 다시 만들어 읽는다.
       // paintStrokeWantsWholePath는 이 함수로 보내는 판정이며, liveHost의 dab 누적이나 sc.reused를 끄는 판정은
       // 아니다.
       if (wEdge && wEdge.csp && ww > 0 && wh > 0) {
@@ -79996,8 +79957,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const eW = Math.max(1, px1 - px0), eH = Math.max(1, py1 - py0);
         const inX = wx - px0, inY = wy - py0;   // 확장 캔버스 안에서 작업 구역의 자리
         const weTmp = function(key) {
-          return host ? paintScratchCanvas(host, key, eW, eH)
-            : (function() { const c = document.createElement('canvas'); c.width = eW; c.height = eH; return c; })();
+          return paintScratchCanvas(host, key, eW, eH);
         };
         const weReset = function(c) {
           const x = c.getContext('2d');
@@ -80177,8 +80137,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 느려진다(아래 mask 블록의 destination-in 과 같은 이유). 좌표는 전부 정수(paintStrokeScratchBox 의
         // floor/ceil)라 (wx,wy)→(0,0) 이동에 리샘플이 없다 — 픽셀 등가.
         const inkW = Math.max(1, ww), inkH = Math.max(1, wh);
-        const inkTmp = opts.liveHost ? paintScratchCanvas(opts.liveHost, 'inkFieldWork', inkW, inkH)
-          : (function() { const c = document.createElement('canvas'); c.width = inkW; c.height = inkH; return c; })();
+        const inkTmp = paintScratchCanvas(opts.liveHost, 'inkFieldWork', inkW, inkH);
         const inkCtx = inkTmp.getContext('2d');
         inkCtx.filter = lumFilter;
         inkCtx.drawImage(s.cv, wx, wy, ww, wh, 0, 0, ww, wh);   // 작업 구역만
@@ -80722,8 +80681,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintInkSessionInit(s, host, ctx, opts, tipImage);
       }
       const unpresentedBox = canResume ? s.unpresentedBox : null;
-      const unpresentedShaded = unpresentedBox && s.unpresentedShaded && s.scratchOwner
-        && paintGrainScratchKey === s.scratchOwner && paintGrainScratch && paintGrainScratch.width === w && paintGrainScratch.height === h;
+      const unpresentedShaded = Boolean(unpresentedBox && s.unpresentedShaded && s.scratchOwner) && paintGrainScratchOwnedBy(s.scratchOwner, w, h);
       s.unpresentedBox = null; s.unpresentedShaded = false; s.outputDirty = null;
       const cx = s.cv.getContext('2d');
       cx.setTransform(1, 0, 0, 1, 0, 0);
@@ -82135,6 +82093,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return match;
     }
 
+    // 마스크의 켜진 픽셀 상자 { x0, y0, x1, y1 }(양끝 포함). 비었으면 null.
+    function paintMaskBounds(mask, W, H) {
+      let x0 = W, y0 = H, x1 = -1, y1 = -1;
+      for (let y = 0, i = 0; y < H; y += 1) {
+        for (let x = 0; x < W; x += 1, i += 1) {
+          if (!mask[i]) continue;
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          y1 = y;
+        }
+      }
+      return x1 < 0 ? null : { x0: x0, y0: y0, x1: x1, y1: y1 };
+    }
+
     // 「어디까지 확장할까」를 거리로 정한다(사용자 판정).
     //
     // `dilate(mask, expand)` 로 무조건 N 픽셀 밀면 미는 거리가 선 굵기와 무관해서, 굵은 선에서는 못 미쳐
@@ -82153,20 +82126,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //
     // 바깥 배경이 없으면(캔버스가 통째로 채워진 경우) dOut 이 없어 조건이 상한 하나로 떨어진다(안전한 물러섬).
     // 거리 커널은 paintChamferDistance 를 틈 닫기와 함께 쓴다.
-    // 마스크의 켜진 픽셀 상자 { x0, y0, x1, y1 }(양끝 포함). 비었으면 null.
-    function paintMaskBounds(mask, W, H) {
-      let x0 = W, y0 = H, x1 = -1, y1 = -1;
-      for (let y = 0, i = 0; y < H; y += 1) {
-        for (let x = 0; x < W; x += 1, i += 1) {
-          if (!mask[i]) continue;
-          if (x < x0) x0 = x;
-          if (x > x1) x1 = x;
-          if (y < y0) y0 = y;
-          y1 = y;
-        }
-      }
-      return x1 < 0 ? null : { x0: x0, y0: y0, x1: x1, y1: y1 };
-    }
     // 상한 L 이 유한하면 거리 지도는 채운 영역의 상자 + (2L+1) 창 안에서만 구한다. 흡수 후보는 상자 + L 안이고,
     // 거리 ≤ 3L 인 경로는 L 걸음이라 창을 벗어나지 않으므로 dIn 은 전면과 같다. dOut 은 창 밖 바깥 픽셀이면 거리가
     // 3(L+1) 을 넘어 dIn ≤ 3L 과의 비교가 바뀌지 않는다. 기본(領域拡張 1)의 작은 칸 채우기가 용지 전면을 두 번 돌지 않는다.
@@ -82972,16 +82931,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function layerDrawingThumbnailKey(canvas, drawingRef) {
       const ref = String(drawingRef || '');
       const drawing = ensureLayerDrawingData(state.project, ref);
-      const rect = layerDrawingBitmapRect(drawing);
-      return [
-        ref,
-        canvas && canvas.dataset ? String(canvas.dataset.conteLayerId || '') : '',
-        layerDrawingContentKey(ref, drawing),
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h
-      ].join(':');
+      return [ref, canvas && canvas.dataset ? String(canvas.dataset.conteLayerId || '') : '', layerDrawingContentKey(ref, drawing)].join(':');
     }
 
     // 그림 내용(layerDrawingContentKey)마다 원화 썸과 같은 작은 그림(drawingThumbBake)을 하나 굽고 풀어, 잉크 범위와
@@ -83969,8 +83919,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintReleaseCanvas(paintStrokeBufferPool[key]); paintStrokeBufferPool[key] = null;
       }
     }
-    // rect를 주는 호출자는 그 창만 소비한다. 창 밖의 재사용 픽셀은 그대로 둔다.
+    // rect를 주는 호출자는 그 창만 소비한다. 창 밖의 재사용 픽셀은 그대로 둔다. owner 가 없으면(세션 host 없는 획 — Shift 직선·
+    // 도형·one-shot) 매번 새 투명 캔버스다.
     function paintScratchCanvas(owner, key, w, h, rect) {
+      if (!owner) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
       const store = owner.paintScratch || (owner.paintScratch = {});
       let buf = store[key];
       if (!buf) { buf = document.createElement('canvas'); store[key] = buf; }
@@ -99128,7 +99080,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // (never commit — the cancel rule). genga has the same guard.
       window.addEventListener('blur', discardCameraFrameDrag);
       document.addEventListener('visibilitychange', function() {
-        if (document.visibilityState === 'hidden') { pauseStorageSweep(); flushIndexedDbAutosave(); }
+        if (document.visibilityState === 'hidden') flushIndexedDbAutosave();   // 디스크 sweep 의 멈춤은 그 정의 옆 리스너가 먼저 한다
         else {
           resumePlaybackAudioContextIfNeeded(); // iOS suspends audio in the background.
           // Returning to the app is not a project cleanup boundary.
@@ -106555,7 +106507,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const yieldsPixels = !asContainer && gengaIsTileSet(value) && (asBlob || !gengaTileSetDecodedComplete(value));
           let payload = '';
           try {
-            payload = asContainer ? (function(b) { return b.slice(0, b.size, GENGA_TILE_MIME); })(gengaTileSetToBlob(value))
+            payload = asContainer ? gengaTileSetToBlob(value)   // 조립이 GENGA_TILE_MIME 으로 만든다
               : gengaIsTileSet(value) ? await gengaPortableTile(value, owner, asBlob)
               : value instanceof Blob ? (asBlob ? value : await gengaBlobToDataUrl(value))
                 : asBlob ? gengaDataUrlToBlob(gengaStoreValueUrl(value)) : gengaStoreValueUrl(value);
@@ -106780,17 +106732,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       //   이유로 돌려준다.
       if (gengaIsTileSet(v)) {
         if (v.pendingBake && !gengaTileSetBakePending(v)) return { ok: false, ref: ref, code: 'encode' };
+        let written = null;
         if (!gengaTileCellsAllBlob(v)) {
-          // 칸은 메인 밖에서 굽는다(자동저장 flush 가 시작한 작업이 있으면 그것을 기다린다). 그사이 store 가 바뀌었으면
-          // 지금 값으로 다시 판정하고, 진행 중 쓰기가 생겼으면 그것을 기다린다. 못 구운 칸만 아래에서 동기로 마저 굽는다.
-          await gengaStartTileEncodeJob(ref, v);
+          // 칸은 메인 밖에서 굽고, 그 작업이 gd: 쓰기까지 잇는다(자동저장 flush 가 시작한 작업이 있으면 그것). 그사이 store 가
+          // 바뀌었으면 지금 값으로 다시 판정한다. 작업이 쓰지 않았으면(워커가 못 구운 칸·대기에서 빠진 묶음) 아래에서 동기로 마저 한다.
+          written = await gengaStartTileEncodeJob(ref, v);
           if (gengaDrawStore.get(ref) !== v) return gengaEnsureDrawingDurable(ref);
-          const writing = gengaPersistJobs.get(ref);
-          if (writing) return (await writing) ? { ok: true, ref: ref, representation: 'gd' } : { ok: false, ref: ref, code: 'write' };
         }
-        gengaEncodeTileCells(v, Infinity);
-        if (!gengaTileCellsAllBlob(v)) return { ok: false, ref: ref, code: 'encode' };
-        return (await gengaPersistTileSet(ref, v)) ? { ok: true, ref: ref, representation: 'gd' } : { ok: false, ref: ref, code: 'write' };
+        if (written == null) {
+          const writing = gengaPersistJobs.get(ref);
+          written = writing ? await writing : gengaPersistTileSetNow(ref, v);
+          if (written == null) return { ok: false, ref: ref, code: 'encode' };
+          written = await written;
+        }
+        return written ? { ok: true, ref: ref, representation: 'gd' } : { ok: false, ref: ref, code: 'write' };
       }
       if ((typeof v === 'string' && v) || (v instanceof Blob && v.size)) {
         const ok = await gengaPersistJobRegister(ref, gengaMarkPersisted(ref, putWorkspaceDbValue('gd:' + ref, gengaDiskValueFor(v))));
@@ -106835,24 +106790,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         console.warn('[gengaDelta] delta row is missing or not a Blob - the caller treats this as unknown');
         return null;
       }
-      const magicLen = GENGA_DELTA_MAGIC.length;
-      let buf = null, nl = -1;
-      try { ({ buf: buf, nl: nl } = await gengaContainerHead(b, magicLen)); } catch (e) {
-        console.error('[gengaDelta] delta container read failed', e); return null;
-      }
-      for (let i = 0; i < magicLen; i++) { if (buf[i] !== GENGA_DELTA_MAGIC.charCodeAt(i)) { console.error('[gengaDelta] delta container magic mismatch'); return null; } }
-      if (nl < 0) { console.error('[gengaDelta] delta container header has no terminator'); return null; }
-      let head = null;
-      try { head = JSON.parse(new TextDecoder('utf-8').decode(buf.subarray(magicLen, nl))); } catch (e) {
-        console.error('[gengaDelta] delta container header parse failed', e); return null;
-      }
+      const c = await gengaContainerHeadJson(b, GENGA_DELTA_MAGIC, '[gengaDelta] delta');
+      if (!c) return null;
+      const head = c.head;
       if (!head || !head.base || !Number.isFinite(Number(head.sx)) || !Number.isFinite(Number(head.sy))) {
         console.error('[gengaDelta] delta container header is incomplete'); return null;
       }
       return { base: String(head.base), sx: Number(head.sx), sy: Number(head.sy),
         pw: Math.max(1, Number(head.pw) || 1), ph: Math.max(1, Number(head.ph) || 1),
         x: Number(head.x), y: Number(head.y), w: Number(head.w), h: Number(head.h),
-        png: b.slice(nl + 1, b.size, 'image/png') };
+        png: b.slice(c.bodyAt, b.size, 'image/png') };
     }
     // 같은 ref 로 겹쳐 들어오는 복원을 하나로 합친다(hydrate 의 일괄 복원과 화면 소비처의 fault-in 이
     // 같은 ref 를 동시에 요구한다). fault-in 의 `gengaDrawStoreFaults` 와 같은 무늬. 두 소비처가 같은 ts 를
@@ -107219,27 +107166,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       return new Blob([magic, JSON.stringify(Object.assign({}, hdr, { cells: index })), '\n'].concat(parts), { type: 'application/x-moart-tiles' });
     }
-    // 준비(마지막 그물 인코드·장부 갱신)는 여기, 조립은 위 순수 함수다. 인코드에 실패한 셀이 있으면 행을 만들지
-    // 않고 위로 던진다 — 부르는 쪽(gengaPersistTileSetMain)이 그것을 저장 실패로 정규화해 게시를 막는다(부분
-    // 그림을 적느니 직전 저장본이 낫다).
+    // 칸 컨테이너 머리 — 메인 직렬화와 워커 쓰기 메시지가 같은 값을 싣는다. x/y/w/h 를 싣는다 — 베이크 이월 커밋의
+    // bounds(물려받은 칸 ∪ dirty 창)는 cells 재계산(빈 가장자리 칸이 빠진 값)과 갈릴 수 있고, 리로드가 재계산으로 갈아타면
+    // 그림 객체의 x(dr.x = ts.x 불변식)와 어긋나 그림이 민다. 옛 로더는 모르는 필드를 무시한다.
+    function gengaTileHeader(ts) {
+      return { v: 1, tile: ts.tile, gw: ts.gw, gh: ts.gh, pw: ts.pw, ph: ts.ph, x: ts.x, y: ts.y, w: ts.w, h: ts.h };
+    }
+    // 칸이 확정된 묶음 → gd: 행 Blob(조립만). 베이크·인코드는 부르는 쪽 몫이다(펌프·인코드 작업·gengaPersistTileSetNow).
+    // 베이크 대기거나 Blob 이 아닌 칸이 있으면 행을 만들지 않고 던진다 — 부르는 쪽(gengaPersistTileSetMain)이 저장 실패로
+    // 정규화해 게시를 막는다(부분 그림을 적느니 직전 저장본이 낫다).
     function gengaTileSetToBlob(ts) {
-      // 베이크 대기분의 마지막 그물 — 여기서도 실패하면 dirty 창의 칸이 통째로 빠진 행이 된다.
-      if (ts.pendingBake && !gengaTileSetBakePending(ts)) {
-        throw new Error('serialize-time bake failed - the newest stroke would be missing from the row');
-      }
-      const solidBlobs = new Map();
-      ts.cells.forEach(function(b, idx) {
-        if (b && typeof b.size !== 'number') {   // Flush 를 안 지난 미확정 조각 — 마지막 그물
-          const enc = gengaTileEncodeCanvas(b, solidBlobs);
-          ts.cells.set(idx, enc); gengaTileSetCellBlobSettled(ts, enc);   // 공유 장부의 가산 짝
-        }
-      });
-      gengaDrawStoreReweighValue(ts); // 마지막 그물 인코드의 Blob 몫은 위 settled 가 가산했다 — 여기는 자기 몫 그물(장부 미스면 no-op)
-      // x/y/w/h 를 싣는다 — 베이크 이월 커밋의 bounds(물려받은 칸 ∪ dirty 창)는 cells 재계산(빈 가장자리 칸이
-      // 빠진 값)과 갈릴 수 있고, 리로드가 재계산으로 갈아타면 그림 객체의 x(dr.x = ts.x 불변식)와 어긋나 그림이
-      // 민다. 옛 로더는 모르는 필드를 무시한다.
-      return gengaTileBlobAssemble(GENGA_TILE_MAGIC,
-        { v: 1, tile: ts.tile, gw: ts.gw, gh: ts.gh, pw: ts.pw, ph: ts.ph, x: ts.x, y: ts.y, w: ts.w, h: ts.h }, ts.cells);
+      if (ts.pendingBake) throw new Error('deferred bake pending - the newest stroke would be missing from the row');
+      return gengaTileBlobAssemble(GENGA_TILE_MAGIC, gengaTileHeader(ts), ts.cells);
     }
     function gengaBlobToArrayBuffer(b) {
       if (b && typeof b.arrayBuffer === 'function') return b.arrayBuffer();
@@ -107250,17 +107188,25 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         rd.readAsArrayBuffer(b);
       });
     }
-    // 칸 묶음/변경분 컨테이너는 머리(마법 문자열 + JSON 한 줄)만 읽는다. 칸 PNG 는 원본 Blob 의 slice 로
-    // 남아 디코드할 때 읽힌다. 첫 창에 줄바꿈이 없으면 전체를 읽어 판정한다.
+    // 칸 묶음/변경분 컨테이너(마법 문자열 + JSON 머리 한 줄 + 본문)의 머리만 읽는다 → { head, bodyAt(본문 첫 바이트) } | null
+    // (읽기 실패·마법 불일치·머리 끝 없음·JSON 파손 — tag 를 붙여 남긴다). 칸 PNG 는 원본 Blob 의 slice 로 남아 디코드할 때
+    // 읽힌다. 첫 창에 줄바꿈이 없으면 전체를 읽어 판정한다.
     const GENGA_CONTAINER_HEAD_BYTES = 64 * 1024;
-    async function gengaContainerHead(b, magicLen) {
-      let buf = new Uint8Array(await gengaBlobToArrayBuffer(b.size > GENGA_CONTAINER_HEAD_BYTES ? b.slice(0, GENGA_CONTAINER_HEAD_BYTES) : b));
-      let nl = buf.indexOf(10, magicLen);
-      if (nl < 0 && buf.length < b.size) {
-        buf = new Uint8Array(await gengaBlobToArrayBuffer(b));
+    async function gengaContainerHeadJson(b, magic, tag) {
+      const magicLen = magic.length;
+      let buf = null, nl = -1;
+      try {
+        buf = new Uint8Array(await gengaBlobToArrayBuffer(b.size > GENGA_CONTAINER_HEAD_BYTES ? b.slice(0, GENGA_CONTAINER_HEAD_BYTES) : b));
         nl = buf.indexOf(10, magicLen);
-      }
-      return { buf: buf, nl: nl };
+        if (nl < 0 && buf.length < b.size) {
+          buf = new Uint8Array(await gengaBlobToArrayBuffer(b));
+          nl = buf.indexOf(10, magicLen);
+        }
+      } catch (e) { console.error(tag + ' container read failed', e); return null; }
+      for (let i = 0; i < magicLen; i++) { if (buf[i] !== magic.charCodeAt(i)) { console.error(tag + ' container magic mismatch'); return null; } }
+      if (nl < 0) { console.error(tag + ' container header has no terminator'); return null; }
+      try { return { head: JSON.parse(new TextDecoder('utf-8').decode(buf.subarray(magicLen, nl))), bodyAt: nl + 1 }; }
+      catch (e) { console.error(tag + ' container header parse failed', e); return null; }
     }
     // 디스크 행이 칸 묶음인가 — 앞 몇 바이트만 본다. 통짜 PNG Blob 과 한 키 공간을 나눠 쓰므로
     // 이 판별이 있어야 옛 그림이 그대로 열린다(통짜·칸 혼재는 여기서 갈린다).
@@ -107279,20 +107225,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Blob → 칸 묶음. 헤더가 깨졌으면 null 을 내고 부르는 쪽이 통짜로 다룬다(조용히 빈 그림을 만들지 않는다).
     async function gengaTileSetFromBlob(b) {
-      const magicLen = GENGA_TILE_MAGIC.length;
-      let buf = null, nl = -1;
-      try { ({ buf: buf, nl: nl } = await gengaContainerHead(b, magicLen)); } catch (e) {
-        console.error('[gengaTile] container read failed', e); return null;
-      }
-      if (nl < 0) { console.error('[gengaTile] container header has no terminator'); return null; }
-      let head = null;
-      try { head = JSON.parse(new TextDecoder('utf-8').decode(buf.subarray(magicLen, nl))); } catch (e) {
-        console.error('[gengaTile] container header parse failed', e); return null;
-      }
+      const c = await gengaContainerHeadJson(b, GENGA_TILE_MAGIC, '[gengaTile]');
+      if (!c) return null;
+      const head = c.head;
       if (!head || !Array.isArray(head.cells)) { console.error('[gengaTile] container header has no cell index'); return null; }
       const ts = { tile: Number(head.tile) || GENGA_TILE_PX, gw: Number(head.gw) || 1, gh: Number(head.gh) || 1,
                    pw: Number(head.pw) || 1, ph: Number(head.ph) || 1, cells: new Map(), decoded: new Map(), x: 0, y: 0, w: 1, h: 1 };
-      let off = nl + 1;
+      let off = c.bodyAt;
       for (let i = 0; i < head.cells.length; i++) {
         const idx = Number(head.cells[i][0]), len = Number(head.cells[i][1]);
         if (!Number.isFinite(idx) || !Number.isFinite(len) || len <= 0 || off + len > b.size) {
@@ -107482,7 +107421,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 경계). 프로젝트 교체마다 gengaThumbWorkerPoolReset() 이 끝낸다(아래) — 탭 종료까지 들고 있지 않는다.
     const GENGA_THUMB_BAKE_WORKERS = 3;   // 동시 디코드+인코드 상한 — 시트 첫 렌더의 다건 미스가 한꺼번에 몰려도 메인 스레드는 비운다
     let gengaThumbWorkerPool;             // undefined: 미시도, null: 미지원/실패(이후 항상 메인 경로), 그 외: 이 프로젝트의 풀
-    const gengaThumbWorkerJobQueue = [];  // 풀이 꽉 찼을 때 기다리는 { blob, done } — 유휴 워커가 생기는 즉시 투입
     // 워커 쪽은 createImageBitmap 으로 디코드해 메인 스레드 Image 디코드를 비우고, 축소·인코드는 바로
     // 위 gengaThumbCanvasFrom 을 그대로 문자열로 심어 쓴다 — 칸 썸·커밋 썸과 같은 산수라 결과 픽셀이 같다
     // (tvppPngWorkerSource 가 이미 같은 방식으로 재사용 중). 실패/미지원은 호출부가 메인 경로로 떨어진다.
@@ -107500,44 +107438,21 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaThumbWorkerPoolEnsure() {
       if (gengaThumbWorkerPool === undefined) {
-        const supported = typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
-          && typeof OffscreenCanvas.prototype.convertToBlob === 'function' && typeof createImageBitmap === 'function';
-        gengaThumbWorkerPool = supported ? tvppWorkerPoolOpen(gengaThumbWorkerSource(), GENGA_THUMB_BAKE_WORKERS, 'genga thumb bake') : null;
+        gengaThumbWorkerPool = offscreenWorkerSupported() ? tvppWorkerPoolOpen(gengaThumbWorkerSource(), GENGA_THUMB_BAKE_WORKERS, 'genga thumb bake') : null;
       }
       return gengaThumbWorkerPool;
     }
-    // 유휴 워커가 있는 만큼만 큐에서 뽑는다 — 그 이상은 기다린다(메인 스레드 toBlob 폭주를 워커 쪽
-    // 무제한 동시 디코드로 옮기지 않기 위한 경계다). 풀이 없거나 죽으면 큐 전체를 null 로 비워 호출부가
-    // 전부 메인 경로로 떨어지게 한다.
-    function gengaThumbBakeWorkerPump() {
-      const pool = gengaThumbWorkerPoolEnsure();
-      if (!pool || pool.dead) {
-        while (gengaThumbWorkerJobQueue.length) gengaThumbWorkerJobQueue.shift().done(null);
-        return;
-      }
-      while (gengaThumbWorkerJobQueue.length && pool.idle.length) {
-        const job = gengaThumbWorkerJobQueue.shift();
-        tvppWorkerPoolRun(pool, { blob: job.blob }, []).then(function(m) {
-          gengaThumbBakeWorkerPump();   // 자리가 났다 — 기다리던 다음 일을 밀어넣는다
-          job.done(m && m.thumb ? m.thumb : null);
-        }, function() {
-          gengaThumbBakeWorkerPump();   // 워커 크래시(fatal reject) — 이 한 건만 메인 경로로, 나머지 대기열은 계속 돈다
-          job.done(null);
-        });
-      }
-    }
+    // 빈 워커를 기다려 굽는다(동시 디코드는 워커 수까지 — 메인 스레드 toBlob 폭주를 워커 쪽 무제한 동시 디코드로 옮기지 않는다).
+    // 풀이 없거나 죽거나 워커가 실패하면 null — 부르는 쪽이 메인 경로로 굽는다.
     function gengaThumbBakeWorkerEncode(blob, done) {
-      gengaThumbWorkerJobQueue.push({ blob: blob, done: done });
-      gengaThumbBakeWorkerPump();
+      tvppWorkerPoolQueue(gengaThumbWorkerPoolEnsure(), { msg: { blob: blob } })
+        .then(function(m) { done(m && m.thumb ? m.thumb : null); }, function() { done(null); });
     }
-    // B: 프로젝트 교체(gengaResetEngineTransients)가 부른다. 풀을 끝내고(진행 중인 워커 작업은
-    // tvppWorkerPoolClose 가 reject 로 끝내 pump 의 catch 가 돈다) undefined 로 돌려 다음 접근이 새
-    // 프로젝트 몫의 풀을 새로 연다. 아직 디스패치 전인 대기열은 pool.jobs 밖이라 tvppWorkerPoolClose 가
-    // 못 보므로 여기서 직접 비운다. done(null) 뿐 — gengaThumbBakeFromDataUrl 쪽 stale() 가드가 그 늦은
-    // 답을 메인 폴백도 persist 도 없이 버린다(아래).
+    // B: 프로젝트 교체(gengaResetEngineTransients)가 부른다. 풀을 닫고(진행 중 작업은 reject, 대기 중 작업은 null 로 끝난다)
+    // undefined 로 돌려 다음 접근이 새 프로젝트 몫의 풀을 새로 연다. gengaThumbBakeFromDataUrl 쪽 stale() 가드가 그 늦은 답을
+    // 메인 폴백도 persist 도 없이 버린다(아래).
     function gengaThumbWorkerPoolReset() {
       if (gengaThumbWorkerPool) { tvppWorkerPoolClose(gengaThumbWorkerPool); gengaThumbWorkerPool = undefined; }
-      gengaThumbWorkerJobQueue.splice(0).forEach(function(job) { job.done(null); });
     }
     // Patch current connected consumers in the header rAF; preserve their placement and active editors.
     function gengaPatchBakedThumbs() {
@@ -107777,9 +107692,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // (알파 ≥ 1, gengaTileCellHasInk 와 같은 식)·자르기(행 복사 → putImageData, gengaTileCutCell 과 같은 순서)·PNG·
     // decoded 비트맵까지 만들어 돌려준다.
     const GENGA_TILE_ENCODE_WORKERS = 2;
-    let gengaTileEncodePool;              // undefined: 미시도, null: 미지원(이후 toBlob)
-    const gengaTileEncodeQueue = [];      // 빈 워커를 기다리는 { t(원천 캔버스), cells?(베이크할 칸), done(워커 답) } — 비트맵은 워커에 넘길 때만 뜬다
-    let gengaTileEncodeStarting = 0;      // 비트맵을 뜨는 중인 작업 수 — 빈 워커 수를 넘겨 뜨지 않는다
+    let gengaTileEncodePool;              // undefined: 미시도, null: 미지원(이후 toBlob), dead: 실패·무응답으로 닫힘(이후 toBlob·동기 베이크)
     // 워커·toBlob 이 답하지 않아도(WebKit 이 오류 없이 멈춘 관측이 있다) 게시 배리어가 끝없이 기다리지 않게 한다. 넘기면
     // 풀을 닫고(이후 toBlob) 그 칸은 null — 부르는 쪽이 동기로 마저 굽는다.
     const GENGA_TILE_ENCODE_TIMEOUT_MS = 8000;
@@ -107791,9 +107704,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaTileEncodePoolEnsure() {
       if (gengaTileEncodePool === undefined) {
-        const supported = typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
-          && typeof OffscreenCanvas.prototype.convertToBlob === 'function' && typeof createImageBitmap === 'function';
-        gengaTileEncodePool = supported ? tvppWorkerPoolOpen(
+        gengaTileEncodePool = offscreenWorkerSupported() ? tvppWorkerPoolOpen(
           'onmessage=async function(e){const d=e.data;let c;const out=[];try{c=new OffscreenCanvas(d.bmp.width,d.bmp.height);'
           + 'const g=c.getContext("2d");g.drawImage(d.bmp,0,0);d.bmp.close();'
           + 'if(!d.cells){postMessage({id:d.id,blob:await c.convertToBlob({type:"image/png"})});return;}'
@@ -107811,32 +107722,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return gengaTileEncodePool;
     }
-    function gengaTileEncodeWorkerPump() {
-      const pool = gengaTileEncodePoolEnsure();
-      if (!pool || pool.dead) {
-        while (gengaTileEncodeQueue.length) gengaTileEncodeQueue.shift().done(null);
-        return;
-      }
-      while (gengaTileEncodeQueue.length && pool.idle.length > gengaTileEncodeStarting) {
-        const job = gengaTileEncodeQueue.shift();
-        gengaTileEncodeStarting += 1;
-        createImageBitmap(job.t).then(function(bmp) {
-          gengaTileEncodeStarting -= 1;
-          if (pool.dead || gengaTileEncodePool !== pool) { bmp.close(); job.done(null); gengaTileEncodeWorkerPump(); return; }
-          gengaTileEncodeWithin(tvppWorkerPoolRun(pool, job.cells ? { bmp: bmp, cells: job.cells } : { bmp: bmp }, [bmp]), function() {
-            if (gengaTileEncodePool === pool) { console.error('[gengaTile] encode worker did not answer - closing the pool'); tvppWorkerPoolClose(pool); gengaTileEncodePool = null; gengaTileEncodeWorkerPump(); }
-          }).then(function(m) {
-            gengaTileEncodeWorkerPump();
-            job.done(m);
-          }, function() { gengaTileEncodeWorkerPump(); job.done(null); });
-        }, function() { gengaTileEncodeStarting -= 1; job.done(null); gengaTileEncodeWorkerPump(); });
-      }
-    }
-    // 풀 작업 하나 → 워커 답(워커 없음·실패·무응답이면 null). 시간 제한은 워커에 보낸 순간부터 센다(gengaTileEncodeWorkerPump) —
-    // 대기열에서 기다린 시간은 세지 않는다. 무응답이면 풀을 닫아 진행 중·대기 작업을 null 로 끝내고 이후는 메인 경로(toBlob·
-    // 동기 베이크)로 간다.
+    // 풀 작업 하나 → 워커 답(워커 없음·실패·무응답이면 null). 원천 비트맵은 빈 워커를 잡은 뒤에 뜬다(대기 중인 일이 비트맵을
+    // 쥐지 않는다). 무응답이면 풀이 닫혀 진행 중·대기 작업이 null 로 끝나고 이후는 메인 경로(toBlob·동기 베이크)로 간다.
     function gengaTileWorkerJob(source, cells) {
-      return new Promise(function(resolve) { gengaTileEncodeQueue.push({ t: source, cells: cells, done: resolve }); gengaTileEncodeWorkerPump(); });
+      return tvppWorkerPoolQueue(gengaTileEncodePoolEnsure(), {
+        prepare: function() {
+          return createImageBitmap(source).then(function(bmp) { return { msg: cells ? { bmp: bmp, cells: cells } : { bmp: bmp }, transfer: [bmp] }; });
+        },
+        timeoutMs: GENGA_TILE_ENCODE_TIMEOUT_MS
+      }).catch(function() { return null; });
     }
     function gengaTileEncodeCellAsync(t) {
       if (t._tileBlob) return Promise.resolve(t._tileBlob);
@@ -107884,19 +107778,26 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return gengaTileCellsAllBlob(ts);
       });
     }
-    // 묶음당 진행 중 작업 하나. 끝나면 펌프를 깨워 확정·내구화(gengaPersistTileSet)와 실패 계수를 펌프가 잇는다.
+    // 묶음당 진행 중 작업 하나. 칸을 다 구웠고 그 묶음이 아직 인코드 대기(gengaPendingTileEncode — 아무도 gd: 쓰기를 시작하지
+    // 않은 묶음)에 있으면 gd: 쓰기까지 시작한다 — 인코드 뒤 쓰기의 소유자는 이 작업 하나다(펌프·게시 배리어는 결과만 본다). 그사이
+    // 다른 경로(동기 flush)가 쓰기를 시작했으면 그 쓰기(ts._persistJob — 칸이 다 구워지기 전에는 쓰기가 없으므로 이 작업 동안
+    // 시작된 것이다)의 결과를 돌려준다. → 쓰기 결과(boolean), 쓰기가 없으면 null. 실패 계수와 남은 일은 깨운 펌프가 잇는다.
     function gengaStartTileEncodeJob(ref, ts) {
       if (ts._encodeJob) return ts._encodeJob;
-      const job = gengaEncodeTileCellsAsync(ref, ts).then(function(ok) {
+      const job = gengaEncodeTileCellsAsync(ref, ts).then(function(allBlob) {
         if (ts._encodeJob === job) ts._encodeJob = null;
-        if (!ok && gengaDrawStore.get(ref) === ts) ts.encodeFailures = (Number(ts.encodeFailures) || 0) + 1;
+        let write = null;
+        if (gengaDrawStore.get(ref) === ts) {
+          if (!allBlob) ts.encodeFailures = (Number(ts.encodeFailures) || 0) + 1;
+          else write = (!ts.pendingBake && gengaPendingTileEncode.get(ref) === ts) ? gengaPersistTileSet(ref, ts) : (ts._persistJob || null);
+        }
         gengaKickTileEncodePump();
-        return ok;
+        return write;
       }, function(e) {
         if (ts._encodeJob === job) ts._encodeJob = null;
         console.error('[gengaTile] background encode failed for ' + ref, e);
         gengaKickTileEncodePump();
-        return false;
+        return null;
       });
       ts._encodeJob = job;
       return job;
@@ -108210,14 +108111,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       pb.bakeJob = job;
       return true;
     }
+    // 원화 재생 창이 바쁜가 — 재생·재생 예열·재생바 끌기. 배경 칸 일(인코드·통짜 변환)은 이 동안 새 일을 만들지 않는다.
+    function gengaPlaybackBusy() { return state.gengaPlaying || Boolean(gengaPlaybackWarm) || gengaScrubInFlight; }
     const gengaPendingTileEncode = new Map();   // ref → ts (인코드 미확정 칸이 남은 묶음)
     let gengaTileEncodeTimer = 0;
     function gengaScheduleTileEncode(ref, ts) {
       gengaPendingTileEncode.set(ref, ts);
-      if (!gengaTileEncodeTimer) gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, 0);
+      gengaKickTileEncodePump();
     }
-    // 미확정(캔버스) 칸을 최대 n 개 Blob 으로 확정한다. 실패한 칸은 캔버스로 남는다 — 재시도는
-    // 부르는 쪽 소관이고, 저장 직전의 gengaTileSetToBlob 방어가 마지막 그물이다.
+    // 미확정(캔버스) 칸을 최대 n 개 Blob 으로 확정한다. 실패한 칸은 캔버스로 남는다 — 재시도는 부르는 쪽 소관이다.
     function gengaEncodeTileCells(ts, n, deadline) {
       let done = 0, failed = 0;
       const solidBlobs = new Map();
@@ -108237,6 +108139,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       if (done) gengaDrawStoreReweighValue(ts); // Blob 몫은 위 gengaTileSetCellBlobSettled 가 가산했다 — 여기는 자기 몫(decoded 등)만
       return { done: done, failed: failed };
+    }
+    // 남은 캔버스 칸을 지금 동기로 굽고, 전부 Blob 이 됐으면 gd: 쓰기를 시작한다 → 쓰기 작업(Promise<boolean>), 못 구운 칸이
+    // 남았으면 null(부분 그림은 쓰지 않는다 — 실패 처리는 부르는 쪽 몫). 저장·스왑 직전처럼 기다릴 수 없는 자리의 마감이다.
+    function gengaPersistTileSetNow(ref, ts, preferMain) {
+      gengaEncodeTileCells(ts, Infinity);
+      return gengaTileCellsAllBlob(ts) ? gengaPersistTileSet(ref, ts, preferMain) : null;
     }
     function gengaTileCellsAllBlob(ts) {
       let ok = true;
@@ -108325,8 +108233,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return null;
       }
     }
-    // 메인 경로 — 워커가 없거나 실패했을 때의 폴백이기도 하다(마지막 그물 인코드·pendingBake 방어는
-    // gengaTileSetToBlob 안에 있다). 반환은 Promise<boolean> 한 모양이다 — 워커 갈래와 같은 결과 계약이라
+    // 메인 경로 — 워커가 없거나 실패했을 때의 폴백이기도 하다(미확정 묶음은 gengaTileSetToBlob 이 던져 실패가
+    // 된다). 반환은 Promise<boolean> 한 모양이다 — 워커 갈래와 같은 결과 계약이라
     // 실행기를 바꿔도 소비처가 실패값을 실행기별로 해석할 필요가 없다.
     function gengaPersistTileSetMain(ref, ts) {
       try {
@@ -108349,7 +108257,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 프로젝트 본문 게시는 실행기와 무관하게 완료 promise를 확인한다. 어느 실행기든 같은 완료 프라미스
     // (Promise<boolean>)를 돌려주고 ref 당 하나의 논리 작업으로 등록한다 — 워커 실패 뒤의 메인 대체 처리도 그
     // 작업 안이라 응답 맵에서 빠져도 최종 결과가 유실되지 않는다(게시 배리어가 이 작업을 기다린다).
+    // 쓰기를 시작한 묶음은 인코드 대기(gengaPendingTileEncode)에서 빼고 그 작업을 ts._persistJob 에 둔다 — 대기에 남으면 펌프가
+    // 같은 행을 또 쓰고, 기록이 없으면 인코드를 기다리던 게시 배리어가 그 결과를 못 보고 다시 쓴다.
     function gengaPersistTileSet(ref, ts, preferMain) {
+      if (gengaPendingTileEncode.get(ref) === ts) gengaPendingTileEncode.delete(ref);
       if (!gengaDrawingShouldPersist()) return Promise.resolve(true);   // 안 적는 모드 — 실패가 아니다
       const w = (!preferMain && !ts.pendingBake && gengaTileCellsAllBlob(ts)) ? gengaPersistWorkerGet() : null;
       if (w) {
@@ -108358,7 +108269,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         try {
           w.postMessage({ op: 'put', seq: seq, key: 'gd:' + ref, delKey: canDel ? 'gdd:' + ref : null,
             magic: GENGA_TILE_MAGIC,
-            hdr: { v: 1, tile: ts.tile, gw: ts.gw, gh: ts.gh, pw: ts.pw, ph: ts.ph, x: ts.x, y: ts.y, w: ts.w, h: ts.h },
+            hdr: gengaTileHeader(ts),
             cells: ts.cells });
           const job = { settle: null, timer: 0 };
           const done = new Promise(function(resolve) {
@@ -108376,18 +108287,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           // retrying, so a late worker cannot overwrite the main-thread result.
           job.timer = setTimeout(function() { gengaPersistWorkerStop(w, 'drawing storage timed out'); }, WORKSPACE_DB_OP_TIMEOUT_MS);
           gengaMarkPersisted(ref, done);
-          return gengaPersistJobRegister(ref, done);
+          return (ts._persistJob = gengaPersistJobRegister(ref, done));
         } catch (e) {
           console.error('[gengaPersist] worker postMessage threw for gd:' + ref + ' - main-thread fallback', e);
         }
       }
-      return gengaPersistJobRegister(ref, gengaPersistTileSetMain(ref, ts));
+      return (ts._persistJob = gengaPersistJobRegister(ref, gengaPersistTileSetMain(ref, ts)));
     }
     function gengaTileEncodePump() {
       gengaTileEncodeTimer = 0;
-      // 재생·재생바 끌기 중에는 화면이 기다리는 일(want)이 아니면 미룬다 — 인코드(toDataURL)가 재생 프레임 사이의 메인
-      // 스레드를 먹어 프레임을 건너뛴다(통짜 그림 변환 펌프와 같은 규칙).
-      if ((state.gengaPlaying || gengaPlaybackWarm || gengaScrubInFlight) && !gengaDeltaWant.size) { gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, GENGA_BG_STROKE_DEFER_MS); return; }
+      // 재생·재생바 끌기 중에는 화면이 기다리는 일(want)이 아니면 미룬다 — 메인에 남은 일(동기 베이크 리드백·delta 붕괴·
+      // 단색 칸 인코드)과 워커 결과 게시가 재생 프레임 사이의 메인 스레드를 먹어 프레임을 건너뛴다(통짜 그림 변환 펌프와 같은 규칙).
+      if (gengaPlaybackBusy() && !gengaDeltaWant.size) { gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, GENGA_BG_STROKE_DEFER_MS); return; }
       if (strokeInProgress()) { gengaTileEncodeTimer = setTimeout(gengaTileEncodePump, GENGA_BG_STROKE_DEFER_MS); return; } // strokeInProgress 판정 — 콘티 획도 물리고, 곡선 pending(포인터 없음)은 무기한 미루지 않는다
       // 베이크 대기가 있으면 그것부터, 태스크당 한 건만 — 리드백(GPU 동기화)이 태스크의 지배 비용이라
       // 인코드 배치와 같은 태스크에 안 섞는다. 남은 일은 재예약이 잇는다.
@@ -108473,10 +108384,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (gengaDrawStore.get(ref) !== ts) { gengaPendingTileEncode.delete(ref); continue; }
         if (gengaIsDrawDelta(ts)) continue;   // 붕괴 전 delta — 인코드할 cells 가 아직 없다(붕괴는 위 선택 로직의 몫)
         if (ts.pendingBake) continue;   // 대기 중인 prev(참조 없음) — 인코드·persist 하지 않는다(획이 빠진 부분 그림이 된다)
-        if (gengaTileCellsAllBlob(ts)) { gengaPendingTileEncode.delete(ref); gengaPersistTileSet(ref, ts); continue; }
+        if (gengaTileCellsAllBlob(ts)) { gengaPersistTileSet(ref, ts); continue; }
         if (ts.encodeFailures >= LAYER_BITMAP_FLUSH_MAX_ATTEMPTS) {
           gengaPendingTileEncode.delete(ref);
-          console.error('[gengaTile] giving up background encode for ' + ref + ' - serialize-time fallback remains');
+          console.error('[gengaTile] giving up background encode for ' + ref + ' - the next save encodes it synchronously');
           continue;
         }
         if (ts._encodeJob) continue;   // 메인 밖에서 굽는 중 — 끝나면 이 펌프를 다시 깨운다
@@ -108551,10 +108462,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           gengaStartTileEncodeJob(ref, ts);
           return;
         }
-        gengaEncodeTileCells(ts, Infinity);
-        // 동기 준비는 메인에 태운다. 본문 게시자는 이 쓰기의 성공도 기다린다.
-        if (gengaTileCellsAllBlob(ts)) gengaPersistTileSet(ref, ts, !(opts && opts.deltaAsync));
-        else console.error('[gengaTile] flush left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
+        // 동기 준비는 메인에 태운다. 본문 게시자는 이 쓰기의 성공도 기다린다. 못 구운 칸이 남으면 베이크 실패처럼 펌프에 돌려준다.
+        if (!gengaPersistTileSetNow(ref, ts, !(opts && opts.deltaAsync))) {
+          gengaScheduleTileEncode(ref, ts);
+          console.error('[gengaTile] flush left unencoded cell(s) for ' + ref + ' - the gd: row is not written yet');
+        }
       });
       // 참조 없는 묶음을 대기에 되돌렸으면 펌프가 idle 에서 잇는다 — 위에서 타이머를 지웠으므로 여기서 안
       // 깨우면 undo 가 올 때까지 잠든다.
@@ -108575,8 +108487,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     const gengaWholeRasterSkip = new Set();   // 이번 세션에 다시 변환하지 않는 ref — 등가·디코드·칸 확정·재저장 실패(재시도하면 실패 루프가 된다)
     let gengaWholeRasterTimer = 0;
     // 한 번에 한 장 — { ref, ts }. ts 가 없으면 변환 중(이미지 로드 대기 포함), 있으면 그 변환본의 칸이 Blob 으로
-    // 확정되기를 기다리는 중이다. 미확정(캔버스) 칸은 예산이 회수할 수 없는 픽셀이고 저장 직전 flush 가 동기로 전부
-    // 인코드한다 — 겹쳐 만들면 둘 다 장수에 비례한다.
+    // 확정되기를 기다리는 중이다. 미확정(캔버스) 칸은 예산이 회수할 수 없는 픽셀이고 저장이 그 인코드를 기다린다 —
+    // 겹쳐 만들면 둘 다 장수에 비례한다.
     let gengaWholeRasterActive = null;
     const GENGA_WHOLE_RASTER_ENCODE_WAIT_MS = 16;
     function gengaWholeRasterKick(ms) {
@@ -108627,7 +108539,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (active && !active.ts) return;   // 변환 중 — 그 변환이 끝나며 펌프를 다시 깨운다(그동안의 예약은 큐만 늘린다)
       // Whole rasters can be displayed and persisted without conversion. This is optional background work;
       // do not create a new tile/PNG workload while drawing, warming playback, playing, or scrubbing.
-      if (strokeInProgress() || state.gengaPlaying || gengaPlaybackWarm || gengaScrubInFlight) { gengaWholeRasterKick(GENGA_BG_STROKE_DEFER_MS); return; }
+      if (strokeInProgress() || gengaPlaybackBusy()) { gengaWholeRasterKick(GENGA_BG_STROKE_DEFER_MS); return; }
       if (active) {
         if (gengaPendingTileEncode.get(active.ref) === active.ts) { gengaWholeRasterKick(GENGA_WHOLE_RASTER_ENCODE_WAIT_MS); return; }
         gengaWholeRasterActive = null;
@@ -108683,7 +108595,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!img || !img.naturalWidth) { gengaWholeRasterSkip.add(String(ref)); console.error('[gengaTile] whole-raster decode failed for ' + ref + ' - keeping the whole bitmap'); return; }
       // Input/playback can start while Image decodes. Retry the ref after it stops, before allocating
       // surfaces or publishing tiles; the existing store identity guard still owns cancellation.
-      if (strokeInProgress() || state.gengaPlaying || gengaPlaybackWarm || gengaScrubInFlight) { gengaScheduleWholeRasterConvert(ref); return; }
+      if (strokeInProgress() || gengaPlaybackBusy()) { gengaScheduleWholeRasterConvert(ref); return; }
       const w = img.naturalWidth, h = img.naturalHeight;   // placed 그림은 1:1 — 그리기 커널과 같은 규약
       const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
       const cx = cv.getContext('2d', { willReadFrequently: true });
@@ -123080,7 +122992,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const source = Object.assign({ kind: 'clip', fileName: file.name, fileHandle: request.fileHandle || null }, sourceIdentity);
         setProjectFileSource(state.project, source);
         owner = request.owner = projectIoOwner(request);
-        projectSessionSnapshots.delete(String(state.project.projectId)); releaseProjectTabHistory(state.project.projectId);
+        forgetProjectSession(state.project.projectId);
         markProjectSavedBaseline();
         await rememberProjectSource(owner, source);
         assertProjectIoOwner(owner);
@@ -123708,13 +123620,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return { data: crop, w: cw, h: chh, x: x0, y: y0 };
     }
-    // PNG and TVPP encoding workers live only for one import or export operation.
+    // 워커 풀. 가져오기·내보내기는 한 작업 동안만 열고 빈 워커가 없으면 메인 경로로 간다(tvppWorkerPoolRun). 여러 작업이
+    // 재사용하는 풀(칸 인코드·원화 썸 굽기·참고 이미지)은 빈 워커를 기다린다(tvppWorkerPoolQueue — 대기열은 풀이 가진다).
     // 답은 {id, ...}. 워커가 일을 못 하면 {id, error, buf}로 받은 픽셀을 돌려주고, 호출부가 메인 경로로 같은 결과를
     // 만든다. 워커가 죽으면 맡긴 픽셀은 돌아오지 않으므로 그 일은 실패(reject)로 알린다.
+    function offscreenWorkerSupported() {
+      return typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
+        && typeof OffscreenCanvas.prototype.convertToBlob === 'function' && typeof createImageBitmap === 'function';
+    }
     function tvppWorkerPoolOpen(src, size, label) {
       if (typeof Worker !== 'function') return null;
       let url = null;
-      const pool = { idle: [], all: [], jobs: new Map(), seq: 0, dead: false, label: label };
+      const pool = { idle: [], all: [], jobs: new Map(), queue: [], seq: 0, dead: false, label: label };
       try {
         url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
         for (let i = 0; i < size; i++) {
@@ -123725,6 +123642,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             pool.jobs.delete(m.id);
             pool.idle.push(w);
             job(m);
+            tvppWorkerPoolDrain(pool);
           };
           // 한 워커가 죽으면 풀 전체를 닫는다: 죽은 풀은 새 일을 받지 않고 진행 중 작업도 모두 실패로 끝나므로, 살아 있는
           // 동료를 남겨 두면 그 늦은 답(전달된 ImageBitmap 포함)이 받을 사람 없이 버려진다.
@@ -123749,18 +123667,59 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const jobs = Array.from(pool.jobs.values());
       pool.jobs.clear();
       jobs.forEach(function(job) { job({ error: 'closed', fatal: true }); });
+      tvppWorkerPoolDrain(pool);   // 아직 안 보낸 일은 null(보낸 일은 위에서 reject) — 부르는 쪽 대체 경로로
     }
     // → 워커의 답 / null(빈 워커 없음 → 메인 경로). 일을 못 한 답(error)이 오면 이후 일은 메인으로 보낸다.
     function tvppWorkerPoolRun(pool, msg, transfer) {
       if (!pool || pool.dead || !pool.idle.length) return Promise.resolve(null);
-      const w = pool.idle.pop(), id = ++pool.seq;
+      return tvppWorkerPoolSend(pool, pool.idle.pop(), msg, transfer);
+    }
+    // 빈 워커가 날 때까지 기다려 실행한다 → 워커 답, 풀이 없거나 죽었거나 닫히면 null(워커가 죽으면 reject — Run 과 같다).
+    // job: { msg, transfer } 또는 { prepare() → Promise<{ msg, transfer } | null> } — prepare 는 워커를 잡은 뒤에 부른다(큰
+    // 전달물을 빈 워커가 있을 때만 만든다). timeoutMs: 보낸 순간부터(대기열에서 기다린 시간은 빼고) 답이 없으면 풀을 닫는다 —
+    // WebKit 이 오류 없이 멈춘 관측이 있다.
+    function tvppWorkerPoolQueue(pool, job) {
+      if (!pool || pool.dead) return Promise.resolve(null);
+      return new Promise(function(resolve, reject) { pool.queue.push({ job: job, resolve: resolve, reject: reject }); tvppWorkerPoolDrain(pool); });
+    }
+    function tvppWorkerPoolDrain(pool) {
+      if (pool.dead) { pool.queue.splice(0).forEach(function(q) { q.resolve(null); }); return; }
+      while (pool.queue.length && pool.idle.length) tvppWorkerPoolDispatch(pool, pool.queue.shift(), pool.idle.pop());
+    }
+    // 잡은 워커 w 로 대기 작업 q 하나를 준비·전송한다. 동기로 던지지 않는다 — 준비 실패(동기 예외 포함)·못 보냄은 이 작업을 null 로
+    // 끝낸 뒤에 워커를 돌려주고 다음을 잇는다.
+    function tvppWorkerPoolDispatch(pool, q, w) {
+      const giveBack = function() { q.resolve(null); if (!pool.dead) { pool.idle.push(w); tvppWorkerPoolDrain(pool); } };
+      let ready;
+      try { ready = Promise.resolve(q.job.prepare ? q.job.prepare() : q.job); } catch (e) { ready = Promise.reject(e); }
+      ready.then(function(r) {
+        if (!r || pool.dead) {
+          ((r && r.transfer) || []).forEach(function(t) { if (t && typeof t.close === 'function') t.close(); });   // 못 보낸 비트맵
+          giveBack(); return;
+        }
+        const timer = q.job.timeoutMs ? setTimeout(function() {
+          console.error('[tvpp] ' + pool.label + ' worker did not answer - closing the pool');
+          tvppWorkerPoolClose(pool);
+        }, q.job.timeoutMs) : 0;
+        tvppWorkerPoolSend(pool, w, r.msg, r.transfer || []).then(function(m) { clearTimeout(timer); q.resolve(m); },
+          function(e) { clearTimeout(timer); q.reject(e); });
+      }, giveBack);
+    }
+    // 워커 w 에 일을 보낸다 → 답. 보내기가 동기로 던지면(복제 불가 등) 등록을 지우고 워커를 돌려준 뒤 reject — 워커는 일을 받지 않았다.
+    function tvppWorkerPoolSend(pool, w, msg, transfer) {
+      const id = ++pool.seq;
       return new Promise(function(resolve, reject) {
         pool.jobs.set(id, function(m) {
           if (m.fatal) { reject(new Error('TVPP ' + pool.label + ' worker failed: ' + m.error)); return; }
           if (m.error) { console.warn('[tvpp] ' + pool.label + ' in worker failed - main thread from here', m.error); pool.dead = true; }
           resolve(m);
         });
-        w.postMessage(Object.assign({ id: id }, msg), transfer);
+        try { w.postMessage(Object.assign({ id: id }, msg), transfer); }
+        catch (e) {
+          pool.jobs.delete(id);
+          if (!pool.dead) { pool.idle.push(w); Promise.resolve().then(function() { tvppWorkerPoolDrain(pool); }); }
+          reject(e);
+        }
       });
     }
     // PNG 인코드는 워커의 OffscreenCanvas.convertToBlob 으로 한다. 메인 캔버스 toBlob 은 Chromium 에서
@@ -124034,7 +123993,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const source = Object.assign({ kind: 'tvpp', fileName: file.name, fileHandle: request.fileHandle || null }, sourceIdentity);
         setProjectFileSource(state.project, source);
         owner = request.owner = projectIoOwner(request);
-        projectSessionSnapshots.delete(String(state.project.projectId)); releaseProjectTabHistory(state.project.projectId);
+        forgetProjectSession(state.project.projectId);
         markProjectSavedBaseline();
         await rememberProjectSource(owner, source);
         assertProjectIoOwner(owner);
@@ -135504,11 +135463,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 두어 멈춘 자리의 다시 그리기·선택 규칙은 건너뛴다: 옛 프로젝트는 곧 떠난다.
       state.gengaPlaying = false; stopGengaPlayback();
       state.gengaSoloView = false; document.documentElement.classList.remove('genga-solo-on'); // 보기 상태도 옛 프로젝트의 것이다
-      gengaImageCache.clear(); // Decoded rasters belong to the outgoing project, independently of encoded stores.
-      gengaVectorThumbCache.clear();
-      // 동화 채우기·환경 마스크·벡터 굽기도 옛 프로젝트 그림의 파생 픽셀이다 — 남기면 LRU 로 밀릴 때까지 예산을 쥔다.
-      gengaSilInvalidateCaches(); gengaVectorBakeCache.clear();
-      gengaReleaseCompositeScratch();
+      gengaReleaseCompositeScratch();   // 해독·파생 캐시는 resetProjectTransientRuntime 의 dropRebuildableDisplayCaches 가 비운다
       gengaClearOtherSelections('');
       // 선택 규칙: 프로젝트 교체는 전부 비운다 — 레이어 집합·앵커·오디오 레인은 옛 프로젝트의 id·번호다
       // (오디오 레인은 다음 가져오기·녹음 위치를 정한다).
@@ -142394,7 +142349,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const tick = function() {
         if (!state.gengaPlaying) return;
         const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
-        let f = gengaPlayStartFrame + Math.floor((now - gengaPlayStartTime) / 1000 * fps);
+        let f = gengaPlayStartFrame + clockElapsedFrames(gengaPlayStartTime, fps, now);   // 콘티 재생과 같은 규칙(그림은 내림)
         if (f > r.hi) {
           if (state.gengaRepeat) { gengaPlayStartFrame = r.lo; gengaPlayStartTime = now; f = r.lo; gengaStartAudioPlayback(r.lo); }
           else { setGengaFrame(r.hi); stopGengaPlayback(); return; }
@@ -144171,13 +144126,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return 0;
     }
 
-    // Total pixel-cache budget for the device, split into per-cache shares below. deviceMemory is a coarse GB
-    // hint (absent on some engines → assume a modest 4GB machine rather than a generous one).
-    // 상한·하한은 사용자 판정이다. 두 가지 제약을 본다:
-    // ① Chrome 의 deviceMemory 는 상한이 걸린 값이라(데스크톱 상한은 Chrome 147 부터 변경) 큰 머신끼리 구분이
-    // 안 될 수 있다 — 도달할 수 없는 클램프 값을 두지 않는다.
-    // ② `deviceMemory` 는 Safari 전 버전에 없어 아이패드는 실기가 8~16GB 여도 늘 4 로 폴백한다. 그래서 하한을
-    // 올려야 그 폴백이 덜 아프다.
+    // Total pixel-cache budget for the device, split into per-cache shares below. 기기별 값·클램프는 MEMORY_BUDGET_MB 표가 정한다.
     // 이 예산은 원본 픽셀의 상주량이다(축소 사본 없음) — 모자라면 흐려지는 것이 아니라 디코드 캐시 히트율이
     // 떨어진다. 참고 수치: Pencil2D 는 기본 1GB(클램프 100MB~16GB), Krita 는 RAM 의 50% + 스왑 4096MiB.
     // 브라우저 탭은 OOM 이 곧 작업 손실이므로 네이티브보다 보수적으로 잡는다.
