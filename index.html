@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3323</title>
+  <title>MoArt ver3324</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -21308,7 +21308,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!gt) return '';
       const out = {};
       Object.keys(gt).sort().forEach(function(key) {
-        if (key === 'layers' || key === 'audioClips' || key === 'audioLaneVol' || key === 'audioVolume') return;
+        if (key === 'layers' || key === 'audioClips' || key === 'audioLaneVol' || key === 'audioVolume' || key === 'dialogue') return;
         out[key] = gt[key];
       });
       return JSON.stringify(out);
@@ -21340,7 +21340,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!beforeProject || !afterProject || beforeProject.kind !== 'genga' || afterProject.kind !== 'genga') return null;
       const beforeGt = beforeProject.gengaTimeline, afterGt = afterProject.gengaTimeline;
       if (!beforeGt || !afterGt) return { scope: 'all' };
-      if (String(beforeProject.title || '') !== String(afterProject.title || '')) return { scope: 'all' };
+      const topbar = String(beforeProject.title || '') !== String(afterProject.title || '');
       // 수정용지 색(project.settings.gengaRevisionColors)은 gengaTimeline.layers 밖이라 아래 레이어 diff 로
       // 잡히지 않는다. 리비전 레이어 태그 색이 이 값을 읽으므로 따로 본다.
       if (JSON.stringify((beforeProject.settings || {}).gengaRevisionColors || {}) !== JSON.stringify((afterProject.settings || {}).gengaRevisionColors || {})) return { scope: 'all' };
@@ -21348,6 +21348,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const afterIds = (afterGt.layers || []).map(function(layer) { return String(layer.id); });
       if (beforeIds.join('\u0001') !== afterIds.join('\u0001')) return { scope: 'all' };
       if (gengaTimelineContentExtent(beforeGt) !== gengaTimelineContentExtent(afterGt)) return { scope: 'all' };
+      if (gengaDialogueRowsShape(beforeGt) !== gengaDialogueRowsShape(afterGt)) return { scope: 'all' };
+      const dialogue = JSON.stringify(beforeGt.dialogue) !== JSON.stringify(afterGt.dialogue);
       if (gengaTimelineGlobalRenderSignature(beforeGt) !== gengaTimelineGlobalRenderSignature(afterGt)) return { scope: 'all' };
       if (gengaLayerGlobalRenderSignature(beforeGt) !== gengaLayerGlobalRenderSignature(afterGt)) return { scope: 'all' };
       const beforeById = {};
@@ -21364,9 +21366,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const audioBefore = audioPlaybackSignature(beforeProject);
       const audioAfter = audioPlaybackSignature(afterProject);
       const audio = audioBefore !== audioAfter;
-      if (!layerIds.length && !audio) return { scope: 'none' };
+      if (!layerIds.length && !audio && !dialogue && !topbar) return { scope: 'none' };
       // A-Z 탭은 행의 자식이라 행 패치에 함께 간다. 높이가 바뀐 레이어도 layerIds 에 들어 있다.
-      return { scope: 'partial', layerIds: layerIds, audio: audio };
+      return { scope: 'partial', layerIds: layerIds, audio: audio, dialogue: dialogue, topbar: topbar };
     }
     function runCommand(name, mutator, refreshOptions) {
       paintInputFlushSync(); // Synchronous command callers retain their return/ownership contract.
@@ -24399,7 +24401,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let contePaperMeasureCtx = null;
     // 상자 폭으로 줄바꿈해 들어가는 가장 큰 글자 크기(base 에서 0.92 배씩, 최소·한계는 꼭 한 번 잰다). 최소로도 넘치면 fits false — 칸을
     // 늘릴 수 있으면 호출 쪽이 늘린다. shrinkPast(칸을 더 늘릴 수 없음)면 한계까지 줄이고, 그래도 넘치면 overflow — 그리는 쪽이 「…」.
+    // 측정 컨텍스트·글꼴 집합·폭에 영향을 주는 상태가 같을 때만 재사용한다. 로딩 중에는 저장하지 않는다.
+    // 결과는 복사해 돌려주며 최대 2048건/키 1M UTF-16 단위만 보유한다(큰 글 한 건은 캐시하지 않는다).
+    const contePaperFitCache = new Map();
+    let contePaperFitCacheUnits = 0, contePaperFitCacheCtx = null, contePaperFitFontState = '';
+    let contePaperFitFontFaces = [];
     function fitPaperText(text, w, h, base, shrinkPast) {
+      const value = String(text || '').trim(), fonts = document.fonts;
+      if (!value || !(w > 0 && h > 0)) return measurePaperText(value, w, h, base, shrinkPast);
+      if (!contePaperMeasureCtx) contePaperMeasureCtx = document.createElement('canvas').getContext('2d');
+      const ctx = contePaperMeasureCtx, P = CONTE_PAPER, faces = fonts ? Array.from(fonts) : [];
+      // 이미 로드된 FontFace의 add/delete/descriptor 변경도 loading 이벤트 없이 측정값을 바꿀 수 있다.
+      const fontState = JSON.stringify(faces.map(function(f) {
+        return [f.family, f.style, f.weight, f.stretch, f.unicodeRange, f.variant, f.featureSettings,
+          f.variationSettings, f.status, f.sizeAdjust, f.ascentOverride, f.descentOverride, f.lineGapOverride];
+      }));
+      const ready = fonts && fonts.status === 'loaded';
+      if (!ready || ctx !== contePaperFitCacheCtx || fontState !== contePaperFitFontState ||
+          faces.length !== contePaperFitFontFaces.length || faces.some(function(f, i) { return f !== contePaperFitFontFaces[i]; })) {
+        contePaperFitCache.clear(); contePaperFitCacheUnits = 0;
+        contePaperFitCacheCtx = ctx; contePaperFitFontState = fontState; contePaperFitFontFaces = faces;
+      }
+      const key = ready && value.length <= 16384 ? JSON.stringify([value, w, h, base, !!shrinkPast,
+        P.font, P.textMin, P.textFloor, P.line, P.paraGap,
+        ctx.direction, ctx.lang, ctx.fontKerning, ctx.fontStretch, ctx.fontVariantCaps,
+        ctx.letterSpacing, ctx.wordSpacing, ctx.textRendering,
+        ctx.canvas.lang, ctx.canvas.dir, document.documentElement.lang, document.documentElement.dir]) : null;
+      const cached = key && contePaperFitCache.get(key);
+      if (cached) {
+        ctx.font = outputFont(cached.fs, P.font);
+        return Object.assign({}, cached);
+      }
+      const result = measurePaperText(value, w, h, base, shrinkPast);
+      if (key) {
+        while (contePaperFitCache.size >= 2048 || contePaperFitCacheUnits + key.length > 1048576) {
+          const oldest = contePaperFitCache.keys().next().value;
+          contePaperFitCache.delete(oldest); contePaperFitCacheUnits -= oldest.length;
+        }
+        contePaperFitCache.set(key, Object.assign({}, result)); contePaperFitCacheUnits += key.length;
+      }
+      return result;
+    }
+    if (document.fonts) {
+      ['loading', 'loadingdone', 'loadingerror'].forEach(function(type) {
+        document.fonts.addEventListener(type, function() { contePaperFitCache.clear(); contePaperFitCacheUnits = 0; });
+      });
+    }
+    function measurePaperText(text, w, h, base, shrinkPast) {
       const value = String(text || '').trim();
       if (!value) return { fs: base, fits: true };
       if (!(w > 0 && h > 0)) return { fs: base, fits: false, overflow: true };
@@ -24408,8 +24456,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const next = function(fs) { return fs > min + 1e-6 ? Math.max(min, fs * 0.92) : Math.max(floor, fs * 0.92); };
       for (let fs = base; ; fs = next(fs)) {
         ctx.font = outputFont(fs, P.font);
-        const lines = paragraphs.reduce(function(sum, p) { return sum + wrapTextLine(ctx, p, w).length; }, 0);
-        if ((lines + (paragraphs.length - 1) * P.paraGap) * fs * P.line <= h) return { fs: fs, fits: fs >= min - 1e-6 };
+        const maxLines = h / (fs * P.line) - (paragraphs.length - 1) * P.paraGap;
+        let lines = 0;
+        const fits = paragraphs.every(function(p) {
+          lines += wrapTextLine(ctx, p, w, maxLines - lines + 1).length;
+          return (lines + (paragraphs.length - 1) * P.paraGap) * fs * P.line <= h;
+        });
+        if (fits) return { fs: fs, fits: fs >= min - 1e-6 };
         if (!shrinkPast && fs <= min + 1e-6) return { fs: fs, fits: false };
         if (fs <= floor + 1e-6) return { fs: fs, fits: false, overflow: true };
       }
@@ -25506,6 +25559,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3324, items: [{ja: '大きなプロジェクトでの編集を軽く(原画のタイトル・セリフ編集は該当部分だけ描き直し、コンテ用紙の文字合わせを再利用)', ko: '큰 프로젝트의 편집을 가볍게(원화 제목·대사 편집은 해당 부분만 다시 그림, 콘티 용지 글 맞춤 재사용)', en: 'Lighter edits in large projects (genga title and dialogue edits redraw only their part; storyboard paper text fitting is reused)', zh: '大型项目编辑更轻快(原画标题·台词编辑只重绘相关部分，分镜纸张文字排版结果复用)'}, {ja: 'セリフや音声を変えたとき口パク表示がすぐ更新されるように', ko: '대사·음성을 바꾸면 口パク 표시가 바로 갱신되게', en: 'The lip-sync display updates immediately when dialogue or audio changes', zh: '修改台词或音频时口型显示立即更新'}] },
       { ver: 3323, items: [{ja: '通常の塗りつぶしを作業スレッドで(大きな範囲でも画面が止まらない)', ko: '일반 채우기를 작업 스레드로(넓은 영역에서도 화면이 멈추지 않음)', en: 'Regular bucket fill now runs in a worker (no freeze on large areas)', zh: '普通填充改在工作线程(大范围也不卡顿)'}, {ja: '原画の保存・書き出し準備で描きかけの絵の切り分けを作業スレッドで待つように(保存時の停止を減らす)', ko: '원화 저장·출력 준비가 그리던 그림의 칸 굽기를 작업 스레드에서 기다리게(저장 때 멈춤 감소)', en: 'Genga saving and export preparation wait for pending tile bakes in the worker (fewer stalls on save)', zh: '原画保存与导出准备改为在工作线程等待未完成的分块(减少保存时卡顿)'}] },
       { ver: 3322, items: [{ja: '内部の整理を続けました。原画の再生開始で音声デバイスを起こせなかったとき、エラーにならず静かに止まります。', ko: '내부 정리를 이어 했습니다. 원화 재생을 시작할 때 오디오 장치를 깨우지 못하면 오류 없이 조용히 넘어갑니다.', en: 'More internal cleanup. When genga playback cannot wake the audio device, it now stops quietly instead of raising an error.', zh: '继续内部整理。原画播放开始时若无法唤醒音频设备，将安静跳过而不再报错。'}] },
       { ver: 3321, items: [{ja: '口パクの音声分析・PSD用紙の読み込みを作業スレッドで(長い音声や大きなPSDで止まらない)', ko: '口パク 음성 분석·PSD 용지 불러오기를 작업 스레드로(긴 음성·큰 PSD 에서 멈추지 않음)', en: 'Lip-sync voice analysis and PSD paper loading now run in a worker (no freeze on long audio or large PSDs)', zh: '口型语音分析与PSD纸张读取改在工作线程(长音频·大PSD不再卡顿)'}, {ja: 'セル移動指示の書き出しで同じ絵を使う露出の合成を1回に(書き出しが速く)', ko: '셀 이동 지시 출력에서 같은 그림을 쓰는 노출의 합성을 한 번으로(출력이 빨라짐)', en: 'Cel-move instruction export composites a drawing reused by many exposures only once (faster export)', zh: '移动赛璐珞指示导出时，同一画面的多个曝光只合成一次(导出更快)'}] },
@@ -105904,21 +105958,24 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return cursorY;
     }
 
-    function wrapTextLine(ctx, text, maxWidth) {
+    // maxLines is only a fit probe: return an overflowing prefix once further wrapping cannot make it fit.
+    // Output callers omit it and receive every original line.
+    function wrapTextLine(ctx, text, maxWidth, maxLines) {
       if (!text) return [''];
       if (ctx.measureText(text).width <= maxWidth) return [text];
       const chars = Array.from(text);
       const lines = [];
       let line = '';
-      chars.forEach(function(char) {
+      for (const char of chars) {
         const next = line + char;
         if (line && ctx.measureText(next).width > maxWidth) {
           lines.push(line);
+          if (lines.length > maxLines) return lines;
           line = char;
         } else {
           line = next;
         }
-      });
+      }
       if (line) lines.push(line);
       return lines;
     }
@@ -116561,7 +116618,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 대사 행의 줄 수·높이를 정하는 것: 켜짐, 레인 수, 맞추는 대사의 레인(그 레인과 머리 줄이 높고 조작 줄이 붙는다).
     function gengaDialogueRowsShape(gt) {
       if (!state.gengaDialogueLanes) return 'off';
-      const e = gengaDlgAlign && gengaDialogueFind(state.project, gengaDlgAlign.id);
+      const e = gengaDlgAlign && ((gt.dialogue && gt.dialogue.entries) || []).find(function(entry) { return entry.id === gengaDlgAlign.id; });
       return ((gt.dialogue && gt.dialogue.lanes) || 1) + ':' + (e ? e.lane : '-');
     }
     function gengaDialogueRowsHtml(gt) {
@@ -142839,6 +142896,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // 대사 행은 머리·레인을 함께 바꾼다(한쪽만 바뀌면 높이가 어긋난다). 호출자가 모양이 같을 때만 요청한다.
         const dialoguePairs = renderPlan.dialogue ? [requirePair(currentPanel, nextPanel, '.genga-dlg-heads', 'dialogue heads'),
           requirePair(currentPanel, nextPanel, '.genga-dlg-lanes', 'dialogue lanes')] : [];
+        const topbarPair = renderPlan.topbar ? requirePair(currentPanel, nextPanel, '.genga-topbar', 'topbar') : null;
         // Preflight above is complete: no live node changes before every required pair exists.
         const seenRows = new Set();
         rowPairs.forEach(function(pair) {
@@ -142860,6 +142918,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           audioNodes.currentAudioLanes.replaceChildren(...audioNodes.nextAudioLanes.childNodes);
         }
         dialoguePairs.forEach(replacePair);
+        if (topbarPair) replacePair(topbarPair);
         return 'patched';
       }
       // Full generated-content patch: preflight the complete contract before touching any live descendant.
@@ -143559,21 +143618,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
       }
       const importCheck = gengaSheetImportReportFor(project);
-      // A partial patch parses only the selected row/audio fragments — building and reparsing the full stage
-      // string when one keyed row changes would preserve node identity but still pay the Rule-5 O(all)
-      // build/parse tax. The patcher needs only these selector-bearing containers for a partial operation.
-      return partialRender ?
-        '<div class="genga-preview"></div>' +
-        '<div class="genga-timeline-panel" data-chrome-hide="canvas phone">' + dlgHead + dlgLane +
-          '<div class="genga-vscroll-heads">' + rowsHead + '</div>' +
-          '<div class="genga-vscroll"><div class="genga-lanes">' + rowsLane + '</div></div>' +
-          '<div class="genga-audio-scroll-heads" style="height:' + audioRegionH + 'px">' + audioHead + '</div>' +
-          '<div class="genga-audio-scroll" style="height:' + audioRegionH + 'px"><div class="genga-audio-lanes-wrap">' + audioLane + '</div></div>' +
-        '</div>' :
-        '<div id="gengaPreviewInput" class="genga-preview"><canvas id="gengaPreviewCanvas" class="genga-preview-canvas"></canvas></div>' +
-        // The whole timeline block (topbar + dopesheet + hscroll) sits in one card panel,
-        // visually independent from the preview — same grammar as the conte video-editor-timeline
-        '<div class="genga-timeline-panel" data-chrome-hide="canvas phone" style="--genga-heads-extra-w:' + gengaHeadsExtraWidth() + 'px">' +
+      const topbarHtml = !partialRender || renderPlan.topbar ?
         '<div class="genga-topbar">' +
           '<span class="tl-win-grab" data-genga-tl-grab="true" title="' + escapeAttr(t('toolbar.dragMove')) + '"></span>' + // Dot = only drag handle
           gengaTransportControlsHtml() +
@@ -143593,7 +143638,23 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
               return escapeHtml(shortTitle) + ' / ' + gt.camera.w + '×' + gt.camera.h;
             })() +
           '</button>' +
-        '</div>' +
+        '</div>' : '';
+      // A partial patch parses only the selected row/audio fragments — building and reparsing the full stage
+      // string when one keyed row changes would preserve node identity but still pay the Rule-5 O(all)
+      // build/parse tax. The patcher needs only these selector-bearing containers for a partial operation.
+      return partialRender ?
+        '<div class="genga-preview"></div>' +
+        '<div class="genga-timeline-panel" data-chrome-hide="canvas phone">' + topbarHtml + dlgHead + dlgLane +
+          '<div class="genga-vscroll-heads">' + rowsHead + '</div>' +
+          '<div class="genga-vscroll"><div class="genga-lanes">' + rowsLane + '</div></div>' +
+          '<div class="genga-audio-scroll-heads" style="height:' + audioRegionH + 'px">' + audioHead + '</div>' +
+          '<div class="genga-audio-scroll" style="height:' + audioRegionH + 'px"><div class="genga-audio-lanes-wrap">' + audioLane + '</div></div>' +
+        '</div>' :
+        '<div id="gengaPreviewInput" class="genga-preview"><canvas id="gengaPreviewCanvas" class="genga-preview-canvas"></canvas></div>' +
+        // The whole timeline block (topbar + dopesheet + hscroll) sits in one card panel,
+        // visually independent from the preview — same grammar as the conte video-editor-timeline
+        '<div class="genga-timeline-panel" data-chrome-hide="canvas phone" style="--genga-heads-extra-w:' + gengaHeadsExtraWidth() + 'px">' +
+        topbarHtml +
         '<div class="genga-dopesheet">' +
           '<div class="genga-layers-col">' +
             '<div class="genga-col-head">' + timelineSettingsButtonHtml() + '<span class="genga-onion-slot"></span><span class="genga-colhead-gap"></span><button id="gengaSoloViewBtn" class="genga-solo-eye genga-head-btn' + (state.gengaSoloView ? ' active' : '') + '" type="button" title="' + escapeAttr(t('project.genga.soloViewTitle')) + '" aria-label="' + escapeAttr(t('project.genga.soloViewTitle')) + '" aria-pressed="' + (state.gengaSoloView ? 'true' : 'false') + '">' + gengaEyeIconSvg() + '</button><button class="genga-add-layer" type="button" title="' + escapeAttr(t('menu.conteLayer.add')) + '" aria-label="' + escapeAttr(t('menu.conteLayer.add')) + '">' + appIconSvg('plus') + '</button></div>' + dlgHead + camHead +
@@ -143634,6 +143695,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     const gengaBoundViewNodes = new WeakSet();
     function gengaBindView(stageEl, renderPlan, partialRender) {
       const newlyBoundNodes = new Set();
+      // Keyed patches only create controls inside their requested heads/lanes. Retained rows already
+      // own their listeners; scanning their entire exposure trees for each selector is unnecessary.
+      const bindingRoots = partialRender ? [] : [stageEl];
+      if (partialRender) {
+        const ids = new Set((renderPlan.layerIds || []).map(String));
+        stageEl.querySelectorAll('.genga-layer-head[data-genga-layer], .genga-lane[data-genga-layer]').forEach(function(el) {
+          if (ids.has(el.dataset.gengaLayer)) bindingRoots.push(el);
+        });
+        if (renderPlan.topbar) bindingRoots.push(stageEl.querySelector('.genga-topbar'));
+        if (renderPlan.dialogue) bindingRoots.push(stageEl.querySelector('.genga-dlg-heads'), stageEl.querySelector('.genga-dlg-lanes'));
+        if (renderPlan.audio) bindingRoots.push(stageEl.querySelector('.genga-audio-scroll-heads'), stageEl.querySelector('.genga-audio-scroll'));
+      }
       const gengaUnboundNode = function(el) {
         if (!el || gengaBoundViewNodes.has(el)) return null;
         newlyBoundNodes.add(el);
@@ -143643,12 +143716,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return gengaUnboundNode(stageEl.querySelector(selector));
       };
       const gengaShowNodes = function(selector) {
-        return Array.from(stageEl.querySelectorAll(selector)).filter(gengaUnboundNode);
+        if (!partialRender) return Array.from(stageEl.querySelectorAll(selector)).filter(gengaUnboundNode);
+        const nodes = new Set();
+        bindingRoots.forEach(function(root) {
+          if (!root) return;
+          if (root.matches(selector)) nodes.add(root);
+          root.querySelectorAll(selector).forEach(function(el) { nodes.add(el); });
+        });
+        return Array.from(nodes).filter(gengaUnboundNode);
       };
       gengaBindLayerControls(stageEl, gengaShowOne, gengaShowNodes);
       gengaBindTimelineNavigation(stageEl, gengaShowOne, gengaShowNodes);
       const partialLayerIds = partialRender && Array.isArray(renderPlan.layerIds) ? renderPlan.layerIds : null;
       if (!partialRender || (partialLayerIds && partialLayerIds.length)) drawGengaPreview();
+      else if (renderPlan.dialogue || renderPlan.audio) gengaLipsyncUpdateHud();
       drawGengaLayerThumbs(partialLayerIds);
       gengaUpdateZoomHeader(); // shared-header label + camera-frame active state for this project
       gengaHydrateDrawStore(state.project); // load any {ref} drawings missing from memory (autosave restore) → re-render
@@ -144667,8 +144748,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Choosing gengaRenderPlan.scope:
     // 'all'     — the camera lane, or any cross-layer label sequence, may have changed. The camera lane and the
     // a/b/c.. FX label sequence are only rebuilt on a non-partial render.
-    // 'partial' — one layer's own row content changed and nothing outside that row derives from it. The two
-    // lean paths must still run gengaLayerDependenciesChanged() and escalate to 'all' when it is true.
+    // 'partial' — keyed layer/audio/dialogue rows or the topbar changed without changing geometry. The two
+    // lean layer paths must still run gengaLayerDependenciesChanged() and escalate to 'all' when it is true.
     // 'none'    — nothing visible changed; the stage render is skipped (the timesheet still refreshes).
     // The two plan producers are gengaRenderPlanForProjects (signature diff, used by runCommand) and the
     // hand-built plans in the lean per-layer paths; keep any new cross-layer dependency in step with both.
