@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3327</title>
+  <title>MoArt ver3328</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -21024,8 +21024,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Genga's docked timeline panel (top/bottom; the floating 'window' mode sizes via gengaTlWinH) has its own
     // height with a drag handle. Same idea as clampTimelineTracksHeight: the floor keeps a couple of rows visible,
     // the ceiling leaves room for the canvas above.
-    function clampGengaDopesheetHeight(value) {
-      const max = Math.max(160, Math.round(uiLocalViewportH() - 200));
+    function clampGengaDopesheetHeight(value, viewportHeight) {
+      const max = Math.max(160, Math.round((viewportHeight == null ? uiLocalViewportH() : viewportHeight) - 200));
       return clampInt(value, 120, max, 240);
     }
 
@@ -24406,27 +24406,36 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     const contePaperFitCache = new Map();
     let contePaperFitCacheUnits = 0, contePaperFitCacheCtx = null, contePaperFitFontState = '';
     let contePaperFitFontFaces = [];
-    function fitPaperText(text, w, h, base, shrinkPast) {
-      const value = String(text || '').trim(), fonts = document.fonts;
-      if (!value || !(w > 0 && h > 0)) return measurePaperText(value, w, h, base, shrinkPast);
-      if (!contePaperMeasureCtx) contePaperMeasureCtx = document.createElement('canvas').getContext('2d');
-      const ctx = contePaperMeasureCtx, P = CONTE_PAPER, faces = fonts ? Array.from(fonts) : [];
+    // 측정 환경(글꼴 집합·로드 상태·측정 컨텍스트 상태·문서 언어/방향)은 한 번의 동기 실행 안에서 바뀌지 않는다 — 한 번 읽고 그 실행
+    // (마이크로태스크 전)까지만 쓴다. 용지 재배치 한 번이 글 맞춤을 수백 번 부르므로 부를 때마다 글꼴 목록을 직렬화하던 몫이 컸다.
+    let contePaperFitEnvNow = null;
+    function contePaperFitEnv(ctx) {
+      if (contePaperFitEnvNow && contePaperFitEnvNow.ctx === ctx) return contePaperFitEnvNow;
+      const fonts = document.fonts, faces = fonts ? Array.from(fonts) : [], P = CONTE_PAPER;
       // 이미 로드된 FontFace의 add/delete/descriptor 변경도 loading 이벤트 없이 측정값을 바꿀 수 있다.
       const fontState = JSON.stringify(faces.map(function(f) {
         return [f.family, f.style, f.weight, f.stretch, f.unicodeRange, f.variant, f.featureSettings,
           f.variationSettings, f.status, f.sizeAdjust, f.ascentOverride, f.descentOverride, f.lineGapOverride];
       }));
-      const ready = fonts && fonts.status === 'loaded';
+      const ready = Boolean(fonts && fonts.status === 'loaded');
       if (!ready || ctx !== contePaperFitCacheCtx || fontState !== contePaperFitFontState ||
           faces.length !== contePaperFitFontFaces.length || faces.some(function(f, i) { return f !== contePaperFitFontFaces[i]; })) {
         contePaperFitCache.clear(); contePaperFitCacheUnits = 0;
         contePaperFitCacheCtx = ctx; contePaperFitFontState = fontState; contePaperFitFontFaces = faces;
       }
-      const key = ready && value.length <= 16384 ? JSON.stringify([value, w, h, base, !!shrinkPast,
-        P.font, P.textMin, P.textFloor, P.line, P.paraGap,
+      contePaperFitEnvNow = { ctx: ctx, ready: ready, key: JSON.stringify([P.font, P.textMin, P.textFloor, P.line, P.paraGap,
         ctx.direction, ctx.lang, ctx.fontKerning, ctx.fontStretch, ctx.fontVariantCaps,
         ctx.letterSpacing, ctx.wordSpacing, ctx.textRendering,
-        ctx.canvas.lang, ctx.canvas.dir, document.documentElement.lang, document.documentElement.dir]) : null;
+        ctx.canvas.lang, ctx.canvas.dir, document.documentElement.lang, document.documentElement.dir]) };
+      queueMicrotask(function() { contePaperFitEnvNow = null; });
+      return contePaperFitEnvNow;
+    }
+    function fitPaperText(text, w, h, base, shrinkPast) {
+      const value = String(text || '').trim();
+      if (!value || !(w > 0 && h > 0)) return measurePaperText(value, w, h, base, shrinkPast);
+      if (!contePaperMeasureCtx) contePaperMeasureCtx = document.createElement('canvas').getContext('2d');
+      const ctx = contePaperMeasureCtx, P = CONTE_PAPER, env = contePaperFitEnv(ctx);
+      const key = env.ready && value.length <= 16384 ? JSON.stringify([value, w, h, base, !!shrinkPast, env.key]) : null;
       const cached = key && contePaperFitCache.get(key);
       if (cached) {
         ctx.font = outputFont(cached.fs, P.font);
@@ -24946,7 +24955,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       markProjectSavedBaseline();
       updateWorkspaceUI();
       updatePrefsUI();
-      refresh();
+      // 원화 생성은 활성화가 끝난 finalizeNewProject 에서 한 번 그린다. 다른 초기화 호출은 즉시 갱신한다.
+      if (!(opts && opts.deferGengaRender && state.project.kind === 'genga')) refresh();
     }
 
     // <dialog> 를 모달로 띄우고 누른 버튼의 value 로 답한다. close·cancel·submit·click 네 갈래를 듣는 배선을 이
@@ -25022,6 +25032,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (state.projectActive) { scheduleStorageSweep('project-open'); scheduleLocalProjectRecovery(state.project); }
       else cancelLocalProjectRecoveryTimer();
       drawingRecordingUpdateWindow();
+      // 곧바로 다른 프로젝트를 여는 사이의 비활성(이웃 탭으로 넘어가는 닫기)은 시작 화면·빈 탭 바를 띄우지 않는다 — 띄우면 이웃 복원이
+      // 끝날 때까지 시작 화면이 깜빡 보였다. 다음 프로젝트의 setProjectActive(true) 가 화면을 맞춘다.
+      // 입력은 막는다(닫은 프로젝트에 그리지 않게) — project-locked 는 시작 화면 닫기 버튼 숨김·작업 영역 입력 차단뿐이다.
+      if (!state.projectActive && opts && opts.handingOver) { document.body.classList.add('project-locked'); return; }
       const overlay = projectStartOverlayEl();
       if (overlay) overlay.hidden = state.projectActive;
       document.body.classList.toggle('project-locked', !state.projectActive);
@@ -25118,6 +25132,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const el = document.createElement('button');
       el.type = 'button';
       el.className = 'project-tab' + (active ? ' active' : '');
+      el.dataset.projectTabId = slot.id;
       el.setAttribute('role', 'tab');
       el.setAttribute('aria-selected', active ? 'true' : 'false');
       el.appendChild(buildProjectTabBadgeEl(slot.kind));
@@ -25229,17 +25244,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       gengaStopRecording(gengaRecSession, true);
       releaseProjectTabHistory(id);
       clearProjectHistory();
-      setProjectActive(false);
+      setProjectActive(false, { handingOver: Boolean(nextId) });
       projectSaveReleaseHead(id, closingHead);
       // The last tab is closed, not parked: release its runtime through the normal project reset.
       if (!nextId) {
         resetProjectForNewProject(); // The project reset owns display-cache release too.
       }
       request.owner = projectIoOwner(request);
-      renderProjectTabBar();
+      // 이웃이 있으면 바를 비우지 않는다(projectActive=false 렌더는 바를 비우고, 이웃 복원이 끝날 때까지 탭이 사라져 보였다).
+      if (nextId) projectTabBarShowPending(nextId, id); else renderProjectTabBar();
       // projectActive is already false, so the common switch skips the discarded
       // project's snapshot while preserving the neighbor's source/session ownership.
-      if (nextId) await switchToProjectTab(nextId);
+      if (nextId) {
+        const serialBefore = projectFileLoadSerial;
+        try { await switchToProjectTab(nextId); }
+        finally {
+          // 이웃을 못 열었으면 시작 화면으로. 그 사이 사용자가 다른 탭·파일을 열기 시작했으면(로드 순번이 더 나갔으면) 그쪽이 화면을 맡는다.
+          if (!state.projectActive && projectFileLoadSerial === serialBefore + 1) setProjectActive(false);
+        }
+      }
       // 닫기는 폐기다(위 주석) — 저장 안 된 편집분의 그림은 여기서 무참조가 된다.
       // 닫은 프로젝트 자체는 슬롯 payload 가 남아 있으므로 그 그림은 계속 root 다.
       scheduleStorageSweep('close-slot');
@@ -25252,6 +25275,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const el = document.createElement('button');
       el.type = 'button';
       el.className = 'project-backup-chip' + (active ? ' active' : '');
+      el.dataset.projectTabId = slot.id;
       el.setAttribute('role', 'tab');
       el.setAttribute('aria-selected', active ? 'true' : 'false');
       const dot = document.createElement('span');
@@ -25343,6 +25367,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // list, so it does no DOM work); only a real change builds a detached fragment and swaps it in one shot.
     // Clearing the live bar before awaiting IndexedDB would flash an empty tab bar on every caller (conte
     // undo/redo reaches here via refresh() -> updateChromeControls -> updateWorkspaceUI).
+    // 전환·닫기는 결과를 바로 보인다 — 진짜 렌더(저장소를 다시 읽는다)는 프로젝트 복원이 끝난 뒤에 온다. 그 사이 눌린 탭이 활성으로
+    // 보이고, 닫은 고정 슬롯은 비운다(남은 슬롯이 앞으로 당겨지는 것과 같은 모양). 실패하면 호출부가 renderProjectTabBar 로 되돌린다.
+    function projectTabBarShowPending(activeId, closedId) {
+      const bar = document.getElementById('projectTabBar');
+      if (!bar) return;
+      const fixed = bar.querySelector('.project-tab-group-fixed');
+      bar.querySelectorAll('[data-project-tab-id]').forEach(function(el) {
+        const id = el.dataset.projectTabId;
+        if (closedId && id === String(closedId)) {
+          el.remove();
+          if (fixed && el.classList.contains('project-tab')) fixed.appendChild(buildProjectTabEmptyEl());
+          return;
+        }
+        el.classList.toggle('active', id === String(activeId));
+        el.setAttribute('aria-selected', id === String(activeId) ? 'true' : 'false');
+      });
+      projectTabBarSig = '';   // 화면이 저장소와 다를 수 있다 — 다음 렌더는 서명이 같아도 다시 그린다
+    }
     async function renderProjectTabBar() {
       const bar = document.getElementById('projectTabBar');
       if (!bar) return;
@@ -25559,6 +25601,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3328, items: [{ja: '新規プロジェクトのタブが約1.6秒遅れて出ていたのを修正、タブの切り替え・閉じるは押した直後に反映(閉じるときに開始画面が一瞬出ない)', ko: '새 프로젝트 탭이 약 1.6초 늦게 나타나던 것 수정, 탭 전환·닫기는 누르자마자 반영(닫을 때 시작 화면이 깜빡이지 않음)', en: 'New project tabs no longer appear ~1.6s late; tab switches and closes show immediately (no start-screen flash on close)', zh: '修复新项目标签约1.6秒后才出现的问题，切换·关闭标签立即反映(关闭时不再闪现开始画面)'}, {ja: '原画のカメラキー編集を軽く、コンテ用紙の文字合わせを軽く', ko: '원화 카메라 키 편집과 콘티 용지 글 맞춤을 가볍게', en: 'Lighter genga camera-key edits and storyboard paper text fitting', zh: '原画摄影机关键帧编辑与分镜纸张文字排版更轻快'}] },
       { ver: 3327, items: [{ja: '内部の整理を続けました。コンテ再生の背景合成キャッシュが、絵が変わったカットだけを作り直すようになりました。', ko: '내부 정리를 이어 했습니다. 콘티 재생의 바탕 합성 캐시가 그림이 바뀐 컷만 다시 만듭니다.', en: 'More internal cleanup. Conte playback\'s base composite cache now rebuilds only the cuts whose drawings changed.', zh: '继续内部整理。分镜播放的底图合成缓存现在只重建画面有变化的镜头。'}] },
       { ver: 3326, items: [{ja: '原画のタイトル・セリフだけの更新でレイヤー全体の計算をしないように、PSDの読み込みは1枚ずつ', ko: '원화 제목·대사만 갱신할 때 레이어 전체 계산을 하지 않게, PSD 불러오기는 한 장씩', en: 'Title/dialogue-only genga updates skip layer-wide work; PSD imports convert one file at a time', zh: '原画仅更新标题·台词时不再计算全部图层，PSD读取逐张进行'}, {ja: '取り消された読み込みのエラーが別のプロジェクトに表示されないように', ko: '밀려난 불러오기의 오류가 다른 프로젝트에 뜨지 않게', en: 'Errors from a superseded import no longer show in another project', zh: '被取代的导入错误不再显示在其他项目中'}] },
       { ver: 3325, items: [{ja: '内部の整理を続けました。筆圧で不透明度を変えるCSP水彩境界のストロークが、描いている間に変わった部分だけを再計算するようになり軽くなりました。', ko: '내부 정리를 이어 했습니다. 필압으로 불투명도를 바꾸는 CSP 수채 경계 획이 그리는 동안 바뀐 부분만 다시 계산해 가벼워졌습니다.', en: 'More internal cleanup. CSP watercolor-edge strokes with pressure-to-opacity now recompute only the changed area while drawing.', zh: '继续内部整理。笔压控制不透明度的CSP水彩边界笔画在绘制时只重新计算变化的部分，更轻快。'}] },
@@ -30800,7 +30843,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         Array.from(gengaDrawStore.keys()).forEach(function(ref) { if (!beforeRefs.has(ref)) gengaDrawStoreDrop(ref); });
         throw error;
       }
-      resetProjectForNewProject({ project: next });
+      resetProjectForNewProject({ project: next, deferGengaRender: kind === 'genga' });
       if (kind !== 'genga') {
         // A fresh conte project opens straight into video-edit mode with one blank cut already
         // in place, instead of an empty paper-mode grid the user had to switch mode and add a cut into.
@@ -62607,6 +62650,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const recoveringCurrent = options.recovery && state.projectActive && String(state.project.projectId) === String(id);
       if (recoveringCurrent && await confirmProjectReplacement(request.owner, 'msg.project.unsavedClose') === null) return;
       const outgoing = state.project;
+      if (!recoveringCurrent) projectTabBarShowPending(id);
       let saved;
       try {
       saved = recoveringCurrent ? { ok: true } : await snapshotCurrentProjectForTabSwitch();
@@ -62630,6 +62674,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // A superseding switch may already have parked a newer entry for this project.
         if (saved && saved.history && state.project === outgoing && projectTabHistories.get(String(outgoing.projectId)) === saved.history) releaseProjectTabHistory(outgoing.projectId);
         trimProjectTabHistories();
+        // 막히거나 실패해 다른 프로젝트에 머물렀으면 미리 옮긴 활성 표시를 저장소 기준으로 되돌린다(새 전환이 이어받았으면 그쪽이 그린다).
+        if (projectIoOwnerCurrent(request.owner) && !(state.projectActive && state.project && String(state.project.projectId) === String(id))) renderProjectTabBar();
       }
     }
 
@@ -64102,8 +64148,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.indexedDbAutosaveTimer = 0;
         runIndexedDbAutosave(request, false);
       };
-      state.indexedDbAutosaveTimer = setTimeout(request.flush, Math.max(0, Math.min(
-        Math.max(300, Math.round(Number(delay) || INDEXED_DB_AUTOSAVE_DELAY_MS)),
+      // 넘긴 지연은 그대로(0 = 이 턴이 끝나면 — 새 프로젝트의 첫 저장이 고정 슬롯을 게시한다), 없을 때만 기본값. 같은 턴의 연속
+      // 호출은 위에서 타이머를 갈아 끼워 한 번으로 합쳐진다. (전에는 0 이 기본값 1.6초로 바뀌고 최소 300ms 가 붙었다.)
+      const wanted = delay == null || !Number.isFinite(Number(delay)) ? INDEXED_DB_AUTOSAVE_DELAY_MS : Math.max(0, Math.round(Number(delay)));
+      state.indexedDbAutosaveTimer = setTimeout(request.flush, Math.max(0, Math.min(wanted,
         INDEXED_DB_AUTOSAVE_MAX_WAIT_MS - (now - indexedDbAutosavePendingSince))));
     }
 
@@ -138591,6 +138639,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const gt = project && project.gengaTimeline;
       return { cameraWork: fastClone((gt && gt.cameraWork) || { keyframes: [] }) };
     }
+    function gengaCameraRenderPlan(gt, structural) {
+      if (structural) return { scope: 'all', reason: 'camera-structure' };
+      const instr = gengaCameraInstrLayer(gt);
+      return { scope: 'partial', layerIds: instr ? [String(instr.id)] : [], camera: true };
+    }
     function applyGengaCameraHistoryState(snapshot) {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt || !snapshot) return;
@@ -138601,7 +138654,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // timeline (#timingDashboard, body gated on state.videoEditMode, always false for genga), so it would do
       // nothing here and camera-key ◆ state would refresh only on reload. Rebuild the genga view (camera lane),
       // then repaint the preview, through refresh() for the same reason as runGengaCameraCommand.
-      refresh({ skipChrome: true, gengaRenderPlan: { scope: 'all', reason: 'camera-history' } });
+      refresh({ skipChrome: true, gengaRenderPlan: gengaCameraRenderPlan(gt, Boolean(snapshot.instr)) });
     }
     function runGengaCameraCommand(name, mutator) {
       const before = captureGengaCameraState(state.project);
@@ -138623,9 +138676,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // repaint the preview. Go through refresh(), not guardedRender('stage'): refresh() is the one place that
       // calls gengaTimesheetUpdate, and every non-drag camera edit (◆ toggle, right-click key delete, key retime,
       // undo/redo) comes through here; the bypass leaves the timesheet stale. A live drag is unaffected because
-      // gengaCameraApply calls gengaTimesheetDraw per frame. scope:'all' is required: the camera lane is rebuilt
-      // only on a non-partial render.
-      refresh({ skipChrome: true, gengaRenderPlan: { scope: 'all', reason: 'camera' } });
+      // gengaCameraApply calls gengaTimesheetDraw per frame. Rebuild the camera and instruction rows only;
+      // instruction-row insertion/removal and renderGengaView's geometry/failure boundaries still require all.
+      refresh({ skipChrome: true, gengaRenderPlan: gengaCameraRenderPlan(gtNow, Boolean(after.instr)) });
       try { scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS); } catch (e) { console.warn('[persist] 오토세이브 예약 실패 — 계속 실패하면 저장이 영영 안 된다', e); }
     }
     // ── lean per-layer genga history — the conte runConteLayerCutPatchCommand model, one level down.
@@ -142897,6 +142950,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // 대사 행은 머리·레인을 함께 바꾼다(한쪽만 바뀌면 높이가 어긋난다). 호출자가 모양이 같을 때만 요청한다.
         const dialoguePairs = renderPlan.dialogue ? [requirePair(currentPanel, nextPanel, '.genga-dlg-heads', 'dialogue heads'),
           requirePair(currentPanel, nextPanel, '.genga-dlg-lanes', 'dialogue lanes')] : [];
+        const cameraPairs = renderPlan.camera ? [requirePair(currentPanel, nextPanel, '.genga-cam-head', 'camera head'),
+          requirePair(currentPanel, nextPanel, '.genga-cam-lane', 'camera lane')] : [];
         const topbarPair = renderPlan.topbar ? requirePair(currentPanel, nextPanel, '.genga-topbar', 'topbar') : null;
         // Preflight above is complete: no live node changes before every required pair exists.
         const seenRows = new Set();
@@ -142918,6 +142973,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           audioNodes.currentAScroll.style.cssText = audioNodes.nextAScroll.style.cssText;
           audioNodes.currentAudioLanes.replaceChildren(...audioNodes.nextAudioLanes.childNodes);
         }
+        cameraPairs.forEach(replacePair);
         dialoguePairs.forEach(replacePair);
         if (topbarPair) replacePair(topbarPair);
         return 'patched';
@@ -143530,7 +143586,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       // camera-work keyframe track (head + lane of diamonds)
       let camHead = '', camLane = '', dlgHead = '', dlgLane = '';
-      if (!partialRender) {
+      if (!partialRender || renderPlan.camera) {
         camHead = '<div class="genga-cam-head"><span class="genga-cam-title">' + escapeHtml(t('project.cameraShort')) + '</span>' +
           '<button class="genga-cam-kf-btn' + (gengaHasCameraKeyframe(gt, frame) ? ' on' : '') + '" type="button" title="' + escapeAttr(t('project.genga.cam.kfToggleTitle')) + '" aria-label="' + escapeAttr(t('project.genga.cam.kfToggleTitle')) + '">' + appIconSvg('cameraKeyframe') + '</button></div>';
         // The camera lane says what happens between the keys, the way a timesheet does — a 区間 line
@@ -143647,7 +143703,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // build/parse tax. The patcher needs only these selector-bearing containers for a partial operation.
       return partialRender ?
         '<div class="genga-preview"></div>' +
-        '<div class="genga-timeline-panel" data-chrome-hide="canvas phone">' + topbarHtml + dlgHead + dlgLane +
+        '<div class="genga-timeline-panel" data-chrome-hide="canvas phone">' + topbarHtml + dlgHead + dlgLane + camHead + camLane +
           '<div class="genga-vscroll-heads">' + rowsHead + '</div>' +
           '<div class="genga-vscroll"><div class="genga-lanes">' + rowsLane + '</div></div>' +
           '<div class="genga-audio-scroll-heads" style="height:' + audioRegionH + 'px">' + audioHead + '</div>' +
@@ -143706,6 +143762,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (ids.size) stageEl.querySelectorAll('.genga-layer-head[data-genga-layer], .genga-lane[data-genga-layer]').forEach(function(el) {
           if (ids.has(el.dataset.gengaLayer)) bindingRoots.push(el);
         });
+        if (renderPlan.camera) bindingRoots.push(stageEl.querySelector('.genga-cam-head'), stageEl.querySelector('.genga-cam-lane'));
         if (renderPlan.topbar) bindingRoots.push(stageEl.querySelector('.genga-topbar'));
         if (renderPlan.dialogue) bindingRoots.push(stageEl.querySelector('.genga-dlg-heads'), stageEl.querySelector('.genga-dlg-lanes'));
         if (renderPlan.audio) bindingRoots.push(stageEl.querySelector('.genga-audio-scroll-heads'), stageEl.querySelector('.genga-audio-scroll'));
@@ -143731,7 +143788,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaBindLayerControls(stageEl, gengaShowOne, gengaShowNodes);
       gengaBindTimelineNavigation(stageEl, gengaShowOne, gengaShowNodes);
       const partialLayerIds = partialRender && Array.isArray(renderPlan.layerIds) ? renderPlan.layerIds : null;
-      if (!partialRender || (partialLayerIds && partialLayerIds.length)) drawGengaPreview();
+      if (!partialRender || renderPlan.camera || (partialLayerIds && partialLayerIds.length)) drawGengaPreview();
       else if (renderPlan.dialogue || renderPlan.audio) gengaLipsyncUpdateHud();
       drawGengaLayerThumbs(partialLayerIds);
       gengaUpdateZoomHeader(); // shared-header label + camera-frame active state for this project
@@ -144755,7 +144812,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // lean layer paths must still run gengaLayerDependenciesChanged() and escalate to 'all' when it is true.
     // 'none'    — nothing visible changed; the stage render is skipped (the timesheet still refreshes).
     // The two plan producers are gengaRenderPlanForProjects (signature diff, used by runCommand) and the
-    // hand-built plans in the lean per-layer paths; keep any new cross-layer dependency in step with both.
+    // hand-built plans in the lean layer/camera paths; keep any new cross-layer dependency in step with both.
     // ============================================================================================
     function refresh(options) {
       options = options || {};
@@ -147362,6 +147419,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const panel = stageEl ? stageEl.querySelector('.genga-timeline-panel') : null;
       if (!panel) return;
       const dock = normalizedGengaTimelineDock();
+      // 화면 크기는 도크·손잡이를 쓰기 전에 한 번 읽는다(쓴 뒤 읽으면 그 자리에서 레이아웃을 강제로 정착시킨다).
+      const viewportH = uiLocalViewportH();
+      const viewportW = dock === 'window' ? uiLocalViewportW() : 0;
       panel.classList.toggle('genga-dock-top', dock === 'top');
       panel.classList.toggle('genga-dock-window', dock === 'window');
       // 도크 클래스를 쓴 직후 — 콘티 짝(applyTimelineDockState)이 같은 자리에서 부른다. 이 함수는 도킹
@@ -147393,7 +147453,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         panel.appendChild(hs);
       } else if (!wantS && curS) curS.remove();
       if (dock !== 'window') {
-        state.gengaDopesheetHeight = clampGengaDopesheetHeight(state.gengaDopesheetHeight);
+        state.gengaDopesheetHeight = clampGengaDopesheetHeight(state.gengaDopesheetHeight, viewportH);
         // 시트에 직접 쓴다(위 gengaDopesheetEl 주석). 이 함수는 스테이지를 그린 직후에도 불리므로 시트는
         // 이미 있다.
         const sheet = panel.querySelector('.genga-dopesheet');
@@ -147404,12 +147464,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         panel.querySelectorAll('.genga-win-resize-e, .genga-win-resize-s').forEach(function(h) { h.remove(); });
         return;
       }
-      const maxW = Math.max(520, uiLocalViewportW() - 24); // GengaTlWin* are LOCAL px (--genga-tl-*) — clamp in the same space
-      const maxH = Math.max(240, uiLocalViewportH() - 56);
+      const maxW = Math.max(520, viewportW - 24); // GengaTlWin* are LOCAL px (--genga-tl-*) — clamp in the same space
+      const maxH = Math.max(240, viewportH - 56);
       state.gengaTlWinW = Math.round(clampInt(state.gengaTlWinW, 520, maxW, Math.min(1020, maxW)));
       state.gengaTlWinH = Math.round(clampInt(state.gengaTlWinH, 240, maxH, Math.min(440, maxH)));
-      state.gengaTlWinX = Math.round(clampInt(state.gengaTlWinX, 8, Math.max(8, uiLocalViewportW() - 120), 100));
-      state.gengaTlWinY = Math.round(clampInt(state.gengaTlWinY, 34, Math.max(34, uiLocalViewportH() - 120), 90));
+      state.gengaTlWinX = Math.round(clampInt(state.gengaTlWinX, 8, Math.max(8, viewportW - 120), 100));
+      state.gengaTlWinY = Math.round(clampInt(state.gengaTlWinY, 34, Math.max(34, viewportH - 120), 90));
       panel.style.setProperty('--genga-tl-left', state.gengaTlWinX + 'px');
       panel.style.setProperty('--genga-tl-top', state.gengaTlWinY + 'px');
       panel.style.setProperty('--genga-tl-width', state.gengaTlWinW + 'px');
