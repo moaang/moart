@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3342</title>
+  <title>MoArt ver3343</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -20281,7 +20281,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return;
       }
       pushUndoCommand({ name: name, before: before, after: after, targetTimeEdit: true });
-      state.redoStack = [];
       applyTargetTimeHistoryState(after);
     }
 
@@ -20550,7 +20549,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         attachSelectionRider(command, { engineId: 'paintSelection', before: selectionHistory.before || null, after: selectionHistory.after || null });
       }
       pushUndoCommand(command);
-      state.redoStack = [];
     }
 
     function layerDrawingEditCommandHasRef(command, ref) {
@@ -20632,8 +20630,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // an already accepted total. It is skipped for correctness: the stack behind a user who is mid-undo is live, and
     // trimming its far end deletes the future they are walking back toward.
     // Async stores/caches may change resident bytes; traversal itself allocates no new command.
-    // On a new edit every producer clears state.redoStack one statement later, so redo bytes are not counted
-    // against the undo stack; counting them would evict live undo steps for bytes freed on the next line.
+    // A new edit clears state.redoStack at the end of this call, so redo bytes are not counted against the undo
+    // stack; counting them would evict live undo steps for bytes freed a few statements later.
     // Redo grows only by traversal, so it needs no byte trim; the budget is enforced on new edits, subject to the
     // minimum-step floor.
     function pushUndoCommand(command, options) {
@@ -20656,7 +20654,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         trimUndoStackToMemoryBudget(accounting);
       }
       // 그림을 붙잡던 스냅샷이 사라지는 두 경우에만 회수를 예약한다. ① push 로 +1 했는데 길이가 안 늘었다 =
-      // 예산이 하나 이상 밀어냈다. ② redo 스택이 차 있다 = 호출부가 바로 다음 줄에서 비운다. 이동(historyTraversal)
+      // 예산이 하나 이상 밀어냈다. ② redo 스택이 차 있다 = 이 함수 끝에서 비운다. 이동(historyTraversal)
       // 때는 redo 가 버려지지 않고 undo 로 옮겨 간다.
       const droppedFromStack = state.undoStack.length <= lenBeforePush;
       const redoAboutToBeDropped = !(options && options.historyTraversal) && state.redoStack.length > 0;
@@ -20664,7 +20662,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       flushPendingBudgetTrims(); // 커밋 = 확실한 획 끝 — 획 중 미룬 캐시 트림을 여기서 거둔다(축출 순서 ②)
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
       updateUndoHistoryWindow(); // no-op unless the 履歴 window is open (debounced past this command's redo-clear)
-      if (!(options && options.historyTraversal)) drawingRecordingNotifyCommand(command, false);
+      if (options && options.historyTraversal) return;
+      drawingRecordingNotifyCommand(command, false);
+      // 새 편집은 다시 하기를 버린다. 픽셀 해제·회수 예약은 위에서 이 스택을 보고 했다.
+      state.redoStack = [];
+      // タイムライン練習이 실제 조작을 감지한다 — 레슨이 기다리는 이름이 아니면 아무것도 하지 않는다.
+      if (tlTut) { try { tlTutOnCommand(command.name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } }
     }
 
     function pushRedoCommand(command, options) {
@@ -21288,6 +21291,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return Math.max(1, maxFrame);
     }
+    // 정규화된 gt 의 전체 길이. normalizeGengaTimeline 이 정규화한 입력으로 정하는 totalFrames 와 같은 식이다(그쪽은
+    // 정규화 전 값을 받으므로 따로 센다). layers 를 주면 그 목록으로 잰다 — 바꾸기 전에 미리 재 볼 때.
+    function gengaNormalizedTotalFrames(gt, layers) {
+      const durationFrames = Number.isSafeInteger(Number(gt.durationFrames)) && Number(gt.durationFrames) > 0 ? Number(gt.durationFrames) : 1;
+      return Math.max(durationFrames, gengaDerivedTotalFrames(layers || gt.layers, gt.audioClips || [], (gt.cameraWork && gt.cameraWork.keyframes) || [],
+        gengaMediaFps(gt), gt.markIn, gt.markOut, (gt.dialogue && gt.dialogue.entries) || []));   // media fps · dialogue entries count toward the length
+    }
     function gengaTimelineContentExtent(gt) {
       if (!gt) return 0;
       const fps = gengaMediaFps(gt);   // Audio clip frame span
@@ -21389,8 +21399,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gengaRenderPlan = gengaRenderPlanForProjects(before, after);
       // RefreshOptions.selectionRider 가 있으면 선택 스냅샷이 같은 undo 스텝에 함께 실린다.
       pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaPixels: refreshOptions && refreshOptions.gengaPixels, gengaDrawingContext: refreshOptions && refreshOptions.gengaDrawingContext, gengaRenderPlan: gengaRenderPlan, conteDialogCutId: refreshOptions && refreshOptions.conteDialogCutId, conteGeometryUi: refreshOptions && refreshOptions.conteGeometryUi, gengaGeometryUi: refreshOptions && refreshOptions.gengaGeometryUi, recordingKind: refreshOptions && refreshOptions.recordingKind }, refreshOptions && refreshOptions.selectionRider));
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } } // タイムライン練習 detects real ops
-      state.redoStack = [];
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
       if (gengaRenderPlan && !effectiveRefreshOptions.gengaRenderPlan) effectiveRefreshOptions.gengaRenderPlan = gengaRenderPlan;
       refresh(effectiveRefreshOptions);
@@ -21484,7 +21492,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // twin runAudioTimelineCommand compares the same way.
       if (!jsonDeepEquals(before, after)) {
         pushUndoCommand({ name: name, before: before, after: after, cameraTimelineEdit: true });
-        state.redoStack = [];
       }
       updateCameraTimelineEdit();
     }
@@ -21570,7 +21577,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           beforeSelection: beforeSelection,
           afterSelection: afterSelection
         });
-        state.redoStack = [];
       }
       if (state.videoEditMode) {
         clampCurrentPage();
@@ -21931,7 +21937,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       normalizeProject(state.project);
       const after = captureConteLayerTimelineState(state.project);
       pushUndoCommand({ name: name, before: before, after: after, conteLayerTimelineEdit: true });
-      state.redoStack = [];
       clampCurrentPage();
       updateConteLayerTimelineEdit({
         deferThumbnails: options.deferThumbnails !== false,
@@ -21972,8 +21977,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       cut.meta.userOverride = true;
       const after = { cutId: String(cutId), actionText: text, meta: fastClone(cut.meta) };
       pushUndoCommand({ name: name, before: before, after: after, conteCutActionTextEdit: true });
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } }
-      state.redoStack = [];
       refresh(conteCutActionTextRefreshOptions());
       return true;
     }
@@ -21998,7 +22001,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const changed = !options.skipUnchanged || !jsonDeepEquals(before, after);
       if (changed) {
         pushUndoCommand({ name: name, before: before, after: after, conteLayerCutPatchEdit: true, patchOwnerCutIds: cutIds.slice() });
-        state.redoStack = [];
       }
       clampCurrentPage();
       updateConteLayerTimelineEdit({
@@ -22071,7 +22073,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const canPartialTimeline = Boolean(options.partialTimeline) && beforeLowerTopology === timelineLowerTopologySignature(project);
         command = { name: name, before: before, after: after, timelineStructureEdit: true, partialTimeline: canPartialTimeline };
         pushUndoCommand(command);
-        state.redoStack = [];
         if (state.videoEditMode) {
           if (options.deferThumbnails) deferTimelineLayerThumbnails(options.deferThumbnailMs || 420);
           clampCurrentPage();
@@ -22081,6 +22082,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } catch (error) {
         // Undo 등록 뒤에는 이전 이력의 자산이 이미 해제될 수 있다. 확정한 명령을 되감지 않는다.
         const committed = command && state.undoStack.includes(command);
+        // 등록 도중(넣은 뒤 다시 하기를 비우기 전) 난 예외면 다시 하기가 남아 있다 — 새 편집과 옛 분기가 함께 남지 않게 비운다.
         if (committed) state.redoStack = [];
         else {
           Object.keys(project.layerDrawings || {}).forEach(function(ref) {
@@ -22384,7 +22386,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         syncAudioClipId: clipId,
         beforeDialogue: beforeDialogue, afterDialogue: captureDialogueState(state.project)
       });
-      state.redoStack = [];
       if (before.trackId !== after.trackId || placement.createdTrack) writeTimelineTracks(state.project);
       refreshPlayingAudio();   // a move during playback reschedules the running queue, like every other audio edit commit
       return {
@@ -22454,7 +22455,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         after: null,
         beforeDialogue: beforeDialogue, afterDialogue: captureDialogueState(state.project)
       });
-      state.redoStack = [];
       removeAudioClipDom(clipId);
       return true;
     }
@@ -22511,7 +22511,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         syncCuts: false, syncAudioClipId: clipId,
         beforeDialogue: beforeDialogue, afterDialogue: captureDialogueState(state.project)
       });
-      state.redoStack = [];
       // skipRender 옵션을 updateAudioTimelineEdit에 넘긴다(빠뜨리면 full re-render). skipWriteTrack: 위에서
       // writeTimelineTracks을 이미 호출했으므로 중복 회피.
       if (traceStart) traceStart('audioEdit:refresh');
@@ -22545,7 +22544,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const command = { name: label, selectionEdit: true, engineId: engineId, before: before, after: after };
       if (engineId === 'paintSelection' && paintTargetIsMemoPage()) command.pageNo = state.project.currentPage;
       pushUndoCommand(command);
-      state.redoStack = [];
     }
 
     // One dispatcher for undo and redo: the direction picks the stack, the counter-push, and which payload side
@@ -23289,7 +23287,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       updateUndoHistoryWindowNow();
     }
 
-    // Debounced: pushUndoCommand fires before the same command clears the redo stack, so rendering
+    // Debounced: pushUndoCommand calls this before it clears the redo stack at its end, so rendering
     // synchronously inside the push would show a one-tick-stale redo column. A 0-timeout reads final state.
     let undoHistorySyncTimer = 0;
     function updateUndoHistoryWindow() {
@@ -25659,6 +25657,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3343, items: [{ja: '取り消し・やり直しの記録処理を整理しました（動作は同じです）。', ko: '실행 취소·다시 하기 기록 처리를 정리했습니다(동작은 같습니다).', en: 'Tidied how undo/redo history is recorded (behavior unchanged).', zh: '整理了撤销/重做历史的记录处理（行为不变）。'}] },
       { ver: 3342, items: [{ja: 'コンテのタイムラインで、パネル・カットの端とクリップのトリムが少しの手ぶれで長さを変えないようにし(ドラッグ開始距離をマウス4px・指/ペン8pxにそろえる)、ルーラーをドラッグ中のEscで押す前の位置に戻るようにしました。', ko: '콘티 타임라인에서 패널·컷 끝과 클립 트림이 조금 흔들린 손에 길이가 바뀌지 않게 하고(끌기 시작 거리를 마우스 4px·손가락/펜 8px로 맞춤), 눈금자를 끄는 중 Esc로 누르기 전 자리로 돌아가게 했습니다.', en: 'In the conte timeline, panel/cut edges and clip trims no longer change length from a small hand wobble (drag start now 4px mouse, 8px finger/pen), and Esc while dragging the ruler returns to where you pressed.', zh: '分镜时间轴中，面板/镜头边缘和片段修剪不会因手的轻微抖动而改变长度（拖动起始距离统一为鼠标4px、手指/笔8px），拖动标尺时按Esc返回按下前的位置。'}] },
       { ver: 3341, items: [{ja: 'カットの時間・構成の編集を少し軽くしました。', ko: '컷 시간·구성 편집을 조금 가볍게 했습니다.', en: 'Editing cut timing and structure is a little lighter.', zh: '镜头时长和结构的编辑稍微更轻快。'}] },
       { ver: 3340, items: [{ja: '原画タイムライン: タップで選んだコマを長押しドラッグでリップルしても選択が付いていくようにし、動かしたり長さを変えたりしたコマも選択のまま残るようにしました。ドラッグ中にShiftを押すとリップルに切り替わり、Ctrl(⌘)+←/→で前後のコマへ移動し、レーンの空き場所をダブルクリックするとそのレイヤーのコマを全部選べます。ドラッグの開始距離を全タイムラインでそろえ(マウス4px・指/ペン8px)、ドラッグ中のEscで押す前の状態に戻ります。', ko: '원화 타임라인: 탭으로 고른 코마를 길게 눌러 끌어 리플해도 선택이 따라가고, 옮기거나 길이를 바꾼 코마도 선택된 채 남게 했습니다. 끄는 중 Shift를 누르면 리플로 바뀌고, Ctrl(⌘)+←/→로 이전·다음 코마로 가며, 레인 빈 곳을 더블클릭하면 그 레이어의 코마를 모두 고릅니다. 끌기 시작 거리를 모든 타임라인에서 맞췄고(마우스 4px·손가락/펜 8px), 끄는 중 Esc로 누르기 전으로 돌아갑니다.', en: 'Genga timeline: a tapped koma keeps its selection through a long-press ripple, and a moved or resized koma stays selected. Pressing Shift mid-drag switches to ripple, Ctrl(⌘)+Left/Right jumps to the previous/next koma, and double-clicking an empty lane spot selects the layer\'s komas. Every timeline now starts a drag at the same distance (mouse 4px, finger/pen 8px), and Esc during a drag restores the state before the press.', zh: '原画时间轴：点选的格长按拖动波纹移动时选择会跟随，移动或改变长度的格也保持选中。拖动中按Shift切换为波纹，Ctrl(⌘)+←/→跳到前后格，双击轨道空白处选中该图层所有格。所有时间轴的拖动起始距离统一（鼠标4px、手指/笔8px），拖动中按Esc恢复按下前的状态。'}] },
@@ -34337,7 +34336,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         before: before,
         after: after
       });
-      state.redoStack = [];
       updateConteLayerVisibilityDom(root, after);
       updateTimelineSelectionDom(root, { thumbnails: false });
       updateConteLayerAppearancePreview(refs);
@@ -36652,7 +36650,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         name: 'Toggle track ' + property,
         trackFlagToggle: { trackId: String(trackId), property: property, before: before, after: !before }
       });
-      state.redoStack = [];
       applyTimelineTrackFlagState(trackId, property, !before);
     }
 
@@ -37754,7 +37751,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       updateVideoMediaFlagsForCuts(project, [clip.panelCutId, clip.sourceCutId]);
       const after = captureVideoClipEditState(clip);
       pushUndoCommand({ name: name, videoClipEdit: true, clipId: clipId, before: before, after: after });
-      state.redoStack = [];
       updateVideoMediaTimelineEdit();
       return clip;
     }
@@ -40626,7 +40622,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!jsonDeepEquals(edit.before, after)) {
           pushUndoCommand({ name: 'Conte layer opacity', before: edit.before, after: after,
             conteLayerCutPatchEdit: true, patchOwnerCutIds: edit.ownerIds.slice() });
-          state.redoStack = [];
         }
         if (drag) drag.conteOpacityEdit = null;
         updateConteLayerTimelineEdit({ patchOwnerCutIds: edit.ownerIds, deferThumbnails: true,
@@ -44435,7 +44430,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           beforeSelection: beforeSelection,
           afterSelection: afterSelection
         });
-        state.redoStack = [];
         state.timelineStatus = !audioStored ? t('msg.workspace.saveFailed', t('msg.project.audioKeptInline')) : t('status.genga.audioRecording.recorded', session.storageKind === 'workspace' ? clip.audioFileName : 'IndexedDB');
         if (state.videoEditMode) {
           guardedRender('timing', renderTimingDashboard);
@@ -48140,7 +48134,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         ensureConteLayerActiveFallback(project, currentPicturePanelId());
       }
       pushUndoCommand({ name: 'Delete V media clip', videoClipRemove: true, clipId: clipId, before: { clip: removed, index: index }, after: null });
-      state.redoStack = [];
       updateVideoMediaTimelineEdit();
       return true;
     }
@@ -48838,7 +48831,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           beforeSelection: beforeSelection,
           afterSelection: afterSelection
         });
-        state.redoStack = [];
         committed = true;
         refreshPlayingAudio();   // a clip dropped during playback joins the running queue
         state.timelineStatus = audioStored === false ? t('msg.workspace.saveFailed', t('msg.project.audioKeptInline')) : t('status.audio.imported', file.name, clip.trackId);
@@ -55906,7 +55898,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           before: before,
           after: after
         });
-        state.redoStack = [];
         updateLayerDrawingEdit([ref]);
         return true;
       } catch (error) {
@@ -60599,7 +60590,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         before: before,
         after: after
       });
-      state.redoStack = [];
       updateLayerDrawingEdit(refs);
       return true;
     }
@@ -65355,10 +65345,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // kept 를 주면 큰 미디어 문자열을 비워 두고 [restore, value] 로 모은다(깊은 복제가 문자열을 복사하지 않게).
     // kept 가 없으면 문자열을 그대로 둔다 — 바로 JSON 문자열로 만드는 경로가 쓴다.
     function projectStorageView(kept) {
-      flushAllLayerLiveBitmaps(); // Materialize any deferred layer PNGs into the live drawings before cloning
-      // Project a storage view before deep copying: discarded media bytes must not be cloned.
-      // Every branch written below is detached first; the final clone owns all nested saved data.
-      // Kept media strings are immutable, so they skip the clone and the snapshot shares them.
+      flushAllLayerLiveBitmaps(); // Materialize any deferred layer PNGs into the live drawings before reading them
       const copy = Object.assign({}, state.project);
       const keep = function(item, key, restore) {
         const value = item[key];
@@ -68507,7 +68494,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const command = { name: 'Edit memo drawing', memoPageEdit: true, pageNo: pageNo,
         before: before, after: captureMemoPageEditState(pageNo) };
       if (options && options.selectionHistory) attachSelectionRider(command, Object.assign({ engineId: 'paintSelection' }, options.selectionHistory));
-      pushUndoCommand(command); state.redoStack = [];
+      pushUndoCommand(command);
       redrawMemoCanvas(); updatePaintUndoRedoButtonsOnly();
       return true;
     }
@@ -87974,13 +87961,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       refresh();
     }
 
-    // The runCommand observer calls this after every command while the tutorial is running.
+    // pushUndoCommand calls this for every new edit (not undo/redo traversal) while the tutorial is running.
     function tlTutOnCommand(name){
       if (!tlTut || tlTut.solved || !tlTut.lessons) return;
       const les = tlTut.lessons[tlTut.idx]; if (!les) return;
       if (les.requireAll){ // must use every listed method at least once
+        if (les.requireAll.indexOf(name) < 0) return;   // 이 레슨과 무관한 명령 — 진행판을 다시 그리지 않는다
         if (!tlTut.fired) tlTut.fired = {};
-        if (les.requireAll.indexOf(name) >= 0) tlTut.fired[name] = true;
+        tlTut.fired[name] = true;
         if (les.requireAll.every(function(c){ return tlTut.fired[c]; })){ tlTut.solved = true; tlTutReward(); }
         tlTutRenderCoach();
         return;
@@ -91217,7 +91205,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       page.redo = [];
       pushUndoCommand({ name: 'Move memo drawing', memoPageEdit: true, pageNo: pageNo,
         before: before, after: fastClone({ strokes: page.strokes, redo: page.redo }) });
-      state.redoStack = [];
       redrawMemoCanvas();
       updatePaintUndoRedoButtonsOnly();
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
@@ -93545,7 +93532,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       page.redo = [];
       pushUndoCommand({ name: 'メモ消去', memoPageEdit: true, pageNo: pageNo,
                         before: before, after: captureMemoPageEditState(pageNo) });
-      state.redoStack = [];
       redrawMemoCanvas();
       updatePaintUndoRedoButtonsOnly();
       scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
@@ -110641,8 +110627,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { drawings: freedDrawings, bytes: freedBytes };
     }
     // 히스토리에서 밀려난 그림(원화 저장소·콘티 레이어 blob URL)은 여기서 거둔다. 디바운스하는 이유: 예산 초과 뒤에는 획마다 이력이 밀려날 수 있어
-    // 즉시 부르면 프로젝트 전체 훑기가 획마다 돈다. 또 redo 스택은 pushUndoCommand 뒤에 비워지므로(호출부 공통
-    // 모양) 지연 후에 돌아야 그 그림들까지 거둔다.
+    // 즉시 부르면 프로젝트 전체 훑기가 획마다 돈다. 또 redo 스택은 pushUndoCommand 가 이 예약을 한 뒤 끝에서 비우므로
+    // 지연 후에 돌아야 그 그림들까지 거둔다.
     const GENGA_STORE_PRUNE_DELAY_MS = 4000;
     let gengaStorePruneTimer = 0;
     function scheduleGengaStorePrune() {
@@ -138399,10 +138385,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!(ev.dataTransfer && Array.from(ev.dataTransfer.types || []).indexOf('Files') >= 0)) return;
       ev.preventDefault(); ev.stopPropagation(); ev.dataTransfer.dropEffect = 'copy';
     }
-    function gengaExposureFileDrop(ev, block) {
+    function gengaExposureFileDrop(ev, block) {   // block: 레인 라우터가 준 카드
       const files = ev.dataTransfer && ev.dataTransfer.files; if (!files || !files.length) return;
       ev.preventDefault(); ev.stopPropagation();
-      block = block || ev.currentTarget;
       const layerId = block.getAttribute('data-genga-layer');
       const exp = gengaFindExposure(state.project, layerId, block.getAttribute('data-genga-exposure'));
       if (!exp) return;
@@ -139125,8 +139110,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       mutator(state.project);
       const after = captureGengaDialogueState(state.project);
       pushUndoCommand({ name: name, before: before, after: after, gengaDialogueEdit: true });
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } }
-      state.redoStack = [];
       refresh({ skipChrome: true, gengaRenderPlan: gengaDialogueRenderPlan(gt, shape) });   // 카메라 명령과 같이 툴바는 그대로
     }
     function applyGengaDialogueHistoryState(snapshot) {
@@ -139161,8 +139144,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaFrameStackInvalidate(); gengaDropUnfitSelections();   // 행 구조가 바뀌었다(일반 명령의 정규화·무효화 대신 이 둘만)
       }
       pushUndoCommand({ name: name, before: before, after: after, gengaCameraEdit: true });
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] camera command detection failed', e); } } // 도장 cameraFrame·cameraKey 의 판정 라벨은 이 러너만 낸다
-      state.redoStack = [];
       // renderGengaView is genga's dope-sheet renderer, not renderTimingDashboard (a no-op for genga; see
       // applyGengaCameraHistoryState). Rebuild the lane so a set/removed/moved camera key shows immediately, then
       // repaint the preview. Go through refresh(), not guardedRender('stage'): refresh() is the one place that
@@ -139250,8 +139231,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after,
         gengaVectorAppend: append, gengaStrokeCommit: true, gengaDrawingContext: options.gengaDrawingContext,
         recordingKind: 'drawing' }, options.selectionRider));
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] vector append command detection failed', e); } }
-      state.redoStack = [];
       refresh(Object.assign({}, options, { gengaRenderPlan: { scope: 'partial', layerIds: [String(layer.id)], audio: false } }));
       return true;
     }
@@ -139319,7 +139298,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         for (const e of normalized.exposures) e.drawing = art.get(String(e.id)) || null;
         replaceObjectContentsInPlace(member, normalized);
       }
-      gt.totalFrames = Math.max(Number(gt.durationFrames) || 1, gengaDerivedTotalFrames(gt.layers, gt.audioClips, gt.cameraWork.keyframes, gengaMediaFps(gt), gt.markIn, gt.markOut, gt.dialogue && gt.dialogue.entries));   // media fps · dialogue entries count toward the length
+      gt.totalFrames = gengaNormalizedTotalFrames(gt);
       const stored = gengaExposureAt(layer, frame).drawing;
       const metadata = stored ? Object.assign({}, stored) : null;
       if (metadata) delete metadata.strokes;
@@ -139329,8 +139308,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after,
         gengaKomaCreation: { layerId: String(layer.id), expId: String(created.id) }, gengaPixels: options.gengaPixels,
         gengaDrawingContext: options.gengaDrawingContext, recordingKind: 'drawing' }, options.selectionRider));
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] koma creation command detection failed', e); } }
-      state.redoStack = [];
       gengaRefreshExposureStructure(members.map(function(l) { return l.id; }), previousLabels);
       return true;
     }
@@ -139470,8 +139447,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         ? { scope: 'all', reason: 'layer-dependencies' }
         : { scope: 'partial', layerIds: ids, audio: false };
       pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaLayerPatchEdit: true, gengaStrokeCommit: isStrokeCommit, gengaPixels: refreshOptions && refreshOptions.gengaPixels, gengaDrawingContext: refreshOptions && refreshOptions.gengaDrawingContext, gengaRenderPlan: gengaRenderPlan, recordingKind: refreshOptions && refreshOptions.recordingKind }, refreshOptions && refreshOptions.selectionRider)); // 선택 라이더 · 획 커밋 표시 — undo/redo 의 캐시 keep 판정이 읽는다
-      if (tlTut) { try { tlTutOnCommand(name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } } // Layer-patch ops (post/preBehavior, onion, eye…) are detectable too
-      state.redoStack = [];
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
       if (!effectiveRefreshOptions.gengaRenderPlan) effectiveRefreshOptions.gengaRenderPlan = gengaRenderPlan;
       refresh(effectiveRefreshOptions);
@@ -140938,9 +140913,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return 'move';
     }
-    function gengaExposurePointerDown(ev, block) {
+    function gengaExposurePointerDown(ev, block) {   // block: 레인 라우터가 준 카드(currentTarget 은 레인)
       if (!pointerDragCanStart('genga-koma-drag', ev)) return false;
-      block = block || ev.currentTarget;   // 레인 위임이 카드를 준다(그때 currentTarget 은 레인)
       // armed (touch) → this drag moves the whole existence region, same handler as the right-drag
       if (gengaRegionMoveArmedFor(block.getAttribute('data-genga-layer'))) {
         const _rmMode = state.gengaRegionMoveArmedMode; gengaDisarmRegionMove();
@@ -142388,16 +142362,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(l) { return String(l.id) === String(layerId); }); if (!L) return;
         ripple(L);
       };
-      // 레이어 하나만 바뀌고 전체 길이(정규화가 내는 totalFrames)도 그대로면 레이어 범위 실행기로 — 셀 그룹이면 전체 명령이다
-      // (gengaLayerPatchScopeOk). 길이가 바뀌면 정규화·카메라 지시 맞추기가 따라야 하므로 전체 명령.
+      // 그 레이어의 정규화가 아무것도 바꾸지 않고 전체 길이도 그대로면 레이어 범위 실행기로(gengaLayerEditLeanOk). 셀 그룹이면
+      // 전체 명령이다(gengaLayerPatchScopeOk). 길이가 바뀌면 정규화·카메라 지시 맞추기가 따라야 하므로 전체 명령.
       if (gengaLayerPatchScopeOk([layerId]) && gengaLayerEditLeanOk(layerId, ripple)) runGengaLayerPatchCommand('原画コマ露出変更', [layerId], mutate);
       else runCommand('原画コマ露出変更', mutate);
       return true;
     }
     // 레이어 하나에 edit(layer) 를 한 결과가 전체 명령의 정규화를 거쳐도 그대로인가 — 레이어 깊은 사본에 해 본다(실제
     // 프로젝트는 그대로). ① 그 레이어의 정규화(normalizeGengaLayer)가 아무것도 바꾸지 않는다(예: 상한을 넘는 노출은 정규화가
-    // 1 로 되돌리고 앞뒤 유지를 바꾼다), ② 정규화가 낼 전체 길이(normalizeGengaTimeline 과 같은 식: gengaDerivedTotalFrames·
-    // durationFrames 하한)가 지금과 같다. 둘 다 참일 때만 레이어 범위 실행기가 전체 명령과 같은 결과를 낸다.
+    // 1 로 되돌리고 앞뒤 유지를 바꾼다), ② 정규화가 낼 전체 길이(gengaNormalizedTotalFrames)가 지금과 같다. 둘 다 참일 때만
+    // 레이어 범위 실행기가 전체 명령과 같은 결과를 낸다.
     function gengaLayerEditLeanOk(layerId, edit) {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt || !Array.isArray(gt.layers)) return false;
@@ -142409,11 +142383,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         stable = JSON.stringify(normalizeGengaLayer(fastClone(copy))) === JSON.stringify(copy);
         return copy;
       });
-      if (!stable) return false;
-      const durationFrames = Number.isSafeInteger(Number(gt.durationFrames)) && Number(gt.durationFrames) > 0 ? Number(gt.durationFrames) : 1;
-      const total = Math.max(durationFrames, gengaDerivedTotalFrames(layers, gt.audioClips || [], (gt.cameraWork && gt.cameraWork.keyframes) || [],
-        gengaMediaFps(gt), gt.markIn, gt.markOut, (gt.dialogue && gt.dialogue.entries) || []));
-      return total === gt.totalFrames;
+      return stable && gengaNormalizedTotalFrames(gt, layers) === gt.totalFrames;
     }
     // 이 코마 바로 뒤의 빈 칸 수. 뒤에 아무도 없으면 Infinity 다.
     // `endPlusOne` 은 이 코마의 원래 끝 다음 칸이다.
