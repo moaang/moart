@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3352</title>
+  <title>MoArt ver3353</title>
 
   <!-- Usage transport: fixed categories only. Project content never enters this API. -->
   <script id="moart-usage-transport">
@@ -22717,6 +22717,71 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (layerChanged) selectGengaLayer(layer.id);
       setGengaFrame(frame);
     }
+    // 가벼운 이력 명령의 종류(불리언 플래그)마다 되돌리기·다시 하기 적용. 위에서부터 처음 맞는 하나가 맡는다. viewport 가 참이면
+    // 적용 전 타임라인 뷰포트를 잡아 두고 적용 뒤 되돌린다(콘티 타임라인 편집). 원화 명령은 뷰포트를 건드리지 않는다.
+    // 새 명령 종류는 여기 한 줄이다. 맞는 것이 없으면 프로젝트 전체 복원(applyHistoryCommandPayload 의 끝)이다.
+    const HISTORY_COMMAND_HANDLERS = [
+      { flag: 'audioClipEdit', viewport: true, apply: function(command, payload, undoing) {
+        const clip = applyAudioClipEditState(state.project, command.clipId, payload);
+        const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
+        if (dialogue) { applyDialogueState(state.project, dialogue); updateAudioTimelineEdit(false); return; }
+        if (command.syncAudioClipId && clip) { updateSingleAudioClipToCuts(state.project, clip); updateAudioTimelineEdit(false); return; }
+        updateAudioTimelineEdit(Boolean(command.syncCuts));
+      } },
+      { flag: 'audioClipRemove', viewport: true, apply: function(command, payload, undoing) {
+        const restored = applyAudioClipRemoveState(state.project, command.clipId, payload);
+        const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
+        if (dialogue) applyDialogueState(state.project, dialogue);
+        else if (restored) updateSingleAudioClipToCuts(state.project, restored);
+        updateAudioTimelineEdit(false);
+      } },
+      { flag: 'videoClipEdit', viewport: true, apply: function(command, payload) {
+        applyVideoClipEditState(state.project, command.clipId, payload);
+        updateVideoMediaTimelineEdit();
+      } },
+      { flag: 'videoClipRemove', viewport: true, apply: function(command, payload) {
+        applyVideoClipRemoveState(state.project, command.clipId, payload);
+        updateVideoMediaTimelineEdit();
+      } },
+      { flag: 'conteLayerVisibilityEdit', viewport: true, apply: function(command, payload) { applyConteLayerVisibilityHistoryState(payload); } },
+      // 함께 실린 선택은 공용 라이더(applySelectionRider)가 이 밖에서 한 번에 복원한다. 원화도 같은 것이 필요한데 원화는 이
+      // 커맨드 종류를 타지 않기 때문이다.
+      { flag: 'layerDrawingEdit', viewport: true, apply: function(command, payload) {
+        if (layerDrawingEditIsPositionOnly(command.before, command.after)) { // Pure-position nudge → no re-decode/rebuild (flicker fix)
+          applyLayerDrawingPositionOnlyState(state.project, payload);
+          if (restoreLayerDrawingEditContext(command.drawingContext)) updateLayerDrawingEdit([]);
+          return;
+        }
+        const refs = applyLayerDrawingEditState(state.project, payload);
+        restoreLayerDrawingEditContext(command.drawingContext);
+        updateLayerDrawingEdit(refs);
+      } },
+      { flag: 'conteLayerCutPatchEdit', viewport: true, apply: function(command, payload) {
+        applyConteLayerCutPatchHistoryState(payload, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.contentEdit, patchOwnerCutIds: command.patchOwnerCutIds || [] });
+      } },
+      { flag: 'conteLayerTimelineEdit', viewport: true, apply: function(command, payload) {
+        applyConteLayerTimelineHistoryState(payload, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.contentEdit });
+      } },
+      { flag: 'audioTimelineStateEdit', viewport: true, apply: function(command, payload, undoing) {
+        applyAudioTimelineHistoryState(payload, undoing ? command.beforeSelection : command.afterSelection);
+      } },
+      { flag: 'trackFlagToggle', viewport: true, apply: function(command, payload, undoing) {
+        const flag = command.trackFlagToggle;
+        applyTimelineTrackFlagState(flag.trackId, flag.property, undoing ? flag.before : flag.after, undoing ? flag.beforeSelection : flag.afterSelection);
+      } },
+      { flag: 'targetTimeEdit', viewport: true, apply: function(command, payload) { applyTargetTimeHistoryState(payload); } },
+      { flag: 'cameraTimelineEdit', viewport: true, apply: function(command, payload) { applyCameraTimelineHistoryState(payload); } },
+      { flag: 'conteCutActionTextEdit', viewport: true, apply: function(command, payload) { applyConteCutActionTextHistoryState(payload); } },
+      { flag: 'gengaCameraEdit', viewport: false, apply: function(command, payload) { applyGengaCameraHistoryState(payload); } },   // cameraWork 만
+      { flag: 'gengaDialogueEdit', viewport: false, apply: function(command, payload) { applyGengaDialogueHistoryState(payload); } },   // 원화 대사만
+      { flag: 'gengaKomaCreation', viewport: false, apply: function(command, payload, undoing) { applyGengaExposureCreationHistory(command, undoing); } },
+      { flag: 'gengaVectorAppend', viewport: false, apply: function(command, payload, undoing) { applyGengaVectorAppendHistory(command, undoing); } },
+      // 원화 레이어별 가벼운 이력(그림·FX). 획 커밋 표시를 넘긴다 — 프레임 캐시 keep 판정.
+      { flag: 'gengaLayerPatchEdit', viewport: false, apply: function(command, payload) { applyGengaLayerPatchHistoryState(payload, { gengaStrokeCommit: Boolean(command.gengaStrokeCommit) }); } },
+      { flag: 'timelineStructureEdit', viewport: true, apply: function(command, payload) {
+        applyTimelineStructureHistoryState(payload, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.cutStructure, partialTimeline: Boolean(command.partialTimeline) });
+      } }
+    ];
     function applyHistoryCommandPayload(command, undoing, pushOther) {
       const payload = undoing ? command.before : command.after;
       if (command.selectionEdit) { // Conte lasso / conte gizmo / genga floating selection — one type
@@ -22737,145 +22802,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
         return;
       }
-      const historyViewport = captureTimelineViewportForHistory();
-      if (command.audioClipEdit) {
+      const handler = HISTORY_COMMAND_HANDLERS.find(function(h) { return command[h.flag]; });
+      const historyViewport = (!handler || handler.viewport) ? captureTimelineViewportForHistory() : null;
+      if (handler) {
         pushOther(command);
-        const clip = applyAudioClipEditState(state.project, command.clipId, payload);
-        const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
-        if (dialogue) {
-          applyDialogueState(state.project, dialogue);
-          updateAudioTimelineEdit(false);
-          restoreTimelineViewportForHistory(historyViewport);
-          return;
-        }
-        if (command.syncAudioClipId && clip) {
-          updateSingleAudioClipToCuts(state.project, clip);
-          updateAudioTimelineEdit(false);
-          restoreTimelineViewportForHistory(historyViewport);
-          return;
-        }
-        updateAudioTimelineEdit(Boolean(command.syncCuts));
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.audioClipRemove) {
-        pushOther(command);
-        const restored = applyAudioClipRemoveState(state.project, command.clipId, payload);
-        const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
-        if (dialogue) applyDialogueState(state.project, dialogue);
-        else if (restored) updateSingleAudioClipToCuts(state.project, restored);
-        updateAudioTimelineEdit(false);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.videoClipEdit) {
-        pushOther(command);
-        applyVideoClipEditState(state.project, command.clipId, payload);
-        updateVideoMediaTimelineEdit();
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.videoClipRemove) {
-        pushOther(command);
-        applyVideoClipRemoveState(state.project, command.clipId, payload);
-        updateVideoMediaTimelineEdit();
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.conteLayerVisibilityEdit) {
-        pushOther(command);
-        applyConteLayerVisibilityHistoryState(payload);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.layerDrawingEdit) {
-        pushOther(command);
-        // 함께 실린 선택은 공용 라이더(applySelectionRider)가 이 분기 밖에서 한 번에 복원한다. 원화도 같은 것이
-        // 필요한데 원화는 이 커맨드 종류를 타지 않기 때문이다.
-        if (layerDrawingEditIsPositionOnly(command.before, command.after)) { // Pure-position nudge → no re-decode/rebuild (flicker fix)
-          applyLayerDrawingPositionOnlyState(state.project, payload);
-          if (restoreLayerDrawingEditContext(command.drawingContext)) updateLayerDrawingEdit([]);
-          restoreTimelineViewportForHistory(historyViewport);
-          return;
-        }
-        const refs = applyLayerDrawingEditState(state.project, payload);
-        restoreLayerDrawingEditContext(command.drawingContext);
-        updateLayerDrawingEdit(refs);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.conteLayerCutPatchEdit) {
-        pushOther(command);
-        applyConteLayerCutPatchHistoryState(payload, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.contentEdit, patchOwnerCutIds: command.patchOwnerCutIds || [] });
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.conteLayerTimelineEdit) {
-        pushOther(command);
-        applyConteLayerTimelineHistoryState(payload, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.contentEdit });
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.audioTimelineStateEdit) {
-        pushOther(command);
-        applyAudioTimelineHistoryState(payload, undoing ? command.beforeSelection : command.afterSelection);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.trackFlagToggle) {
-        pushOther(command);
-        const flag = command.trackFlagToggle;
-        applyTimelineTrackFlagState(flag.trackId, flag.property, undoing ? flag.before : flag.after, undoing ? flag.beforeSelection : flag.afterSelection);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.targetTimeEdit) {
-        pushOther(command);
-        applyTargetTimeHistoryState(payload);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.cameraTimelineEdit) {
-        pushOther(command);
-        applyCameraTimelineHistoryState(payload);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.conteCutActionTextEdit) {
-        pushOther(command);
-        applyConteCutActionTextHistoryState(payload);
-        restoreTimelineViewportForHistory(historyViewport);
-        return;
-      }
-      if (command.gengaCameraEdit) { // Genga camera = dedicated light undo/redo (cameraWork only)
-        pushOther(command);
-        applyGengaCameraHistoryState(payload);
-        return;
-      }
-      if (command.gengaDialogueEdit) { // 원화 대사만(dialogue)
-        pushOther(command);
-        applyGengaDialogueHistoryState(payload);
-        return;
-      }
-      if (command.gengaKomaCreation) {
-        pushOther(command);
-        applyGengaExposureCreationHistory(command, undoing);
-        return;
-      }
-      if (command.gengaVectorAppend) {
-        pushOther(command);
-        applyGengaVectorAppendHistory(command, undoing);
-        return;
-      }
-      if (command.gengaLayerPatchEdit) { // Genga per-layer light undo/redo (drawing / FX)
-        pushOther(command);
-        applyGengaLayerPatchHistoryState(payload, { gengaStrokeCommit: Boolean(command.gengaStrokeCommit) }); // 획 커밋 표시를 넘긴다 — 캐시 keep 판정(a1)
-        return;
-      }
-      if (command.timelineStructureEdit) {
-        pushOther(command);
-        applyTimelineStructureHistoryState(payload, { deferThumbnails: true, deferThumbnailMs: TIMELINE_THUMB_DEFER_MS.cutStructure, partialTimeline: Boolean(command.partialTimeline) });
-        restoreTimelineViewportForHistory(historyViewport);
+        handler.apply(command, payload, undoing);
+        if (handler.viewport) restoreTimelineViewportForHistory(historyViewport);
         return;
       }
       const memoPages = snapshotMemoPages();
@@ -25725,6 +25657,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3353, items: [{ja: '録音: SafariでのコンテのAAC録音を.m4aで保存するようにしました(作業フォルダの音声一覧に出なかった問題)。2値化の範囲、CLIP/TVPP読み込み、取り消し処理の内部を整理しました。', ko: '녹음: Safari 에서 콘티 녹음을 .m4a 로 저장하게 했습니다(작업 폴더 음성 목록에 안 나오던 문제). 2値化 범위, CLIP/TVPP 가져오기, 실행 취소 처리 내부를 정리했습니다.', en: 'Recording: conte recordings in Safari are now saved as .m4a (they were missing from the work-folder audio list). Tidied binarize bounds, CLIP/TVPP import and undo internals.', zh: '录音：Safari 中的分镜录音现在保存为 .m4a（之前不会出现在工作文件夹的音频列表中）。整理了二值化范围、CLIP/TVPP 导入和撤销处理的内部。'}] },
       { ver: 3352, items: [{ja: '原画: セルのサブレイヤーで結んだレイヤーは、前後の処理(ホールド・リピート)と途中のリピートも一緒に変わるようにしました(これまでは美術グループだけ)。フォルダーがロックされたレイヤーは前後の処理を変えられないようにしました。', ko: '원화: 셀 서브레이어로 묶은 레이어는 앞뒤 처리(홀드·리피트)와 중간 리피트도 함께 바뀌게 했습니다(전에는 미술 그룹만). 폴더가 잠긴 레이어는 앞뒤 처리를 바꿀 수 없게 했습니다.', en: 'Genga: layers linked as cel sub-layers now also share pre/post behavior (hold, repeat) and mid repeats (previously only art groups). Layers in a locked folder can no longer change pre/post behavior.', zh: '原画：以赛璐璐子图层连接的图层，前后处理（保持・循环）和中间循环也会一起变化（以前只有美术组）。文件夹被锁定的图层不能再更改前后处理。'}] },
       { ver: 3351, items: [{ja: 'ブラシ: ライブラリでブラシを替えると、サイズ・合成モード以外の設定はそのブラシのもの(なければ既定値)になる仕組みを、今後追加される設定にも自動で適用するようにしました(動作は同じです)。', ko: '브러시: 라이브러리에서 브러시를 바꾸면 크기·합성 모드 밖의 설정이 그 브러시 것(없으면 기본값)이 되는 규칙을, 앞으로 더해질 설정에도 자동으로 적용되게 했습니다(동작은 같습니다).', en: 'Brush: switching brushes in the library sets every setting except size and blend mode to that brush (or its default); this now also applies to settings added later (behavior unchanged).', zh: '笔刷：在笔刷库切换笔刷时，除大小和混合模式外的设置都会变为该笔刷的设置（没有则为默认值），此规则今后新增的设置也会自动适用（行为不变）。'}] },
       { ver: 3350, items: [{ja: 'コンテ: コマをパネル間で動かしたり、パネルの挿入・削除・リップルでコマが動いたりしても、レイヤーFXの動きがコマについていくようにしました。ブラシ・FX・タイムラインの内部処理を整理しました。', ko: '콘티: 코마를 다른 패널로 옮기거나 패널 삽입·삭제·리플로 코마가 밀려도 레이어 FX 움직임이 코마를 따라가게 했습니다. 브러시·FX·타임라인 내부 처리를 정리했습니다.', en: 'Conte: layer FX motion now follows a koma when it is moved to another panel or pushed by panel insert, delete or ripple. Tidied brush, FX and timeline internals.', zh: '分镜：将格移到其他分格，或因插入、删除分格及涟漪而移动时，图层FX的动作会跟随格。整理了笔刷、FX和时间轴的内部处理。'}] },
@@ -49422,17 +49355,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function mimeForAudioFileName(name) {
-      if (/\.wav$/i.test(name || '')) return 'audio/wav';
-      if (/\.mp3$/i.test(name || '')) return 'audio/mpeg';
-      if (/\.ogg$/i.test(name || '')) return 'audio/ogg';
-      if (/\.webm$/i.test(name || '')) return 'audio/webm';
-      if (/\.flac$/i.test(name || '')) return 'audio/flac';   // isSupportedAudioFile accepts it; the audio/mpeg default would name it .mp3
-      // 대안을 묶어 `$` 앵커를 공유한다 — `/\.m4a|\.aac$/i` 처럼 쓰면 앵커가 뒤쪽 대안에만 걸려
-      // `track.m4a.flac` · `my.m4a.opus` 가 `audio/mp4` 로 나간다.
-      if (/\.(m4a|aac)$/i.test(name || '')) return 'audio/mp4';
-      return 'audio/mpeg';
+    // 파일 이름의 마지막 확장자 → mime 한 표(소리·그림, 묶음 안 이름에도 쓴다). 모르면 ''. 소리의 mp4 컨테이너(.m4a·.mp4)는
+    // audio/mp4, ADTS(.aac)는 audio/aac 다. 영상 이름은 부르는 쪽이 먼저 가른다(mp4·m4v·mov·webm).
+    const FILE_EXT_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+      wav: 'audio/wav', flac: 'audio/flac', mp3: 'audio/mpeg', mpeg: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac',
+      ogg: 'audio/ogg', webm: 'audio/webm', mp4: 'audio/mp4' };
+    function mimeForFileName(name) {
+      const match = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/);
+      return (match && Object.prototype.hasOwnProperty.call(FILE_EXT_MIME, match[1])) ? FILE_EXT_MIME[match[1]] : '';   // 표 밖(.constructor 등 상속 이름 포함)은 ''
     }
+    function mimeForAudioFileName(name) { const mime = mimeForFileName(name); return /^audio\//.test(mime) ? mime : 'audio/mpeg'; }
 
     function previewAudioTrim(original, edge, deltaFrames) {
       const preview = Object.assign({}, original);
@@ -65438,8 +65370,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (/flac/i.test(mime)) return 'flac';
       if (/webm/i.test(mime)) return 'webm';
       if (/quicktime|mov/i.test(mime)) return 'mov';
-      if (/m4a/i.test(mime)) return 'm4a';   // audio/x-m4a
-      if (/aac/i.test(mime)) return 'aac';   // .moart 의 m4a·aac 음성은 audio/aac 로 읽힌다(bundleMimeFromFileName)
+      // 소리의 mp4 컨테이너(audio/mp4·x-m4a — Safari 녹음)는 .m4a 다. .mp4 로 지으면 작업 폴더의 음성 목록이 세지 않는다.
+      if (/m4a|^audio\/mp4/i.test(mime)) return 'm4a';
+      if (/aac/i.test(mime)) return 'aac';
       if (/mp4|m4v/i.test(mime)) return 'mp4';
       return 'bin';
     }
@@ -66782,7 +66715,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // The source may have been edited since its old filename was assigned. Match the current bytes.
           const baseName = d.bitmapStorage && d.bitmapStorage.fileName || ref;
           const mime = /^image\//i.test(blob.type) ? blob.type
-            : d.bitmapStorage && d.bitmapStorage.mime || bundleMimeFromFileName(baseName) || 'image/png';
+            : d.bitmapStorage && d.bitmapStorage.mime || mimeForFileName(baseName) || 'image/png';
           const name = uniqueName(baseName.replace(/\.[^.]+$/, '') + '.' + extensionForMime(mime));
           media.push({ path: 'assets/layers/' + name, blob: blob });
           d.bitmapStorage = { dir: 'assets/layers', fileName: name, mime: mime };
@@ -67632,7 +67565,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const file = await readBlobFromWorkspace(dir, name, handle);
           assertProjectIoOwner(owner);
           if (!file.size) throw new Error('Drawing/audio source unavailable: ' + name);
-          const mime = st.mime || file.type || bundleMimeFromFileName(name) || (item.isDraw ? 'image/png' : 'audio/mpeg');
+          const mime = st.mime || file.type || mimeForFileName(name) || (item.isDraw ? 'image/png' : 'audio/mpeg');
           // Snapshot file-backed rasters before publication: later external edits must not change Undo/source bytes.
           let blob = file.slice(0, file.size, mime);
           {
@@ -68054,21 +67987,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    function bundleMimeFromFileName(name) {
-      const match = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/);
-      const ext = match ? match[1] : '';
-      if (ext === 'png') return 'image/png';
-      if (ext === 'jpg' || ext === 'jpeg') return 'image/jpeg';
-      if (ext === 'webp') return 'image/webp';
-      if (ext === 'wav') return 'audio/wav';
-      if (ext === 'flac') return 'audio/flac';
-      if (ext === 'mp3' || ext === 'mpeg') return 'audio/mpeg';
-      if (ext === 'm4a' || ext === 'aac') return 'audio/aac';
-      if (ext === 'ogg') return 'audio/ogg';
-      if (ext === 'webm') return 'audio/webm';
-      if (ext === 'mp4') return 'audio/mp4';
-      return '';
-    }
 
     function referencedConteLayerDrawingRefs(project) {
       const refs = new Set();
@@ -68369,7 +68287,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           assertProjectIoOwner(owner);
           showLoadingOverlay(t('msg.loading.extractingZipImages', index + 1, refs.length), null, request);
           try {
-            const mime = bundleMimeFromFileName(fileName) || 'image/png';
+            const mime = mimeForFileName(fileName) || 'image/png';
             const blob = entry.blob.slice(0, entry.blob.size, mime);
             if (preferIndexedDb) {
               if (pendingDrawings.length && pendingBytes + blob.size > WORKSPACE_DB_BATCH_BYTES) await flushDrawings();
@@ -68412,7 +68330,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (!entry) { missing.push({ kind: isDraw ? 'genga-drawing' : 'genga-audio', ref: item.ref, name: fileName || item.ref }); continue; }
             assertProjectIoOwner(owner);
             try {
-              const mime = item.storage.mime || bundleMimeFromFileName(fileName) || (isDraw ? 'image/png' : 'audio/mpeg');
+              const mime = item.storage.mime || mimeForFileName(fileName) || (isDraw ? 'image/png' : 'audio/mpeg');
               const imported = isDraw ? importedDrawings : importedAudio, previous = imported.get(item.ref);
               if (previous && isDraw && !previous.settled && previous.entry === entry && previous.mime === mime) {
                 previous.repeats++; continue; // Share the pending write, retaining each later placement's retry.
@@ -68480,7 +68398,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let pendingAudio = [];
         const importAudio = async function(clip, fileName, base, entry) {
           try {
-            const mime = clip.audioMime || bundleMimeFromFileName(fileName) || 'audio/mpeg';
+            const mime = clip.audioMime || mimeForFileName(fileName) || 'audio/mpeg';
             if (preferIndexedDb) {
               let shared = sharedAudioByBase[base];
               if (!shared) {
@@ -68588,7 +68506,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (pendingVideo.length && pendingVideoBytes + entry.blob.size > WORKSPACE_DB_BATCH_BYTES) await flushVideo();
           assertProjectIoOwner(owner);
           try {
-            const mime = clip.mediaMime || (/\.(mp4|m4v|mov)$/i.test(fileName) ? 'video/mp4' : (/\.webm$/i.test(fileName) ? 'video/webm' : (bundleMimeFromFileName(fileName) || 'video/mp4')));
+            const mime = clip.mediaMime || (/\.(mp4|m4v|mov)$/i.test(fileName) ? 'video/mp4' : (/\.webm$/i.test(fileName) ? 'video/webm' : (mimeForFileName(fileName) || 'video/mp4')));
             const row = { clip: clip, fileName: fileName, base: base, mime: mime, blob: entry.blob.slice(0, entry.blob.size, mime) };
             if (preferIndexedDb) videoRecord(row);
             pendingVideo.push(row); pendingVideoBytes += row.blob.size;
@@ -76573,7 +76491,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (owner.project !== state.project) return;
         refsStatus(t('refs.importing', ++done, files.length));
         if (!r.ok) { failed += 1; console.warn('[refs] import skipped', file.name, r.message); return; }
-        const mime = r.blob ? r.blob.type : (file.type || bundleMimeFromFileName(file.name) || 'image/png');
+        const mime = r.blob ? r.blob.type : (file.type || mimeForFileName(file.name) || 'image/png');
         const blob = r.blob || file.slice(0, file.size, mime);
         entries.push({ order: order, thumb: r.thumb, blob: blob, item: { id: newPrefixedId('ref'), tab: tab,
           name: String(file.name || '').replace(/\.[^.]+$/, ''), w: r.w, h: r.h, mime: mime } });
@@ -83520,7 +83438,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let maxWidthFactor = 1;
       pts.forEach(function(p) { if (p) maxWidthFactor = Math.max(maxWidthFactor, paintPressureWidthFactor(stroke, p.p, p.t)); });
       if (stroke.lineEnd) maxWidthFactor = Math.max(maxWidthFactor, paintPressureWidthFactor(stroke, stroke.lineEnd.p, stroke.lineEnd.t));
-      const pad = (Number(stroke.size) || 1) * Math.max(1.5, maxWidthFactor / 2) + 3;
+      // 팁 흩뿌림은 dab 중심을 지름의 scatter% 까지 옮긴다(paintStrokeLayerPadPx 와 같은 배율) — 안 세면 먼 dab 이 상자 밖에서 잘린다.
+      const scatter = Math.max(0, (Number(stroke.tipScatter) || 0) / 100);
+      const pad = (Number(stroke.size) || 1) * Math.max(1.5, maxWidthFactor / 2) * (1 + 2 * scatter) + 3;
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
       const eat = function(p) {
         if (!p) return;
@@ -84651,8 +84571,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // 좌표는 drawPaintStroke 와 같은 변환(정규화 × 用紙 − 비트맵 원점)이고, 여유는 paintStrokeScratchBox 가
         // 반지름에 1.5 배 + 2px 를 더한다. 못 내면 null → 전면.
         if (stroke.aa === false) {
-          const bpad = Math.max(1, Number(stroke.size) || 1); // 반지름 자리에 지름을 넣어 넉넉히
-          const bpts = (stroke.points || []).map(function(p) {
+          // 반경은 레이어 캔버스 확장과 같은 정본(paintStrokeLayerPadPx — 기울기 폭·흩뿌림 포함)이고, Shift 직선의 끝점
+          // (points 밖)도 센다 — 빠지면 그 바깥 dab 가장자리가 임계화되지 않아 2値化에 AA 가 남는다.
+          const bsrc = (stroke.points || []).concat(stroke.lineEnd ? [stroke.lineEnd] : []);
+          const bpad = paintStrokeLayerPadPx(stroke, bsrc);
+          const bpts = bsrc.map(function(p) {
             return { x: (Number(p.x) || 0) * op.geometry.paper.w - (Number(op.bitmapX) || 0),
                      y: (Number(p.y) || 0) * op.geometry.paper.h - (Number(op.bitmapY) || 0) };
           });
@@ -111315,9 +111238,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaAssetExtFor(mime) {
       const m = String(mime || '').toLowerCase();
-      if (m === 'image/jpeg') return 'jpg';
-      if (m === 'audio/mpeg') return 'mp3';
       if (m === GENGA_TILE_MIME) return 'mtil';
+      const known = extensionForMime(m);
+      if (known !== 'bin') return known;
       const slash = m.indexOf('/');
       const tail = slash >= 0 ? m.slice(slash + 1) : '';
       return /^[a-z0-9]{1,5}$/.test(tail) ? tail : 'bin';
@@ -112121,7 +112044,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           }
           if (!blob.size) { gengaShowStatus(t('status.genga.micRecord.noData'), { warn: true }); renderGengaView(); return; }
           const stamp = new Date();
-          const name = '録音_' + String(stamp.getHours()).padStart(2, '0') + String(stamp.getMinutes()).padStart(2, '0') + String(stamp.getSeconds()).padStart(2, '0') + '.' + (/mp4/i.test(blob.type) ? 'm4a' : extensionForMime(blob.type || 'audio/webm'));
+          const name = '録音_' + String(stamp.getHours()).padStart(2, '0') + String(stamp.getMinutes()).padStart(2, '0') + String(stamp.getSeconds()).padStart(2, '0') + '.' + extensionForMime(blob.type || 'audio/webm');
           trackAudioRecordingPublication(state.project, gengaAddAudioFile(new File([blob], name, { type: blob.type || 'audio/webm' }), atFrame, atLane, null, atLaneShape).then(function(id) { return !!id; })); // decode + free-lane placement + undoable add
         });
         rec.addEventListener('error', function(event) {
@@ -124584,20 +124507,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!built || !built.gt) { hideLoadingOverlay(request); alert(t('msg.genga.tvppImport.empty') + gengaClipOmissionMessage(built && built.omittedVisible)); return false; }
         built.gt.sheetInfo.header = gengaImportedSheetHeader(file.name);
         const title = String(file.name || 'clip').replace(/\.clip$/i, '') || 'clip';
-        assertProjectReplacement(owner, replacement);
-        resetProjectForNewProject({ deferGengaPrune: true }); // 참조를 붙인 뒤에 prune 한다(아래)
-        state.project.title = title;
-        state.project.projectId = identity.projectId;
-        state.project.kind = 'genga';
-        state.project.gengaTimeline = built.gt;
-        state.project.settings = state.project.settings || {};
-        state.project.settings.indexedDbAutosaveEnabled = true;
         // 수정공정 리비전은 gengaSpawnCelGroupMember(진짜 커널, addGengaRevisionLayer 와 같은 경로)로 붙인다 —
         // state.project.gengaTimeline 이 이미 대입된 지금부터 호출 가능하다. 커널이 null 을 돌려주면 그 장은
         // 안 붙는다 — 반환값을 세지 않으면 리비전 폴더와 BG 서브가 통째로 빠진 프로젝트가 「정상 임포트」로
         // 열리고 흔적이 없다. 원화 화면은 상태문구가 안 보이므로(시트 임포트 짝은 `console.warn`) 실패가
         // 하나라도 있을 때 아래에서 `gengaShowStatus` 로 낸다.
         let memberSpawnFailN = 0;
+        const attachMembers = function() {
         const noteSpawnFail = function(what, refLayerId, label) {
           memberSpawnFailN += 1;
           console.warn('clip import: ' + what + ' could not attach to ' + refLayerId + ' (' + (label || '') + ')');
@@ -124643,25 +124559,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             }
           }
         }
-        // 리비전·BG 서브 그림도 참조다 — 다 붙인 뒤에 옛 프로젝트 것만 버린다(시트 가져오기와 같은 순서).
-        gengaPruneRuntimeStores();
-        normalizeProject(state.project);
-        setProjectActive(true);
+        };
         const source = Object.assign({ kind: 'clip', fileName: file.name, fileHandle: request.fileHandle || null }, sourceIdentity);
-        setProjectFileSource(state.project, source);
-        owner = request.owner = projectIoOwner(request);
-        forgetProjectSession(state.project.projectId);
-        markProjectSavedBaseline();
-        await rememberProjectSource(owner, source);
-        assertProjectIoOwner(owner);
-        hideLoadingOverlay(request);
-        refresh();
+        owner = await gengaActivateImportedProject({ request: request, owner: owner, replacement: replacement, gt: built.gt, title: title,
+          projectId: identity.projectId, source: source,
+          attach: attachMembers });
         const importNotes = [];
         if (memberSpawnFailN) importNotes.push(t('msg.genga.clipImport.memberSpawnFailed', memberSpawnFailN));
         if (built.skippedInbetweenCount) importNotes.push(t('msg.genga.clipImport.inbetweenSkipped', built.skippedInbetweenCount));
         if (importNotes.length) gengaShowStatus(importNotes.join(' '));
-        gengaZoomReset();
-        scheduleIndexedDbAutosave(0);
         state.timelineStatus = t('status.genga.assetImport.complete', 'clip', built.layerCount, built.komaCount, built.totalFrames)
           + (built.failCount ? t('status.genga.assetImport.failNote', built.failCount) : '');
         // 텍스트 레이어·변형 미확인 이미지소재처럼 "원래 보이는데 못 가져온" 것은 failCount(디코드
@@ -125612,6 +125518,38 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                pixelAspect: Number(tv.pixelAspect) || 1 };
     }
 
+    // CLIP·TVPP 가져오기의 「새 원화 프로젝트로 활성화」 — 순서를 여기 한 곳에 둔다.
+    // 1. 옛 프로젝트를 비운다. 런타임 그림 정리(prune)는 미룬다.
+    // 2. 제목·id·원화 타임라인을 넣고, attach(CLIP 의 리비전·BG 서브 붙이기)를 한다.
+    // 3. prune 한다. 붙인 그림도 참조라 반드시 그 뒤다 — 앞에서 하면 IDB 를 못 쓰는 환경에서 그 그림이 빠진다.
+    // 4. 정규화 → 활성화 → 원본 연결 → owner 재발급 → 같은 id 의 세션 몫 놓기 → 저장 기준선 → 원본 기억(await 뒤 owner 확인).
+    // 5. 오버레이 내림·refresh·확대 초기화·자동 저장 예약.
+    // 새 owner 를 돌려준다. 시트 가져오기는 원본을 연결하지 않는 다른 꼬리라 따로 둔다.
+    async function gengaActivateImportedProject(o) {
+      assertProjectReplacement(o.owner, o.replacement);
+      resetProjectForNewProject({ deferGengaPrune: true });
+      state.project.title = o.title;
+      state.project.projectId = o.projectId;
+      state.project.kind = 'genga';
+      state.project.gengaTimeline = o.gt;
+      state.project.settings = state.project.settings || {};
+      state.project.settings.indexedDbAutosaveEnabled = true;
+      if (o.attach) o.attach();
+      gengaPruneRuntimeStores();
+      normalizeProject(state.project);
+      setProjectActive(true);
+      setProjectFileSource(state.project, o.source);
+      const owner = o.request.owner = projectIoOwner(o.request);
+      forgetProjectSession(state.project.projectId);
+      markProjectSavedBaseline();
+      await rememberProjectSource(owner, o.source);
+      assertProjectIoOwner(owner);
+      hideLoadingOverlay(o.request);
+      refresh();
+      gengaZoomReset();
+      scheduleIndexedDbAutosave(0);
+      return owner;
+    }
     // 전체 흐름: 확인 → 디코드 → 새 원화 프로젝트로 활성화. gengaImportSheetProjectFlow 와 같은 골격.
     async function gengaImportTvppProjectFlow(file, request) {
       if (!file) return false;
@@ -125637,28 +125575,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (canceled || !projectIoOwnerCurrent(owner)) { hideLoadingOverlay(request); return false; }
         if (!built) { hideLoadingOverlay(request); alert(t('msg.genga.tvppImport.empty')); return false; }
         const title = String(file.name || 'tvpp').replace(/\.tvpp$/i, '') || 'tvpp';
-        assertProjectReplacement(owner, replacement);
-        resetProjectForNewProject({ deferGengaPrune: true }); // 참조를 붙인 뒤에 prune 한다(아래)
-        state.project.title = title;
-        state.project.projectId = identity.projectId;
-        state.project.kind = 'genga';
-        state.project.gengaTimeline = built.gt;
-        gengaPruneRuntimeStores(); // 참조가 있다 — 옛 프로젝트 것만 버린다
-        state.project.settings = state.project.settings || {};
-        state.project.settings.indexedDbAutosaveEnabled = true;
-        normalizeProject(state.project);
-        setProjectActive(true);
         const source = Object.assign({ kind: 'tvpp', fileName: file.name, fileHandle: request.fileHandle || null }, sourceIdentity);
-        setProjectFileSource(state.project, source);
-        owner = request.owner = projectIoOwner(request);
-        forgetProjectSession(state.project.projectId);
-        markProjectSavedBaseline();
-        await rememberProjectSource(owner, source);
-        assertProjectIoOwner(owner);
-        hideLoadingOverlay(request);
-        refresh();
-        gengaZoomReset();
-        scheduleIndexedDbAutosave(0);
+        owner = await gengaActivateImportedProject({ request: request, owner: owner, replacement: replacement, gt: built.gt, title: title,
+          projectId: identity.projectId, source: source });
         state.timelineStatus = t('status.genga.assetImport.complete', 'tvpp', built.layerCount, built.komaCount, built.totalFrames)
           + (built.failCount ? t('status.genga.assetImport.failNote', built.failCount) : '');
         // Annotation has one persisted timeline string; status below is only its shortened view.
