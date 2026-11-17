@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3393</title>
+  <title>MoArt ver3394</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -9328,7 +9328,7 @@
       width: min(720px, 94vw); min-height: 350px; padding: 0; overflow: hidden;
     }
     /* position:relative — ガイドブックボタンの基準（.es-guide-btn の注釈参照）。 */
-    .es-left { position: relative; display: flex; flex-direction: column; justify-content: space-between; gap: 24px; padding: 38px 34px 30px; border-right: 1px solid var(--sh-hairline); }
+    .es-left { position: relative; display: flex; flex-direction: column; justify-content: flex-start; gap: 24px; padding: 38px 34px 30px; border-right: 1px solid var(--sh-hairline); }
     .es-word { font-size: 25px; font-weight: 800; letter-spacing: 0.30em; line-height: 1.3; color: var(--sh-text); }
     /* MoArt branding — avatar + kirin モアート lockup */
     /* Center the brand lockup + subtitle for a symmetric entry header */
@@ -15027,6 +15027,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'dropbox.disconnect': { ja: '接続を解除', ko: '연결 해제', en: 'Disconnect', zh: '断开连接' },
         'dropbox.account': { ja: function(name){ return '接続中: ' + name; }, ko: function(name){ return '연결됨: ' + name; }, en: function(name){ return 'Connected: ' + name; }, zh: function(name){ return '已连接: ' + name; } },
         'dropbox.up': { ja: '上へ', ko: '위로', en: 'Up', zh: '上一级' },
+        'dropbox.timeout': { ja: 'Dropbox の応答がありません。再試行してください。', ko: 'Dropbox 응답이 없습니다. 다시 시도해 주세요.', en: 'Dropbox did not respond. Please retry.', zh: 'Dropbox 未响应，请重试。' },
         'dropbox.loading': { ja: '読み込み中…', ko: '불러오는 중…', en: 'Loading…', zh: '正在读取…' },
         'dropbox.empty': { ja: '該当するファイルがありません', ko: '해당 파일이 없습니다', en: 'No matching files', zh: '没有匹配的文件' },
         'dropbox.listFailed': { ja: function(err){ return '一覧を読めませんでした: ' + err; }, ko: function(err){ return '목록을 읽지 못했습니다: ' + err; }, en: function(err){ return 'Could not read the list: ' + err; }, zh: function(err){ return '无法读取列表: ' + err; } },
@@ -69046,9 +69047,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       bytes.forEach(function(b) { binary += String.fromCharCode(b); });
       return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
+    // Metadata/auth requests are bounded through body decoding. Canceling a reader never cancels
+    // another reader's shared token refresh; its later continuation sees the aborted signal.
+    async function dropboxReadRequest(run, signal) {
+      const controller = new AbortController();
+      const cancel = function() { controller.abort(new DOMException(t('ui.cancel'), 'AbortError')); };
+      if (signal && signal.aborted) cancel();
+      else if (signal) signal.addEventListener('abort', cancel, { once: true });
+      const timer = setTimeout(function() { controller.abort(new Error(t('dropbox.timeout'))); }, 30000);
+      let abort;
+      const stopped = new Promise(function(resolve, reject) {
+        abort = function() { reject(controller.signal.reason); };
+        if (controller.signal.aborted) abort(); else controller.signal.addEventListener('abort', abort, { once: true });
+      });
+      try { return await Promise.race([Promise.resolve().then(function() { controller.signal.throwIfAborted(); return run(controller.signal); }), stopped]); }
+      finally { clearTimeout(timer); controller.signal.removeEventListener('abort', abort); if (signal) signal.removeEventListener('abort', cancel); }
+    }
     async function dropboxTokenRequest(params) {
+      return dropboxReadRequest(async function(signal) {
       const response = await fetch('https://api.dropboxapi.com/oauth2/token', { method: 'POST', credentials: 'omit', cache: 'no-store',
-        body: new URLSearchParams(Object.assign({ client_id: DROPBOX_APP_KEY }, params)) });
+        body: new URLSearchParams(Object.assign({ client_id: DROPBOX_APP_KEY }, params)), signal: signal });
       const json = await response.json().catch(function() { return null; });
       if (!response.ok || !json || !json.access_token) {
         const error = new Error(json && (json.error_description || json.error) || 'HTTP ' + response.status);
@@ -69056,6 +69074,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         throw error;
       }
       return json;
+      });
     }
     let dropboxRefreshing = null;
     let dropboxAuthEpoch = 0;
@@ -69087,15 +69106,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function dropboxHeaderArg(args) {
       return JSON.stringify(args).replace(/[\u007f-\uffff]/g, function(c) { return '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4); });
     }
-    async function dropboxFetch(host, endpoint, headers, body) {
+    async function dropboxFetch(host, endpoint, headers, body, signal) {
       const auth = dropboxAuth(), identity = auth && auth.refreshToken;
       const check = function() { if (!identity || !dropboxAuth() || dropboxAuth().refreshToken !== identity) throw new Error(t('dropbox.relink')); };
       for (let attempt = 0; ; attempt++) {
         check();
+        if (signal) signal.throwIfAborted();
         const token = await dropboxAccessToken(attempt > 0);
         check();
+        if (signal) signal.throwIfAborted();
         const response = await fetch('https://' + host + '/2/' + endpoint, { method: 'POST', credentials: 'omit', cache: 'no-store',
-          headers: Object.assign({ Authorization: 'Bearer ' + token }, headers), body: body });
+          headers: Object.assign({ Authorization: 'Bearer ' + token }, headers), body: body, signal: signal });
         check();
         if (response.status === 401 && attempt === 0) continue; // expired early: refresh once
         if (response.ok) return response;
@@ -69107,9 +69128,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         throw failure;
       }
     }
-    async function dropboxRpc(endpoint, args) {
-      const response = await dropboxFetch('api.dropboxapi.com', endpoint, { 'Content-Type': 'application/json' }, JSON.stringify(args));
-      return response.json();
+    async function dropboxRpc(endpoint, args, signal) {
+      return dropboxReadRequest(async function(requestSignal) {
+        const response = await dropboxFetch('api.dropboxapi.com', endpoint, { 'Content-Type': 'application/json' }, JSON.stringify(args), requestSignal);
+        return response.json();
+      }, signal);
     }
     function dropboxContent(endpoint, args, body) {
       const headers = { 'Dropbox-API-Arg': dropboxHeaderArg(args) };
@@ -69137,18 +69160,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return (await dropboxContent('files/upload_session/finish', { cursor: { session_id: started.session_id, offset: offset }, commit: commit },
         blob.slice(offset))).json();
     }
-    async function dropboxListFolder(path) {
-      let page = await dropboxRpc('files/list_folder', { path: path, include_non_downloadable_files: false });
+    async function dropboxListFolder(path, signal, progress) {
+      let page = await dropboxRpc('files/list_folder', { path: path, include_non_downloadable_files: false }, signal);
       const entries = page.entries.slice();
+      if (progress) progress(entries.length);
       while (page.has_more) {
-        page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor });
+        page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor }, signal);
         entries.push.apply(entries, page.entries);
+        if (progress) progress(entries.length);
       }
       return entries;
     }
     // Only metadata is indexed; files are downloaded on open. Publish a complete page chain atomically.
     // The cursor and cache belong to one linked account and work folder, and never survive a page reload.
-    async function dropboxReadWorkIndex(path, current) {
+    async function dropboxReadWorkIndex(path, current, signal, progress) {
       const auth = dropboxAuth(), identity = auth && auth.refreshToken;
       if (!identity) throw new Error(t('dropbox.notConnected'));
       const check = function() {
@@ -69164,10 +69189,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         for (const key of entries.keys()) rememberParents(key);
         check();
         try {
-          let page = cached ? await dropboxRpc('files/list_folder/continue', { cursor: cached.cursor })
-            : await dropboxRpc('files/list_folder', { path: path, recursive: true, include_deleted: true, include_non_downloadable_files: false });
+          let page = cached ? await dropboxRpc('files/list_folder/continue', { cursor: cached.cursor }, signal)
+            : await dropboxRpc('files/list_folder', { path: path, recursive: true, include_deleted: true, include_non_downloadable_files: false }, signal);
+          let seen = 0;
           for (;;) {
             check();
+            seen += page.entries.length; if (progress) progress(seen);
             page.entries.forEach(function(entry) {
               const key = entry.path_lower || String(entry.path_display || '').toLowerCase();
               if (!key) return;
@@ -69182,7 +69209,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               }
             });
             if (!page.has_more) break;
-            page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor });
+            page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor }, signal);
           }
           check();
           dropboxWorkIndex = { identity: identity, path: path, entries: entries, cursor: page.cursor };
@@ -69314,6 +69341,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function renderProjectStartDropbox(request) {
       const box = document.getElementById('projectStartDropbox');
       const seq = ++projectStartDropboxSeq;
+      if (projectStartDropboxView && projectStartDropboxView.abort) projectStartDropboxView.abort.abort();
       if (!box || box.hidden) return;
       const auth = dropboxAuth();
       if (!auth) {
@@ -69342,7 +69370,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const nav = make('div', 'es-dropbox-path', box);
         v.up = button(nav, 'chevronUp', 'dropbox.up', function() { if (!v.busy) renderProjectStartDropbox({ path: v.path.slice(0, v.path.lastIndexOf('/')), indexed: false }); });
         v.where = make('span', '', nav);
-        v.reload = button(nav, 'repeat', 'dropbox.refresh', function() { renderProjectStartDropbox(v.pending || { path: v.path, indexed: v.indexed }); });
+        v.reload = button(nav, 'repeat', 'dropbox.refresh', function() { if (v.busy && v.abort) { v.abort.abort(); return; } renderProjectStartDropbox(v.pending || { path: v.path, indexed: v.indexed }); });
         const tools = make('div', 'es-dropbox-tools', box);
         v.search = document.createElement('input'); v.search.type = 'search'; tools.appendChild(wrapSearchInput(v.search));
         v.browse = button(tools, 'folder', 'dropbox.browse', function() { renderProjectStartDropbox({ path: v.path, indexed: false }); });
@@ -69360,14 +69388,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           v.where.textContent = 'Dropbox' + v.path; v.where.title = v.where.textContent;
           v.search.title = t(v.indexed ? 'dropbox.search' : 'dropbox.browse'); v.search.setAttribute('aria-label', v.search.title);
           v.up.disabled = v.busy || !v.ready || !v.path || v.indexed;
-          v.reload.disabled = v.busy; v.browse.disabled = v.busy || !v.ready;
+          v.reload.disabled = false; v.reload.title = t(v.busy ? 'ui.cancel' : 'dropbox.refresh'); v.reload.setAttribute('aria-label', v.reload.title); v.browse.disabled = v.busy || !v.ready;
           v.work.disabled = v.busy || !work; v.pin.disabled = v.busy || !v.ready;
           v.browse.setAttribute('aria-pressed', String(!v.indexed)); v.work.setAttribute('aria-pressed', String(v.indexed));
           v.pin.setAttribute('aria-pressed', String(!!work && work.path === v.path));
           v.list.inert = v.busy; v.search.readOnly = v.busy;
           box.setAttribute('aria-busy', String(v.busy));
           v.who.textContent = auth.name ? t('dropbox.account', auth.name) : ''; v.who.title = v.who.textContent;
-          v.status.textContent = v.error ? t('dropbox.listFailed', v.error) : v.busy ? t('dropbox.loading') : String(v.shown || 0);
+          v.status.textContent = v.error ? t('dropbox.listFailed', v.error) : v.busy ? t('dropbox.loading') + (v.progress ? ' ' + v.progress : '') : String(v.shown || 0);
           v.status.title = v.status.textContent;
         };
         v.entryName = function(entry) { return v.indexed ? String(entry.path_display || entry.name).slice(v.path.length + 1) : entry.name; };
@@ -69397,7 +69425,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             };
             fragment.appendChild(row);
           });
-          if (!shown.length) { const empty = document.createElement('div'); empty.className = 'es-empty'; empty.textContent = t(v.ready ? 'dropbox.empty' : 'dropbox.loading'); fragment.appendChild(empty); }
+          if (!shown.length) { const empty = document.createElement('div'); empty.className = 'es-empty'; empty.textContent = v.ready ? t('dropbox.empty') : v.busy ? t('dropbox.loading') : ''; fragment.appendChild(empty); }
           v.list.replaceChildren(fragment); v.shown = shown.length;
           v.list.scrollTop = restore || 0; v.update();
         };
@@ -69405,19 +69433,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       const work = dropboxStorageGet(localStorage, DROPBOX_WORK_FOLDER_KEY);
       const target = request || (v.ready ? { path: v.path, indexed: v.indexed } : {
-        path: work && !dropboxBrowseFolders ? work.path : String(dropboxStorageGet(localStorage, DROPBOX_FOLDER_KEY) || ''), indexed: !!work && !dropboxBrowseFolders });
+        path: work ? work.path : String(dropboxStorageGet(localStorage, DROPBOX_FOLDER_KEY) || ''), indexed: false });
       const current = function() { const a = dropboxAuth(); return seq === projectStartDropboxSeq && !box.hidden && a && a.refreshToken === v.identity && projectStartDropboxView === v; };
-      v.remember(); v.pending = target; v.busy = true; v.error = ''; v.update();
+      v.remember(); v.pending = target; v.busy = true; v.error = ''; v.progress = 0; v.abort = new AbortController(); v.update();
       if (!v.ready) v.draw(0);
       let entries;
-      try { entries = target.indexed ? await dropboxReadWorkIndex(target.path, current) : await dropboxListFolder(target.path); }
+      const progress = function(count) { if (current()) { v.progress = count; v.update(); } };
+      try { entries = target.indexed ? await dropboxReadWorkIndex(target.path, current, v.abort.signal, progress) : await dropboxListFolder(target.path, v.abort.signal, progress); }
       catch (error) {
         if (seq !== projectStartDropboxSeq || box.hidden) return;
         if (!current()) { renderProjectStartDropbox(); return; }
-        v.busy = false; v.error = error.message || String(error); v.update();
+        v.busy = false; v.error = error.message || String(error); if (!v.ready) v.draw(0); else v.update();
         // Only the initial remembered path may fall back automatically; a failed navigation retains its listing.
         if (!v.ready && target.path && error.status === 409 && /not_found/.test(error.summary || '')) {
-          dropboxStorageSet(localStorage, DROPBOX_WORK_FOLDER_KEY, null); dropboxWorkIndex = null;
+          if (work && work.path === target.path) { dropboxStorageSet(localStorage, DROPBOX_WORK_FOLDER_KEY, null); dropboxWorkIndex = null; }
           renderProjectStartDropbox({ path: '', indexed: false });
         }
         return;
