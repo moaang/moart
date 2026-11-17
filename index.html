@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3412</title>
+  <title>MoArt ver3413</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -3342,6 +3342,14 @@
       /* 회전은 미러 안쪽에 온다 — 用紙와 같은 순서라 되돌릴 때도 같은 커널(viewInverseOffset: 미러를 먼저
          풀고 회전을 나중)이 맞는다. 팬은 둘보다 바깥이라 미러는 종이 자신의 중심 기준이다. */
       transform: translate(var(--paint-pan-x, 0px), var(--paint-pan-y, 0px)) scaleX(var(--video-flip-x, 1)) rotate(var(--video-rot, 0rad));
+    }
+
+    /* A reflected custom frame otherwise blends across the fractional reflection axis a second time.
+       Snap the whole paper including its drawing and guides, and let the pointer use that same DOM geometry. */
+    .paper-mirrored-x .conte-paper.paper-frame-active {
+      transform: translate(
+        calc(round(nearest, calc(100% + var(--paint-pan-x, 0px)), var(--view-device-pixel, 1px)) - 100%),
+        round(nearest, var(--paint-pan-y, 0px), var(--view-device-pixel, 1px))) scaleX(-1);
     }
 
     /* 스테이지에 붙는 자체 스크롤바(사용자 판정). 영상편집·원화 두 표면은 transform 으로 팬하므로 스크롤
@@ -19582,6 +19590,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // 세 표면의 % 만 다시 잰다(DOM·줌은 건드리지 않는다). UI 배율·기기 픽셀 비·창 크기가 바뀌는 자리에서 부른다.
     function refreshViewZoomLabels() {
+      document.documentElement.style.setProperty('--view-device-pixel', 1 / viewDevicePxPerLocalPx() + 'px');
       if (state.project && state.project.kind === 'genga') updateGengaZoomLabel();
       updateVideoZoomLabel();
       updatePaperZoomLabel();
@@ -25100,7 +25109,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.videoPreviewZoom = 1; state.paintViewportPanX = 0; state.paintViewportPanY = 0;
       state.videoViewRot = 0; state.videoViewFlipX = false; state.videoViewFlipY = false; state.videoPaintPointerCanvasRect = null;
       const videoStage = document.getElementById('conteVideoStage');
-      if (videoStage) { videoStage.style.setProperty('--video-flip-x', 1); videoStage.style.setProperty('--video-rot', '0rad'); }
+      if (videoStage) { videoStage.style.setProperty('--video-flip-x', 1); videoStage.style.setProperty('--video-rot', '0rad'); videoStage.classList.remove('paper-mirrored-x'); }
       ['videoViewFlipBtn', 'videoViewFlipYBtn'].forEach(function(id) { const b = document.getElementById(id); if (b) b.classList.remove('active'); });
       // 원화 엔진의 같은 것들. 모듈 let 이라 위 목록에 넣을 수 없어 훅으로 부른다.
       // 이 함수는 부트 중(원화 let 초기화 전)에도 불릴 수 있고, let 의 TDZ 는 typeof 검사로도 못 막는다. 부트 중의
@@ -87486,35 +87495,74 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const dx = n.x * r.w - o.x - e.tx, dy = n.y * r.h - o.y - e.ty;
       return { x: (o.x + (dx * Math.cos(a) - dy * Math.sin(a)) * s) / r.w, y: (o.y + (dx * Math.sin(a) + dy * Math.cos(a)) * s) / r.h };
     }
+    // The browser snaps the media box inside the paper before applying the view transform.
+    // Sampling the final bounding box directly misses that first rounding at fractional zoom.
+    function paintPaperImagePixelAtEvent(image, event, style, sw, sh, sheet) {
+      const paper = image.closest('.conte-paper');
+      if (!paper) return null;
+      const paperStyle = getComputedStyle(paper);
+      const transform = paperStyle.transform === 'none' ? new DOMMatrix() : new DOMMatrix(paperStyle.transform);
+      const axes = new DOMMatrix([transform.a, transform.b, transform.c, transform.d, 0, 0]);
+      const rect = paper.getBoundingClientRect(), imageRect = image.getBoundingClientRect();
+      const pw = parseFloat(paperStyle.width), ph = parseFloat(paperStyle.height), ps = uiPointerToRectScale();
+      const zoom = rect.width / (Math.abs(axes.a) * pw + Math.abs(axes.c) * ph) / ps;
+      if (!Number.isFinite(zoom) || zoom <= 0) return null;
+      const ox = pw * zoom / 2, oy = ph * zoom / 2;
+      const centerX = (rect.left + rect.width / 2) / ps, centerY = (rect.top + rect.height / 2) / ps;
+      const panX = transform.e * zoom, panY = transform.f * zoom;
+      const left = Math.round(centerX - ox - panX), top = Math.round(centerY - oy - panY);
+      const view = new DOMMatrix().translate(left + ox + panX, top + oy + panY).multiply(axes).translate(-ox, -oy);
+      const center = axes.inverse().transformPoint(new DOMPoint(
+        (imageRect.left + imageRect.width / 2) / ps - centerX, (imageRect.top + imageRect.height / 2) / ps - centerY));
+      const w = parseFloat(style.width) * zoom, h = parseFloat(style.height) * zoom;
+      const fit = Math.min(w / sw, h / sh);
+      const dw = style.objectFit === 'contain' ? sw * fit : w, dh = style.objectFit === 'contain' ? sh * fit : h;
+      const x = Math.round(ox + center.x - dw / 2), y = Math.round(oy + center.y - dh / 2);
+      const width = Math.round(ox + center.x + dw / 2) - x, height = Math.round(oy + center.y + dh / 2) - y;
+      const dpr = window.devicePixelRatio || 1;
+      const px = Math.floor(event.clientX * dpr), py = Math.floor(event.clientY * dpr);
+      const upright = sheet && axes.isIdentity;
+      const direct = upright || (sheet && (axes.b !== 0 || axes.c !== 0));
+      const tile = document.createElement('canvas');
+      tile.width = tile.height = direct ? 1 : 2;
+      const ctx = tile.getContext('2d');
+      ctx.imageSmoothingQuality = 'medium';
+      ctx.imageSmoothingEnabled = style.imageRendering !== 'pixelated';
+      try {
+        if (direct) {
+          if (upright) {
+            // An untransformed sheet paints directly in viewport coordinates.
+            const l = Math.round(imageRect.left / ps) * dpr, t = Math.round(imageRect.top / ps) * dpr;
+            const r = Math.round(imageRect.right / ps) * dpr, b = Math.round(imageRect.bottom / ps) * dpr;
+            ctx.drawImage(image, l - px, t - py, r - l, b - t);
+          } else {
+            ctx.setTransform(view.a * dpr, view.b * dpr, view.c * dpr, view.d * dpr, view.e * dpr - px, view.f * dpr - py);
+            ctx.drawImage(image, x, y, width, height);
+          }
+          const pixel = ctx.getImageData(0, 0, 1, 1).data;
+          return { r: pixel[0], g: pixel[1], b: pixel[2], a: pixel[3] };
+        }
+        // Read the four paper raster pixels that contribute to the output pixel, in premultiplied alpha.
+        const local = view.inverse().transformPoint(new DOMPoint((px + .5) / dpr, (py + .5) / dpr));
+        const lx = local.x * dpr - .5, ly = local.y * dpr - .5, ix = Math.floor(lx), iy = Math.floor(ly);
+        ctx.setTransform(dpr, 0, 0, dpr, -ix, -iy);
+        ctx.drawImage(image, x, y, width, height);
+        const data = ctx.getImageData(0, 0, 2, 2).data, fx = lx - ix, fy = ly - iy;
+        let r = 0, g = 0, b = 0, a = 0;
+        for (let i = 0; i < 4; i++) {
+          const weight = (i % 2 ? fx : 1 - fx) * (i >= 2 ? fy : 1 - fy) * data[i * 4 + 3];
+          a += weight; r += weight * data[i * 4]; g += weight * data[i * 4 + 1]; b += weight * data[i * 4 + 2];
+        }
+        return a > 0 ? { r: r / a, g: g / a, b: b / a, a: a } : null;
+      } catch (error) { return null; } // A tainted frame cannot suppress the other surfaces.
+    }
+
+
     function paintCanvasPixelAtEvent(canvas, event) {
       if (canvas && canvas.matches('.video-preview-layered')) return paintConteGroupPixelAtEvent(canvas, event);
       if (canvas && canvas.matches('.conte-paper-sheet-image')) {
-        const n = paintCanvasLocalNorm(canvas, event);
-        if (!n || n.x < 0 || n.x > 1 || n.y < 0 || n.y > 1 || !canvas.complete || !canvas.naturalWidth) return null;
-        // 회전·반전이 없는 이미지는 화면의 한 기기 픽셀을 읽는다. 원본 전체를 표시 크기·소수 원점으로 그려야
-        // 확대 경계의 보간이 남는다. 1×1 출력의 클립이 필요한 영역만 남기므로 화면 크기 버퍼는 만들지 않는다.
-        const sample = document.createElement('canvas');
-        sample.width = sample.height = 1;
-        const ctx = sample.getContext('2d');
-        try {
-          const rf = viewRotFlipForEl(canvas);
-          if (rf.rot || rf.flip < 0) {
-            // 회전·반전 표면의 최종 합성 보간은 별도 미결이다. 직접 재투영으로 오차를 더하지 않고 기존 판독을 보존한다.
-            ctx.drawImage(canvas, Math.min(canvas.naturalWidth - 1, Math.floor(n.x * canvas.naturalWidth)),
-              Math.min(canvas.naturalHeight - 1, Math.floor(n.y * canvas.naturalHeight)), 1, 1, 0, 0, 1, 1);
-          } else {
-            const rect = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
-            const pointerScale = uiPointerToRectScale();
-            // CSS 표시 상자의 양 끝을 먼저 정렬하고 DPR을 적용한다. 기기 픽셀에서 반올림하면 소수 DPR의 경계가 밀린다.
-            const left = Math.round(rect.left / pointerScale) * dpr, top = Math.round(rect.top / pointerScale) * dpr;
-            const right = Math.round((rect.left + rect.width) / pointerScale) * dpr, bottom = Math.round((rect.top + rect.height) / pointerScale) * dpr;
-            ctx.setTransform(1, 0, 0, 1, (left + right) / 2 - Math.floor(event.clientX * dpr), (top + bottom) / 2 - Math.floor(event.clientY * dpr));
-            ctx.imageSmoothingEnabled = getComputedStyle(canvas).imageRendering !== 'pixelated';
-            ctx.drawImage(canvas, -(right - left) / 2, -(bottom - top) / 2, right - left, bottom - top);
-          }
-          const data = ctx.getImageData(0, 0, 1, 1).data;
-          return { r: data[0], g: data[1], b: data[2], a: data[3] };
-        } catch (error) { return null; }
+        if (!canvas.complete || !canvas.naturalWidth) return null;
+        return paintPaperImagePixelAtEvent(canvas, event, getComputedStyle(canvas), canvas.naturalWidth, canvas.naturalHeight, true);
       }
       if (canvas && canvas.matches('img[data-video-media-clip-id], video[data-video-media-clip-id]')) {
         // 표시 중인 원본만 읽는다. seek 중 숨긴 이전 영상이나 해독 전 프레임으로 그림을 덮지 않는다.
@@ -87523,6 +87571,13 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         if (!sw || !sh || (video ? canvas.readyState < 2 || canvas.seeking : !canvas.complete)) return null;
         const style = getComputedStyle(canvas), w = parseFloat(style.width), h = parseFloat(style.height);
         if (!w || !h) return null;
+        const paper = canvas.closest('.conte-paper');
+        if (paper && style.transform === 'none' && style.filter === 'none') {
+          let parent = canvas.parentElement;
+          while (parent !== paper && getComputedStyle(parent).transform === 'none') parent = parent.parentElement;
+          if (parent === paper) return paintPaperImagePixelAtEvent(canvas, event, style, sw, sh, false);
+        }
+
         // CSS 표시 상자의 중심과 실제 조상 행렬로 contain·클립 FX·카메라·뷰 변환을 함께 읽는다.
         // 이동/transform-origin 은 최종 상자의 중심에 이미 들어 있다. 새 프레임 면이나 캐시는 만들지 않는다.
         let matrix = new DOMMatrix();
@@ -94508,12 +94563,19 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 회전 정규화는 用紙와 같은 커널을 쓴다 — 라디안 (-PI, PI] 규약이 표면마다 갈리면
     // 같은 각도가 표면에 따라 다른 수로 저장된다.
     function videoViewRotValue() { return clampPaperRotation(state.videoViewRot, 0); }
+    function applyVideoPaperViewTransform(stage) {
+      if (!stage) return;
+      const flip = videoViewFlipSign(), rot = videoViewRotEff();
+      stage.style.setProperty('--video-flip-x', flip);
+      stage.style.setProperty('--video-rot', rot + 'rad');
+      stage.classList.toggle('paper-mirrored-x', flip < 0 && rot === 0);
+    }
     // The applier owns every piece of DOM this feature touches, including the indicator. That is deliberate: an
     // indicator synced from updatePaintUI goes stale on any mirror path that does not call it (e.g. a reset),
     // leaving the button lit over an unmirrored sheet. Every path that changes the mirror ends here instead.
     function applyVideoViewFlipDom() {
       const stage = document.getElementById('conteVideoStage');
-      if (stage) stage.style.setProperty('--video-flip-x', videoViewFlipSign());
+      applyVideoPaperViewTransform(stage);
       const btn = document.getElementById('videoViewFlipBtn');
       if (btn) btn.classList.toggle('active', Boolean(state.videoViewFlipX));
       const btnY = document.getElementById('videoViewFlipYBtn');
@@ -94558,7 +94620,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     }
     function applyVideoViewRotDom() {
       const stage = document.getElementById('conteVideoStage');
-      if (stage) stage.style.setProperty('--video-rot', videoViewRotEff() + 'rad');
+      applyVideoPaperViewTransform(stage);
       state.videoPaintPointerCanvasRect = null; // 회전이 바뀌면 캐시된 rect 는 옛 각도의 bbox 다
       if (state.videoEditMode) drawPaintStageOverlay();
     }
