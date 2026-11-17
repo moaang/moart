@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3398</title>
+  <title>MoArt ver3399</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -25784,6 +25784,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3399, items: [{ja: 'スポイトが絵の下のV1画像・映像の色も拾います。再生中に押すと、停止で画面が変わる前の色を拾います。', ko: '스포이트가 그림 아래 V1 이미지·영상의 색도 집습니다. 재생 중에 누르면 멈춰서 화면이 바뀌기 전의 색을 집습니다.', en: 'The eyedropper now also picks colors from V1 images and videos under the drawing, and during playback it picks the color shown before playback stops.', zh: '吸管现在也能拾取画面下方V1图像和视频的颜色；播放中点击时，会拾取停止前屏幕上显示的颜色。'}] },
       { ver: 3390, items: [{ja: 'スポイトが用紙FXの色調・前面ウィンドウ・OLの重なり・ユーザー用紙枠の上でも画面どおりの色を拾います。', ko: '스포이트가 用紙 FX 색조·앞 창·OL 겹침·사용자 용지 틀 위에서도 화면에 보이는 색을 집습니다.', en: 'The eyedropper now picks the on-screen color over paper FX tints, front windows, OL overlaps and custom paper frames.', zh: '吸管在纸张FX色调、前方窗口、OL叠化和自定义纸框上也能拾取屏幕上显示的颜色。'}] },
       { ver: 3389, items: [{ja: 'Dropbox・環境設定・ショートカット・ガイドブックの検索欄を、虫眼鏡アイコンのコンパクトな共通デザインにそろえました。', ko: 'Dropbox·환경설정·단축키·가이드북 검색칸을 돋보기 아이콘이 있는 간결한 공용 디자인으로 통일했습니다.', en: 'Unified Dropbox, preferences, shortcuts and guidebook search fields with a compact magnifier design.', zh: '统一了Dropbox、偏好设置、快捷键和指南的搜索框，采用带放大镜图标的紧凑设计。'}] },
       { ver: 3388, items: [{ja: 'DropboxからTVPaint・CLIP・JSONも開けます。作業フォルダーを指定して、下位フォルダーの対応ファイルを名前やパスで検索できます。', ko: 'Dropbox에서 TVPaint·CLIP·JSON도 열 수 있습니다. 작업 폴더를 지정하면 하위 폴더의 지원 파일을 이름과 경로로 검색할 수 있습니다.', en: 'Open TVPaint, CLIP and JSON files from Dropbox. Choose a work folder to search supported files in its subfolders by name or path.', zh: '可从Dropbox打开TVPaint、CLIP和JSON文件。选择工作文件夹后，可按名称或路径搜索子文件夹中的支持文件。'}] },
@@ -86834,6 +86835,8 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     // 그 면의 상태 좌표로 풀며 색은 paintCanvasPixelAtEvent 에서 표시와 같은 행렬로 물들인다. 용지 칸(.picture-frame, overflow:hidden) 밖의 포인터도
     // null — FX 로 칸 밖에 나가 잘린 그림을 빈 칸·여백에서 집지 않는다.
     function paintCanvasLocalNorm(canvas, event) {
+      // 원화 프리뷰는 카메라·뷰 회전까지 캔버스 픽셀에 이미 그려져 있다.
+      if (canvas && canvas.id === 'gengaPreviewCanvas') return viewClientToLocalNorm(canvas, null, event.clientX, event.clientY, 0, 1);
       const rf = viewRotFlipForEl(canvas); // 이 캔버스가 탄 표면의 회전·미러
       const clip = canvas.closest('.picture-frame');
       if (clip) {
@@ -86892,6 +86895,45 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
           return { r: data[0], g: data[1], b: data[2], a: data[3] };
         } catch (error) { return null; }
       }
+      if (canvas && canvas.matches('img[data-video-media-clip-id], video[data-video-media-clip-id]')) {
+        // 표시 중인 원본만 읽는다. seek 중 숨긴 이전 영상이나 해독 전 프레임으로 그림을 덮지 않는다.
+        const video = canvas.tagName === 'VIDEO';
+        const sw = video ? canvas.videoWidth : canvas.naturalWidth, sh = video ? canvas.videoHeight : canvas.naturalHeight;
+        if (!sw || !sh || (video ? canvas.readyState < 2 || canvas.seeking : !canvas.complete)) return null;
+        const style = getComputedStyle(canvas), w = parseFloat(style.width), h = parseFloat(style.height);
+        if (!w || !h) return null;
+        // CSS 표시 상자의 중심과 실제 조상 행렬로 contain·클립 FX·카메라·뷰 변환을 함께 읽는다.
+        // 이동/transform-origin 은 최종 상자의 중심에 이미 들어 있다. 새 프레임 면이나 캐시는 만들지 않는다.
+        let matrix = new DOMMatrix();
+        for (let el = canvas; el && el !== document.body; el = el.parentElement) {
+          const transform = getComputedStyle(el).transform;
+          if (transform !== 'none') matrix = new DOMMatrix(transform).multiply(matrix);
+        }
+        let rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        // 변환 없는 미디어도 용지 틀과 같은 CSS 픽셀 정렬 뒤 기기 픽셀을 읽는다.
+        if (matrix.b === 0 && matrix.c === 0 && matrix.a === 1 && matrix.d === 1) {
+          const ps = uiPointerToRectScale(), left = Math.round(rect.left / ps) * ps, top = Math.round(rect.top / ps) * ps;
+          rect = { left: left, top: top, width: Math.round(rect.right / ps) * ps - left, height: Math.round(rect.bottom / ps) * ps - top };
+        }
+        const k = rect.width / (Math.abs(matrix.a) * w + Math.abs(matrix.c) * h) / uiPointerToRectScale() * dpr;
+        if (!matrix.is2D || !Number.isFinite(k) || k <= 0) return null;
+        const sample = document.createElement('canvas'); sample.width = sample.height = 1;
+        const ctx = sample.getContext('2d');
+        try {
+          ctx.setTransform(matrix.a * k, matrix.b * k, matrix.c * k, matrix.d * k,
+            (rect.left + rect.width / 2) / uiPointerToRectScale() * dpr - Math.floor(event.clientX * dpr),
+            (rect.top + rect.height / 2) / uiPointerToRectScale() * dpr - Math.floor(event.clientY * dpr));
+          // Canvas filter 의 px 는 출력 기기 픽셀이다. CSS 는 요소에서 흐린 뒤 조상과 함께 확대한다.
+          const filterScale = k * Math.hypot(matrix.a, matrix.b);
+          ctx.imageSmoothingEnabled = style.imageRendering !== 'pixelated';
+          ctx.filter = style.filter.replace(/blur\(([\d.]+)px\)/g, function(_, px) { return 'blur(' + Number(px) * filterScale + 'px)'; });
+          const scale = Math.min(w / sw, h / sh), dw = sw * scale, dh = sh * scale;
+          ctx.drawImage(canvas, -dw / 2, -dh / 2, dw, dh);
+          const data = ctx.getImageData(0, 0, 1, 1).data;
+          return { r: data[0], g: data[1], b: data[2], a: data[3] };
+        } catch (error) { return null; } // 교차 출처 오염도 다른 그림·바탕 판독을 막지 않는다.
+      }
       if (!canvas || String(canvas.tagName || '').toLowerCase() !== 'canvas') return null;
       // Normalize through the rotation-aware chokepoint, then bounds-check in normalized space. A client-space
       // box test would use the rotated bbox, which admits the four corner regions that are outside the sheet —
@@ -86914,10 +86956,10 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       }
     }
 
-    // 영상 묶음은 정지 합성 면 + 흰 배경(사용자 용지 틀이 있으면 투명)이다. OL 은 빈 묶음도 배경을 그린다.
+    // 영상 묶음은 정지 합성 면·표시 중인 V1 미디어 + 흰 배경(사용자 용지 틀이 있으면 투명)이다. OL 은 빈 묶음도 배경을 그린다.
     // 묶음 안을 먼저 합쳐야 부모 opacity 가 배경과 그림에 한 번만 걸린다. 좌표·FX 는 각 면의 판독을 재사용한다.
     function paintConteGroupPixelAtEvent(group, event) {
-      const canvases = Array.from(group.querySelectorAll('canvas')).filter(function(canvas) {
+      const surfaces = Array.from(group.querySelectorAll('canvas, img[data-video-media-clip-id], video[data-video-media-clip-id]')).filter(function(canvas) {
         const style = getComputedStyle(canvas);
         return style.visibility !== 'hidden' && style.display !== 'none';
       }).sort(function(a, b) {
@@ -86925,7 +86967,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         return dz || (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? 1 : -1);
       });
       let r = 0, g = 0, b = 0, cover = 0;
-      canvases.forEach(function(canvas) {
+      surfaces.forEach(function(canvas) {
         if (cover >= 1) return;
         const p = paintCanvasPixelAtEvent(canvas, event);
         if (!p) return;
@@ -86960,8 +87002,13 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         // 레이어 묶음도 순회한다)
         const n = paintCanvasLocalNorm(canvas, event);
         if (n && n.x >= 0 && n.x <= 1 && n.y >= 0 && n.y <= 1) return true;
-        return canvas.matches('.video-preview-layered') && Array.from(canvas.querySelectorAll('canvas')).some(function(child) {
-          if (getComputedStyle(child).visibility === 'hidden') return false;
+        return canvas.matches('.video-preview-layered') && Array.from(canvas.querySelectorAll('canvas, img[data-video-media-clip-id], video[data-video-media-clip-id]')).some(function(child) {
+          const style = getComputedStyle(child);
+          if (style.visibility === 'hidden' || style.display === 'none') return false;
+          if (child.matches('[data-video-media-clip-id]')) {
+            const pixel = paintCanvasPixelAtEvent(child, event);
+            return pixel && pixel.a > 0;
+          }
           const p = paintCanvasLocalNorm(child, event);
           return p && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
         });
@@ -87012,7 +87059,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     // 쌓고 불투명해지면 멈춘다. 남은 투명분은 종이(흰)다. 면이 모두 비었으면 빈 픽셀(= 흰색 규칙, applyEyedropperSample).
     // 用紙 FX 의 물들이기는 표시와 같은 행렬을 쓴다. 영상의 부모 불투명도·배경은 paintConteGroupPixelAtEvent 가 맡는다.
     // 사용자 용지 틀은 묶음 아래의 실제 이미지 면으로 한 번 합성한다(OL 부모 opacity 를 중복 적용하지 않는다).
-    // 임의의 DOM 쌓임 맥락·그룹까지 해석하지는 않는다. 제품의 면/묶음 밖 UI 장식·미디어는 샘플 대상이 아니다.
+    // 임의의 DOM 쌓임 맥락·그룹까지 해석하지는 않는다. 제품의 면/묶음 밖 UI 장식은 샘플 대상이 아니다.
     function paintCanvasEffectiveOpacity(canvas) {
       let opacity = 1;
       for (let el = canvas; el && el !== document.body; el = el.parentElement) opacity *= Number(getComputedStyle(el).opacity);
@@ -93987,14 +94034,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 이미 시작된 획의 계속이고, 그 획의 phase-1 이 여기를 지나며 재생을 멈췄다. Space 팬은 그리기가 아니라 재생을
       // 멈추지 않는다(가운데 버튼 팬·원화와 같다).
       if (beginPaintSpacePan(event, videoPreviewDrawTargets(event.currentTarget))) return;
-      stopPlaybackForDrawing();
-      const canvas = videoPreviewDrawTargets(event.currentTarget);
-      state.videoPaintPointerCanvasRect = canvas ? videoPaintBaseRect() : null;
       if (state.paintEyedropper) {
-        pickPaintColorFromEvent(event, canvas);
+        // 정지가 카메라·미디어를 다시 그리기 전에 누른 순간의 표시를 읽는다. 읽은 뒤에는 같은 정지를 수행한다.
+        pickPaintColorFromEvent(event, videoPreviewDrawTargets(event.currentTarget));
+        stopPlaybackForDrawing();
         state.videoPaintPointerCanvasRect = null;
         return;
       }
+      stopPlaybackForDrawing();
+      const canvas = videoPreviewDrawTargets(event.currentTarget);
+      state.videoPaintPointerCanvasRect = canvas ? videoPaintBaseRect() : null;
       const rawPoint = getVideoPaintPointFromEventRaw(event);
       let layerTarget = videoConteLayerPaintTarget(true);
       if (!layerTarget) {
@@ -135769,8 +135818,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // This runs after the middle-click pan above (that needs button 1) so panning still works; the
       // contextmenu event fires normally afterward (suppressed to nothing by the global handler on the canvas).
       if (!memoPrimaryPointerDownAllowed(ev)) return;
-      // (사용자 판정) 재생 중이면 여기서 멈춘다 — 콘티(beginVideoPaintStroke)와 같은 자리다. 팬·핀치·ユビパラ
-      // 플립·손가락 게이트는 위에서 이미 갈렸고, 아래는 전부 그리기/편집 조작이다.
+      // 스포이트는 정지가 카메라 뷰를 편집 뷰로 바꾸기 전에 읽는다. FX 상자 입력의 우선순위는 유지한다.
+      const pickPoint = state.paintEyedropper && (!state.gengaFxOpenId || state.paintEditTool === 'camera' || !gengaLayerById(state.gengaFxOpenId))
+        ? gengaPreviewPointerXYRaw(ev) : null;
+      if (pickPoint) {
+        if (state.gengaPlaying) applyEyedropperSample(paintCanvasPixelAtEvent(document.getElementById('gengaPreviewCanvas'), ev));
+        else gengaPickColorAt(pickPoint);
+      }
+      // (사용자 판정) 스포이트를 포함한 그리기/편집 조작은 재생을 멈춘다. 팬·핀치·손가락 게이트는 위에서 갈렸다.
       stopPlaybackForDrawing();
       gengaNoteCanvasEdit(); // 선택 규칙의 「편집」 — 핀치·팬·우클릭 같은 보기 조작을 걸러낸 뒤다(화면만 움직여도 선택이 내려가지 않게)
       gengaEndWheelViewLock(); // Editing must not reuse the preceding wheel gesture snapshot.
@@ -135782,12 +135837,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const gl = gengaLayerById(state.gengaFxOpenId);
         if (gl) { gengaFxGizmoPointerDown(ev, gl); if (ev.cancelable) ev.preventDefault(); return; }
       }
-      // eyedropper (スポイト): intercept before any tool op (same as conte) — sample the visible composite,
-      // never start a stroke.
-      if (state.paintEyedropper) {
-        const pp = gengaPreviewPointerXYRaw(ev);
-        if (pp) { gengaPickColorAt(pp); ev.preventDefault(); return; }
-      }
+      // 정지 전 채취한 입력은 획이나 다른 도구 조작으로 이어지지 않는다.
+      if (pickPoint) { ev.preventDefault(); return; }
       if (state.paintEditTool === 'camera') { gengaCameraPointerDown(ev); return; } // camera-frame edit (no layer needed)
       // 診断 mode = silhouette correction tool: click knocks out a wrongly-filled region (−) or adds a missed one (+)
       if (state.gengaSilDebug) { const pp = gengaPreviewPointerXY(ev); if (pp) { gengaSilFixClick(pp); ev.preventDefault(); } return; }
