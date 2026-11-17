@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3407</title>
+  <title>MoArt ver3408</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69266,11 +69266,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // Read a bounded, shallow set of folders before the exact background scan. Recursive Dropbox requests can spend
     // seconds enumerating deep media/backup branches before returning even their first page.
-    async function dropboxPreviewWorkIndex(path, list, signal, show, archive = false) {
+    async function dropboxPreviewWorkIndex(path, list, signal, show, selected = '') {
       const root = await list(path);
       signal.throwIfAborted();
       const entries = root.filter(dropboxIndexFile);
-      if (!archive && entries.length) show(entries);
+      if (!selected && entries.length) show(entries);
       const subfolders = function(rows) {
         return rows.filter(function(entry) {
           return entry['.tag'] === 'folder' && entry.path_display && !dropboxNonWorkFolder(entry.name);
@@ -69280,16 +69280,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const at = ['LO', '演出', '原画', '作監', '総作監', 'コンテ'].indexOf(dropboxCutStage(entry.name, false));
         return at < 0 ? 6 : at;
       };
-      const stages = subfolders(root).sort(function(a, b) { return rank(a) - rank(b); });
-      if (archive) {
-        // Discover archive roots in stage order and rotate their pages. The project scan owns the final cursor.
+      let stages = subfolders(root).sort(function(a, b) { return rank(a) - rank(b); });
+      if (selected) {
+        const archive = selected === ':archive';
+        // The chosen tab shares one queue. Rotate pages from its branches while the project scan reconciles all files.
         const pages = [];
         const discover = function(rows) {
           for (const folder of rows) {
             if (folder['.tag'] === 'folder' && dropboxArchiveFolder(folder.name)) pages.push({ path: folder.path_display });
           }
         };
-        discover(root);
+        if (archive) discover(root);
+        else {
+          stages = stages.filter(function(e) { return (dropboxCutStage(e.name, false) || e.name.replace(/^#/, '')) === selected; });
+          for (const stage of stages) {
+            const rows = await list(stage.path_display);
+            signal.throwIfAborted();
+            const files = rows.filter(dropboxIndexFile);
+            if (files.length) show(files);
+            const children = subfolders(rows).sort(function(a, b) {
+              return Number(/^[^_#0-9]*[0-9]/.test(b.name)) - Number(/^[^_#0-9]*[0-9]/.test(a.name));
+            });
+            for (const child of children) pages.push({ path: child.path_display });
+          }
+          stages = [];
+        }
         const worker = async function() {
           while (pages.length || stages.length) {
             signal.throwIfAborted();
@@ -69311,7 +69326,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
           }
         };
-        await Promise.allSettled([worker(), worker(), worker()]);
+        const results = await Promise.allSettled([worker(), worker(), worker()]);
+        const failed = results.find(function(result) { return result.status === 'rejected'; });
+        if (failed) throw failed.reason;
         return;
       }
       let queue = stages.slice(0, 2);
@@ -69611,6 +69628,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (box && !box.hidden && request?.indexed && !request.refresh && visible?.indexJob && visible.canOpen()
           && dropboxSamePath(request.path, visible.path)
           && (!request.cut || dropboxPinnedProjects().some(function(p) { return dropboxSamePath(p.path, request.path); }))) {
+        if (!request.cut) visible.previewStage?.('');
         visible.paintIndex(visible.entries, !!request.cut);
         return;
       }
@@ -69740,7 +69758,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }).setAttribute('aria-label', t('dropbox.cutRename'));
           if (v.cuts) {
             const stageTab = function(key, text) {
-              tab(v.stages, text, v.stage === key, function() { if (v.canOpen()) { v.stage = key; v.draw(0); if (key === ':archive') v.previewArchive?.(); } });
+              tab(v.stages, text, v.stage === key, function() { if (v.canOpen()) { v.stage = key; v.draw(0); v.previewStage?.(key); } });
             };
             stageTab('', t('dropbox.cutAll'));
             stages.forEach(function(key) { stageTab(key, active?.stages?.[key] || key); });
@@ -69762,10 +69780,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           for (const group of view.cuts.groups) {
             if (group.archived !== (view.stage === ':archive')) continue;
             if (!group.archived && view.stage && view.stage !== group.stage) continue;
-            const label = 'C' + group.cut + ((group.archived ? view.cuts.multipleArchiveScopes : view.cuts.multipleScopes) && group.scope ? ' · ' + group.scope : '');
+            const number = parseCutNoNumberSuffix(group.cut);
+            const cutLabel = 'C' + String(number.num).padStart(3, '0') + number.suffix.toUpperCase();
+            const label = cutLabel + ((group.archived ? view.cuts.multipleArchiveScopes : view.cuts.multipleScopes) && group.scope ? ' · ' + group.scope : '');
             const stage = project?.stages?.[group.stage] || group.stage;
             const title = label + (stage ? ' · ' + stage : '');
-            const matchesCut = title.toLowerCase().includes(query);
+            const matchesCut = title.toLowerCase().includes(query) || ('c' + number.num + number.suffix.toLowerCase()).includes(query);
             const files = types.map(function(type) { return group.files[type].filter(function(item) { return matchesCut || item.relative.toLowerCase().includes(query); }); });
             if (!files.some(function(items) { return items.length; })) continue;
             const row = make('div', 'es-dropbox-cut', fragment);
@@ -69911,6 +69931,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let previous = memory?.identity === v.identity ? memory : null;
         const same = v.ready && v.indexed && dropboxSamePath(v.path, target.path);
         v.partial = same ? v.partial : !previous;
+        let pendingPaint = 0;
         try {
           v.paintIndex(previous ? previous.entries.values() : same ? v.entries : [], !!target.cut, target.path);
           if (work?.path !== target.path && dropboxPinnedProjects().some(function(p) { return dropboxSamePath(p.path, target.path); })) {
@@ -69919,8 +69940,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const partialEntries = new Map();
           const show = function(entries) {
             if (!owns() || !v.partial) return;
-            for (const e of entries) partialEntries.set(e.path_display.toLowerCase(), e);
-            v.paintIndex(partialEntries.values(), !!v.cuts);
+            let changed = false;
+            for (const e of entries) {
+              const key = e.path_display.toLowerCase();
+              if (!partialEntries.has(key)) changed = true;
+              partialEntries.set(key, e);
+            }
+            if (!changed || pendingPaint) return;
+            const paint = function() {
+              pendingPaint = 0;
+              if (owns() && v.partial) v.paintIndex(partialEntries.values(), !!v.cuts);
+            };
+            if (v.shown) pendingPaint = setTimeout(paint, 180);
+            else paint();
           };
           // Both previews can reach the same stage. Share only shallow reads for this job.
           const shallow = new Map();
@@ -69929,11 +69961,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (!shallow.has(path)) shallow.set(path, dropboxListFolder(path, controller.signal));
             return shallow.get(path);
           };
-          let archiveStarted = false;
-          v.previewArchive = function() {
-            if (archiveStarted || !v.partial || !owns()) return;
-            archiveStarted = true;
-            dropboxPreviewWorkIndex(target.path, list, controller.signal, show, true).catch(function() { /* exact index continues */ });
+          let priority = null;
+          const completed = new Set();
+          v.previewStage = function(key) {
+            if (priority?.key === key) return;
+            priority?.controller.abort(); priority = null;
+            if (!key || key === '?' || completed.has(key) || !v.partial || !owns()) return;
+            const job = { key: key, controller: new AbortController() };
+            priority = job;
+            const stop = function() { job.controller.abort(); };
+            controller.signal.addEventListener('abort', stop, { once: true });
+            dropboxPreviewWorkIndex(target.path, list, job.controller.signal, show, key).then(function() {
+              if (!job.controller.signal.aborted) completed.add(key);
+            }).catch(function() { /* exact index continues */ }).finally(function() {
+              controller.signal.removeEventListener('abort', stop);
+              if (priority === job) priority = null;
+            });
           };
           if (previous && !target.refresh && Date.now() - previous.at < 30000) return;
           if (!previous && owner) {
@@ -69950,15 +69993,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               controller.signal, 4500).catch(function() { /* visible preview is optional */ });
           }
           if (!owns()) return;
-          let lastPreview = 0;
           const result = await dropboxRequest(function(signal) {
             return dropboxReadWorkIndex(target.path, previous, owns, signal, function(received, matched) {
               if (!owns()) return;
               v.status.title = String(matched) + ' / ' + String(received);
             }, function(entries) {
-              if ((!v.shown || v.stage === ':archive') && Date.now() - lastPreview >= 500) {
-                lastPreview = Date.now(); show(entries.values());
-              }
+              show(entries.values());
             });
           }, controller.signal, 180000, 'dropbox.indexTimeout');
           if (!owns()) return;
@@ -69979,7 +70019,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         } catch (error) {
           if (owns()) v.error = error.message || String(error);
         } finally {
-          if (v.indexJob === controller) { v.indexJob = null; v.previewArchive = null; controller.abort(); }
+          clearTimeout(pendingPaint);
+          if (v.indexJob === controller) { v.indexJob = null; v.previewStage = null; controller.abort(); }
           if (v.abort === controller) {
             v.abort = null;
             if (current()) { if (!v.shown) v.draw(v.list.scrollTop); else v.update(); }
