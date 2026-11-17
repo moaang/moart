@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3392</title>
+  <title>MoArt ver3393</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -114240,38 +114240,48 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         drawInstrPixelLines(ctx, lines, CAMERA_RED);
         drawInstrTicks(ctx, path, o.tickScale || scale, (o.keys || []).map(function(k) { return k.frame; }), o.frameTicks, CAMERA_RED);
       }
-      // 키마다 쿼드 도장 + 라벨. 중심에 굵은 채운 원은 찍지 않는다(사용자 판정, 실기 출력 기준) — 쿼드 도장과 중심
-      // 궤도·키 눈금(目盛り)이 이미 그 자리를 말하므로 점은 덮어서 읽기를 방해할 뿐이다.
+      // Stamp every frame before labels so a later frame cannot paint through an earlier label.
+      const labels = [], m = ctx.getTransform();
+      const bounds = { x: -m.e / m.a, y: -m.f / m.d, w: ctx.canvas.width / m.a, h: ctx.canvas.height / m.d };
+      let labelHeight = 0;
       (o.keys || []).forEach(function(k) {
         const corners = cornersAt(k.frame);
         if (!corners) return;
         strokePoly(ctx, corners, CAMERA_RED, lw);
-        ctx.save();
-        ctx.fillStyle = CAMERA_RED;
-        if (k.tag) {
-          // 라벨은 틀 왼쪽 위 바깥. 그 자리가 캔버스 위로 나가면(용지 위 끝에 붙은 틀 — 캔버스는 틀만 감싼다) 틀 안쪽 위에 둔다.
-          const asc = ctx.measureText(k.tag).actualBoundingBoxAscent || 0, m = ctx.getTransform();
-          // 회전한 틀에서도 눈에 보이는 왼쪽 위 모서리에 붙인다(corners[0] 은 틀과 함께 돈다).
-          const c0 = corners.reduce(function(a, c) { return (c.y < a.y - 0.5 || (Math.abs(c.y - a.y) <= 0.5 && c.x < a.x)) ? c : a; }, corners[0]);
-          const noteW = k.note && o.noteFont ? (function() { const f = ctx.font; ctx.font = o.noteFont; const w = ctx.measureText(k.note).width; ctx.font = f; return w + Math.round(5 * scale); })() : 0;
-          const labelW = ctx.measureText(k.tag).width + noteW;
-          let tx = c0.x + Math.round(6 * scale);
-          const rightEdge = (ctx.canvas.width - m.e) / m.a;   // 캔버스 오른쪽 끝(세계 좌표)
-          if (tx + labelW > rightEdge - 2 * scale) tx = Math.max((0 - m.e) / m.a + 2 * scale, rightEdge - labelW - 2 * scale);
-          let ty = c0.y - Math.round(6 * scale);
-          if (m.d * (ty - asc) + m.f < 0) ty = c0.y + Math.round(6 * scale) + asc;
-          ctx.lineWidth = Math.max(3, 4 * scale); ctx.strokeStyle = '#ffffff';
-          ctx.strokeText(k.tag, tx, ty); ctx.fillText(k.tag, tx, ty);
-          if (k.note && o.noteFont) {
-            const nx = tx + ctx.measureText(k.tag).width + Math.round(5 * scale);
-            const keptFont = ctx.font;
-            ctx.font = o.noteFont;
-            ctx.strokeText(k.note, nx, ty); ctx.fillText(k.note, nx, ty);
-            ctx.font = keptFont;
-          }
-        }
-        ctx.restore();
+        // A held boundary can reuse one sheet label across several nearly identical frames.
+        if (!k.tag || labels.some(label => label.text === k.tag && label.note === k.note)) return;
+        const metrics = ctx.measureText(k.tag), asc = metrics.actualBoundingBoxAscent || 16 * scale;
+        const height = asc + Math.max(2 * scale, metrics.actualBoundingBoxDescent || 0);
+        labelHeight = Math.max(labelHeight, height);
+        const c0 = corners.reduce(function(a, c) { return (c.y < a.y - 0.5 || (Math.abs(c.y - a.y) <= 0.5 && c.x < a.x)) ? c : a; }, corners[0]);
+        const noteW = k.note && o.noteFont ? (function() { const f = ctx.font; ctx.font = o.noteFont; const w = ctx.measureText(k.note).width; ctx.font = f; return w + Math.round(5 * scale); })() : 0;
+        const width = metrics.width + noteW;
+        const x = Math.max(bounds.x + 2 * scale, Math.min(c0.x + Math.round(6 * scale), bounds.x + bounds.w - width - 2 * scale));
+        let y = c0.y - Math.round(6 * scale) - height;
+        if (y < bounds.y) y = c0.y + Math.round(6 * scale);
+        labels.push({ text: k.tag, note: k.note, width: width, anchor: c0, normal: { x: 0, y: 1 }, preferred: { x: x, y: y } });
       });
+      const placed = gengaInstructionLabelLayout(ctx, labels, bounds, labelHeight, 12 * scale);
+      ctx.save(); ctx.fillStyle = CAMERA_RED;
+      placed.forEach(function(label) {
+        if (!label.preferredPlaced) {
+          const end = { x: Math.max(label.x, Math.min(label.anchor.x, label.x + label.w)),
+            y: label.anchor.y < label.y ? label.y : label.y + label.h };
+          drawInstrPixelLines(ctx, [[label.anchor, end]], CAMERA_RED);
+        }
+      });
+      placed.forEach(function(label) {
+        const ty = label.y + label.h;
+        ctx.lineWidth = Math.max(3, 4 * scale); ctx.strokeStyle = '#ffffff';
+        ctx.strokeText(label.text, label.x, ty); ctx.fillText(label.text, label.x, ty);
+        if (label.note && o.noteFont) {
+          const nx = label.x + ctx.measureText(label.text).width + Math.round(5 * scale), keptFont = ctx.font;
+          ctx.font = o.noteFont;
+          ctx.strokeText(label.note, nx, ty); ctx.fillText(label.note, nx, ty);
+          ctx.font = keptFont;
+        }
+      });
+      ctx.restore();
     }
     // Labels are resolved by the work model; this helper only chooses their printed glyphs.
     function cameraInstructionLabelText(label) {
@@ -114701,6 +114711,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Leaders follow the same local normal as the ticks. Alternate sides separate nearby endpoints;
     // collision handling extends a normal instead of choosing an unrelated compass direction.
+    // Camera corner tags keep their preferred position when free; their width includes the rotation note.
     function gengaInstructionLabelLayout(ctx, labels, bounds, height, gap) {
       const placed = [], unique = [], margin = height * .35;
       labels.forEach(function(label) {
@@ -114708,12 +114719,19 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (at < 0) unique.push(label); else unique[at] = label;
       });
       unique.forEach(function(label, index) {
-        const width = ctx.measureText(label.text).width, normal = label.normal || { x: 0, y: 1 };
+        const width = label.width == null ? ctx.measureText(label.text).width : label.width, normal = label.normal || { x: 0, y: 1 };
         let nx = normal.x, ny = normal.y;
         if ((Math.abs(nx) > Math.abs(ny) ? nx : ny) < 0) { nx = -nx; ny = -ny; }
         const extent = Math.min(Math.abs(nx) > 1e-9 ? width / 2 / Math.abs(nx) : Infinity,
           Math.abs(ny) > 1e-9 ? height / 2 / Math.abs(ny) : Infinity);
         let box, fallback;
+        if (label.preferred) {
+          const p = label.preferred;
+          if (p.x >= bounds.x && p.y >= bounds.y && p.x + width <= bounds.x + bounds.w && p.y + height <= bounds.y + bounds.h
+            && !placed.some(q => p.x < q.x + q.w + margin && p.x + width + margin > q.x && p.y < q.y + q.h + margin && p.y + height + margin > q.y)) {
+            box = { ...label, x: p.x, y: p.y, w: width, h: height, preferredPlaced: true };
+          }
+        }
         for (let ring = 0; ring < 24 && !box; ring++) {
           for (const side of [index % 2 ? 1 : -1, index % 2 ? -1 : 1]) {
             const distance = gap + ring * (height + margin);
