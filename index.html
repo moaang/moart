@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3395</title>
+  <title>MoArt ver3396</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -114251,8 +114251,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 겹쳐 엉키고, 그 구간에서는 중심 궤도 + 눈금만 맞는 정보다(사용자 판정, 실기 출력 기준). 판정은 부르는 쪽이 한다 —
     // 카메라는 키의 rotation/w, 츠케팬은 레이어 fx 의 rot/scale 을 보므로 「무엇이 변했는가」를 아는 곳이 다르고,
     // 커널이 추측하면 기준이 둘이 된다.
-    // `keys[].note` = 키 라벨 옆의 작은 글씨 주기(각도 / 배율). 라벨 폭을 measureText 로 재서 같은 베이스라인
-    // 오른쪽에 놓는다 — 아래로 내리면 도장 쿼드 안을 침범한다.
+    // Moving labels use the memori curved fan-out. PAN anchors to the first corner; zoom/rotation anchors
+    // to the centre trajectory. Notes (angle/scale) travel with their label, without changing any key geometry.
     function drawInstrMarks(ctx, o) {
       const cornersAt = o.cornersAt, scale = o.scale, lw = o.lw;
       // 궤적 = 네 모서리와 중심. 모서리만으로는 앵커를 복원할 수 없어 컴포지터에서 다시 만들기 어렵다(사용자 판단).
@@ -114269,48 +114269,36 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         drawInstrPixelLines(ctx, lines, CAMERA_RED);
         drawInstrTicks(ctx, path, o.tickScale || scale, (o.keys || []).map(function(k) { return k.frame; }), o.frameTicks, CAMERA_RED);
       }
-      // Stamp every frame before labels so a later frame cannot paint through an earlier label.
-      const labels = [], m = ctx.getTransform();
-      const bounds = { x: -m.e / m.a, y: -m.f / m.d, w: ctx.canvas.width / m.a, h: ctx.canvas.height / m.d };
-      let labelHeight = 0;
+      // All frame outlines precede their labels; later frames must not paint through text.
+      const named = [], points = [];
       (o.keys || []).forEach(function(k) {
         const corners = cornersAt(k.frame);
         if (!corners) return;
         strokePoly(ctx, corners, CAMERA_RED, lw);
-        // A held boundary can reuse one sheet label across several nearly identical frames.
-        if (!k.tag || labels.some(label => label.text === k.tag && label.note === k.note)) return;
-        const metrics = ctx.measureText(k.tag), asc = metrics.actualBoundingBoxAscent || 16 * scale;
-        const height = asc + Math.max(2 * scale, metrics.actualBoundingBoxDescent || 0);
-        labelHeight = Math.max(labelHeight, height);
-        const c0 = corners.reduce(function(a, c) { return (c.y < a.y - 0.5 || (Math.abs(c.y - a.y) <= 0.5 && c.x < a.x)) ? c : a; }, corners[0]);
-        const noteW = k.note && o.noteFont ? (function() { const f = ctx.font; ctx.font = o.noteFont; const w = ctx.measureText(k.note).width; ctx.font = f; return w + Math.round(5 * scale); })() : 0;
-        const width = metrics.width + noteW;
-        const x = Math.max(bounds.x + 2 * scale, Math.min(c0.x + Math.round(6 * scale), bounds.x + bounds.w - width - 2 * scale));
-        let y = c0.y - Math.round(6 * scale) - height;
-        if (y < bounds.y) y = c0.y + Math.round(6 * scale);
-        labels.push({ text: k.tag, note: k.note, width: width, anchor: c0, normal: { x: 0, y: 1 }, preferred: { x: x, y: y } });
+        if (!k.tag || named.some(q => q.tag === k.tag && q.note === k.note)) return;
+        named.push(k);
+        points.push({ frame: k.frame, p: o.corners === false ? instrQuadCentre(corners) : corners[0] });
       });
-      const placed = gengaInstructionLabelLayout(ctx, labels, bounds, labelHeight, 12 * scale);
-      ctx.save(); ctx.fillStyle = CAMERA_RED;
-      placed.forEach(function(label) {
-        if (!label.preferredPlaced) {
-          const end = { x: Math.max(label.x, Math.min(label.anchor.x, label.x + label.w)),
-            y: label.anchor.y < label.y ? label.y : label.y + label.h };
-          drawInstrPixelLines(ctx, [[label.anchor, end]], CAMERA_RED);
-        }
-      });
-      placed.forEach(function(label) {
-        const ty = label.y + label.h;
-        ctx.lineWidth = Math.max(3, 4 * scale); ctx.strokeStyle = '#ffffff';
-        ctx.strokeText(label.text, label.x, ty); ctx.fillText(label.text, label.x, ty);
-        if (label.note && o.noteFont) {
-          const nx = label.x + ctx.measureText(label.text).width + Math.round(5 * scale), keptFont = ctx.font;
-          ctx.font = o.noteFont;
-          ctx.strokeText(label.note, nx, ty); ctx.fillText(label.note, nx, ty);
-          ctx.font = keptFont;
-        }
-      });
-      ctx.restore();
+      if (!named.length) return;
+      if (named.length > 1) {
+        // Reuse the memori fan-out: PAN belongs to a frame corner, zoom/rotation to the centre trajectory.
+        const labelAt = new Map(named.map(function(k) { return [k.frame, k.tag + (k.note ? ' ' + k.note : '')]; }));
+        const fs = Math.max(16, 18 * scale);
+        const layout = instrMemoriLayout(points, { fs: fs, unit: o.tickScale || scale, keyFrames: new Set(),
+          mergeCoincident: false, label: function(f) { return labelAt.get(f); }, measure: function(t) { return ctx.measureText(t).width; } });
+        drawInstrMemori(ctx, layout, fs, o.tickScale || scale, CAMERA_RED);
+        return;
+      }
+      // A lone/static frame keeps its outside-corner caption, clamped to the output paper.
+      const k = named[0], corners = cornersAt(k.frame), m = ctx.getTransform();
+      const c0 = corners.reduce(function(a, c) { return c.y < a.y - .5 || (Math.abs(c.y - a.y) <= .5 && c.x < a.x) ? c : a; });
+      const text = k.tag + (k.note ? ' ' + k.note : ''), metrics = ctx.measureText(text), asc = metrics.actualBoundingBoxAscent || 16 * scale;
+      const left = -m.e / m.a, right = (ctx.canvas.width - m.e) / m.a;
+      const x = Math.max(left + 2 * scale, Math.min(c0.x + 6 * scale, right - metrics.width - 2 * scale));
+      let y = c0.y - 6 * scale;
+      if (m.d * (y - asc) + m.f < 0) y = c0.y + 6 * scale + asc;
+      ctx.save(); ctx.fillStyle = CAMERA_RED; ctx.strokeStyle = '#ffffff'; ctx.lineWidth = Math.max(3, 4 * scale);
+      ctx.strokeText(text, x, y); ctx.fillText(text, x, y); ctx.restore();
     }
     // Labels are resolved by the work model; this helper only chooses their printed glyphs.
     function cameraInstructionLabelText(label) {
@@ -114740,7 +114728,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Leaders follow the same local normal as the ticks. Alternate sides separate nearby endpoints;
     // collision handling extends a normal instead of choosing an unrelated compass direction.
-    // Camera corner tags keep their preferred position when free; their width includes the rotation note.
     function gengaInstructionLabelLayout(ctx, labels, bounds, height, gap) {
       const placed = [], unique = [], margin = height * .35;
       labels.forEach(function(label) {
@@ -114748,19 +114735,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (at < 0) unique.push(label); else unique[at] = label;
       });
       unique.forEach(function(label, index) {
-        const width = label.width == null ? ctx.measureText(label.text).width : label.width, normal = label.normal || { x: 0, y: 1 };
+        const width = ctx.measureText(label.text).width, normal = label.normal || { x: 0, y: 1 };
         let nx = normal.x, ny = normal.y;
         if ((Math.abs(nx) > Math.abs(ny) ? nx : ny) < 0) { nx = -nx; ny = -ny; }
         const extent = Math.min(Math.abs(nx) > 1e-9 ? width / 2 / Math.abs(nx) : Infinity,
           Math.abs(ny) > 1e-9 ? height / 2 / Math.abs(ny) : Infinity);
         let box, fallback;
-        if (label.preferred) {
-          const p = label.preferred;
-          if (p.x >= bounds.x && p.y >= bounds.y && p.x + width <= bounds.x + bounds.w && p.y + height <= bounds.y + bounds.h
-            && !placed.some(q => p.x < q.x + q.w + margin && p.x + width + margin > q.x && p.y < q.y + q.h + margin && p.y + height + margin > q.y)) {
-            box = { ...label, x: p.x, y: p.y, w: width, h: height, preferredPlaced: true };
-          }
-        }
         for (let ring = 0; ring < 24 && !box; ring++) {
           for (const side of [index % 2 ? 1 : -1, index % 2 ? -1 : 1]) {
             const distance = gap + ring * (height + margin);
@@ -114878,14 +114858,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 결과 = { items:[{ text, key, x, y, w, h }](번호 상자 중심·크기), wires:[[p0, c1, c2, p3]], box:{l,t,r,b} }.
     function instrMemoriLayout(path, o) {
       const fs = o.fs, unit = o.unit, MIN = 1.4 * fs, NEAR = 1.15 * fs, FAR = 4.2 * fs;
-      // 같은 자리(출력 0.5px 이내)에 멈춘 코마는 한 항목
+      // 같은 자리(출력 0.5px 이내)에 멈춘 코마는 한 항목. 카메라 키는 중심이 같아도 서로 다른 배율이므로 mergeCoincident:false 로 각각 남긴다.
       const pts = [];
       // 키가 코마마다 이어지면(画面動 등) 그 연속의 양끝만 동그라미 — 전부 치면 동그라미가 뜻을 잃는다. 판정은 병합 전
       // 코마로 한다(정지로 묶인 「3〜4」 의 키 3 은 앞뒤 코마가 키가 아니면 동그라미).
       const runEnd = function(f) { return o.keyFrames.has(f) && !(o.keyFrames.has(f - 1) && o.keyFrames.has(f + 1)); };
       path.filter(function(s) { return s && s.p && Number.isFinite(s.p.x) && Number.isFinite(s.p.y); }).forEach(function(s) {
         const last = pts[pts.length - 1];
-        if (last && Math.hypot(s.p.x - last.x, s.p.y - last.y) < unit * 0.5) { last.to = s.frame; last.key = last.key || runEnd(s.frame); return; }
+        if (o.mergeCoincident !== false && last && Math.hypot(s.p.x - last.x, s.p.y - last.y) < unit * 0.5) { last.to = s.frame; last.key = last.key || runEnd(s.frame); return; }
         pts.push({ x: s.p.x, y: s.p.y, from: s.frame, to: s.frame, key: runEnd(s.frame) });
       });
       const n = pts.length, out = { items: [], wires: [], box: null };
@@ -115009,9 +114989,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       out.box = { l: l, t: t, r: r, b: b };
       return out;
     }
-    function drawInstrMemori(ctx, layout, fs, unit) {
+    function drawInstrMemori(ctx, layout, fs, unit, color) {
       ctx.save();
-      ctx.strokeStyle = '#222222'; ctx.lineWidth = unit * 1.2;
+      ctx.strokeStyle = color || '#222222'; ctx.lineWidth = unit * 1.2;
       layout.wires.forEach(function(w) {
         ctx.beginPath(); ctx.moveTo(w[0].x, w[0].y); ctx.bezierCurveTo(w[1].x, w[1].y, w[2].x, w[2].y, w[3].x, w[3].y); ctx.stroke();
       });
@@ -115019,7 +114999,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       layout.items.forEach(function(it) {
         ctx.lineWidth = fs * 0.22; ctx.strokeStyle = '#ffffff'; ctx.strokeText(it.text, it.x, it.y);
-        ctx.fillStyle = '#111111'; ctx.fillText(it.text, it.x, it.y);
+        ctx.fillStyle = color || '#111111'; ctx.fillText(it.text, it.x, it.y);
         if (it.key) {
           ctx.strokeStyle = '#111111'; ctx.lineWidth = Math.max(unit * 1.5, fs * 0.07);
           ctx.beginPath(); ctx.ellipse(it.x, it.y, it.w / 2 + fs * 0.42, it.h / 2 + fs * 0.42, 0, 0, Math.PI * 2); ctx.stroke();
