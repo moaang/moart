@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3406</title>
+  <title>MoArt ver3407</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -15027,6 +15027,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'project.dropbox.badge.failed': { ja: 'Dropbox保存失敗', ko: 'Dropbox 저장 실패', en: 'Dropbox save failed', zh: 'Dropbox保存失败' },
         'dropbox.hint': { ja: '自分のDropboxに接続して対応ファイルを開けます。.moartは元のファイルに保存し、TVPaint・CLIP・JSONは読み込みます。接続はこのブラウザーだけに残ります。', ko: '자기 Dropbox에 연결해 지원 파일을 열 수 있습니다. .moart는 원래 파일에 저장하고, TVPaint·CLIP·JSON은 가져옵니다. 연결은 이 브라우저에만 남습니다.', en: 'Connect your Dropbox to open supported files. Save .moart back to its source; import TVPaint, CLIP and JSON. The connection stays in this browser only.', zh: '连接自己的Dropbox以打开支持的文件。.moart保存回原文件，TVPaint、CLIP和JSON作为导入。连接仅保留在此浏览器中。' },
         'dropbox.useFolder': { ja: '現在のフォルダーを作業フォルダーに固定', ko: '현재 폴더를 작업 폴더로 고정', en: 'Pin current folder as work folder', zh: '将当前文件夹固定为工作文件夹' },
+        'dropbox.pinSelected': { ja: '選択したフォルダーを固定', ko: '선택한 폴더 고정', en: 'Pin selected folder', zh: '固定选中的文件夹' },
         'dropbox.cutView': { ja: 'カット一覧', ko: '컷 보기', en: 'Cut view', zh: '镜头列表' },
         'dropbox.cutAll': { ja: 'すべて', ko: '전체', en: 'All', zh: '全部' },
         'dropbox.cutArchive': { ja: '保管', ko: '보관', en: 'Archive', zh: '存档' },
@@ -69281,30 +69282,36 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
       const stages = subfolders(root).sort(function(a, b) { return rank(a) - rank(b); });
       if (archive) {
-        // Start in observed archive directories. A bounded preview never supplies a sync cursor.
-        const readArchives = async function(rows) {
-          for (const folder of rows.filter(function(e) { return e['.tag'] === 'folder' && dropboxArchiveFolder(e.name); }).slice(0, 2)) {
+        // Discover archive roots in stage order and rotate their pages. The project scan owns the final cursor.
+        const pages = [];
+        const discover = function(rows) {
+          for (const folder of rows) {
+            if (folder['.tag'] === 'folder' && dropboxArchiveFolder(folder.name)) pages.push({ path: folder.path_display });
+          }
+        };
+        discover(root);
+        const worker = async function() {
+          while (pages.length || stages.length) {
             signal.throwIfAborted();
-            let page = await dropboxRpc('files/list_folder', { path: folder.path_display, recursive: true, include_deleted: false, limit: 500,
-              include_non_downloadable_files: false }, signal);
-            for (let i = 0; ; i++) {
+            const next = pages.shift();
+            try {
+              if (!next) { discover(await list(stages.shift().path_display)); continue; }
+              const page = next.cursor
+                ? await dropboxRpc('files/list_folder/continue', next, signal)
+                : await dropboxRpc('files/list_folder', { path: next.path, recursive: true, include_deleted: false,
+                    limit: 2000, include_non_downloadable_files: false }, signal);
               signal.throwIfAborted();
               const files = page.entries.filter(dropboxIndexFile);
               if (files.length) show(files);
-              if (!page.has_more || i >= 3) break;
-              page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor }, signal);
+              if (page.has_more) pages.push({ cursor: page.cursor });
+            } catch (error) {
+              signal.throwIfAborted();
+              if (error.status !== 409) throw error;
+              // A folder can move during discovery. The authoritative scan reconciles it.
             }
           }
         };
-        const candidates = [null, ...stages.slice(0, 4)];
-        const worker = async function() {
-          while (candidates.length) {
-            signal.throwIfAborted();
-            const stage = candidates.shift();
-            await readArchives(stage ? await list(stage.path_display) : root);
-          }
-        };
-        await Promise.allSettled([worker(), worker()]);
+        await Promise.allSettled([worker(), worker(), worker()]);
         return;
       }
       let queue = stages.slice(0, 2);
@@ -69656,13 +69663,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         v.cut = button(tools, 'cutTable', 'dropbox.cutView', function() {
           renderProjectStartDropbox({ path: v.path, indexed: true, cut: true });
         });
+        v.pinPath = function() {
+          return !v.indexed && v.entries.some(function(e) { return e['.tag'] === 'folder' && e.path_display === v.selection; }) ? v.selection : v.path;
+        };
         v.pin = button(tools, 'pin', 'dropbox.useFolder', function() {
-          if (v.busy || !v.ready || !v.path) return;
+          const path = v.pinPath();
+          if (v.busy || !v.ready || !path) return;
           const projects = dropboxPinnedProjects();
-          const pinned = projects.some(function(p) { return dropboxSamePath(p.path, v.path); });
-          dropboxSavePinnedProjects(pinned ? projects.filter(function(p) { return !dropboxSamePath(p.path, v.path); }) : projects.concat({ path: v.path }), v.path);
+          const pinned = projects.some(function(p) { return dropboxSamePath(p.path, path); });
+          dropboxSavePinnedProjects(pinned ? projects.filter(function(p) { return !dropboxSamePath(p.path, path); }) : projects.concat({ path: path }),
+            pinned ? dropboxActivePin()?.path : path);
           if (pinned) {
-            const key = v.path.toLowerCase();
+            const key = path.toLowerCase();
             dropboxWorkIndexes.delete(key);
             dropboxIndexStorage(dropboxAuth()?.pinOwner, function(records) {
               return records.filter(function(record) { return record.path !== key; });
@@ -69782,7 +69794,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const projects = dropboxPinnedProjects();
           const pinned = projects.some(function(p) { return dropboxSamePath(p.path, v.path); });
           v.tabs(projects); v.projects.inert = v.stages.inert = v.busy;
-          v.pin.dataset.label = pinned ? 'dropbox.unpinFolder' : 'dropbox.useFolder';
+          const path = v.pinPath();
+          const pinPressed = projects.some(function(p) { return dropboxSamePath(p.path, path); });
+          v.pin.dataset.label = pinPressed ? 'dropbox.unpinFolder' : path !== v.path ? 'dropbox.pinSelected' : 'dropbox.useFolder';
           box.querySelectorAll('[data-label]').forEach(function(e) { e.title = t(e.dataset.label); e.setAttribute('aria-label', e.title); });
           v.where.textContent = 'Dropbox' + v.path; v.where.title = v.where.textContent;
           v.where.setAttribute('aria-label', t('dropbox.ancestors') + ' · ' + v.where.textContent);
@@ -69790,11 +69804,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           v.search.title = t(v.indexed ? 'dropbox.search' : 'dropbox.browse'); v.search.setAttribute('aria-label', v.search.title);
           v.up.disabled = v.busy || !v.ready || !v.path;
           v.reload.disabled = false; v.reload.title = t(v.abort ? 'ui.cancel' : 'dropbox.refresh'); v.reload.setAttribute('aria-label', v.reload.title); v.browse.disabled = v.busy || !v.ready;
-          v.work.disabled = v.busy || !work; v.pin.disabled = v.busy || !v.ready || !v.path;
+          v.work.disabled = v.busy || !work; v.pin.disabled = v.busy || !v.ready || !path;
           v.cut.hidden = !projects.length; v.cut.disabled = v.busy || !pinned;
           v.cut.setAttribute('aria-pressed', String(!!v.cuts));
           v.browse.setAttribute('aria-pressed', String(!v.indexed)); v.work.setAttribute('aria-pressed', String(v.indexed && !v.cuts));
-          v.pin.setAttribute('aria-pressed', String(pinned));
+          v.pin.setAttribute('aria-pressed', String(pinPressed));
           v.list.inert = v.busy; v.search.readOnly = v.busy;
           box.setAttribute('aria-busy', String(v.busy));
           v.who.textContent = auth.name ? t('dropbox.account', auth.name) : ''; v.who.title = v.who.textContent;
@@ -69826,12 +69840,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             date.textContent = !folder && entry.server_modified ? new Date(entry.server_modified).toLocaleDateString() : '';
             row.title = (entry.path_display || entry.name) + (date.textContent ? '\n' + new Date(entry.server_modified).toLocaleString() : '');
             row.append(name, meta, date);
+            if (folder) row.setAttribute('aria-pressed', String(view.selection === entry.path_display));
+            if (folder) row.onkeydown = function(event) {
+              if (event.key === 'Enter' && v.canOpen()) {
+                event.preventDefault();
+                renderProjectStartDropbox({ path: entry.path_display, indexed: false });
+              }
+            };
             row.onclick = function() {
-              if (v.busy || projectStartDropboxView !== v || !dropboxAuth() || dropboxAuth().refreshToken !== v.identity) return;
+              if (!v.canOpen()) return;
+              if (folder && v.selection === entry.path_display) {
+                renderProjectStartDropbox({ path: entry.path_display, indexed: false }); return;
+              }
               v.selection = entry.path_display; v.remember();
-              if (folder) { renderProjectStartDropbox({ path: entry.path_display, indexed: false }); return; }
-              v.list.querySelectorAll('.es-dropbox-row').forEach(function(e) { e.classList.toggle('selected', e === row); });
-              v.open(entry);
+              for (const item of v.list.querySelectorAll('.es-dropbox-row')) {
+                item.classList.toggle('selected', item === row);
+                if (item.hasAttribute('aria-pressed')) item.setAttribute('aria-pressed', String(item === row));
+              }
+              if (folder) v.update();
+              else v.open(entry);
             };
             fragment.appendChild(row);
           });
@@ -69855,7 +69882,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (!same && saved) next.selection = saved.selected;
           v.draw(same ? v.list.scrollTop : saved?.top || 0, next);
         };
-        v.search.oninput = function() { if (v.busy) return; v.queries[v.mode(v)] = v.search.value; v.draw(0); };
+        const clearSelection = function() {
+          if (v.busy || !v.selection || v.indexed) return;
+          v.selection = ''; v.remember(); v.draw(v.list.scrollTop);
+        };
+        v.list.onclick = function(event) { if (!event.target.closest('button')) clearSelection(); };
+        v.list.onkeydown = function(event) {
+          if (event.key === 'Escape' && v.selection && !v.indexed) { event.stopPropagation(); clearSelection(); v.search.focus(); }
+        };
+        v.search.oninput = function() { if (v.busy) return; v.queries[v.mode(v)] = v.search.value; if (!v.indexed) v.selection = ''; v.draw(0); };
       }
       const work = dropboxActivePin();
       const target = request || (v.ready ? { path: v.path, indexed: v.indexed, cut: !!v.cuts } : {
@@ -69891,17 +69926,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const shallow = new Map();
           const list = function(path) {
             if (v.folders.has(path)) return Promise.resolve(v.folders.get(path));
-            if (!shallow.has(path)) shallow.set(path, dropboxRpc('files/list_folder', {
-              path: path, limit: 250, include_non_downloadable_files: false
-            }, controller.signal).then(function(page) { return page.entries; }));
+            if (!shallow.has(path)) shallow.set(path, dropboxListFolder(path, controller.signal));
             return shallow.get(path);
           };
           let archiveStarted = false;
           v.previewArchive = function() {
             if (archiveStarted || !v.partial || !owns()) return;
             archiveStarted = true;
-            dropboxRequest(function(signal) { return dropboxPreviewWorkIndex(target.path, list, signal, show, true); },
-              controller.signal, 10000).catch(function() { /* exact index continues */ });
+            dropboxPreviewWorkIndex(target.path, list, controller.signal, show, true).catch(function() { /* exact index continues */ });
           };
           if (previous && !target.refresh && Date.now() - previous.at < 30000) return;
           if (!previous && owner) {
@@ -69971,7 +70003,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           .concat(entries.filter(function(e) { return e['.tag'] === 'file' && isProjectBundleFile(e); }).sort(byName));
         const next = { entries: nextEntries, path: target.path, indexed: false, cuts: null, stage: '', ready: true, pending: null, selection: '' };
         const saved = v.positions.get(v.key(next));
-        if (saved) next.selection = saved.selected;
         v.draw(saved ? saved.top : 0, next);
         if (dropboxPinnedProjects().some(function(p) { return dropboxSamePath(p.path, v.path); }) && work?.path !== v.path) dropboxSavePinnedProjects(dropboxPinnedProjects(), v.path);
         // Cache ordinary listings for this linked view only; explicit refresh replaces the snapshot.
