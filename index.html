@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3431</title>
+  <title>MoArt ver3432</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -21643,7 +21643,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaPixels: refreshOptions && refreshOptions.gengaPixels, gengaDrawingContext: refreshOptions && refreshOptions.gengaDrawingContext, gengaRenderPlan: gengaRenderPlan, conteDialogCutId: refreshOptions && refreshOptions.conteDialogCutId, conteGeometryUi: refreshOptions && refreshOptions.conteGeometryUi, gengaGeometryUi: refreshOptions && refreshOptions.gengaGeometryUi, recordingKind: refreshOptions && refreshOptions.recordingKind }, refreshOptions && refreshOptions.selectionRider));
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
       const plan = gengaPresetRenderPlan(effectiveRefreshOptions.gengaRenderPlan, gengaRenderPlan);
-      if (plan) effectiveRefreshOptions.gengaRenderPlan = plan;
+      if (plan && plan.reuseCelContent) {
+        // Normalization can update grouped layers. Only reuse cells of matching snapshots.
+        const prev = new Map(before.gengaTimeline.layers.map(function(l) { return [l.id, l]; }));
+        const same = new Set(after.gengaTimeline.layers.filter(function(l) {
+          return prev.has(l.id) && JSON.stringify(prev.get(l.id)) === JSON.stringify(l);
+        }).map(function(l) { return l.id; }));
+        effectiveRefreshOptions.gengaRenderPlan = Object.assign({}, plan, { reusableCelIds: same });
+      } else if (plan) effectiveRefreshOptions.gengaRenderPlan = plan;
       if (genga) effectiveRefreshOptions.gengaPreviewCachesSettled = true;
       refresh(effectiveRefreshOptions);
       gengaNoticeEmptiedLayers(before, after); // 빈 레이어 판정의 유일한 길목
@@ -129168,7 +129175,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // 새 프로젝트의 첫 레이어(applyGengaCreateResolution)와 같은 규칙 — 1프레임째 1코마를 갖고 만든다.
         layer.exposures = [newGengaExposure(1)];
         gengaPlaceNewLayer(gt, layer, anchorId);
-      }, { gengaRenderPlan: { scope: 'all', previewByCaller: true } });   // 레이어 목록이 바뀌어 어차피 전체 렌더다
+      }, { gengaRenderPlan: { scope: 'all', previewByCaller: true, reuseCelContent: true } });   // 레이어 목록이 바뀌어 어차피 전체 렌더다
       // 만든 것을 고른다 — 다음 획이 새 레이어에 앉는다. 벡터면 selectGengaLayer 가 못 담는 효과를 바로 끈다.
       // 선택이 바뀌면 selectGengaLayer 가 미리보기를 그린다(위 previewByCaller). 렌더가 선택 없는 상태에서 이미 새 레이어를
       // 골랐으면(전부 지운 뒤 추가) 선택이 그대로라 그리지 않으므로, 그려지지 않았을 때만 여기서 그린다.
@@ -141141,7 +141148,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { cameraWork: fastClone((gt && gt.cameraWork) || { keyframes: [] }) };
     }
     function gengaCameraRenderPlan(gt, structural) {
-      if (structural) return { scope: 'all', reason: 'camera-structure' };
+      if (structural) return { scope: 'all', reason: 'camera-structure', reuseCelContent: true };
       const instr = gengaCameraInstrLayer(gt);
       return { scope: 'partial', layerIds: instr ? [String(instr.id)] : [], camera: true };
     }
@@ -145511,7 +145518,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaViewRowMarkup(rows, id, markup) {
       const node = rows.current.get(id), cached = node && gengaViewRowCache.get(node);
-      if (!cached || cached.body !== markup.body) return markup.body + markup.fx + '</div>';
+      if (!cached || cached.body !== markup.body || cached.cells !== markup.cells) return markup.body + markup.cells + markup.fx + '</div>';
       const index = rows.reused.push(node) - 1;
       // Cross-layer FX letters can change on reorder without changing any cel. Parse/bind only
       // the replacement FX strips; retain the expensive exposure subtree and its listeners.
@@ -145796,8 +145803,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       try {
         gengaPatchMode = patchGengaViewDom(stageEl, gengaViewHtml, renderPlan, rows);
       } catch (patchError) {
-        if (!partialRender) throw patchError;
-        console.error('[genga] 부분 패치 실패 — 전체 렌더로 다시 그린다', patchError,
+        if (!partialRender && !(renderPlan && renderPlan.reuseCelContent)) throw patchError;
+        console.error('[genga] 패치 실패 — 전체 렌더로 다시 그린다', patchError,
           { layerIds: (renderPlan && renderPlan.layerIds) || [], audio: Boolean(renderPlan && renderPlan.audio) });
         renderGengaView(stageEl, { scope: 'all', reason: 'patch-failed' });
         return;
@@ -145821,6 +145828,213 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // HTML generation owns no DOM replacement or event-listener lifetime.
+    function gengaCelContent(l, gt, context) {
+      // Asset availability changes independently of the layer and of offscreen DOM nodes.
+      let thumbs = null, stable = true;
+      // A セルサブレイヤー (cellGroupId set + tagOff'd) is a sketch/tracing companion; the parent already
+      // carries the group's instance numbers / hold-none-loop notation, so repeating that text on every sub-layer
+      // row is clutter and wasted work on each renderGengaView rebuild. The interactive shapes (koma buttons,
+      // drag handles, postbehavior cycle buttons) stay — only the text inside them is blanked below.
+      const isCelSubLayer = !!(l.cellGroupId && l.tagOff);
+      let blocks = '';
+      // value-less koma show their left-to-right position on the timeline (1,2,3…), not insertion order. 이
+      // 표는 같은 배열의 전 원소에 1 부터 매기므로 읽는 자리에 폴백을 두지 않는다.
+      const numberTitle = escapeAttr(t('project.genga.exposure.numTitle'));
+      const headTitle = escapeAttr(t('project.genga.exposure.headHandleTitle'));
+      const tailTitle = escapeAttr(t('project.genga.exposure.exposureHandleTitle'));
+      const layerAttr = escapeHtml(l.id);
+      const expoRank = gengaPositionalRanks(l); // Same numbering as positional commit.
+      const serifuSpans = new Map(); // One read of this row; discarded before any edit can run.
+      // 시트 표기의 프레임 칸/이음선 마크업 — 전후 비헤이비어·中間リピート·セリフ
+      // 인라인이 같은 생성기(sheetCell/sheetDash)를 쓴다. dash 의 `cells > 0` 가드는 pb 쪽 호출이 전부 상수(1·4·5)라 그쪽에서는 늘 참이다.
+      const sheetCell = function(txt, cls) { return '<span class="pb-cell' + (cls || '') + '" style="width:' + gengaTimelinePx(1) + '">' + txt + '</span>'; };
+      const sheetDash = function(cells) { return cells > 0 ? '<span class="pb-dash" style="width:' + gengaTimelinePx(cells) + '"></span>' : ''; };
+      (l.exposures || []).forEach(function(e) {
+        // セリフ区間のメンバーは個別の値を出さない — 区間ごとに「from ~ to セ リ フ」を1回だけ重ねて描く。
+        // ただし 動画マークで区間が切れた先から始まるコマは区間外なので、ふつうに番号を出す。
+        const inSerifu = gengaExposureInSerifu(l, e, serifuSpans); // 일괄 확정과 같은 판정
+        const valued = !inSerifu && (e.instanceValue !== null && e.instanceValue !== undefined && e.instanceValue !== '');
+        const numText = (inSerifu || isCelSubLayer) ? '' : gengaExposureNumberText(e, expoRank);
+        const eDr = gengaExposureDrawing(l, e);
+        const thumb = gengaExposureThumbInnerHtml(eDr);
+        if (eDr && stable) {
+          const url = eDr.ref && gengaThumbCache.get(eDr.ref);
+          if (!url || eDr.active || gengaThumbBakeFailed.has(eDr.ref)) stable = false;
+          else {
+            if (!thumbs) thumbs = new Map();
+            thumbs.set(eDr.ref, url);
+          }
+        }
+        // 「그린 인스턴스만 활성화」 -- 리비전 레이어는 코마 단위로 흐림을 개별 판정한다.
+        const revExpEmpty = (l.revisionKey || l.revisionCustom) && !eDr ? ' genga-revision-exposure-empty' : '';
+        blocks += '<div class="genga-exposure' + revExpEmpty + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '"' + gengaTimelineWindowAttrs(e.startFrame - 1, e.startFrame - 1 + e.holdFrames) + ' style="left:' + gengaTimelinePx(e.startFrame - 1, 1) + ';width:' + gengaTimelinePx(e.holdFrames, -1) + '">' +
+          '<span class="genga-exposure-thumb">' + thumb + '</span>' +
+          (e.mark ? '<span class="genga-exposure-mark" data-mark="' + escapeAttr(e.mark) + '"></span>' : '') +
+          '<span class="genga-exposure-num' + (valued ? ' valued' : '') + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '" title="' + numberTitle + '">' +
+            '<span class="genga-num-first" style="width:' + ('max(8px, ' + gengaTimelinePx(1, -2) + ')') + '">' + escapeHtml(numText) + '</span>' +
+            (Array.isArray(e.dougaOffsets) ? e.dougaOffsets.map(function(o) { return (o >= 1 && o < e.holdFrames) ? ('<span class="genga-num-douga" data-genga-douga-rel="' + o + '" title="' + escapeAttr(t('project.genga.exposure.dougaOffsetTitle')) + '" style="left:' + gengaTimelinePx(o, -1) + ';width:' + gengaTimelinePx(1) + '"></span>') : ''; }).join('') : '') +
+          '</span>' +
+          '<span class="genga-exposure-h genga-exposure-h-tl" title="' + headTitle + '"></span>' +
+          '<span class="genga-exposure-h genga-exposure-h-br" title="' + tailTitle + '"></span></div>';
+      });
+      // pre/post-behavior toggles flanking the koma-content span: none / hold / repeat, drawn as Japanese
+      // timesheet notation on the instance-number strip — none = ×, hold = a continuation line ───, repeat = the
+      // boundary koma's instance value + リピート. Still the same cycling <button> underneath.
+      // PRE には番号を付けない — ユーザー判定「전혀 실재랑 시트 달라서 안하는게 나을듯」。このバッジは 5
+      // コマぶんの要約で、シートが頭区間にパターンを丸ごと並べる書き方とは同じ形になりようがない。番号を一つ載せると
+      // シートとも再生とも違う三つ目の表記が生まれる。POST と非対称なのは承知の上である。
+      // Both pre/post notation and middle gaps read the same immutable coverage for this row.
+      const sortedExposures = gengaSortedExposures(l);
+      const exposureSpan = sortedExposures.length ? gengaExposureSpanMap(sortedExposures) : null;
+      // Uncovered runs inside the existence region. Empty-cell cards and the mid-gap notation read the
+      // same runs instead of rediscovering them with two identical frame scans.
+      const gapRuns = [];
+      if (exposureSpan) {
+        for (let f = exposureSpan.first; f <= exposureSpan.last; f++) {
+          if (exposureSpan.covered[f]) continue;
+          let runEnd = f;
+          while (runEnd + 1 <= exposureSpan.last && !exposureSpan.covered[runEnd + 1]) runEnd++;
+          gapRuns.push({ start: f, end: runEnd });
+          f = runEnd;
+        }
+      }
+      if (sortedExposures.length) {
+        const pbFirst = sortedExposures[0];
+        const pbSpan = exposureSpan;
+        const firstStart = pbSpan.first;
+        const lastEnd = pbSpan.last; // frame count from 0 → right edge = *cellW
+        // sheet notation — laid out as frame-cell spans so it lands on the exact instance-value
+        // grid/coordinate (each .pb-cell is one cellW, centered like .genga-num-first). One リ/ピ/ー/ト per
+        // frame cell (4 cells), each centered like an instance value.
+        const pbRep = function() { return 'リピート'.split('').map(function(ch) { return sheetCell(ch); }).join(''); };
+        const bhTitle = function(v) { return (v === 'hold' ? t('project.genga.behavior.hold') : (v === 'repeat' ? t('project.genga.behavior.repeat') : t('project.genga.suffix.none'))) + t('project.genga.behavior.clickToCycle'); };
+        // content-region box (first koma start → last koma end; behind the komas) + disabled placeholder cards
+        // on the empty cells inside the region (koma-shaped, blank instance value) so the whole strip reads and
+        // handles as one editable row — grab-drag and cell-select work on them too. Painted under the real komas.
+        // Sheet notation: the first cell of each empty run gets an × (空セル開始); that × / dash lives in the
+        // .genga-midbehavior notation below (one per gap), so each per-cell card is blank — only a
+        // drag-select / right-click surface.
+        // 빈 카드 안에는 번호띠 span 이 없다. 그 자리는 .genga-midbehavior 가 같은 좌표·같은 높이로 덮어
+        // 입력을 받는다. 썸네일 반쪽의 누름은 레인으로 버블해 gengaLanePointerDown 이 결국
+        // gengaCellSelPointerDown 을 부른다. 빈 셀에는 상하 구분이 없다.
+        // Each frame keeps its own card box: the rounded tile and shadow per cell are the visible grid. The
+        // menu/long-press binding, title and viewport window item belong to a display:contents owner of at
+        // most gapOwnerFrames cards, so a long gap does not bind and window every frame. The owner
+        // generates no box; its cards still lay out in the lane with the same calc coordinates.
+        let phHtml = '';
+        const gapOwnerFrames = 32;
+        const emptyLayerAttr = escapeHtml(l.id), emptyTitleAttr = escapeAttr(t('project.genga.exposure.emptyCelTitle'));
+        gapRuns.forEach(function(run) {
+          for (let from = run.start; from <= run.end; from += gapOwnerFrames) {
+            const to = Math.min(run.end, from + gapOwnerFrames - 1);
+            phHtml += '<div class="genga-exposure-gap" data-genga-layer="' + emptyLayerAttr + '" title="' + emptyTitleAttr + '"' + gengaTimelineWindowAttrs(from - 1, to) + '>';
+            for (let f = from; f <= to; f++) {
+              phHtml += '<div class="genga-exposure genga-exposure-empty" style="left:' + gengaTimelinePx(f - 1, 1) + ';width:' + gengaTimelinePx(1, -1) + '">' +
+                '<span class="genga-exposure-thumb"></span></div>';
+            }
+            phHtml += '</div>';
+          }
+        });
+        blocks = '<div class="genga-content-box" style="left:' + gengaTimelinePx(firstStart - 1) + ';width:' + gengaTimelinePx(lastEnd - firstStart + 1) + '">' +
+          '<span class="genga-strip-h genga-strip-h-head" title="' + escapeAttr(t('project.genga.strip.headHandleTitle')) + '"></span>' +
+          '<span class="genga-strip-h genga-strip-h-tail" title="' + escapeAttr(t('project.genga.strip.tailHandleTitle')) + '"></span></div>' + phHtml + blocks;
+        // POST notation: five cells after the last exposure; repeat replays the preceding contiguous cycle.
+        //   none = ×———— (× + 4-cell line) · hold = ————— (5-cell line) · repeat = n + リピート(4 cells)
+        const pb = l.postBehavior || 'none';
+        const postInner = isCelSubLayer ? '' : (pb === 'hold' ? sheetDash(5)
+          : (pb === 'repeat' ? (sheetCell(escapeHtml(gengaExposureNumberText(pbFirst, expoRank))) + pbRep()) : (sheetCell('×') + sheetDash(4))));
+        blocks += '<button class="genga-postbehavior pb-' + pb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="post" style="left:' + gengaTimelinePx(lastEnd) + ';width:' + gengaTimelinePx(5) + '" title="' + escapeAttr(t('project.genga.behavior.postPrefix') + bhTitle(pb)) + '">' + postInner + '</button>';
+        // PRE notation sits before the first exposure; repeat wraps through the first contiguous cycle.
+        //   none = × (1 cell) · hold = ─ line (1 cell, matches the post line) · repeat = リピート (4 cells)
+        if (firstStart >= 2) {
+          const preb = l.preBehavior || 'none';
+          const preInner = isCelSubLayer ? '' : (preb === 'repeat' ? pbRep() : (preb === 'hold' ? sheetDash(1) : sheetCell('×')));
+          const preCells = preb === 'repeat' ? 4 : 1;
+          blocks += '<button class="genga-postbehavior pb-' + preb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="pre" style="left:' + gengaTimelinePx(firstStart - 1 - preCells) + ';width:' + gengaTimelinePx(preCells) + '" title="' + escapeAttr(t('project.genga.behavior.prePrefix') + bhTitle(preb)) + '">' + preInner + '</button>';
+        }
+      }
+      // セリフ（口パク）区間: one grouped notation per section, over the member komas (whose own value
+      // strips render blank above). Cells: from ~ to セ リ フ, then a hold continuation line for the rest
+      // of the span.
+      // 中間リピート/空き: one trailing-line notation per repeating or empty stretch of a mid gap, same
+      // ×————/n リピート———— vocabulary as the pre/post behavior. A plain click toggles the gap's repeat
+      // (gengaCellSelUp); the koma area stays empty while stopped — only playback replays the cycle. A
+      // sheet-imported repeat can start after the gap does or stop at its own × (r.endFrame), so a gap is
+      // cut where playback (gengaRepeatAt) and the sheet writer cut it.
+      let midHtml = '';
+      const midRuns = [];
+      gapRuns.forEach(function(run) {
+        for (let from = run.start; from <= run.end;) {
+          const rep = gengaRepeatAt(l, from);
+          let to = run.end;
+          if (rep) to = Math.min(to, gengaRepeatEndFrame(l, rep.startFrame, gt.totalFrames, rep.endFrame));
+          else (l.repeats || []).forEach(function(r) { if (r.startFrame > from && r.startFrame <= to) to = r.startFrame - 1; });
+          midRuns.push({ start: from, end: to, repeat: rep });
+          from = to + 1;
+        }
+      });
+      midRuns.forEach(function(run) {
+        const gs = run.start, ge = run.end, rep = run.repeat;
+        const gc = ge - gs + 1;
+        let inner, title;
+        if (rep) {
+          const cyc = gengaRepeatCycle(l, gs);
+          const firstExp = cyc ? gengaExposureAt(l, cyc.start) : null;
+          const nv = firstExp ? gengaExposureNumberText(firstExp, expoRank) : '';
+          const glyphs = 'リピート'.split('').slice(0, Math.max(0, gc - 1));
+          inner = isCelSubLayer ? '' : (sheetCell(escapeHtml(nv)) + glyphs.map(function(ch) { return sheetCell(ch); }).join('') + sheetDash(gc - 1 - glyphs.length));
+          title = t('project.genga.midGap.repeatTitle', gs, ge);
+        } else {
+          inner = isCelSubLayer ? '' : (sheetCell('×') + sheetDash(gc - 1));
+          title = t('project.genga.midGap.emptyTitle');
+        }
+        midHtml += '<div class="genga-midbehavior' + (rep ? ' pb-repeat' : '') + '" data-genga-layer="' + escapeHtml(l.id) + '"' +
+          ' style="left:' + gengaTimelinePx(gs - 1) + ';width:' + gengaTimelinePx(gc) + '" title="' + title + '">' + inner + '</div>';
+      });
+      let serifuHtml = '';
+      (l.serifuSections || []).forEach(function(sec) {
+        // effective span — the blue notation and its hold line stop at the first 動画 mark
+        const sp = gengaSerifuEffectiveSpan(l, sec.id, serifuSpans); if (!sp) return;
+        const spanCells = sp.end - sp.start + 1;
+        let inner = '';
+        if (sec.placement && sec.placement.length) {
+          // 수동·구운 배치가 있으면 시트 출력(gengaLayerSheetTokens)과 같이 입이 바뀌는 코마에 번호, 사이는 홀드선
+          // (사용자 — 굽기 = 파란 인스턴스 표기가 입 번호가 되는 것). 배치가 없으면 시트처럼 범위 표기.
+          for (let k = 0; k < spanCells;) {
+            const v = k < sec.placement.length ? sec.placement[k] : null;
+            if (v === null) { let j = k; while (j < spanCells && (j >= sec.placement.length || sec.placement[j] === null)) j++; inner += sheetDash(j - k); k = j; continue; }
+            inner += sheetCell(escapeHtml(v === 'x' ? '×' : String(v)), ''); k++;
+          }
+        } else {
+          const glyphs = [String(sec.from), '~', String(sec.to)].concat(sec.cover ? ['×', 'セ', 'リ', 'フ'] : ['セ', 'リ', 'フ']);
+          const shown = glyphs.slice(0, spanCells);
+          inner = shown.map(function(g, i) {
+            return sheetCell(escapeHtml(g), (i >= 3) ? ' sf-kana' : '');
+          }).join('');
+          inner += sheetDash(spanCells - shown.length);
+        }
+        // 몸 층이 바뀐 뒤는 시트처럼 × 와 그 홀드선(gengaLayerSheetTokens 와 같은 범위)
+        const stripEnd = sp.bodyChangeFrame === null ? sp.end : sp.markEnd;
+        if (sp.bodyChangeFrame !== null) inner += sheetCell('×', '') + sheetDash(sp.markEnd - sp.bodyChangeFrame);
+        serifuHtml += '<div class="genga-serifu-strip" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-serifu="' + escapeHtml(sec.id) + '"' +
+          ' style="left:' + gengaTimelinePx(sp.start - 1) + ';width:' + gengaTimelinePx(stripEnd - sp.start + 1) + '"' +
+          ' title="' + escapeAttr(t('project.genga.serifu.sectionPrefix', gengaSerifuLabel(sec)) + (sec.cover ? t('project.genga.serifu.coverSuffix') : '') +
+          ((sec.placement && sec.placement.length) ? t('project.genga.serifu.manualPlacementSuffix') : t('project.genga.serifu.rollSuffix')) + t('project.genga.serifu.editHint')) + '">' + inner + '</div>';
+      });
+      return { html: blocks + midHtml + serifuHtml, context: stable ? context : null, thumbs: thumbs };
+    }
+
+    function gengaReusableCelContent(cached, context) {
+      const content = cached && cached.content;
+      if (!content || content.context !== context) return null;
+      if (content.thumbs) {
+        for (const [ref, url] of content.thumbs) {
+          if (gengaThumbCache.get(ref) !== url || gengaThumbBakeFailed.has(ref) || (gengaActiveCanvas && gengaActiveCanvas.ref === ref)) return null;
+        }
+      }
+      return content;
+    }
+
     function gengaBuildViewHtml(project, renderPlan, total, partialRender, rows) {
       const gt = project.gengaTimeline;
       const layers = Array.isArray(gt.layers) ? gt.layers : [];
@@ -145834,15 +146048,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const selId = state.gengaSelectedLayerId || '';
       const thumbW = 40;
       const thumbH = Math.max(16, Math.min(28, Math.round(thumbW * gt.paper.h / Math.max(1, gt.paper.w))));
+      const celContext = [I18N.lang, gt.totalFrames, gt.paper.w, gt.paper.h].join('|');
       let rowsHead = '', rowsLane = '';
-      const appendRow = function(id, head, body, fx) {
+      const appendRow = function(id, head, body, fx, content) {
         id = String(id);
         // body contains the lane opener and cel content; this boundary owns its closing tag.
         // Heads repaint their Canvas thumbnails. Cel bodies and FX strips have separate lifetimes.
-        const markup = { body: body, fx: fx || '' };
+        const markup = { body: body, content: content, cells: content ? content.html : '', fx: fx || '' };
         if (rows) rows.markup.set(id, markup);
         rowsHead += head;
-        rowsLane += rows ? gengaViewRowMarkup(rows, id, markup) : body + markup.fx + '</div>';
+        rowsLane += rows ? gengaViewRowMarkup(rows, id, markup) : body + markup.cells + markup.fx + '</div>';
       };
       // ── A-Z 탭은 그 행의 자식이다. 패널 바깥 오버레이로 두고 scroll 이벤트로 translateY 를 따라가게 하면 iOS
       // 관성 스크롤에서 이벤트가 합쳐지거나 늦어 탭이 행에서 어긋난다. 행 안에 있으면 브라우저가 함께 스크롤한다.
@@ -146046,192 +146261,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             '</div>' +
             fxLabels +
             '</div>';
-          // A セルサブレイヤー (cellGroupId set + tagOff'd) is a sketch/tracing companion; the parent already
-          // carries the group's instance numbers / hold-none-loop notation, so repeating that text on every sub-layer
-          // row is clutter and wasted work on each renderGengaView rebuild. The interactive shapes (koma buttons,
-          // drag handles, postbehavior cycle buttons) stay — only the text inside them is blanked below.
-          const isCelSubLayer = !!(l.cellGroupId && l.tagOff);
-          let blocks = '';
-          // value-less koma show their left-to-right position on the timeline (1,2,3…), not insertion order. 이
-          // 표는 같은 배열의 전 원소에 1 부터 매기므로 읽는 자리에 폴백을 두지 않는다.
-          const numberTitle = escapeAttr(t('project.genga.exposure.numTitle'));
-          const headTitle = escapeAttr(t('project.genga.exposure.headHandleTitle'));
-          const tailTitle = escapeAttr(t('project.genga.exposure.exposureHandleTitle'));
-          const layerAttr = escapeHtml(l.id);
-          const expoRank = gengaPositionalRanks(l); // Same numbering as positional commit.
-          const serifuSpans = new Map(); // One read of this row; discarded before any edit can run.
-          // 시트 표기의 프레임 칸/이음선 마크업 — 전후 비헤이비어·中間リピート·セリフ
-          // 인라인이 같은 생성기(sheetCell/sheetDash)를 쓴다. dash 의 `cells > 0` 가드는 pb 쪽 호출이 전부 상수(1·4·5)라 그쪽에서는 늘 참이다.
-          const sheetCell = function(txt, cls) { return '<span class="pb-cell' + (cls || '') + '" style="width:' + gengaTimelinePx(1) + '">' + txt + '</span>'; };
-          const sheetDash = function(cells) { return cells > 0 ? '<span class="pb-dash" style="width:' + gengaTimelinePx(cells) + '"></span>' : ''; };
-          (l.exposures || []).forEach(function(e) {
-            // セリフ区間のメンバーは個別の値を出さない — 区間ごとに「from ~ to セ リ フ」を1回だけ重ねて描く。
-            // ただし 動画マークで区間が切れた先から始まるコマは区間外なので、ふつうに番号を出す。
-            const inSerifu = gengaExposureInSerifu(l, e, serifuSpans); // 일괄 확정과 같은 판정
-            const valued = !inSerifu && (e.instanceValue !== null && e.instanceValue !== undefined && e.instanceValue !== '');
-            const numText = (inSerifu || isCelSubLayer) ? '' : gengaExposureNumberText(e, expoRank);
-            const eDr = gengaExposureDrawing(l, e);
-            // 「그린 인스턴스만 활성화」 -- 리비전 레이어는 코마 단위로 흐림을 개별 판정한다.
-            const revExpEmpty = (l.revisionKey || l.revisionCustom) && !eDr ? ' genga-revision-exposure-empty' : '';
-            blocks += '<div class="genga-exposure' + revExpEmpty + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '"' + gengaTimelineWindowAttrs(e.startFrame - 1, e.startFrame - 1 + e.holdFrames) + ' style="left:' + gengaTimelinePx(e.startFrame - 1, 1) + ';width:' + gengaTimelinePx(e.holdFrames, -1) + '">' +
-              '<span class="genga-exposure-thumb">' + gengaExposureThumbInnerHtml(eDr) + '</span>' +
-              (e.mark ? '<span class="genga-exposure-mark" data-mark="' + escapeAttr(e.mark) + '"></span>' : '') +
-              '<span class="genga-exposure-num' + (valued ? ' valued' : '') + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '" title="' + numberTitle + '">' +
-                '<span class="genga-num-first" style="width:' + ('max(8px, ' + gengaTimelinePx(1, -2) + ')') + '">' + escapeHtml(numText) + '</span>' +
-                (Array.isArray(e.dougaOffsets) ? e.dougaOffsets.map(function(o) { return (o >= 1 && o < e.holdFrames) ? ('<span class="genga-num-douga" data-genga-douga-rel="' + o + '" title="' + escapeAttr(t('project.genga.exposure.dougaOffsetTitle')) + '" style="left:' + gengaTimelinePx(o, -1) + ';width:' + gengaTimelinePx(1) + '"></span>') : ''; }).join('') : '') +
-              '</span>' +
-              '<span class="genga-exposure-h genga-exposure-h-tl" title="' + headTitle + '"></span>' +
-              '<span class="genga-exposure-h genga-exposure-h-br" title="' + tailTitle + '"></span></div>';
-          });
-          // pre/post-behavior toggles flanking the koma-content span: none / hold / repeat, drawn as Japanese
-          // timesheet notation on the instance-number strip — none = ×, hold = a continuation line ───, repeat = the
-          // boundary koma's instance value + リピート. Still the same cycling <button> underneath.
-          // PRE には番号を付けない — ユーザー判定「전혀 실재랑 시트 달라서 안하는게 나을듯」。このバッジは 5
-          // コマぶんの要約で、シートが頭区間にパターンを丸ごと並べる書き方とは同じ形になりようがない。番号を一つ載せると
-          // シートとも再生とも違う三つ目の表記が生まれる。POST と非対称なのは承知の上である。
-          // Both pre/post notation and middle gaps read the same immutable coverage for this row.
-          const sortedExposures = gengaSortedExposures(l);
-          const exposureSpan = sortedExposures.length ? gengaExposureSpanMap(sortedExposures) : null;
-          // Uncovered runs inside the existence region. Empty-cell cards and the mid-gap notation read the
-          // same runs instead of rediscovering them with two identical frame scans.
-          const gapRuns = [];
-          if (exposureSpan) {
-            for (let f = exposureSpan.first; f <= exposureSpan.last; f++) {
-              if (exposureSpan.covered[f]) continue;
-              let runEnd = f;
-              while (runEnd + 1 <= exposureSpan.last && !exposureSpan.covered[runEnd + 1]) runEnd++;
-              gapRuns.push({ start: f, end: runEnd });
-              f = runEnd;
-            }
-          }
-          if (sortedExposures.length) {
-            const pbFirst = sortedExposures[0];
-            const pbSpan = exposureSpan;
-            const firstStart = pbSpan.first;
-            const lastEnd = pbSpan.last; // frame count from 0 → right edge = *cellW
-            // sheet notation — laid out as frame-cell spans so it lands on the exact instance-value
-            // grid/coordinate (each .pb-cell is one cellW, centered like .genga-num-first). One リ/ピ/ー/ト per
-            // frame cell (4 cells), each centered like an instance value.
-            const pbRep = function() { return 'リピート'.split('').map(function(ch) { return sheetCell(ch); }).join(''); };
-            const bhTitle = function(v) { return (v === 'hold' ? t('project.genga.behavior.hold') : (v === 'repeat' ? t('project.genga.behavior.repeat') : t('project.genga.suffix.none'))) + t('project.genga.behavior.clickToCycle'); };
-            // content-region box (first koma start → last koma end; behind the komas) + disabled placeholder cards
-            // on the empty cells inside the region (koma-shaped, blank instance value) so the whole strip reads and
-            // handles as one editable row — grab-drag and cell-select work on them too. Painted under the real komas.
-            // Sheet notation: the first cell of each empty run gets an × (空セル開始); that × / dash lives in the
-            // .genga-midbehavior notation below (one per gap), so each per-cell card is blank — only a
-            // drag-select / right-click surface.
-            // 빈 카드 안에는 번호띠 span 이 없다. 그 자리는 .genga-midbehavior 가 같은 좌표·같은 높이로 덮어
-            // 입력을 받는다. 썸네일 반쪽의 누름은 레인으로 버블해 gengaLanePointerDown 이 결국
-            // gengaCellSelPointerDown 을 부른다. 빈 셀에는 상하 구분이 없다.
-            // Each frame keeps its own card box: the rounded tile and shadow per cell are the visible grid. The
-            // menu/long-press binding, title and viewport window item belong to a display:contents owner of at
-            // most gapOwnerFrames cards, so a long gap does not bind and window every frame. The owner
-            // generates no box; its cards still lay out in the lane with the same calc coordinates.
-            let phHtml = '';
-            const gapOwnerFrames = 32;
-            const emptyLayerAttr = escapeHtml(l.id), emptyTitleAttr = escapeAttr(t('project.genga.exposure.emptyCelTitle'));
-            gapRuns.forEach(function(run) {
-              for (let from = run.start; from <= run.end; from += gapOwnerFrames) {
-                const to = Math.min(run.end, from + gapOwnerFrames - 1);
-                phHtml += '<div class="genga-exposure-gap" data-genga-layer="' + emptyLayerAttr + '" title="' + emptyTitleAttr + '"' + gengaTimelineWindowAttrs(from - 1, to) + '>';
-                for (let f = from; f <= to; f++) {
-                  phHtml += '<div class="genga-exposure genga-exposure-empty" style="left:' + gengaTimelinePx(f - 1, 1) + ';width:' + gengaTimelinePx(1, -1) + '">' +
-                    '<span class="genga-exposure-thumb"></span></div>';
-                }
-                phHtml += '</div>';
-              }
-            });
-            blocks = '<div class="genga-content-box" style="left:' + gengaTimelinePx(firstStart - 1) + ';width:' + gengaTimelinePx(lastEnd - firstStart + 1) + '">' +
-              '<span class="genga-strip-h genga-strip-h-head" title="' + escapeAttr(t('project.genga.strip.headHandleTitle')) + '"></span>' +
-              '<span class="genga-strip-h genga-strip-h-tail" title="' + escapeAttr(t('project.genga.strip.tailHandleTitle')) + '"></span></div>' + phHtml + blocks;
-            // POST notation: five cells after the last exposure; repeat replays the preceding contiguous cycle.
-            //   none = ×———— (× + 4-cell line) · hold = ————— (5-cell line) · repeat = n + リピート(4 cells)
-            const pb = l.postBehavior || 'none';
-            const postInner = isCelSubLayer ? '' : (pb === 'hold' ? sheetDash(5)
-              : (pb === 'repeat' ? (sheetCell(escapeHtml(gengaExposureNumberText(pbFirst, expoRank))) + pbRep()) : (sheetCell('×') + sheetDash(4))));
-            blocks += '<button class="genga-postbehavior pb-' + pb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="post" style="left:' + gengaTimelinePx(lastEnd) + ';width:' + gengaTimelinePx(5) + '" title="' + escapeAttr(t('project.genga.behavior.postPrefix') + bhTitle(pb)) + '">' + postInner + '</button>';
-            // PRE notation sits before the first exposure; repeat wraps through the first contiguous cycle.
-            //   none = × (1 cell) · hold = ─ line (1 cell, matches the post line) · repeat = リピート (4 cells)
-            if (firstStart >= 2) {
-              const preb = l.preBehavior || 'none';
-              const preInner = isCelSubLayer ? '' : (preb === 'repeat' ? pbRep() : (preb === 'hold' ? sheetDash(1) : sheetCell('×')));
-              const preCells = preb === 'repeat' ? 4 : 1;
-              blocks += '<button class="genga-postbehavior pb-' + preb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="pre" style="left:' + gengaTimelinePx(firstStart - 1 - preCells) + ';width:' + gengaTimelinePx(preCells) + '" title="' + escapeAttr(t('project.genga.behavior.prePrefix') + bhTitle(preb)) + '">' + preInner + '</button>';
-            }
-          }
           let cellSelHtml = '';
           if (state.gengaCellSel && String(state.gengaCellSel.layerId) === String(l.id)) {
             const cs = state.gengaCellSel;
             cellSelHtml = '<div class="genga-cell-sel" style="left:' + gengaTimelinePx(cs.start - 1) + ';width:' + gengaTimelinePx(cs.end - cs.start + 1) + '"></div>';
           }
-          // セリフ（口パク）区間: one grouped notation per section, over the member komas (whose own value
-          // strips render blank above). Cells: from ~ to セ リ フ, then a hold continuation line for the rest
-          // of the span.
-          // 中間リピート/空き: one trailing-line notation per repeating or empty stretch of a mid gap, same
-          // ×————/n リピート———— vocabulary as the pre/post behavior. A plain click toggles the gap's repeat
-          // (gengaCellSelUp); the koma area stays empty while stopped — only playback replays the cycle. A
-          // sheet-imported repeat can start after the gap does or stop at its own × (r.endFrame), so a gap is
-          // cut where playback (gengaRepeatAt) and the sheet writer cut it.
-          let midHtml = '';
-          const midRuns = [];
-          gapRuns.forEach(function(run) {
-            for (let from = run.start; from <= run.end;) {
-              const rep = gengaRepeatAt(l, from);
-              let to = run.end;
-              if (rep) to = Math.min(to, gengaRepeatEndFrame(l, rep.startFrame, gt.totalFrames, rep.endFrame));
-              else (l.repeats || []).forEach(function(r) { if (r.startFrame > from && r.startFrame <= to) to = r.startFrame - 1; });
-              midRuns.push({ start: from, end: to, repeat: rep });
-              from = to + 1;
-            }
-          });
-          midRuns.forEach(function(run) {
-            const gs = run.start, ge = run.end, rep = run.repeat;
-            const gc = ge - gs + 1;
-            let inner, title;
-            if (rep) {
-              const cyc = gengaRepeatCycle(l, gs);
-              const firstExp = cyc ? gengaExposureAt(l, cyc.start) : null;
-              const nv = firstExp ? gengaExposureNumberText(firstExp, expoRank) : '';
-              const glyphs = 'リピート'.split('').slice(0, Math.max(0, gc - 1));
-              inner = isCelSubLayer ? '' : (sheetCell(escapeHtml(nv)) + glyphs.map(function(ch) { return sheetCell(ch); }).join('') + sheetDash(gc - 1 - glyphs.length));
-              title = t('project.genga.midGap.repeatTitle', gs, ge);
-            } else {
-              inner = isCelSubLayer ? '' : (sheetCell('×') + sheetDash(gc - 1));
-              title = t('project.genga.midGap.emptyTitle');
-            }
-            midHtml += '<div class="genga-midbehavior' + (rep ? ' pb-repeat' : '') + '" data-genga-layer="' + escapeHtml(l.id) + '"' +
-              ' style="left:' + gengaTimelinePx(gs - 1) + ';width:' + gengaTimelinePx(gc) + '" title="' + title + '">' + inner + '</div>';
-          });
-          let serifuHtml = '';
-          (l.serifuSections || []).forEach(function(sec) {
-            // effective span — the blue notation and its hold line stop at the first 動画 mark
-            const sp = gengaSerifuEffectiveSpan(l, sec.id, serifuSpans); if (!sp) return;
-            const spanCells = sp.end - sp.start + 1;
-            let inner = '';
-            if (sec.placement && sec.placement.length) {
-              // 수동·구운 배치가 있으면 시트 출력(gengaLayerSheetTokens)과 같이 입이 바뀌는 코마에 번호, 사이는 홀드선
-              // (사용자 — 굽기 = 파란 인스턴스 표기가 입 번호가 되는 것). 배치가 없으면 시트처럼 범위 표기.
-              for (let k = 0; k < spanCells;) {
-                const v = k < sec.placement.length ? sec.placement[k] : null;
-                if (v === null) { let j = k; while (j < spanCells && (j >= sec.placement.length || sec.placement[j] === null)) j++; inner += sheetDash(j - k); k = j; continue; }
-                inner += sheetCell(escapeHtml(v === 'x' ? '×' : String(v)), ''); k++;
-              }
-            } else {
-              const glyphs = [String(sec.from), '~', String(sec.to)].concat(sec.cover ? ['×', 'セ', 'リ', 'フ'] : ['セ', 'リ', 'フ']);
-              const shown = glyphs.slice(0, spanCells);
-              inner = shown.map(function(g, i) {
-                return sheetCell(escapeHtml(g), (i >= 3) ? ' sf-kana' : '');
-              }).join('');
-              inner += sheetDash(spanCells - shown.length);
-            }
-            // 몸 층이 바뀐 뒤는 시트처럼 × 와 그 홀드선(gengaLayerSheetTokens 와 같은 범위)
-            const stripEnd = sp.bodyChangeFrame === null ? sp.end : sp.markEnd;
-            if (sp.bodyChangeFrame !== null) inner += sheetCell('×', '') + sheetDash(sp.markEnd - sp.bodyChangeFrame);
-            serifuHtml += '<div class="genga-serifu-strip" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-serifu="' + escapeHtml(sec.id) + '"' +
-              ' style="left:' + gengaTimelinePx(sp.start - 1) + ';width:' + gengaTimelinePx(stripEnd - sp.start + 1) + '"' +
-              ' title="' + escapeAttr(t('project.genga.serifu.sectionPrefix', gengaSerifuLabel(sec)) + (sec.cover ? t('project.genga.serifu.coverSuffix') : '') +
-              ((sec.placement && sec.placement.length) ? t('project.genga.serifu.manualPlacementSuffix') : t('project.genga.serifu.rollSuffix')) + t('project.genga.serifu.editHint')) + '">' + inner + '</div>';
-          });
           // FX keyframe strips (one per shown track) at the bottom of the grown row, stacked from the row's own
           // height so the strips follow --genga-row-h with everything else.
           const fxRowM = gengaRowMetrics();
@@ -146286,8 +146320,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           });
           // `genga-peek` 를 레인에도 붙인다 — 헤드에만 붙이면 헤드만 3px 로 눌리고 레인은 52px 그대로라
           // 둘이 어긋난다.
-          lane += '<div class="genga-lane' + sel + hiddenRow + revisionEmpty + (peek ? ' genga-peek' : '') + '" data-genga-layer="' + escapeHtml(l.id) + '"' + rowStyle + '>' + cellSelHtml + blocks + midHtml + serifuHtml;
-          appendRow(l.id, head, lane, fxStrips);
+          lane += '<div class="genga-lane' + sel + hiddenRow + revisionEmpty + (peek ? ' genga-peek' : '') + '" data-genga-layer="' + escapeHtml(l.id) + '"' + rowStyle + '>' + cellSelHtml;
+          // Camera structure only adds/removes its instruction lane. Layer insertion also normalizes
+          // the project, so that command supplies the ids whose layer data survived unchanged.
+          const node = rows && renderPlan && renderPlan.reuseCelContent &&
+            (!renderPlan.reusableCelIds || renderPlan.reusableCelIds.has(l.id)) &&
+            !(l.serifuSections && l.serifuSections.length) && rows.current.get(String(l.id));
+          const cached = node && gengaViewRowCache.get(node);
+          const content = gengaReusableCelContent(cached, celContext) || gengaCelContent(l, gt, celContext);
+          appendRow(l.id, head, lane, fxStrips, content);
         });
       }
       // camera-work keyframe track (head + lane of diamonds)
