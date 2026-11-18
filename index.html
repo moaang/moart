@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3419</title>
+  <title>MoArt ver3420</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69322,59 +69322,65 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const prefix = path.toLowerCase() + '/', folders = new Set();
       const part = query.split('/').filter(Boolean).pop();
       const matchesQuery = function(entry) { return entry.path_display.slice(prefix.length).toLowerCase().includes(query); };
-      const cached = view.searchCatalogue;
-      if (!refresh && cached?.prefix === prefix && Date.now() - cached.at < 30000) {
-        show(cached.files.filter(matchesQuery));
-        return;
-      }
+      const cached = view.workSearch;
+      const fresh = !refresh && cached?.prefix === prefix && Date.now() - cached.at < 30000;
+      if (fresh && cached.query === query) { show(cached.files); return; }
       const term = part?.match(/(?:^|[_-])(\d+)$/)?.[1] || part;
       if (!term) return;
-      let cursor = '';
-      do {
-        const page = cursor ? await dropboxRpc('files/search/continue_v2', { cursor }, signal)
-          : await dropboxRpc('files/search_v2', { query: term, options: { path, filename_only: true, max_results: 1000 } }, signal);
-        signal.throwIfAborted();
-        const files = [];
-        for (const match of page.matches) {
-          const entry = match.metadata?.metadata, key = entry?.path_display?.toLowerCase();
-          if (!key?.startsWith(prefix)) continue;
-          const relative = key.slice(prefix.length);
-          if (entry['.tag'] === 'folder' && (relative + '/').includes(query)) folders.add(key);
-          else if (dropboxIndexFile(entry) && relative.includes(query)) files.push(entry);
+      const files = new Map();
+      const stats = { search: 0, list: 0, entries: 0 };
+      view.searchStats = stats;
+      function publish(entries) {
+        const added = [];
+        for (const entry of entries) {
+          const key = entry?.path_display?.toLowerCase();
+          if (!key?.startsWith(prefix) || !dropboxIndexFile(entry) || !matchesQuery(entry) || files.has(key)) continue;
+          files.set(key, entry); added.push(entry);
         }
-        show(files);
-        if (page.has_more && (!page.cursor || page.cursor === cursor)) break;
-        cursor = page.has_more ? page.cursor : '';
-      } while (cursor);
-      const roots = Array.from(folders).filter(function(folder) {
-        for (let i = folder.lastIndexOf('/'); i >= prefix.length; i = folder.lastIndexOf('/', i - 1))
-          if (folders.has(folder.slice(0, i))) return false;
-        return true;
-      });
-      // Several folder batches can cost more than a paged search restricted to supported extensions.
-      if (roots.length > 3) {
-        const files = [];
-        const complete = await dropboxSearchExtensions(path, signal, function(entries) {
-          files.push(...entries);
-          show(entries.filter(matchesQuery));
-        }, new Map(), ['moart', 'tvpp', 'clip', 'json', 'zip']);
-        signal.throwIfAborted();
-        if (complete) view.searchCatalogue = { prefix, files, at: Date.now() };
-        return;
+        if (added.length) show(added);
       }
-      async function readFolders() {
-        while (roots.length) {
+      async function names(options, consume) {
+        let cursor = '';
+        do {
+          const page = cursor ? await dropboxRpc('files/search/continue_v2', { cursor }, signal)
+            : await dropboxRpc('files/search_v2', { query: term, options: { path, filename_only: true, max_results: 1000, ...options } }, signal);
           signal.throwIfAborted();
-          let page = await dropboxRpc('files/list_folder', { path: roots.pop(), recursive: true, include_non_downloadable_files: false, limit: 2000 }, signal);
-          for (;;) {
+          stats.search++; stats.entries += page.matches.length;
+          consume(page.matches.map(function(match) { return match.metadata?.metadata; }).filter(Boolean));
+          if (page.has_more && (!page.cursor || page.cursor === cursor)) throw new Error(t('dropbox.indexPartial'));
+          cursor = page.has_more ? page.cursor : '';
+        } while (cursor);
+      }
+      async function descendants() {
+        await names({ file_categories: ['folder'] }, function(entries) {
+          for (const e of entries) {
+            const key = e.path_display?.toLowerCase();
+            if (e['.tag'] === 'folder' && key?.startsWith(prefix) && (key.slice(prefix.length) + '/').includes(query)) folders.add(key);
+          }
+        });
+        const roots = Array.from(folders).filter(function(folder) {
+          for (let i = folder.lastIndexOf('/'); i >= prefix.length; i = folder.lastIndexOf('/', i - 1))
+            if (folders.has(folder.slice(0, i))) return false;
+          return true;
+        });
+        async function worker() {
+          while (roots.length) {
             signal.throwIfAborted();
-            show(page.entries.filter(dropboxIndexFile));
-            if (!page.has_more) break;
-            page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor }, signal);
+            let page = await dropboxRpc('files/list_folder', { path: roots.pop(), recursive: true, include_non_downloadable_files: false, limit: 2000 }, signal);
+            for (;;) {
+              signal.throwIfAborted();
+              stats.list++; stats.entries += page.entries.length;
+              publish(page.entries);
+              if (!page.has_more) break;
+              page = await dropboxRpc('files/list_folder/continue', { cursor: page.cursor }, signal);
+            }
           }
         }
+        await Promise.all(Array.from({ length: Math.min(8, roots.length) }, worker));
       }
-      await Promise.all([readFolders(), readFolders(), readFolders()]);
+      await Promise.all([names({ file_extensions: ['moart', 'tvpp', 'clip', 'json', 'zip'] }, publish), descendants()]);
+      signal.throwIfAborted();
+      view.workSearch = { prefix, query, files: Array.from(files.values()), at: Date.now() };
     }
     async function dropboxSearchExtensions(path, signal, show, pages, extensions) {
       const prefix = path.toLowerCase() + '/';
@@ -69759,7 +69765,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             pinned ? dropboxActivePin()?.path : path);
           if (pinned) {
             const key = path.toLowerCase();
-            if (v.searchCatalogue?.prefix === key + '/') v.searchCatalogue = null;
+            if (v.workSearch?.prefix === key + '/') v.workSearch = null;
             if (v.cutCache?.key === key) v.cutCache = null;
             dropboxWorkIndexes.delete(key);
             dropboxIndexStorage(dropboxAuth()?.pinOwner, function(records) {
@@ -69927,7 +69933,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const count = String(v.shown || 0);
           const partial = v.partial ? t('dropbox.indexPartial') + ' ' + count : count;
           v.status.textContent = v.indexJob && !v.error ? (v.shown ? partial + ' · ' : '') + t('dropbox.indexUpdating') : v.partial && !v.error ? partial : v.error ? t('dropbox.listFailed', v.error) : v.busy ? t('dropbox.loading') + (v.progress ? ' ' + v.progress : '') : String(v.shown || 0);
-          v.status.title = v.status.textContent;
+          const stats = v.indexed && !v.cuts && v.queries[1].trim() && v.partial && v.searchStats;
+          v.status.title = stats ? v.status.textContent + ' · search ' + stats.search + ' · list ' + stats.list + ' · metadata ' + stats.entries : v.status.textContent;
         };
         v.entryName = function(entry, view) { return view.indexed ? String(entry.path_display || entry.name).slice(view.path.length + 1) : entry.name; };
         v.draw = function(restore, next) {
