@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3421</title>
+  <title>MoArt ver3422</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -9586,7 +9586,12 @@
     .es-dropbox-tabs { display: flex; align-items: center; gap: 4px; height: 30px; min-width: 0; overflow-x: auto; border-bottom: 1px solid var(--sh-hairline); scrollbar-width: thin; }
     .es-dropbox-tabs[hidden], .es-dropbox-tools > button[hidden] { display: none; }
     .es-dropbox-tabs > button, .es-dropbox-cut > button { flex: 0 0 auto; min-width: 0; max-width: 110px; height: 24px; min-height: 0; padding: 0 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
-    .es-dropbox-tabs > button[aria-pressed="true"] { color: var(--sh-accent); background: var(--sh-accent-soft); }
+    .es-dropbox-tabs > .es-dropbox-tab { align-self: stretch; height: auto; padding-inline: 7px; border: 0; border-radius: 0; background: transparent; color: var(--sh-text-muted); box-shadow: none; }
+    .es-dropbox-tabs > .es-dropbox-tab:hover { color: var(--sh-text); background: var(--sh-surface-2); }
+    .es-dropbox-tabs > .es-dropbox-tab[aria-pressed="true"] { color: var(--sh-accent); box-shadow: inset 0 -2px var(--sh-accent); }
+    .es-dropbox-tabs > .es-dropbox-tab:focus-visible { outline: 1px solid var(--sh-accent); outline-offset: -2px; }
+    .es-dropbox-tabs > .es-dropbox-more { margin-inline-start: auto; flex: none; }
+    .es-dropbox-count { margin-inline-start: 4px; font-variant-numeric: tabular-nums; color: var(--sh-text-muted); }
     .es-dropbox-cut { display: grid; grid-template-columns: minmax(0, 1.45fr) repeat(3, minmax(0, 1fr)); align-items: center; gap: 3px; min-height: 28px; padding: 0 4px; border-bottom: 1px solid var(--sh-hairline); }
     .es-dropbox-cut-head { position: sticky; top: 0; z-index: 1; background: var(--sh-surface); color: var(--sh-text-muted); font-size: var(--fs-sm); }
     @media (pointer: coarse) {
@@ -69359,21 +69364,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (e['.tag'] === 'folder' && key?.startsWith(prefix) && (key.slice(prefix.length) + '/').includes(query)) folders.add(key);
           }
         });
-        const roots = Array.from(folders).filter(function(folder) {
-          for (let i = folder.lastIndexOf('/'); i >= prefix.length; i = folder.lastIndexOf('/', i - 1))
-            if (folders.has(folder.slice(0, i))) return false;
-          return true;
-        });
-        // Coalesce many matching folders within each project branch. A common ancestor
-        // ends on a component boundary and never crosses into another branch.
+        // Group outermost matches by project branch before choosing listing or search.
         const branches = new Map();
-        for (const root of roots) {
+        for (const root of folders) {
+          let parent = root.slice(0, root.lastIndexOf('/'));
+          while (parent.length >= prefix.length && !folders.has(parent)) parent = parent.slice(0, parent.lastIndexOf('/'));
+          if (folders.has(parent)) continue;
           const branch = root.slice(prefix.length).split('/')[0];
           if (!branches.has(branch)) branches.set(branch, []);
           branches.get(branch).push(root);
         }
-        const scopes = [];
-        roots.length = 0;
+        const scopes = [], roots = [];
         for (const group of branches.values()) {
           if (group.length <= 3) { roots.push(...group); continue; }
           let scope = group[0];
@@ -69836,32 +69837,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             return e;
           };
           const label = function(p) { return p.name || p.path.split('/').filter(Boolean).slice(-2).join(' '); };
-          const rename = function(p, stage) {
-            if (!v.canOpen()) return;
-            const old = stage ? p.stages?.[stage] || stage : label(p);
-            const value = window.prompt(t(stage ? 'dropbox.cutStage' : 'dropbox.cutProject'), old);
-            if (value === null) return;
-            const name = value.trim().slice(0, 32);
-            if (stage) p.stages = Object.assign({}, p.stages, { [stage]: name });
-            else p.name = name;
-            dropboxSavePinnedProjects(projects, v.path); v.draw(v.list.scrollTop);
+          // The empty string identifies All; only an absent stage identifies the project tab.
+          const editLabel = function(p, key, fallback) {
+            const isProject = key === undefined;
+            async function rename() {
+              if (!v.canOpen() || box.hidden) return;
+              const value = await askText(t('dropbox.cutRename'), isProject ? label(p) : p.stages?.[key] || fallback);
+              if (value == null || !v.canOpen() || box.hidden) return;
+              const pins = dropboxPinnedProjects(), pin = pins.find(function(item) { return dropboxSamePath(item.path, p.path); });
+              if (!pin) return;
+              const name = value.trim().slice(0, 32);
+              if (isProject) pin.name = name;
+              else pin.stages = { ...pin.stages, [key]: name };
+              dropboxSavePinnedProjects(pins, dropboxActivePin()?.path); v.draw(v.list.scrollTop);
+            }
+            return function(event) {
+              event.preventDefault(); event.stopPropagation();
+              if (event.key === 'F2') { rename(); return; }
+              openSimpleContextMenu(event, [{ label: t('dropbox.cutRename'), action: rename }], { anchorEl: event.currentTarget, isCurrent: v.canOpen });
+            };
           };
+          function bindEdit(el, edit) {
+            el.oncontextmenu = edit;
+            el.onkeydown = function(event) { if (event.key === 'F2') edit(event); };
+          }
+          function more(parent, edit) {
+            const el = tab(parent, '⋯', false, edit);
+            el.classList.add('es-dropbox-more'); el.removeAttribute('aria-pressed');
+            el.title = t('dropbox.cutRename'); el.setAttribute('aria-label', el.title);
+          }
           const left = v.projects.scrollLeft, stageLeft = v.stages.scrollLeft;
           v.projects.replaceChildren(); v.stages.replaceChildren();
           v.projects.hidden = !projects.length;
           v.stages.hidden = !v.cuts;
           box.classList.toggle('has-cut-tabs', !!projects.length);
           for (const p of projects) {
-            tab(v.projects, label(p), p === active, function() {
+            const el = tab(v.projects, label(p), p === active, function() {
               if (!v.canOpen() || p === active) return;
               renderProjectStartDropbox({ path: p.path, indexed: !!v.cuts, cut: !!v.cuts });
             });
+            const edit = editLabel(p);
+            bindEdit(el, edit);
           }
-          if (active) tab(v.projects, '⋯', false, function(event) {
-            openSimpleContextMenu(event, [{ label: t('dropbox.cutProject'), action: function() { rename(active); } }]);
-          }).setAttribute('aria-label', t('dropbox.cutRename'));
+          if (active) more(v.projects, editLabel(active));
           if (v.cuts) {
-            const stageTab = function(key, text) {
+            let selectedEdit;
+            const stageTab = function(key, fallback, count) {
+              const text = active?.stages?.[key] || fallback;
               const choice = tab(v.stages, text, v.stage === key, function() {
                 if (!v.canOpen()) return;
                 v.stage = key;
@@ -69877,16 +69899,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                   renderProjectStartDropbox({ path: v.path, indexed: true, cut: true });
                 }
               });
+              if (count) make('span', 'es-dropbox-count', choice).textContent = count;
+              if (active) {
+                const edit = editLabel(active, key, fallback);
+                bindEdit(choice, edit);
+                if (key === v.stage) selectedEdit = edit;
+              }
               choice.disabled = loadingStages && !!key && key !== ':archive';
             };
             stageTab('', t('dropbox.cutAll'));
             stageTab(':archive', t('dropbox.cutArchive'));
-            stages.forEach(function(key) { stageTab(key, active?.stages?.[key] || key); });
-            if (v.cuts.unknown.length) stageTab('?', t('dropbox.cutUnknown') + ' ' + v.cuts.unknown.length);
-            if (v.stage && v.stage !== '?' && v.stage !== ':archive' && active) tab(v.stages, '⋯', false, function(event) {
-              const stage = v.stage;
-              openSimpleContextMenu(event, [{ label: t('dropbox.cutStage'), action: function() { rename(active, stage); } }]);
-            }).setAttribute('aria-label', t('dropbox.cutRename'));
+            stages.forEach(function(key) { stageTab(key, key); });
+            if (v.cuts.unknown.length) stageTab('?', t('dropbox.cutUnknown'), v.cuts.unknown.length);
+            if (selectedEdit) more(v.stages, selectedEdit);
           }
           v.projects.scrollLeft = left; v.stages.scrollLeft = stageLeft;
         };
