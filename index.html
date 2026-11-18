@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3418</title>
+  <title>MoArt ver3419</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69318,9 +69318,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       await Promise.all([worker(), worker(), worker()]);
     }
     // Dropbox matches names. Include files inside matched folders for relative-path queries.
-    async function dropboxFindWorkFiles(path, query, signal, show) {
+    async function dropboxFindWorkFiles(path, query, signal, show, view, refresh) {
       const prefix = path.toLowerCase() + '/', folders = new Set();
       const part = query.split('/').filter(Boolean).pop();
+      const matchesQuery = function(entry) { return entry.path_display.slice(prefix.length).toLowerCase().includes(query); };
+      const cached = view.searchCatalogue;
+      if (!refresh && cached?.prefix === prefix && Date.now() - cached.at < 30000) {
+        show(cached.files.filter(matchesQuery));
+        return;
+      }
       const term = part?.match(/(?:^|[_-])(\d+)$/)?.[1] || part;
       if (!term) return;
       let cursor = '';
@@ -69345,6 +69351,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (folders.has(folder.slice(0, i))) return false;
         return true;
       });
+      // Several folder batches can cost more than a paged search restricted to supported extensions.
+      if (roots.length > 3) {
+        const files = [];
+        const complete = await dropboxSearchExtensions(path, signal, function(entries) {
+          files.push(...entries);
+          show(entries.filter(matchesQuery));
+        }, new Map(), ['moart', 'tvpp', 'clip', 'json', 'zip']);
+        signal.throwIfAborted();
+        if (complete) view.searchCatalogue = { prefix, files, at: Date.now() };
+        return;
+      }
       async function readFolders() {
         while (roots.length) {
           signal.throwIfAborted();
@@ -69359,9 +69376,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       await Promise.all([readFolders(), readFolders(), readFolders()]);
     }
-    async function dropboxSearchCutFiles(path, signal, show, pages) {
+    async function dropboxSearchExtensions(path, signal, show, pages, extensions) {
       const prefix = path.toLowerCase() + '/';
-      const results = await Promise.allSettled(['moart', 'tvpp', 'clip'].map(async function(ext) {
+      const results = await Promise.allSettled(extensions.map(async function(ext) {
         const pageState = pages.get(ext) || { cursor: '', count: 0 };
         pages.set(ext, pageState);
         if (pageState.done || pageState.capped) return !!pageState.done;
@@ -69742,6 +69759,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             pinned ? dropboxActivePin()?.path : path);
           if (pinned) {
             const key = path.toLowerCase();
+            if (v.searchCatalogue?.prefix === key + '/') v.searchCatalogue = null;
             if (v.cutCache?.key === key) v.cutCache = null;
             dropboxWorkIndexes.delete(key);
             dropboxIndexStorage(dropboxAuth()?.pinOwner, function(records) {
@@ -70034,7 +70052,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 if (!owns() || !files.length) return;
                 for (const e of files) matches.set(e.path_display.toLowerCase(), e);
                 v.paintIndex(matches.values(), false);
-              });
+              }, v, target.refresh);
             }, controller.signal, 60000, 'dropbox.indexTimeout');
             return;
           }
@@ -70081,7 +70099,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               } else {
                 try {
                   cuts.searched = await dropboxRequest(function(signal) {
-                    return dropboxSearchCutFiles(target.path, signal, show, cuts.pages);
+                    return dropboxSearchExtensions(target.path, signal, show, cuts.pages, ['moart', 'tvpp', 'clip']);
                   }, controller.signal, 60000, 'dropbox.indexTimeout');
                 } catch (error) {
                   if (!owns() || v.stage !== ':archive') throw error;
