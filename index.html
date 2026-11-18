@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3428</title>
+  <title>MoArt ver3429</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69679,40 +69679,64 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Bare "sheet" is used as a prefix for numbered work files; a model sheet is not a timesheet.
     const DROPBOX_SHEET_MARK = /(?:^|[^\p{L}\p{N}])(タイムシート|타임\s*시트|time[ _-]?sheet|x[ _-]?sheet|ts)(?=$|[^\p{L}])|^(sheet)(?=[_ .-]+\S*\d)/iu;
 
-    function dropboxCutCandidate(value) {
+    const DROPBOX_SEQUENCE = /^(op|ed|pv|mv|cm)\d*$/i;
+
+    function dropboxSequenceFolder(value) {
+      const parts = value.normalize('NFKC').toLowerCase().replace(/^#+/, '').split(/[_ -]+/);
+      const unit = parts.pop();
+      return DROPBOX_SEQUENCE.test(unit) ? { unit, scope: [...parts, unit].join(' ') } : null;
+    }
+
+    function dropboxCutCandidate(value, folder) {
       const name = value.normalize('NFKC').toLowerCase().replace(/^[#_]+/, '');
-      const scoped = /^([\p{L}][\p{L}\d-]*?)(?:[_ -]+((?:op|ed)\d*)|[_ -]?(\d{1,3}))[_ -]+c?(\d{1,4}[a-z]?)(?=$|[_ .-])(.*)$/u.exec(name);
-      const plain = /^(c?)(\d{1,4}[a-z]?)(?=$|[_ .-])(.*)$/.exec(name);
-      if (!scoped && !plain) return null;
-      let tail = scoped ? scoped[5] : plain[3];
-      const numbers = [scoped ? scoped[4] : plain[2]];
-      for (let next; (next = /^[_ -]+c?(\d{1,4}[a-z]?)(?=$|[_ .-])/.exec(tail));) {
+      const scoped = /^([\p{L}][\p{L}\d-]*?)(?:[_ -]+([a-z]+\d*)|[_ -]?(\d{1,3}))[_ -]+([a-z]?\d{1,4}[a-z]?)(?=$|[_ .-])(.*)$/u.exec(name);
+      let scope = '', body = name;
+      if (scoped && (!scoped[2] || DROPBOX_SEQUENCE.test(scoped[2]))) {
+        scope = scoped[1] + ' ' + (scoped[2] || Number(scoped[3]));
+        body = scoped[4] + scoped[5];
+      } else if (folder) {
+        const end = name.search(/[_ -]/);
+        const title = name.slice(0, end);
+        if (end > 0 && title.length > folder.unit.length && title.endsWith(folder.unit)) {
+          scope = title.slice(0, -folder.unit.length) + ' ' + folder.unit;
+          body = name.slice(end).replace(/^[_ -]+/, '');
+        }
+      }
+      const plain = /^([a-z]?\d{1,4}[a-z]?)(?=$|[_ .-])(.*)$/.exec(body);
+      if (!plain) return null;
+      let tail = plain[2];
+      const numbers = [plain[1]];
+      for (let next; (next = /^[_ -]+([a-z]?\d{1,4}[a-z]?)(?=$|[_ .-])/.exec(tail));) {
+        if (/^[a-bd-z]/.test(next[1]) && next[1][0] !== plain[1][0]) break;
         numbers.push(next[1]); tail = tail.slice(next[0].length);
       }
-      const cuts = numbers.map(function(cut) {
-        const parts = parseCutNoNumberSuffix(cut);
-        return { cut: cut.toUpperCase(), id: parts.num + parts.suffix };
+      const cuts = numbers.map(function(n) {
+        const [, prefix, digits, suffix] = /^([a-z]?)(\d+)([a-z]?)$/.exec(n);
+        const cut = (prefix === 'c' ? '' : prefix.toUpperCase()) + digits + suffix.toUpperCase();
+        const id = cut.replace(/\d+/, String(Number(digits)));
+        return { cut, id, width: digits.length };
       });
-      return { cuts: cuts, scope: scoped ? scoped[1] + ' ' + (scoped[2] || Number(scoped[3])) : '',
-        explicit: !!scoped || plain[1] === 'c', token: tail.split(/[_ .-]+/).filter(Boolean)[0] || '' };
+      return { cuts, scope, explicit: !!scope || plain[1].startsWith('c'), token: tail.split(/[_ .-]+/).filter(Boolean)[0] || '' };
     }
 
     function dropboxBuildCutView(path, entries) {
       const candidates = [], cohorts = new Map(), groups = new Map(), unknown = [];
       let cutWidth = 3;
       const episodeFolder = /^#?(\d{1,3})$/.exec(path.split('/').at(-1));
+      const rootSequence = dropboxSequenceFolder(path.split('/').at(-1));
       for (const entry of entries) {
         const type = /\.(moart|tvpp|clip)$/i.exec(entry.name);
         if (!type || !entry.path_display || !entry.path_display.toLowerCase().startsWith(path.toLowerCase() + '/')) continue;
         const relative = entry.path_display.slice(path.length + 1);
         const dirs = relative.split('/').slice(0, -1);
+        const sequence = dirs.reduce((found, dir) => dropboxSequenceFolder(dir) || found, rootSequence);
         const stem = entry.name.slice(0, -type[0].length).normalize('NFKC').replace(/^[#_]+/, '');
         const sheet = DROPBOX_SHEET_MARK.exec(stem);
         const marker = sheet && (sheet[1] || sheet[2]).toLowerCase();
-        const file = dropboxCutCandidate(stem) || (sheet?.index === 0 ? dropboxCutCandidate(stem.slice(sheet[0].length).replace(/^[_ .-]+/, '')) : null);
+        const file = dropboxCutCandidate(stem, sequence) || (sheet?.index === 0 ? dropboxCutCandidate(stem.slice(sheet[0].length).replace(/^[_ .-]+/, ''), sequence) : null);
         const inPool = file && /^pool$/i.test(dirs.at(-1));
         const parentName = dirs.at(inPool ? -2 : -1) || '';
-        const parentCandidate = dropboxCutCandidate(parentName);
+        const parentCandidate = dropboxCutCandidate(parentName, sequence);
         const parent = parentCandidate?.explicit || /^#?\d{1,4}[a-z]?(?:[_ -](?:r|retake))?$/i.test(parentName) ? parentCandidate : null;
         const folderStages = dirs.map(function(d) { return dropboxCutStage(d, false); }).filter(Boolean);
         const archived = dirs.some(dropboxArchiveFolder);
@@ -69722,7 +69746,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (marker && file?.scope && file.scope.split(' ')[0] === marker) {
           const episode = file.scope.split(' ').at(-1);
           for (let i = dirs.length - 1; i >= 0; i--) {
-            const ancestor = dropboxCutCandidate(dirs[i]);
+            const ancestor = dropboxCutCandidate(dirs[i], sequence);
             if (!ancestor?.scope) continue;
             if (ancestor.scope.split(' ').at(-1) === episode && file.cuts.every(function(c) { return ancestor.cuts.some(function(a) { return a.id === c.id; }); })) file.scope = ancestor.scope;
             break;
@@ -69734,9 +69758,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const matchedFolder = exactCuts || singleSheet;
         const compound = (file?.cuts.length || 0) > 1 || (parent?.cuts.length || 0) > 1;
         if (reference || conflictingScope || compound && (!matchedFolder || !parent.explicit)) { unknown.push(entry); continue; }
-        const cut = file && parent && !matchedFolder ? !sheet && !inPool && !file.explicit && parent.explicit ? parent : null : file || parent;
+        const cut = file && parent && !matchedFolder ? !sheet && !inPool && !/^[A-Z]/.test(file.cuts[0].cut) && !/^[A-Z]/.test(parent.cuts[0].cut) && !file.explicit && parent.explicit ? parent : null : file || parent;
         if (!cut) { unknown.push(entry); continue; }
-        const scope = cut.scope || parent?.scope || '';
+        const scope = cut.scope || parent?.scope || sequence?.scope || '';
         if (scope && episodeFolder && Number(scope.split(' ').at(-1)) !== Number(episodeFolder[1])) { unknown.push(entry); continue; }
         const detected = folderStages.concat(dropboxCutStage(cut.token, true)).filter(Boolean);
         let process = detected[0];
@@ -69751,9 +69775,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!cohorts.has(cohort)) cohorts.set(cohort, new Set());
         cohorts.get(cohort).add(cut.cuts[0].id);
         const spellings = exactCuts ? cut.cuts.concat(parent.cuts) : cut.cuts;
-        const width = Math.max(...spellings.map(function(c) { return c.cut.match(/^\d+/)[0].length; }));
+        const width = Math.max(...spellings.map(function(c) { return c.width; }));
         candidates.push({ entry: entry, relative: relative, width: width, cuts: cut.cuts, scope: scope, stage: stage, archived: archived,
-          type: type[1].toLowerCase(), sheet: !!sheet, cohort: cohort, matchedFolder: !!matchedFolder, confirmed: compound || cut.explicit || !!parent?.explicit && matchedFolder });
+          type: type[1].toLowerCase(), sheet: !!sheet, cohort: cohort, matchedFolder: !!matchedFolder, confirmed: !!sequence && /^[a-z]?\d{1,4}[a-z]?$/i.test(stem) || compound || cut.explicit || !!parent?.explicit && matchedFolder });
       }
       const currentScopes = new Set(candidates.filter(function(item) { return !item.archived; }).map(function(item) { return item.scope; }).filter(Boolean));
       const archiveScopes = new Set(candidates.filter(function(item) { return item.archived; }).map(function(item) { return item.scope; }).filter(Boolean));
@@ -69993,18 +70017,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           [t('dropbox.cutColumn'), 'MOART', 'TVPP', 'CLIP'].forEach(function(label) { make('span', '', header).textContent = label; });
           const project = dropboxPinnedProjects().find(function(p) { return dropboxSamePath(p.path, view.path); });
           let count = 0;
-          const cutQuery = query.replace(/^c0+(?=\d)/, 'c');
+          const cutQuery = query.replace(/^([a-z])0+(?=\d)/, '$1');
           for (const group of view.cuts.groups) {
             if (group.archived !== (view.stage === ':archive')) continue;
             if (!group.archived && view.stage && view.stage !== group.stage) continue;
-            const number = parseCutNoNumberSuffix(group.cut);
-            const cutLabel = 'C' + String(number.num).padStart(view.cuts.cutWidth, '0') + number.suffix.toUpperCase();
+            const cutCode = (/^[A-Z]/.test(group.cut) ? '' : 'C') + group.cut;
+            const cutLabel = cutCode.replace(/\d+/, digits => digits.padStart(view.cuts.cutWidth, '0'));
             const mixed = group.archived ? view.cuts.multipleArchiveScopes : view.cuts.multipleScopes;
             const qualify = view.cuts.primaryScope ? group.scope !== view.cuts.primaryScope : mixed;
             const label = cutLabel + (qualify ? ' · ' + (group.scope || '?') : '');
             const stage = group.stage ? dropboxStageLabel(group.stage, project?.stages) : '';
             const title = label + (stage ? ' · ' + stage : '');
-            const matchesCut = title.toLowerCase().includes(query) || ('c' + number.num + number.suffix.toLowerCase()).includes(cutQuery);
+            const matchesCut = title.toLowerCase().includes(query) || cutCode.toLowerCase().replace(/^([a-z])0+(?=\d)/, '$1').includes(cutQuery);
             const files = types.map(function(type) { return group.files[type].filter(function(item) { return matchesCut || item.relative.toLowerCase().includes(query); }); });
             if (!files.some(function(items) { return items.length; })) continue;
             const row = make('div', 'es-dropbox-cut', fragment);
