@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3416</title>
+  <title>MoArt ver3417</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69749,7 +69749,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         v.tabs = function(projects) {
           const active = projects.find(function(p) { return dropboxSamePath(p.path, v.path); });
           const stages = v.cuts ? Array.from(new Set(v.cuts.groups.filter(function(g) { return !g.archived; }).map(function(g) { return g.stage; }).filter(Boolean))).sort() : [];
-          const signature = JSON.stringify([projects, v.path, !!v.cuts, v.stage, stages, v.cuts?.unknown.length, t('dropbox.cutAll')]);
+          const loadingStages = !!(v.cuts && v.indexJob && !v.cutCache?.searched);
+          const signature = JSON.stringify([projects, v.path, !!v.cuts, loadingStages, v.stage, stages, v.cuts?.unknown.length, t('dropbox.cutAll')]);
           if (signature === v.tabsKey) return;
           v.tabsKey = signature;
           const tab = function(parent, label, pressed, action) {
@@ -69785,24 +69786,26 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }).setAttribute('aria-label', t('dropbox.cutRename'));
           if (v.cuts) {
             const stageTab = function(key, text) {
-              tab(v.stages, text, v.stage === key, function() {
+              const choice = tab(v.stages, text, v.stage === key, function() {
                 if (!v.canOpen()) return;
                 v.stage = key;
                 const cache = v.cutCache;
                 if ((key === ':archive' || key === '?') && cache?.deferred.size) {
                   for (const [path, entry] of cache.deferred) cache.files.set(path, entry);
                   cache.deferred.clear();
-                  v.paintIndex(cache.files.values(), true);
+                  if (v.indexJob) v.draw(0);
+                  else v.paintIndex(cache.files.values(), true);
                 } else v.draw(0);
                 if (v.archiveJob && key !== ':archive') { v.partial = !v.cutCache?.searched; v.archiveJob.abort(); }
                 if (key === ':archive' && !v.indexJob && !cache?.searched && !cache?.archiveDone) {
                   renderProjectStartDropbox({ path: v.path, indexed: true, cut: true });
                 }
               });
+              choice.disabled = loadingStages && !!key && key !== ':archive';
             };
             stageTab('', t('dropbox.cutAll'));
-            stages.forEach(function(key) { stageTab(key, active?.stages?.[key] || key); });
             stageTab(':archive', t('dropbox.cutArchive'));
+            stages.forEach(function(key) { stageTab(key, active?.stages?.[key] || key); });
             if (v.cuts.unknown.length) stageTab('?', t('dropbox.cutUnknown') + ' ' + v.cuts.unknown.length);
             if (v.stage && v.stage !== '?' && v.stage !== ':archive' && active) tab(v.stages, '⋯', false, function(event) {
               const stage = v.stage;
@@ -69964,7 +69967,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (target.indexed) {
         v.remember();
         const controller = new AbortController();
-        const retry = !!v.error && v.partial && !!v.cuts;
+        const retry = v.partial && v.cuts && v.cutCache && !Array.from(v.cutCache.pages.values()).some(function(page) { return page.capped; });
         v.abort = v.indexJob = controller; v.busy = false; v.error = ''; v.pending = null;
         const owner = dropboxIndexOwner();
         const key = target.path.toLowerCase();
@@ -70003,7 +70006,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               if (!partialEntries.has(key)) changed = true;
               partialEntries.set(key, e);
             }
-            if (!changed || pendingPaint) return;
+            // Publish the cut grid and its stage buttons together, after the search pages settle.
+            if (cuts && !v.archiveJob || !changed || pendingPaint) return;
             const paint = function() {
               pendingPaint = 0;
               if (owns() && v.partial) v.paintIndex(partialEntries.values(), !!v.cuts);
@@ -70039,7 +70043,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               cuts.archiveDone = true;
             }
             cuts.at = Date.now(); v.partial = !cuts.searched;
-            v.paintIndex(cuts.files.values(), true);
             return;
           }
           if (previous && !target.refresh && Date.now() - previous.at < 30000) return;
@@ -70083,7 +70086,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (owns()) v.error = error.message || String(error);
         } finally {
           clearTimeout(pendingPaint);
-          if (owns() && cuts && pendingPaint && v.error) v.paintIndex(cuts.files.values(), true);
+          if (cuts && current() && v.indexJob === controller && dropboxAuth()?.pinOwner === owner
+              && (cuts.files.size || !v.partial || !v.shown)) {
+            v.paintIndex(cuts.files.values(), true);
+          }
           if (v.archiveJob === controller) v.archiveJob = null;
           if (v.indexJob === controller) { v.indexJob = null; controller.abort(); }
           if (v.abort === controller) {
