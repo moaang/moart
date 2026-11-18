@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3429</title>
+  <title>MoArt ver3430</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -114737,8 +114737,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function tvpaintFromHsv(h, s, v, out) {
       const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
-      const k = ((i % 6) + 6) % 6;
-      out[0] = [v, q, p, p, t, v][k]; out[1] = [t, v, v, q, p, p][k]; out[2] = [p, p, t, v, v, q][k];
+      switch (i % 6) {
+        case 0: out[0] = v; out[1] = t; out[2] = p; break;
+        case 1: out[0] = q; out[1] = v; out[2] = p; break;
+        case 2: out[0] = p; out[1] = v; out[2] = t; break;
+        case 3: out[0] = p; out[1] = q; out[2] = v; break;
+        case 4: out[0] = t; out[1] = p; out[2] = v; break;
+        default: out[0] = v; out[1] = p; out[2] = q;
+      }
     }
     function tvpaintHlsOf(r, g, b, out) {
       const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
@@ -124905,6 +124911,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       } finally { paintReleaseCanvas(source);paintReleaseCanvas(target); }
     }
 
+    // Decoded raster already owns RGBA. Find ink before allocating the cropped canvas.
+    function gengaClipRasterPiece(img) {
+      const pixels = new ImageData(img.rgba, img.w, img.h);
+      const b = alphaInkBoundsScan(pixels, { imageData: pixels }).bounds;
+      if (!b) return null;
+      const canvas = document.createElement('canvas'); canvas.width = b.w; canvas.height = b.h;
+      canvas.getContext('2d').putImageData(pixels, -b.x, -b.y, b.x, b.y, b.w, b.h);
+      return { canvas, w: b.w, h: b.h, x: img.x + b.x, y: img.y + b.y };
+    }
     // Import-only composition. Cropped pieces are released as soon as their parent consumes them.
     // Through paints into the same backdrop; Normal gets an isolated surface. Root style stays on the output layer.
     async function gengaRenderClipFolder(cd, recipe, shouldAbort) {
@@ -124922,21 +124937,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         let target = null;
         async function pieceOf(node) {
           if (node.children) return masked(await render(node.children), node.mask);
-          const cv = document.createElement('canvas');
-          let x = 0, y = 0;
+          if (!node.vectorChunkIds) {
+            const img = await gengaDecodeClipLayerBitmap(cd, node);
+            if (!img) throw new Error('Missing CLIP folder source: ' + node.name);
+            return gengaClipRasterPiece(img);
+          }
+          const cv = document.createElement('canvas'); cv.width = cd.width; cv.height = cd.height;
           try {
-            if (node.vectorChunkIds) {
-              cv.width = cd.width; cv.height = cd.height;
-              gengaDrawVectorStrokes(cv.getContext('2d'), clipDecodeLayerVector(cd, node).strokes);
-            } else {
-              const img = await gengaDecodeClipLayerBitmap(cd, node);
-              if (!img) throw new Error('Missing CLIP folder source: ' + node.name);
-              cv.width = img.w; cv.height = img.h; x = img.x; y = img.y;
-              cv.getContext('2d').putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
-            }
-            const piece = gengaTrimCanvasToDrawing(cv, null, true);
-            if (piece) { piece.x += x; piece.y += y; }
-            return piece;
+            gengaDrawVectorStrokes(cv.getContext('2d'), clipDecodeLayerVector(cd, node).strokes);
+            return gengaTrimCanvasToDrawing(cv, null, true);
           } finally { paintReleaseCanvas(cv); }
         }
         // A base with the clipping nodes right above it (CSP): each clipping node is drawn onto the base piece alone
@@ -125356,21 +125365,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const hit = dedupe.map.get(contentKey);
           if (hit) { dedupe.canon = hit.canon; return hit.drawing; }
         }
-        const cv = document.createElement('canvas'); cv.width = img.w; cv.height = img.h;
-        cv.getContext('2d').putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
-        // 용지는 프로젝트 크기로 유지한다. 래스터는 트림 원점에 원본 배치값을 더한다.
-        // 같은 픽셀도 배치가 다르면 다른 그림이므로 위 dedupe 키에도 위치를 포함한다.
-        const trimmed = gengaTrimCanvasToDrawing(cv);
-        if (trimmed) { trimmed.x += img.x; trimmed.y += img.y; }
-        // 트림이 픽셀을 자기 캔버스로 복사해 갔으므로 원본은 여기서 놓는다 — 놓지 않으면 레이어 수만큼 레이어
-        // 크기 백킹이 쌓인다.
-        paintReleaseCanvas(cv);
-        const d = trimmed ? gengaIngestDrawing(trimmed) : null;
-        // 빈 레이어는 실패가 아니다. gengaTrimCanvasToDrawing 은 잉크가 한 점도 없으면 null 을 준다 — 디코드가
-        // 깨진 것과는 다른 사실이다. CLIP 에 빈 레이어는 흔해서 한 통에 세면 경보가 사실상 상시 거짓이 되고, 진짜
-        // 실패를 구분할 수 없다.
-        const emptyLayer = !trimmed;
-        if (!d && !emptyLayer) failCount++;
+        const piece = gengaClipRasterPiece(img);
+        if (!piece) return null; // A decoded, transparent layer is empty, not a decode failure.
+        let d;
+        try {
+          d = gengaIngestDrawing({ dataUrl: piece.canvas.toDataURL('image/png'), w: piece.w, h: piece.h, x: piece.x, y: piece.y });
+        } finally { paintReleaseCanvas(piece.canvas); }
+        if (!d) failCount++;
         if (dedupe && d) { dedupe.map.set(contentKey, { drawing: d, canon: dedupe.name }); dedupe.canon = dedupe.name; }
         return d;
       }
