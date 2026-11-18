@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3420</title>
+  <title>MoArt ver3421</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69324,9 +69324,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const matchesQuery = function(entry) { return entry.path_display.slice(prefix.length).toLowerCase().includes(query); };
       const cached = view.workSearch;
       const fresh = !refresh && cached?.prefix === prefix && Date.now() - cached.at < 30000;
-      if (fresh && cached.query === query) { show(cached.files); return; }
+      if (fresh && cached.query === query) { view.searchStats = null; show(cached.files); return; }
       const term = part?.match(/(?:^|[_-])(\d+)$/)?.[1] || part;
       if (!term) return;
+      const extensions = ['moart', 'tvpp', 'clip', 'json', 'zip'];
       const files = new Map();
       const stats = { search: 0, list: 0, entries: 0 };
       view.searchStats = stats;
@@ -69363,6 +69364,30 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (folders.has(folder.slice(0, i))) return false;
           return true;
         });
+        // Coalesce many matching folders within each project branch. A common ancestor
+        // ends on a component boundary and never crosses into another branch.
+        const branches = new Map();
+        for (const root of roots) {
+          const branch = root.slice(prefix.length).split('/')[0];
+          if (!branches.has(branch)) branches.set(branch, []);
+          branches.get(branch).push(root);
+        }
+        const scopes = [];
+        roots.length = 0;
+        for (const group of branches.values()) {
+          if (group.length <= 3) { roots.push(...group); continue; }
+          let scope = group[0];
+          for (const folder of group) {
+            while (folder !== scope && !folder.startsWith(scope + '/')) scope = scope.slice(0, scope.lastIndexOf('/'));
+          }
+          scopes.push(scope);
+        }
+        async function searchScopes() {
+          while (scopes.length) {
+            signal.throwIfAborted();
+            await dropboxSearchExtensions(scopes.pop(), signal, publish, new Map(), extensions, stats);
+          }
+        }
         async function worker() {
           while (roots.length) {
             signal.throwIfAborted();
@@ -69376,13 +69401,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
           }
         }
-        await Promise.all(Array.from({ length: Math.min(8, roots.length) }, worker));
+        await Promise.all([searchScopes(), ...Array.from({ length: Math.min(4, roots.length) }, worker)]);
       }
-      await Promise.all([names({ file_extensions: ['moart', 'tvpp', 'clip', 'json', 'zip'] }, publish), descendants()]);
+      await Promise.all([names({ file_extensions: extensions }, publish), descendants()]);
       signal.throwIfAborted();
       view.workSearch = { prefix, query, files: Array.from(files.values()), at: Date.now() };
     }
-    async function dropboxSearchExtensions(path, signal, show, pages, extensions) {
+    async function dropboxSearchExtensions(path, signal, show, pages, extensions, stats) {
       const prefix = path.toLowerCase() + '/';
       const results = await Promise.allSettled(extensions.map(async function(ext) {
         const pageState = pages.get(ext) || { cursor: '', count: 0 };
@@ -69396,6 +69421,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                   file_extensions: [ext], max_results: 1000 } }, pageSignal);
           }, signal, 8000);
           signal.throwIfAborted();
+          if (stats) { stats.search++; stats.entries += page.matches.length; }
           show(page.matches.map(function(match) { return match.metadata?.metadata; }).filter(function(e) {
             return e && dropboxIndexFile(e) && e.path_display.toLowerCase().startsWith(prefix);
           }));
