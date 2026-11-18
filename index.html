@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3426</title>
+  <title>MoArt ver3427</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -69676,9 +69676,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const code = gengaSheetRevisionInfo(base ? (base === 'LO' ? 'l' : 'g') + suffix : suffix).role;
       return code ? base + GENGA_REVISION_ROLES.find(function(r) { return r.code === code; }).ja : '';
     }
-    function dropboxSheetName(name) {
-      return /(?:^|[^\p{L}\p{N}])(?:タイムシート|타임\s*시트|time[ _-]?sheet|x[ _-]?sheet)(?=$|[^\p{L}])/iu.test(name.normalize('NFKC'));
-    }
+    // Bare "sheet" is used as a prefix for numbered work files; a model sheet is not a timesheet.
+    const DROPBOX_SHEET_MARK = /(?:^|[^\p{L}\p{N}])(タイムシート|타임\s*시트|time[ _-]?sheet|x[ _-]?sheet|ts)(?=$|[^\p{L}])|^(sheet)(?=[_ .-]+\S*\d)/iu;
 
     function dropboxCutCandidate(value) {
       const name = value.normalize('NFKC').toLowerCase().replace(/^[#_]+/, '');
@@ -69707,7 +69706,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!type || !entry.path_display || !entry.path_display.toLowerCase().startsWith(path.toLowerCase() + '/')) continue;
         const relative = entry.path_display.slice(path.length + 1);
         const dirs = relative.split('/').slice(0, -1);
-        const file = dropboxCutCandidate(entry.name.slice(0, -type[0].length));
+        const stem = entry.name.slice(0, -type[0].length).normalize('NFKC').replace(/^[#_]+/, '');
+        const sheet = DROPBOX_SHEET_MARK.exec(stem);
+        const marker = sheet && (sheet[1] || sheet[2]).toLowerCase();
+        const file = dropboxCutCandidate(stem) || (sheet?.index === 0 ? dropboxCutCandidate(stem.slice(sheet[0].length).replace(/^[_ .-]+/, '')) : null);
         const parentName = dirs.at(-1) || '';
         const parentCandidate = dropboxCutCandidate(parentName);
         const parent = parentCandidate?.explicit || /^#?\d{1,4}[a-z]?(?:[_ -](?:r|retake))?$/i.test(parentName) ? parentCandidate : null;
@@ -69716,7 +69718,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const reference = dirs.some(function(d) { return /^#?(?:参考|資料|設定|references?|assets|retake|原作ページ)$/i.test(d); });
         // A sheet filename can carry an episode and cut but no production title.
         // Resolve it only against an enclosing cut folder with the same episode and cuts.
-        if (archived && file?.scope && /^(?:タイムシート|타임시트|timesheet|xsheet) \d+$/.test(file.scope)) {
+        if (marker && file?.scope && file.scope.split(' ')[0] === marker) {
           const episode = file.scope.split(' ').at(-1);
           for (let i = dirs.length - 1; i >= 0; i--) {
             const ancestor = dropboxCutCandidate(dirs[i]);
@@ -69725,11 +69727,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             break;
           }
         }
-        const sameCuts = file && parent && file.cuts.map(function(c) { return c.id; }).join(',') === parent.cuts.map(function(c) { return c.id; }).join(',');
+        const exactCuts = file && parent && file.cuts.map(function(c) { return c.id; }).join(',') === parent.cuts.map(function(c) { return c.id; }).join(',');
         const conflictingScope = file?.scope && parent?.scope && file.scope !== parent.scope;
+        const singleSheet = sheet && file?.scope && file.scope === parent?.scope && file.cuts.length === 1 && parent.cuts.some(c => c.id === file.cuts[0].id);
+        const matchedFolder = exactCuts || singleSheet;
         const compound = (file?.cuts.length || 0) > 1 || (parent?.cuts.length || 0) > 1;
-        if (reference || conflictingScope || compound && (!sameCuts || !parent.explicit)) { unknown.push(entry); continue; }
-        const cut = file && parent && !sameCuts ? !file.explicit && parent.explicit ? parent : null : file || parent;
+        if (reference || conflictingScope || compound && (!matchedFolder || !parent.explicit)) { unknown.push(entry); continue; }
+        const cut = file && parent && !matchedFolder ? !file.explicit && parent.explicit ? parent : null : file || parent;
         if (!cut) { unknown.push(entry); continue; }
         const scope = cut.scope || parent?.scope || '';
         if (scope && episodeFolder && Number(scope.split(' ').at(-1)) !== Number(episodeFolder[1])) { unknown.push(entry); continue; }
@@ -69741,14 +69745,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         const stage = process || (dirs[0]?.startsWith('#') && !dropboxCutCandidate(dirs[0]) ? dirs[0].slice(1) : '');
         if (archived && !stage) { unknown.push(entry); continue; }
-        const cohortPath = parent && !parent.explicit && (sameCuts || !file) ? dirs.slice(0, -1) : dirs;
+        const cohortPath = parent && !parent.explicit && (matchedFolder || !file) ? dirs.slice(0, -1) : dirs;
         const cohort = cohortPath.join('/').toLowerCase() + '|' + cut.cuts[0].cut.replace(/[A-Z]$/, '').replace(/\d/g, '0');
         if (!cohorts.has(cohort)) cohorts.set(cohort, new Set());
         cohorts.get(cohort).add(cut.cuts[0].id);
-        const spellings = sameCuts ? cut.cuts.concat(parent.cuts) : cut.cuts;
+        const spellings = exactCuts ? cut.cuts.concat(parent.cuts) : cut.cuts;
         const width = Math.max(...spellings.map(function(c) { return c.cut.match(/^\d+/)[0].length; }));
         candidates.push({ entry: entry, relative: relative, width: width, cuts: cut.cuts, scope: scope, stage: stage, archived: archived,
-          type: type[1].toLowerCase(), cohort: cohort, matchedFolder: !!sameCuts, confirmed: compound || cut.explicit || !!parent?.explicit && sameCuts });
+          type: type[1].toLowerCase(), sheet: !!sheet, cohort: cohort, matchedFolder: !!matchedFolder, confirmed: compound || cut.explicit || !!parent?.explicit && matchedFolder });
       }
       const currentScopes = new Set(candidates.filter(function(item) { return !item.archived; }).map(function(item) { return item.scope; }).filter(Boolean));
       const archiveScopes = new Set(candidates.filter(function(item) { return item.archived; }).map(function(item) { return item.scope; }).filter(Boolean));
@@ -70007,7 +70011,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             files.forEach(function(items, i) {
               if (!items.length) { make('span', '', row); return; }
               const sheets = [], others = [];
-              for (const item of items) (dropboxSheetName(item.entry.name) ? sheets : others).push(item);
+              for (const item of items) (item.sheet ? sheets : others).push(item);
               const cell = sheets.length && others.length ? make('div', 'es-dropbox-file-stack', row) : row;
               function fileButton(matches, caption) {
                 if (!matches.length) return;
