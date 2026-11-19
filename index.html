@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3454</title>
+  <title>MoArt ver3455</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -109546,6 +109546,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         let cursor = 0, failure = null;
         const worker = async function() {
           while (!failure && cursor < missing.length) {
+            if (asThumb && strokeInProgress()) {
+              await gengaThumbAfterInput();
+              try { assertProjectIoOwner(owner); } catch (error) { failure = error; }
+              continue;
+            }
             const cell = missing[cursor++]; let bitmap = null;
             try {
               bitmap = await gengaDecodeTileCell(cell.blob); assertProjectIoOwner(owner);
@@ -110388,10 +110393,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return keep;
     }
     function gengaTrimThumbnailCaches() {
-      const keep = gengaThumbProtectedRefs();
+      let keep;
       [gengaThumbCache, gengaThumbImageCache].forEach(function(map) {
         let bytes = gengaThumbMapBytes(map);
         const budget = gengaThumbBudgetBytes(map === gengaThumbImageCache);
+        if (bytes <= budget) return;
+        if (!keep) keep = gengaThumbProtectedRefs();
         for (const entry of map) {
           if (bytes <= budget) break;
           const ref = entry[0], value = entry[1];
@@ -110403,6 +110410,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     const gengaThumbReadPending = new Map();
     function gengaDropThumbnailCaches(ownershipOnly) {
+      gengaColdThumbChain = Promise.resolve();
       drawingThumbBakeEpoch += 1; // 既存の共用bake境界で遅い応答を捨てる
       gengaThumbCache.clear(); gengaThumbImageCache.clear(); gengaThumbReadPending.clear();
       gengaThumbBakePending.clear(); gengaThumbBakeFailed.clear();
@@ -110411,6 +110419,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // LRU miss: gt:だけを読む。失敗/欠落は既存の原本bakeへ。古いreadは新しいキャッシュへ書き戻さない。
     function gengaThumbReadOrBake(dr) {
+      if (strokeInProgress()) { scheduleGengaLayerThumbsRedraw(); return; }
       const ref = dr.ref;
       if (gengaThumbReadPending.has(ref) || gengaThumbBakePending.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
       const epoch = drawingThumbBakeEpoch, job = {};
@@ -110422,6 +110431,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           gengaThumbReadPending.delete(ref);
           if (gengaThumbCache.has(ref)) return;
           if (url) { gengaThumbCache.set(ref, url); scheduleGengaLayerThumbsRedraw(); }
+          else if (strokeInProgress()) scheduleGengaLayerThumbsRedraw();
           else if (dr.dataUrl) gengaThumbBakeFromDataUrl(ref, dr.dataUrl);
           else {
             const ts = gengaDrawingTiles(dr);
@@ -110567,6 +110577,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaPatchBakedThumbs() {
       document.querySelectorAll('#gengaStage .genga-exposure-thumb-img[data-genga-thumb-ref], #gengaCelPickPop img[data-genga-thumb-ref]').forEach(function(img) {
         const ref = img.dataset.gengaThumbRef;
+        if (!gengaThumbBakeFailed.has(ref) && img.hasAttribute('src') && img.getAttribute('src') === gengaThumbCache.get(ref)) return;
         if (!ref || !gengaThumbIsVisible(img)) return;
         const expEl = img.closest('.genga-exposure');
         const layer = gengaLayerById(expEl ? expEl.dataset.gengaLayer : img.dataset.gengaLayer);
@@ -110636,31 +110647,52 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // gengaThumbCommitBakePending 가드: 통짜 폴백 커밋의 bake 대기 중 렌더가 이 예약을 겹치면 같은 썸을 두 번 인코드하고
     // gt: 를 두 번 쓴다 — 커밋 쪽 완료가 어차피 persist 한다.
-    function gengaThumbBakeFromDataUrl(ref, dataUrl) {
-      if (!ref || !dataUrl || gengaThumbCache.has(ref) || gengaThumbBakeFailed.has(ref) || gengaThumbBakePending.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
-      gengaThumbBakePending.add(ref);
-      drawingThumbBake(dataUrl, function(url) { gengaThumbBakeSettled(ref, url); });
+    function gengaThumbVisibleNow(ref) {
+      const cards = document.querySelectorAll('[data-genga-thumb-ref="' + CSS.escape(ref) + '"]');
+      for (const card of cards) if (gengaThumbIsVisible(card)) return true;
+      for (const cv of document.querySelectorAll('#gengaStage .genga-layer-thumb')) {
+        const layer = gengaLayerById(cv.dataset.gengaLayer);
+        if (layer && gengaNearestDrawing(layer, gengaCurrentFrame())?.ref === ref && gengaThumbIsVisible(cv)) return true;
+      }
+      return false;
     }
-    // 안 푼 칸 묶음의 썸 굽기. 칸을 사적으로 풀어 합성·축소하고 바로 놓는다(gengaPortableTile asThumb). 화면 밖 코마까지
-    // 한꺼번에 몰리지 않게 한 장씩 잇는다. 프로젝트가 바뀌면(drawingThumbBakeEpoch) 남은 차례는 버린다.
-    let gengaTileThumbBakeChain = Promise.resolve();
-    function gengaThumbBakeFromTiles(ref, ts) {
+    function gengaThumbAfterInput() {
+      return new Promise(function(resolve) { setTimeout(resolve, GENGA_BG_STROKE_DEFER_MS); });
+    }
+    // Only a currently visible cold thumbnail gets a decode slot. Recheck demand after scrolling.
+    let gengaColdThumbChain = Promise.resolve();
+    function gengaQueueColdThumb(ref, bake) {
       if (!ref || gengaThumbCache.has(ref) || gengaThumbBakeFailed.has(ref) || gengaThumbBakePending.has(ref) || gengaThumbCommitBakePending.has(ref)) return;
       gengaThumbBakePending.add(ref);
-      const epoch = drawingThumbBakeEpoch, owner = projectIoOwner();
-      gengaTileThumbBakeChain = gengaTileThumbBakeChain.then(async function() {
-        if (epoch !== drawingThumbBakeEpoch || !projectIoOwnerCurrent(owner)) return;
-        let tcv = null;
-        try { tcv = await gengaPortableTile(ts, owner, false, true); }
-        catch (error) { if (epoch === drawingThumbBakeEpoch) gengaThumbBakeSettled(ref, ''); return; }
+      const epoch = drawingThumbBakeEpoch;
+      gengaColdThumbChain = gengaColdThumbChain.then(async function() {
+        if (epoch !== drawingThumbBakeEpoch) return;
         await new Promise(function(resolve) {
-          gengaThumbEncodeAsync(tcv, function(url) {
-            paintReleaseCanvas(tcv);
-            if (epoch === drawingThumbBakeEpoch) gengaThumbBakeSettled(ref, url);
-            resolve();
-          });
+          if (typeof requestIdleCallback === 'function') requestIdleCallback(resolve, { timeout: 300 });
+          else setTimeout(resolve, 0);
         });
-      }).catch(function(error) { console.error('[genga] tile thumbnail bake failed', error); });
+        while (strokeInProgress() && epoch === drawingThumbBakeEpoch) await gengaThumbAfterInput();
+        if (epoch !== drawingThumbBakeEpoch) return;
+        if (!gengaThumbVisibleNow(ref)) { gengaThumbBakePending.delete(ref); return; }
+        const url = await bake();
+        if (epoch === drawingThumbBakeEpoch) gengaThumbBakeSettled(ref, url);
+      }).catch(function(error) {
+        if (epoch === drawingThumbBakeEpoch) gengaThumbBakeSettled(ref, '');
+        console.error('[genga] thumbnail bake failed', error);
+      });
+    }
+    function gengaThumbBakeFromDataUrl(ref, dataUrl) {
+      if (dataUrl) gengaQueueColdThumb(ref, function() {
+        return new Promise(function(resolve) { drawingThumbBake(dataUrl, resolve); });
+      });
+    }
+    function gengaThumbBakeFromTiles(ref, ts) {
+      gengaQueueColdThumb(ref, async function() {
+        const owner = projectIoOwner();
+        const cv = await gengaPortableTile(ts, owner, false, true);
+        try { return await new Promise(function(resolve) { gengaThumbEncodeAsync(cv, resolve); }); }
+        finally { paintReleaseCanvas(cv); }
+      });
     }
     // Thumbnail URL authority: cached small image, pending bake (no src), then original only on final failure.
     // 벡터 폴백은 호출부 소관 — 코마 썸만 벡터를 안다(셀 픽커는 벡터 미리보기가 없다).
@@ -112728,7 +112760,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                   else if (!gengaDrawStore.has(ref)) { gengaNoteDrawingFailure(ref, null, kind); if (kind === 'absent') missingRefs.add(ref); }
                   continue;
                 }
-                if (gengaIsTileSet(value) && (requiredRefs.has(ref) || !values.get('gt:' + ref))) {
+                if (gengaIsTileSet(value) && requiredRefs.has(ref)) {
                   hydration.reservedBytes = gengaDrawingPixelEstimate({ tileSet: value });
                   if (!prepared) gengaTrimDrawStore(null, hydration.reservedBytes);
                   await gengaTileSetDecode(value);
@@ -112746,7 +112778,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                 const thumbUrl = thumb instanceof Blob ? await gengaBlobToDataUrl(thumb) : (typeof thumb === 'string' ? thumb : '');
                 assertProjectIoOwner(owner);
                 if (thumbUrl) (prepared ? prepared.thumbs : gengaThumbCache).set(ref, thumbUrl);
-                else if (!prepared && gengaIsTileSet(value)) gengaThumbUrlFor({ ref: ref });
                 if (!prepared && !gengaIsTileSet(value)) gengaScheduleWholeRasterConvert(ref);
                 // Durable off-screen drawings are faulted in after adoption, not held twice.
                 if (prepared && !requiredRefs.has(ref) && !delta) {
@@ -135802,6 +135833,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function scheduleGengaLayerThumbsRedraw() {
       if (gengaLayerThumbsRedrawRaf) return;
       gengaLayerThumbsRedrawRaf = requestAnimationFrame(function() {
+        if (strokeInProgress()) {
+          setTimeout(function() { gengaLayerThumbsRedrawRaf = 0; scheduleGengaLayerThumbsRedraw(); }, GENGA_BG_STROKE_DEFER_MS);
+          return;
+        }
         gengaLayerThumbsRedrawRaf = 0;
         gengaPatchBakedThumbs();
         drawGengaLayerThumbs();
