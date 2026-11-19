@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3435</title>
+  <title>MoArt ver3436</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -21643,14 +21643,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       pushUndoCommand(attachSelectionRider({ name: name, before: before, after: after, gengaPixels: refreshOptions && refreshOptions.gengaPixels, gengaDrawingContext: refreshOptions && refreshOptions.gengaDrawingContext, gengaRenderPlan: gengaRenderPlan, conteDialogCutId: refreshOptions && refreshOptions.conteDialogCutId, conteGeometryUi: refreshOptions && refreshOptions.conteGeometryUi, gengaGeometryUi: refreshOptions && refreshOptions.gengaGeometryUi, recordingKind: refreshOptions && refreshOptions.recordingKind }, refreshOptions && refreshOptions.selectionRider));
       const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
       const plan = gengaPresetRenderPlan(effectiveRefreshOptions.gengaRenderPlan, gengaRenderPlan);
-      if (plan && plan.reuseCelContent) {
-        // Normalization can update grouped layers. Only reuse cells of matching snapshots.
-        const prev = new Map(before.gengaTimeline.layers.map(function(l) { return [l.id, l]; }));
-        const same = new Set(after.gengaTimeline.layers.filter(function(l) {
-          return prev.has(l.id) && JSON.stringify(prev.get(l.id)) === JSON.stringify(l);
-        }).map(function(l) { return l.id; }));
-        effectiveRefreshOptions.gengaRenderPlan = Object.assign({}, plan, { reusableCelIds: same });
-      } else if (plan) effectiveRefreshOptions.gengaRenderPlan = plan;
+      if (plan) effectiveRefreshOptions.gengaRenderPlan = plan;
       if (genga) effectiveRefreshOptions.gengaPreviewCachesSettled = true;
       refresh(effectiveRefreshOptions);
       gengaNoticeEmptiedLayers(before, after); // 빈 레이어 판정의 유일한 길목
@@ -22943,10 +22936,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       { flag: 'cameraTimelineEdit', viewport: true, apply: function(command, payload) { applyCameraTimelineHistoryState(payload); } },
       { flag: 'conteCutActionTextEdit', viewport: true, apply: function(command, payload) { applyConteCutActionTextHistoryState(payload); } },
       { flag: 'gengaLayerInsertion', viewport: true, apply: function(command, payload, undoing) {
-        const gt = state.project.gengaTimeline, entry = command.after.layers[0];
-        const index = gt.layers.findIndex(function(l) { return l.id === entry.id; });
-        if (undoing && index >= 0) gt.layers.splice(index, 1);
-        if (!undoing && index < 0) gt.layers.splice(entry.index, 0, fastClone(entry.layer));
+        gengaApplyLayerInsertion(state.project.gengaTimeline, payload, undoing ? command.after : command.before);
         gengaRefreshLayerInsertion(false);
       } },
       { flag: 'gengaCameraEdit', viewport: false, apply: function(command, payload) { applyGengaCameraHistoryState(payload); } },   // cameraWork 만
@@ -128415,8 +128405,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           };
         }).filter(function(a) { return a.name; })
       };
-      const artLabels = gengaAutoArtLabels(project.gengaTimeline);
-      project.gengaTimeline.layers.forEach(function(l) { if (artLabels.has(l.id)) l.artLabel = artLabels.get(l.id); });
+      gengaAssignAutoArtLabels(project.gengaTimeline);
       project.ntscTimebase = ntscTimebase;   // 콘티 코드는 project 를, 원화 코드는 gt 를 읽으므로 둘을 같게 둔다
     }
     // 原画(genga) project — separate kind that shares the editor for now; name = 作品名_話数_カット番号[_suffix].
@@ -129158,18 +129147,70 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       selectGengaLayer(id);
       gengaCenterLayerIntoView(id);
     }
-    function gengaSingleLayerInsertionIndex(gt, layer, anchorId) {
-      // Plan on layer headers. Placement may open the anchor's folder; fixed rows and art blocks
-      // use the same ordering as load/normalize. No exposure or drawing is copied here.
-      const planned = Object.assign({}, gt, { layers: gt.layers.map(function(l) { return Object.assign({}, l); }) });
-      gengaPlaceNewLayer(planned, layer, anchorId);
-      gengaNormalizeLayerOrder(planned.layers);
-      const others = planned.layers.filter(function(l) { return l !== layer; });
-      const labels = gengaAutoArtLabels(planned);
-      const compound = others.some(function(l, i) {
-        return l.id !== gt.layers[i].id || l.folderId !== gt.layers[i].folderId || (labels.has(l.id) && labels.get(l.id) !== l.artLabel);
-      }) || gengaFxInstrPlanAfter(gengaFxInstrInputKey(gt), planned);
-      return compound ? -1 : planned.layers.indexOf(layer);
+    // The draft shares all drawing data. Only layout, automatic labels and FX instruction headers
+    // may change; the same owners settle these fields when a project is normalized.
+    function gengaPlanLayerInsertion(gt, layer, anchorId) {
+      const draft = Object.assign({}, gt, { layers: gt.layers.map(function(l) { return Object.assign({}, l); }) });
+      gengaPlaceNewLayer(draft, layer, anchorId);
+      gengaNormalizeLayerOrder(draft.layers);
+      gengaAssignAutoArtLabels(draft);
+      if (gengaReconcileFxInstrAfter(gt, draft)) {
+        gengaNormalizeLayerOrder(draft.layers);
+        gengaAssignAutoArtLabels(draft);
+      }
+      return draft;
+    }
+    // Capture one side of an insertion. Positions count as moves only when the relative order of
+    // surviving rows changes. Inserting one row above 400 others therefore records just that row.
+    function gengaLayerInsertionState(layers, peers) {
+      const peerById = new Map(peers.map(function(l) { return [l.id, l]; }));
+      const ids = new Set(layers.map(function(l) { return l.id; }));
+      const survivors = peers.filter(function(l) { return ids.has(l.id); });
+      let rank = 0;
+      const entries = [];
+      layers.forEach(function(l, index) {
+        const peer = peerById.get(l.id);
+        if (!peer) { entries.push({ id: l.id, index: index, layer: fastClone(l) }); return; }
+        const entry = { id: l.id };
+        if (survivors[rank++].id !== l.id) entry.index = index;
+        // Existing exposure arrays never enter history here. Only these structural fields are
+        // written on surviving headers. Folder expansion belongs to the current view.
+        for (const key of ['name', 'artLabel', 'folderId', 'instrTargets']) {
+          const value = l[key], previous = peer[key];
+          if (value === previous || (key === 'instrTargets' && jsonDeepEquals(value, previous))) continue;
+          if (!entry.fields) entry.fields = {};
+          entry.fields[key] = Array.isArray(value) ? value.slice() : value;
+        }
+        if (entry.fields || entry.index !== undefined) entries.push(entry);
+      });
+      return { layers: entries };
+    }
+    function gengaApplyLayerInsertion(gt, target, from) {
+      const detached = new Map();
+      const moves = new Set(from.layers.filter(function(e) { return e.index !== undefined; }).map(function(e) { return e.id; }));
+      gt.layers = gt.layers.filter(function(l) {
+        if (!moves.has(l.id)) return true;
+        detached.set(l.id, l);
+        return false;
+      });
+      const byId = new Map(gt.layers.map(function(l) { return [l.id, l]; }));
+      for (const entry of target.layers) {
+        const row = entry.layer ? fastClone(entry.layer) : detached.get(entry.id) || byId.get(entry.id);
+        for (const [key, value] of Object.entries(entry.fields || {})) {
+          if (value === undefined) delete row[key];
+          else row[key] = Array.isArray(value) ? value.slice() : value;
+        }
+        if (entry.index !== undefined) gt.layers.splice(entry.index, 0, row);
+      }
+      if (target.totalFrames !== undefined) gt.totalFrames = target.totalFrames;
+      if (target.dialogueLinks) {
+        const links = new Map(target.dialogueLinks);
+        for (const entry of gt.dialogue.entries) {
+          if (!links.has(entry.id)) continue;
+          const layerId = links.get(entry.id);
+          if (layerId) entry.layerId = layerId; else delete entry.layerId;
+        }
+      }
     }
     // 벡터 레이어를 만든다(CLIP 임포트 말고도 만들 길이 있어야 한다). 셀 레이어와 같은 뼈대에 vector 표식만
     // 세우고, 그림은 첫 획이 만든다. 셀·벡터 레이어는 이 몸을 함께 쓰며 이름 접두와 `vector` 플래그만 다르다.
@@ -129182,20 +129223,25 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const n = gt.layers.length, newId = newPrefixedId('genga-layer');
       const layer = normalizeGengaLayer({ id: newId, name: namePrefix + (n + 1), color: gengaLayerColor(n),
         role: 'cel', vector: vector, exposures: [newGengaExposure(1)] });
-      const index = gengaSingleLayerInsertionIndex(gt, layer, anchorId);
-      if (index < 0) {
-        // A dependent row also changes. Keep the complete command, including normalization and FX reconciliation.
-        runCommand('原画レイヤー追加', function(p) { gengaPlaceNewLayer(p.gengaTimeline, layer, anchorId); },
-          { gengaRenderPlan: gengaLayerStructurePlan(true) });
-      } else {
-        // Folder expansion is view state; history carries its current value in both directions.
-        const folder = layer.folderId && gengaLayerById(layer.folderId);
-        if (folder) folder.collapsed = false;
-        gt.layers.splice(index, 0, layer);
-        pushUndoCommand({ name: '原画レイヤー追加', gengaLayerInsertion: true, recordingKind: 'appearance',
-          after: { layers: [{ id: newId, index: index, layer: fastClone(layer) }] } });
-        gengaRefreshLayerInsertion(true);
+      const draft = gengaPlanLayerInsertion(gt, layer, anchorId);
+      const before = gengaLayerInsertionState(gt.layers, draft.layers);
+      const after = gengaLayerInsertionState(draft.layers, gt.layers);
+      // Removing an untouched instruction row can also shorten the cut or drop a dialogue link.
+      const removed = new Set(before.layers.filter(function(e) { return e.layer; }).map(function(e) { return e.id; }));
+      if (removed.size) {
+        const total = gengaNormalizedTotalFrames(draft);
+        if (total !== gt.totalFrames) { before.totalFrames = gt.totalFrames; after.totalFrames = total; }
+        const linked = gt.dialogue.entries.filter(function(e) { return removed.has(e.layerId); });
+        if (linked.length) {
+          before.dialogueLinks = linked.map(function(e) { return [e.id, e.layerId]; });
+          after.dialogueLinks = linked.map(function(e) { return [e.id, null]; });
+        }
       }
+      const folder = layer.folderId && gengaLayerById(layer.folderId);
+      if (folder) folder.collapsed = false;
+      gengaApplyLayerInsertion(gt, after, before);
+      pushUndoCommand({ name: '原画レイヤー追加', gengaLayerInsertion: true, recordingKind: 'appearance', before: before, after: after });
+      gengaRefreshLayerInsertion(true);
       // 만든 것을 고른다 — 다음 획이 새 레이어에 앉는다. 벡터면 selectGengaLayer 가 못 담는 효과를 바로 끈다.
       // 선택이 바뀌면 selectGengaLayer 가 미리보기를 그린다(위 previewByCaller). 렌더가 선택 없는 상태에서 이미 새 레이어를
       // 골랐으면(전부 지운 뒤 추가) 선택이 그대로라 그리지 않으므로, 그려지지 않았을 때만 여기서 그린다.
@@ -129744,6 +129790,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       layer.artLabel = gengaArtLabel(owner); layer.role = 'bgbook'; layer.tagOff = false;
       if (owner.sheetRole === 'book') layer.sheetRole = 'book';
       else delete layer.sheetRole;
+    }
+    function gengaAssignAutoArtLabels(gt) {
+      const labels = gengaAutoArtLabels(gt);
+      gt.layers.forEach(function(l) { if (labels.has(l.id)) l.artLabel = labels.get(l.id); });
     }
     function gengaAutoArtLabels(gt) {
       const owners = Array.from(new Set(gengaArtGroupIndex(gt).values()));
@@ -146394,10 +146444,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           // `genga-peek` 를 레인에도 붙인다 — 헤드에만 붙이면 헤드만 3px 로 눌리고 레인은 52px 그대로라
           // 둘이 어긋난다.
           lane += '<div class="genga-lane' + solo + hiddenRow + revisionEmpty + (peek ? ' genga-peek' : '') + '" data-genga-layer="' + escapeHtml(l.id) + '"' + rowStyle + '>' + cellSelHtml;
-          // Single-row edits preserve other cells. A compound insertion normalizes the project and
-          // supplies only the ids whose layer data survived that pass unchanged.
           const node = rows && renderPlan && renderPlan.reuseCelContent &&
-            (!renderPlan.reusableCelIds || renderPlan.reusableCelIds.has(l.id)) &&
             !(l.serifuSections && l.serifuSections.length) && rows.current.get(String(l.id));
           const cached = node && gengaViewRowCache.get(node);
           const content = gengaReusableCelContent(cached, celContext) || gengaCelContent(l, gt, celContext);
