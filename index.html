@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3446</title>
+  <title>MoArt ver3447</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -145809,6 +145809,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // synchronous write boundary and does not change generated markup, so no live-cel serialization or
     // model-field whitelist is needed to detect other edits.
     const gengaViewRowCache = new WeakMap();
+    const gengaViewHeadCache = new WeakMap();
     const gengaViewRowTrackers = new WeakMap();
     function gengaViewRowTracker(stageEl) {
       let tracker = gengaViewRowTrackers.get(stageEl);
@@ -145818,6 +145819,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
           const row = target && target.closest('.genga-lane');
           if (row) gengaViewRowCache.delete(row);
+          else {
+            // A detached head could have been edited outside the observer before reinsertion.
+            if (record.type === 'childList' && target && target.classList.contains('genga-vscroll-heads')) {
+              record.addedNodes.forEach(function(el) { gengaViewHeadCache.delete(el); });
+            }
+            const head = target && target.closest('.genga-vscroll-heads > *');
+            if (head) gengaViewHeadCache.delete(head);
+          }
         });
       };
       const observer = new MutationObserver(invalidate);
@@ -145834,7 +145843,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const tracker = gengaViewRowTracker(stageEl);
       tracker.flush(); // consume same-task edits before the observer's microtask runs
       const container = stageEl.querySelector('.genga-vscroll .genga-lanes');
+      const heads = stageEl.querySelector('.genga-vscroll-heads');
       return { markup: new Map(), reused: [], tracker: tracker,
+        heads: new Map(heads ? Array.from(heads.children, function(el) { return [el.dataset.gengaLayer, el]; }) : []),
         current: new Map(container ? Array.from(container.children).map(function(el) { return [el.dataset.gengaLayer, el]; }) : []) };
     }
     function gengaViewRowMarkup(rows, id, markup) {
@@ -145849,6 +145860,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaRememberViewRows(stageEl, rows) {
       rows.tracker.flush(); // invalidate other rows touched by binding before recording the settled rows
+      const heads = stageEl.querySelector('.genga-vscroll-heads');
+      if (heads) Array.from(heads.children).forEach(function(el) {
+        const markup = rows.markup.get(el.dataset.gengaLayer);
+        if (markup) gengaViewHeadCache.set(el, { head: markup.head, bottom: markup.bottom });
+      });
       const container = stageEl.querySelector('.genga-vscroll .genga-lanes');
       if (!container) return;
       Array.from(container.children).forEach(function(node) {
@@ -145899,13 +145915,29 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Generated layer heads keep controls/listeners when their positional role and owner are unchanged.
       // Structural changes replace only the changed branch; long-press binding belongs to the retained node.
       // A render still cancels the head-owned drag, as replacement did before control retention.
+      const materializeBottom = function(slot) {
+        return document.createRange().createContextualFragment(rows.markup.get(slot.dataset.gengaKeepBottom).bottom).firstElementChild;
+      };
+      const bindHeadElement = function(node) {
+        // A changed ancestor can insert a new branch containing the control group.
+        if (node.nodeType === 1) {
+          if (node.hasAttribute('data-genga-keep-bottom')) node = materializeBottom(node);
+          else for (const slot of node.querySelectorAll('[data-genga-keep-bottom]')) slot.replaceWith(materializeBottom(slot));
+        }
+        return bindNewElement(node);
+      };
       const updateHead = function(current, next) {
+        if (next.nodeType === 1 && next.hasAttribute('data-genga-keep-bottom')) {
+          const id = next.dataset.gengaKeepBottom;
+          if (current === rows.heads.get(id).querySelector('.genga-lh-bottom')) return current;
+          next = materializeBottom(next);
+        }
         if (current.nodeType !== next.nodeType || (current.nodeType === 1 &&
             (current.tagName !== next.tagName || current.classList[0] !== next.classList[0] ||
              current.getAttribute('data-genga-layer') !== next.getAttribute('data-genga-layer') ||
              current.getAttribute('data-gauge') !== next.getAttribute('data-gauge') ||
              current.classList.contains('genga-lname-paper') !== next.classList.contains('genga-lname-paper')))) {
-          current.replaceWith(bindNewElement(next)); return next;
+          current.replaceWith(bindHeadElement(next)); return next;
         }
         if (current.nodeType !== 1) { if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue; return current; }
         if (current.classList.contains('genga-layer-head')) cancelPointerDragsIn(current);
@@ -145913,7 +145945,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (current.isEqualNode(next) && current.tagName !== 'SELECT' && !current.querySelector('select')) return current;
         updateElementAttributes(current, next);
         const value = next.value, before = Array.from(current.childNodes), after = Array.from(next.childNodes);
-        after.forEach(function(node, i) { if (before[i]) updateHead(before[i], node); else current.appendChild(bindNewElement(node)); });
+        after.forEach(function(node, i) { if (before[i]) updateHead(before[i], node); else current.appendChild(bindHeadElement(node)); });
         before.slice(after.length).forEach(function(node) { node.remove(); });
         if (current.tagName === 'SELECT' && current.value !== value) current.value = value;
         return current;
@@ -146098,9 +146130,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       patchArea(dlgHeadPair);
       patchArea(camHeadPair);
-      const currentHeadsById = new Map(Array.from(vHeadsPair.current.children).map(function(head) { return [head.dataset.gengaLayer, head]; }));
       replaceRows(vHeadsPair.current, vHeadsPair.next, function(head) {
-        const current = head.dataset && head.dataset.gengaLayer && currentHeadsById.get(head.dataset.gengaLayer);
+        const current = head.dataset && head.dataset.gengaLayer && rows.heads.get(head.dataset.gengaLayer);
+        if (head.hasAttribute('data-genga-keep-head')) {
+          if (!current || current.parentElement !== vHeadsPair.current) failInvariant('retained head');
+          return current;
+        }
         return current ? updateHead(current, head) : bindNewElement(head);
       });
       if (aHeadsPair.current.style.cssText !== aHeadsPair.next.style.cssText) aHeadsPair.current.style.cssText = aHeadsPair.next.style.cssText;
@@ -146438,13 +146473,37 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const thumbH = Math.max(16, Math.min(28, Math.round(thumbW * gt.paper.h / Math.max(1, gt.paper.w))));
       const celContext = [I18N.lang, gt.totalFrames, gt.paper.w, gt.paper.h].join('|');
       let rowsHead = '', rowsLane = '';
-      const appendRow = function(id, head, body, fx, content) {
+      // Labels and mode lists are shared across layers for this render, including the current locale.
+      const blendOptions = new Map();
+      const layerBlendModes = GENGA_BLEND_MODES.concat(GENGA_TVPAINT_BLEND_MODES);
+      function blendOptionsHtml(kind, value, modes) {
+        const key = kind + '/' + value;
+        if (!blendOptions.has(key)) {
+          blendOptions.set(key, modes.map(function(m) {
+            return '<option value="' + m.v + '"' + (value === m.v ? ' selected' : '') + '>' + t(m.labelKey) + '</option>';
+          }).join(''));
+        }
+        return blendOptions.get(key);
+      }
+      const bottomSlot = '<div data-genga-head-controls></div>';
+      const appendRow = function(id, head, body, bottom, fx, content) {
         id = String(id);
         // body contains the lane opener and cel content; this boundary owns its closing tag.
         // Heads repaint their Canvas thumbnails. Cel bodies and FX strips have separate lifetimes.
-        const markup = { body: body, content: content, cells: content ? content.html : '', fx: fx || '' };
+        const markup = { head: head, bottom: bottom, body: body, content: content, cells: content ? content.html : '', fx: fx || '' };
         if (rows) rows.markup.set(id, markup);
-        rowsHead += head;
+        const live = rows && renderPlan && renderPlan.reuseCelContent && rows.heads.get(id);
+        const cached = live && !pointerDragSessions.size && gengaViewHeadCache.get(live);
+        // A native selection can change without a DOM mutation. The selected attribute is the generated default.
+        const select = cached && live.querySelector('select');
+        const original = select && (select.querySelector('option[selected]') || select.options[0]);
+        const reusable = cached && (!select || (original && select.value === original.value));
+        if (reusable && cached.head === head && cached.bottom === bottom) {
+          rowsHead += '<div data-genga-keep-head data-genga-layer="' + escapeAttr(id) + '"></div>';
+        } else if (bottom) {
+          const controls = reusable && cached.bottom === bottom ? '<div data-genga-keep-bottom="' + escapeAttr(id) + '"></div>' : bottom;
+          rowsHead += head.replace(bottomSlot, function() { return controls; });
+        } else rowsHead += head;
         rowsLane += rows ? gengaViewRowMarkup(rows, id, markup) : body + markup.cells + markup.fx + '</div>';
       };
       // ── A-Z 탭은 그 행의 자식이다. 패널 바깥 오버레이로 두고 scroll 이벤트로 translateY 를 따라가게 하면 iOS
@@ -146555,7 +146614,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             return '<div class="genga-lh-bottom">' +
               '<canvas class="genga-layer-thumb" data-genga-layer="' + escapeHtml(l.id) + '" width="' + thumbW + '" height="' + thumbH + '" style="border-left:3px solid ' + escapeHtml(l.color || '#888888') + '"></canvas>' +
               '<select class="genga-blend-sel" data-genga-layer="' + escapeHtml(l.id) + '" title="' + escapeAttr(t(blendTitleKey)) + '">' +
-                blendModes.map(function(m) { return '<option value="' + m.v + '"' + ((gengaBlendChoiceValue(l) === m.v) ? ' selected' : '') + '>' + t(m.labelKey) + '</option>'; }).join('') +
+                blendOptionsHtml(blendTitleKey, gengaBlendChoiceValue(l), blendModes) +
               '</select>' +
               gengaGaugeHtml('genga-op:' + l.id, 0, 100, 1, opPct, 'flex:1', 'ggauge-flat', '%', t('project.opacityTitle')) +
             '</div>';
@@ -146568,7 +146627,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             const fc = l.folderBlend;
             const isoBottom = fc ? '<div class="genga-lh-bottom">' +
               '<select class="genga-blend-sel" data-genga-layer="' + escapeHtml(l.id) + '" title="' + escapeAttr(t('menu.genga.folder.composite')) + '">' +
-                gengaFolderBlendChoices().map(function(m) { return '<option value="' + m.v + '"' + (fc.blend === m.v ? ' selected' : '') + '>' + t(m.labelKey) + '</option>'; }).join('') +
+                blendOptionsHtml('folder', fc.blend, gengaFolderBlendChoices()) +
               '</select>' +
               gengaGaugeHtml('genga-op:' + l.id, 0, 100, 1, Math.round(fc.opacity * 100), 'flex:1', 'ggauge-flat', '%', t('project.opacityTitle')) +
             '</div>' : '';
@@ -146582,33 +146641,35 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                 '<span class="genga-folder-line" aria-hidden="true"></span>' +
                 eyeLockHtml +
               '</div>' +
-              isoBottom +
+              (isoBottom ? bottomSlot : '') +
               '</div>' +
             '</div>';
             lane += '<div class="genga-lane genga-folder-lane' + (fc ? ' genga-folder-iso' : '') + hiddenRow + '" data-genga-layer="' + escapeHtml(l.id) + '">';
-            appendRow(l.id, head, lane);
+            appendRow(l.id, head, lane, isoBottom);
             return;
           }
           // 지시 레이어 행: 용지 행처럼 고정 이름·한 장. 표시·잠금 + 수정 공정 칩(있을 때).
           if (gengaLayerIsInstr(l)) {
             const stage = l.instrStage ? gengaInstrChipHtml(l, '') : '';
+            const bottom = lhBottomHtml(GENGA_PAPER_BLENDS, 'project.genga.blendTitlePaper');
             head += '<div class="genga-layer-head genga-paper-head genga-instr-head' + sel + hiddenRow + '" data-genga-layer="' + escapeHtml(l.id) + '">' +
               '<div class="genga-lh-core">' +
               '<div class="genga-lh-top">' +
                 '<span class="genga-lname genga-lname-paper" title="' + escapeAttr(l.name || t('genga.instr.cameraName')) + '">' + escapeHtml(l.name || t('genga.instr.cameraName')) + '</span>' +
                 stage + eyeLockHtml +
               '</div>' +
-              lhBottomHtml(GENGA_PAPER_BLENDS, 'project.genga.blendTitlePaper') +
+              bottomSlot +
               '</div>' +
             '</div>';
             lane += '<div class="genga-lane genga-paper-lane' + hiddenRow + '" data-genga-layer="' + escapeHtml(l.id) + '"><span class="genga-paper-lanenote">' + escapeHtml(t(l.instrSource === 'fx' ? 'genga.instr.fxLaneNote' : 'genga.instr.laneNote')) + '</span>';
-            appendRow(l.id, head, lane);
+            appendRow(l.id, head, lane, bottom);
             return;
           }
           // 用紙 (frame-sheet) layer: simplified row — name is fixed, single held image, no A-Z tag / fx / onion /
           // alpha / timeline komas. Keeps 表示・ロック・不透明度 + a 通常/乗算 blend + a 最前/最背 side toggle.
           if (l.role === 'paper') {
             const sideTop = l.paperSide !== 'bottom';
+            const bottom = lhBottomHtml(GENGA_PAPER_BLENDS, 'project.genga.blendTitlePaper');
             head += '<div class="genga-layer-head genga-paper-head' + sel + hiddenRow + '" data-genga-layer="' + escapeHtml(l.id) + '">' +
               '<div class="genga-lh-core">' + // the fixed control band
               '<div class="genga-lh-top">' +
@@ -146616,11 +146677,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                 '<button class="genga-paper-side" type="button" data-genga-layer="' + escapeHtml(l.id) + '" title="' + escapeAttr(sideTop ? t('project.genga.paperSide.frontState') : t('project.genga.paperSide.backState')) + '" aria-label="' + escapeAttr(t('project.genga.paperSide.toggleAria')) + '">' + escapeHtml(sideTop ? t('project.genga.side.frontShort') : t('project.genga.side.backShort')) + '</button>' +
                 eyeLockHtml +
               '</div>' +
-              lhBottomHtml(GENGA_PAPER_BLENDS, 'project.genga.blendTitlePaper') +
+              bottomSlot +
               '</div>' +
             '</div>';
             lane += '<div class="genga-lane genga-paper-lane' + hiddenRow + '" data-genga-layer="' + escapeHtml(l.id) + '"><span class="genga-paper-lanenote">' + escapeHtml(t('project.genga.paperLaneNote')) + '</span>';
-            appendRow(l.id, head, lane);
+            appendRow(l.id, head, lane, bottom);
             return;
           }
           // FX lanes grow the row downward, one --genga-fx-track-h per shown effect track (heads and lanes stay
@@ -146631,6 +146692,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const fxLabels = fxH ? ('<div class="genga-fxlane-labels">' + fxTracks.map(function(tr) { return '<span style="color:' + tr.color + '">' + t(tr.labelKey) + '</span>'; }).join('') + '</div>') : '';
           // The A-Z level tag lives only on the left tab, not repeated at the header's right edge (user request).
           // Freeing that 13px right-gutter slot lets the heads column give back 4px (see --genga-heads-w).
+          const bottom = lhBottomHtml(layerBlendModes, 'project.genga.blendTitle');
           head += '<div class="genga-layer-head' + sel + hiddenRow + revisionEmpty + inFolder + '" data-genga-layer="' + escapeHtml(l.id) + '"' + rowStyle + '>' +
             gengaLayerTagHtml(l) + // 탭이 행과 함께 스크롤한다
             '<div class="genga-lh-core">' + // fixed band; FX labels below it, never inside it
@@ -146646,7 +146708,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
               clipBtnHtml('genga-clip-btn') +
               eyeLockHtml +
             '</div>' +
-            lhBottomHtml(GENGA_BLEND_MODES.concat(GENGA_TVPAINT_BLEND_MODES), 'project.genga.blendTitle') +
+            bottomSlot +
             '</div>' +
             fxLabels +
             '</div>';
@@ -146714,7 +146776,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             !(l.serifuSections && l.serifuSections.length) && rows.current.get(String(l.id));
           const cached = node && gengaViewRowCache.get(node);
           const content = gengaReusableCelContent(cached, celContext) || gengaCelContent(l, gt, celContext);
-          appendRow(l.id, head, lane, fxStrips, content);
+          appendRow(l.id, head, lane, bottom, fxStrips, content);
         });
       }
       // camera-work keyframe track (head + lane of diamonds)
