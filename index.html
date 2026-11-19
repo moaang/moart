@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3433</title>
+  <title>MoArt ver3434</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -143488,8 +143488,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // Retain nodes/listeners, but exclude offscreen cells and ruler ticks from layout. Cache only for
-    // this generated content's lifetime; row replacement invalidates it in patchGengaViewDom.
+    // each mounted lane's lifetime. Replacement changes membership; moving a lane preserves its intervals.
     const gengaTimelineWindowCache = new WeakMap();
+    function gengaWindowRowsChanged(node) {
+      const cache = gengaTimelineWindowCache.get(node.closest('.genga-tl-content'));
+      if (cache) cache.rowsChanged = true;
+    }
     function updateGengaTimelineWindow(root, left, width, reveal) {
       const stage = root || document.getElementById('gengaStage');
       const view = stage && stage.querySelector('.genga-timeline-wrap');
@@ -143501,13 +143505,26 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const start = Math.ceil((scroll - 96) / zoom), end = Math.floor((scroll + viewport + 96) / zoom);
       let windowCache = gengaTimelineWindowCache.get(content);
       if (!windowCache) {
-        const items = Array.from(content.querySelectorAll('[data-genga-window-start]')).map(function(el) {
-          const gap = el.classList.contains('genga-exposure-gap');
-          return { el: el, start: Number(el.dataset.gengaWindowStart), end: Number(el.dataset.gengaWindowEnd),
-            gapLayer: gap ? el.getAttribute('data-genga-layer') : null };
-        });
-        windowCache = { items: items };
+        windowCache = { rows: new Map(), rowsChanged: true };
         gengaTimelineWindowCache.set(content, windowCache);
+      }
+      let added = null;
+      if (windowCache.rowsChanged) {
+        const rows = new Map();
+        for (const lane of content.querySelector('.genga-vscroll .genga-lanes').children) {
+          let items = windowCache.rows.get(lane);
+          if (!items) {
+            items = Array.from(lane.querySelectorAll('[data-genga-window-start]'), function(el) {
+              return { el: el, start: Number(el.dataset.gengaWindowStart), end: Number(el.dataset.gengaWindowEnd),
+                gapLayer: el.classList.contains('genga-exposure-gap') ? el.dataset.gengaLayer : null };
+            });
+            if (!added) added = [];
+            added.push(items);
+          }
+          rows.set(lane, items);
+        }
+        windowCache.rows = rows;
+        windowCache.rowsChanged = false;
       }
       // Editors can query offscreen koma geometry; navigation only needs the visible window.
       // Check each owner so a concurrent navigation session cannot hide geometry needed by an editor.
@@ -143521,8 +143538,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const focused = document.activeElement, firstFrame = gengaFirstFrame(state.project.gengaTimeline);
       // Frame intervals are integral. Zoom and its following scroll event often cover the same cells.
       // Revisit only when membership, edit visibility or keyboard focus can change.
-      if (windowCache.start === start && windowCache.end === end && windowCache.editing === editing && windowCache.regionLayers === regionLayers &&
-          windowCache.focused === focused && windowCache.total === state.gengaShownRendered && windowCache.firstFrame === firstFrame) return;
+      const sameWindow = windowCache.start === start && windowCache.end === end && windowCache.editing === editing && windowCache.regionLayers === regionLayers &&
+          windowCache.focused === focused && windowCache.total === state.gengaShownRendered && windowCache.firstFrame === firstFrame;
+      if (sameWindow && !added) return;
       const ruler = content.querySelector('.genga-ruler'), total = state.gengaShownRendered;
       if (ruler && (windowCache.start !== start || windowCache.end !== end || windowCache.total !== total || windowCache.firstFrame !== firstFrame)) {
         // Labels own no input state. Keep the ruler node/capture, and only materialize visible labels.
@@ -143540,7 +143558,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Window membership is transient geometry, reapplied after every row patch. Drain earlier
       // edits first; only this synchronous display-only pass may preserve the generated-row cache.
       if (tracker) tracker.flush();
-      windowCache.items.forEach(function(item) {
+      const groups = sameWindow ? added : windowCache.rows.values();
+      for (const items of groups) items.forEach(function(item) {
         const shown = item.gapLayer === null ? editing : Boolean(regionLayers && regionLayers.has(item.gapLayer));
         const hidden = !shown && (item.end < start || item.start > end) && !item.el.contains(focused);
         const display = hidden ? 'none' : '';
@@ -145578,7 +145597,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!current || !next) failInvariant(detail);
         return { current: current, next: next };
       };
-      const replacePair = function(pair) { pair.current.replaceWith(pair.next); };
+      const replacePair = function(pair) {
+        pair.current.replaceWith(pair.next);
+        if (rows.bindingRoots) rows.bindingRoots.push(pair.next);
+      };
       // Generated layer heads keep controls/listeners when their positional role and owner are unchanged.
       // Structural changes replace only the changed branch; long-press binding belongs to the retained node.
       // A render still cancels the head-owned drag, as replacement did before control retention.
@@ -145609,11 +145631,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Move retained rows directly between live children; never adopt them into the inert template document.
       const resolveRow = function(node) {
         const retained = reused.get(node);
-        if (!retained) return node;
+        if (!retained) {
+          if (rows.bindingRoots) rows.bindingRoots.push(node);
+          return node;
+        }
         if (node.dataset.gengaReuseFx === '1') {
           Array.from(retained.children).forEach(function(child) {
             if (child.classList.contains('genga-fx-strip')) child.remove();
           });
+          if (rows.bindingRoots) rows.bindingRoots.push(...node.children);
           retained.append(...node.childNodes);
         }
         return retained;
@@ -145624,7 +145650,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // strips does not change those nodes or their frame intervals.
         for (const node of nextRows) remaining.delete(node);
         if (remaining.size || nextRows.length !== current.childNodes.length) {
-          gengaTimelineWindowCache.delete(current.closest('.genga-tl-content'));
+          gengaWindowRowsChanged(current);
         }
         for (const stale of remaining) stale.remove();
         let cursor = current.firstChild;
@@ -145684,7 +145710,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           updateHead(pair.currentHead, pair.nextHead);
           const lane = resolveRow(pair.nextLane);
           if (lane !== pair.currentLane) {
-            gengaTimelineWindowCache.delete(pair.currentLane.closest('.genga-tl-content'));
+            gengaWindowRowsChanged(pair.currentLane);
             pair.currentLane.replaceWith(lane);
           }
         });
@@ -145736,6 +145762,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const aRailPair = requirePair(currentPanel, nextPanel, '#gengaABar', 'audio rail');
       const hRailPair = requirePair(currentPanel, nextPanel, '#gengaHScrollbar', 'horizontal rail');
 
+      // Structural edits retain the shell and already-bound cel bodies. Search the replaced
+      // controls and reconciled heads for listeners, including FX strips added to a retained lane.
+      const structuralEdit = renderPlan && renderPlan.reuseCelContent;
+      if (structuralEdit) rows.bindingRoots = [vHeadsPair.current, aHeadsPair.current, currentAudioLanes, ...nextOverlays];
       replacePair(topbarPair);
       replacePair(colHeadPair);
       replacePair(dlgHeadPair);
@@ -145748,10 +145778,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       aHeadsPair.current.style.cssText = aHeadsPair.next.style.cssText;
       aHeadsPair.current.replaceChildren(...aHeadsPair.next.childNodes);
       currentContent.style.cssText = nextContent.style.cssText;
-      // The new ruler needs a window pass even when every cel body survives this patch.
-      const windowCache = gengaTimelineWindowCache.get(currentContent);
-      if (windowCache) delete windowCache.start;
-      replacePair(rulerPair);
+      // Structural edits retain the ruler and its pointer binding. Geometry changes still update its ticks.
+      if (!structuralEdit) {
+        const windowCache = gengaTimelineWindowCache.get(currentContent);
+        if (windowCache) delete windowCache.start;
+        replacePair(rulerPair);
+      }
       replacePair(dlgLanePair);
       replacePair(camLanePair);
       replaceRows(currentLanes, nextLanes);
@@ -145832,7 +145864,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       mountOnionSkinInto(stageEl.querySelector('.genga-onion-slot')); // Onion button lives in the genga layer-column header
       updateGengaTimelineWindow(stageEl);
       if (unmeasuredMount && content && !gengaTimelineWindowCache.has(content)) setGengaTimelineWindowItemsDisplay(stageEl, '');
-      gengaBindView(stageEl, renderPlan, partialRender);
+      gengaBindView(stageEl, renderPlan, partialRender, rows.bindingRoots);
       gengaRememberViewRows(stageEl, rows);
       gengaUpdateLayerSelectionDom();   // 재사용한 레인도 선택·솔로 밝기를 지금 판정으로
     }
@@ -146510,11 +146542,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Mark after every binding pass: the same fresh node can receive several distinct listeners.
     // Binding state follows node identity, without thousands of DOM attribute writes.
     const gengaBoundViewNodes = new WeakSet();
-    function gengaBindView(stageEl, renderPlan, partialRender) {
+    function gengaBindView(stageEl, renderPlan, partialRender, changedRoots) {
       const newlyBoundNodes = new Set();
       // Keyed patches only create controls inside their requested heads/lanes. Retained rows already
       // own their listeners; scanning their entire exposure trees for each selector is unnecessary.
-      const bindingRoots = partialRender ? [] : [stageEl];
+      const bindingRoots = changedRoots || (partialRender ? [] : null);
       if (partialRender) {
         const ids = new Set((renderPlan.layerIds || []).map(String));
         if (ids.size) stageEl.querySelectorAll('.genga-layer-head[data-genga-layer], .genga-lane[data-genga-layer]').forEach(function(el) {
@@ -146534,7 +146566,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return gengaUnboundNode(stageEl.querySelector(selector));
       };
       const gengaShowNodes = function(selector) {
-        if (!partialRender) return Array.from(stageEl.querySelectorAll(selector)).filter(gengaUnboundNode);
+        if (!bindingRoots) return Array.from(stageEl.querySelectorAll(selector)).filter(gengaUnboundNode);
         const nodes = new Set();
         bindingRoots.forEach(function(root) {
           if (!root) return;
