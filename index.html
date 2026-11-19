@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3472</title>
+  <title>MoArt ver3473</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -26484,6 +26484,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 「뭐가 달라졌나」를 한줄로 보는 목록이다. 독자가 다르면 같은 사실도 문장이 달라지므로 합치지 않는다. 새 판을
     // 내면 맨 앞에 한 항목을 더한다(사용자에게 보이는 변화가 없는 판은 적지 않는다). 문구는 지원하는 언어 모두 채운다.
     const UPDATE_LOG = [
+      { ver: 3473, items: [{ja: '線が接する所の細い塗り残しは、塗りつぶすと隣の色で自動的に埋まります。ドラッグでの埋め込みはなくなりました。', ko: '선이 맞닿는 곳의 가는 미채색 칸은 채우면 이웃 색으로 자동으로 메워집니다. 끌어서 메우기는 없어졌습니다.', en: 'Thin gaps where lines meet are now filled automatically with the neighbouring colour when you fill. Dragging to fill gaps has been removed.', zh: '线条相接处的细小未涂区域在填充时会自动填上相邻的颜色。拖动填补已取消。'}] },
       { ver: 3464, items: [{ja: '塗りつぶしツールでドラッグすると、なぞった小さな閉じた塗り残しを、それぞれ周りの色で埋めます。クリックは今までどおり塗りつぶしです。', ko: '채우기 도구로 끌면 지나간 작은 닫힌 미채색 칸을 칸마다 둘레 색으로 메웁니다. 클릭은 지금처럼 채우기입니다.', en: 'Drag with the Bucket fill tool to fill the small enclosed gaps you sweep over, each with its surrounding colour. A click still fills as before.', zh: '用填充工具拖动，可将划过的小块闭合未涂区域各自填上周围的颜色。单击仍为普通填充。'}] },
       { ver: 3460, items: [{ja: 'アニメ塗りの色が線画の外側の縁へはみ出さないようにしました。', ko: '애니메이션 채색의 색이 선화 바깥 가장자리로 번지지 않게 했습니다.', en: 'Animation fill no longer bleeds colour onto the outer edge of the line art.', zh: '动画上色的颜色不再渗到线稿外缘。'}] },
       { ver: 3454, items: [{ja: 'アニメ塗りが、標準ペンや濃いグレーの線を登録なしで線と見なし、線の下まで塗ります。彩色チェックは線の下の塗り残しも赤で示します。', ko: '애니메이션 채색이 기본 펜·짙은 회색 선을 등록 없이 선으로 보고 선 밑까지 칠합니다. 미채색 검사는 선 밑에 남은 빈틈도 빨갛게 표시합니다.', en: 'Animation fill now treats lines in the default pen or dark grey as lines without registering them and paints beneath them. Color Checker also marks gaps left under lines in red.', zh: '动画上色现在无需登记即可将默认笔和深灰色线条视为线条，并涂到线条下方。上色检查也会以红色标出线条下的漏涂处。'}] },
@@ -84690,6 +84691,45 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return { lineIndex: index, lineOwners: owners, lineDistances: distances };
     }
+    // Slivers are the thin enclosed pockets left where lines meet: every pixel within 4 chamfer units (1.33 px) of
+    // the pocket's edge, whatever its length (a size cap leaves the longer pockets empty). Each keeps its neighbouring regions, reached across
+    // the line within 8 steps, in order of contact (ties by region id). An unassigned sliver takes the assignment of
+    // the first assigned neighbour (paintFillAssignments), so it follows its surroundings in any fill order, adds no
+    // saved data and yields to a click on the sliver itself. A pocket deeper than that — an eye highlight — is a
+    // region the painter fills on purpose.
+    function paintFillSlivers(labels, regions, width, height) {
+      const n = width * height, out = new Map(), small = new Set();
+      regions.forEach(function(r, label) { if (!r.edge) small.add(label); });
+      if (!small.size) return out;
+      const edge = new Uint8Array(n);
+      for (let i = 0; i < n; i += 1) edge[i] = labels[i] ? 0 : 1;
+      const dist = paintChamferDistance(edge, width, height), deep = new Set();
+      for (let i = 0; i < n; i += 1) if (small.has(labels[i]) && dist[i] > 4) deep.add(labels[i]);
+      const seen = new Int32Array(n), steps = new Uint8Array(n), queue = new Int32Array(n);
+      let stamp = 0;
+      small.forEach(function(label) {
+        if (deep.has(label)) return;
+        const r = regions.get(label), counts = new Map();
+        let head = 0, tail = 0;
+        stamp += 1;
+        for (let y = r.y0; y <= r.y1; y += 1) for (let i = y * width + r.x0, end = y * width + r.x1; i <= end; i += 1) {
+          if (labels[i] === label) { seen[i] = stamp; steps[i] = 0; queue[tail++] = i; }
+        }
+        while (head < tail) {
+          const i = queue[head++], x = i % width;
+          for (let m = 0; m < 4; m += 1) {
+            const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+            if (j < 0 || j >= n || seen[j] === stamp) continue;
+            seen[j] = stamp;
+            if (labels[j]) counts.set(labels[j], (counts.get(labels[j]) || 0) + 1);
+            else if (steps[i] < 8) { steps[j] = steps[i] + 1; queue[tail++] = j; }
+          }
+        }
+        const order = Array.from(counts.keys()).sort(function(a, b) { return counts.get(b) - counts.get(a) || a - b; });
+        if (order.length) out.set(label, Int32Array.from(order));
+      });
+      return out;
+    }
     function paintFillTopology(images, width, height, settings, placement) {
       const classification = paintFillClassify(images, width, height, settings, placement);
       const n = width * height, allowed = new Uint8Array(n);
@@ -84726,7 +84766,62 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (r) { r.x0 = Math.min(r.x0, x); r.y0 = Math.min(r.y0, y); r.x1 = Math.max(r.x1, x); r.y1 = Math.max(r.y1, y); }
         }
       }
-      return Object.assign(classification, neighbors, { labels: labels, regions: regions, width: width, height: height });
+      const slivers = paintFillSlivers(labels, regions, width, height);
+      // The outside's slope of each outline: line pixels the outside reaches by never stepping to a fainter pixel
+      // (CSP "to darkest pixel", Krita "stop growing at darker pixels"). A darker core seals what lies beyond it.
+      const rim = new Uint8Array(n), alpha = classification.alpha, classes = classification.classes;
+      let head = 0, tail = 0;
+      for (let i = 0; i < n; i += 1) {
+        if (!labels[i] || !regions.get(labels[i]).edge) continue;
+        const x = i % width;
+        for (let m = 0; m < 4; m += 1) {
+          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j]) { rim[j] = 1; queue[tail++] = j; }
+        }
+      }
+      while (head < tail) {
+        const i = queue[head++], x = i % width;
+        for (let m = 0; m < 4; m += 1) {
+          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { rim[j] = 1; queue[tail++] = j; }
+        }
+      }
+      // climb: for a line pixel between enclosed regions, the region that reaches it without stepping to a fainter
+      // pixel (nearest first) when that is not its nearest region by distance; 0 elsewhere. Where two strokes
+      // converge, the valley between their cores keeps climbing from the pocket they enclose, so it belongs to
+      // that pocket, though the face beyond one core is nearer. Only line pixels are queued.
+      const climb = new Int32Array(n);
+      head = 0; tail = 0;
+      for (let i = 0; i < n; i += 1) {
+        if (labels[i] || classes[i] <= 0) continue;
+        const x = i % width;
+        const from = i >= width && labels[i - width] || x > 0 && labels[i - 1] || x < width - 1 && labels[i + 1] || i + width < n && labels[i + width] || 0;
+        if (from) { climb[i] = from; queue[tail++] = i; }
+      }
+      while (head < tail) {
+        const i = queue[head++], x = i % width;
+        for (let m = 0; m < 4; m += 1) {
+          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+          if (j >= 0 && j < n && !climb[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { climb[j] = climb[i]; queue[tail++] = j; }
+        }
+      }
+      for (let k = 0; k < tail; k += 1) {
+        const i = queue[k], first = regions.get(neighbors.lineOwners[neighbors.lineIndex[i] * 4]);
+        if (first && (first.edge || regions.get(climb[i]) === first) || regions.get(climb[i]).edge) climb[i] = 0;
+      }
+      // inkOwner (per lineIndex): the region whose paint goes under an ink pixel, decided once here so that a
+      // render only reads it. Only the outside's own slope of an outline (rim) stays with the outside, so colour
+      // does not bleed past it; every other line pixel next to an enclosed region goes to that region, including a
+      // faint wedge that is nearer the outside by distance but sealed from it by a darker core. The ridge itself (a
+      // distance tie) goes inside, so a 1px translucent outline is not left see-through.
+      const owners = neighbors.lineOwners, distances = neighbors.lineDistances, inkOwner = new Int32Array(owners.length / 4);
+      for (let i = 0; i < n; i += 1) {
+        const at = neighbors.lineIndex[i];
+        if (at < 0) continue;
+        const first = owners[at * 4], second = owners[at * 4 + 1], f = regions.get(first), s = regions.get(second);
+        inkOwner[at] = f && f.edge && second && !(s && s.edge) && (!rim[i] || distances[at * 4 + 1] === distances[at * 4]) ? second : first;
+      }
+      return Object.assign(classification, neighbors, { labels: labels, regions: regions, slivers: slivers, climb: climb, inkOwner: inkOwner, width: width, height: height });
     }
     function paintFillCoverage(clip, width, height) {
       if (!clip) return null;
@@ -84773,13 +84868,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       assignments.sort(function(a, b) { return a.region - b.region || (a.coverage ? a.coverage[0] : 0) - (b.coverage ? b.coverage[0] : 0); });
       return Object.assign({}, model, { assignments: assignments, state: 'active' });
     }
-    function paintFillAssignments(model) {
-      const grouped = new Map();
+    function paintFillAssignments(model, topology) {
+      const grouped = new Map(), slivers = topology && topology.slivers;
       model.assignments.forEach(function(a) { if (!grouped.has(a.region)) grouped.set(a.region, []); grouped.get(a.region).push(a); });
-      function assignment(region, pixel) {
+      function own(region, pixel) {
         const list = grouped.get(region);
         if (list) for (let k = 0; k < list.length; k += 1) if (paintFillCovers(list[k].coverage, pixel)) return list[k];
         return null;
+      }
+      function assignment(region, pixel) {
+        const a = own(region, pixel), order = !a && !grouped.has(region) && slivers && slivers.get(region);
+        if (order) for (let k = 0; k < order.length; k += 1) {
+          const b = own(order[k], pixel);   // the neighbour's own paint only: one hop, never borrowed through it
+          if (b) return b;
+        }
+        return a;
       }
       // An unrestricted first assignment wins at every pixel of this region, even if later
       // assignments overlap it. A partial first assignment must still be resolved per pixel.
@@ -84794,14 +84897,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (topology.classes[i] <= 0) return null;
       const line = model.options.colors[topology.classes[i] - 1];
       const offset = topology.lineIndex[i] * 4;
-      const first = topology.lineOwners[offset], second = topology.lineOwners[offset + 1];
       if (!line || line.role === 'line') {
-        const fEdge = topology.regions.get(first) && topology.regions.get(first).edge;
-        const sEdge = topology.regions.get(second) && topology.regions.get(second).edge;
-        // The fill stops at the line's ridge: a pixel nearer the outside stays unpainted so colour does not
-        // bleed past the outline; only an exact tie at the ridge goes to the enclosed region.
-        const tie = topology.lineDistances[offset + 1] === topology.lineDistances[offset];
-        return assignment(fEdge && !sEdge && second && tie ? second : first, i);
+        // Between enclosed regions the pixel follows the region that climbs to it (topology.climb), when painted;
+        // otherwise the region the topology chose for it (topology.inkOwner).
+        const climbed = topology.climb[i] ? assignment(topology.climb[i], i) : null;
+        return climbed || assignment(topology.inkOwner[topology.lineIndex[i]], i);
       }
       if (line.include) for (let rank = 0; rank < 4; rank += 1) {
         if (rank > 1 && topology.lineDistances[offset + rank] > topology.lineDistances[offset + 1]) break;
@@ -84812,7 +84912,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintFillRender(model, topology, base) {
       const out = new ImageData(new Uint8ClampedArray(base.data), model.width, model.height);
-      const d = out.data, assignment = paintFillAssignments(model);
+      const d = out.data, assignment = paintFillAssignments(model, topology);
       const pixels = new Uint32Array(d.buffer), colors = new Map();
       model.assignments.forEach(function(a) {
         const rgba = new Uint8ClampedArray([a.color[0], a.color[1], a.color[2], 255]);
@@ -84820,9 +84920,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       const preserveLines = model.sources.some(function(source) { return source.target; });
       let x0 = model.width, y0 = model.height, x1 = -1, y1 = -1;
+      const painted = new Set();
       model.assignments.forEach(function(a) {
         const r = topology.regions.get(a.region);
+        painted.add(a.region);
         if (r) { x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1); y1 = Math.max(y1, r.y1); }
+      });
+      topology.slivers.forEach(function(order, label) {
+        const r = topology.regions.get(label);
+        if (r && Array.prototype.some.call(order, function(nb) { return painted.has(nb); })) {
+          x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1); y1 = Math.max(y1, r.y1);
+        }
       });
       for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
         const i = y * model.width + x;
@@ -84857,7 +84965,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // belongs to the outside and stays white.
     function paintFillInspect(model, topology, base) {
       const width = model.width, height = model.height, n = width * height;
-      const image = new ImageData(width, height), assignment = paintFillAssignments(model), d = base.data;
+      const image = new ImageData(width, height), assignment = paintFillAssignments(model, topology), d = base.data;
       const open = new Uint8Array(n), outside = new Int32Array(n), holes = new Uint8Array(n), queue = new Int32Array(n);
       let regions = 0, unfilled = 0, ambiguous = 0;
       for (let i = 0; i < n; i += 1) {
@@ -84882,62 +84990,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       for (let i = 0; i < n; i += 1) if (holes[i] && !outside[i] && paintFloodRegion(holes, width, height, i, outside, 1, queue)) regions += 1;
       return { image: image, regions: regions, unfilled: unfilled, ambiguous: ambiguous };
     }
-    // Gap fill brush: the stroke picks small enclosed unfilled regions (at most `limit` px, not touching the
-    // outside, nothing assigned or already in the target). Each takes the paint colour that dominates the first
-    // painted pixels met within 8 steps across its lines (a tie takes the smaller RGB, so the result does not
-    // depend on order); lines (any registered or dark-ink class) are crossed but never counted, and a gap with
-    // no paint in reach stays. PaintMan/TVPaint carry the start colour and CSP uses the drawing colour; here
-    // each gap finds its own, and the size limit keeps intended empty areas out of reach.
-    function paintFillGaps(model, topology, coverage, selection, base, current, limit) {
-      const width = model.width, height = model.height, n = width * height, labels = topology.labels;
-      const assignment = paintFillAssignments(model), d = current.data;
-      const seen = new Int32Array(n), steps = new Uint8Array(n), queue = new Int32Array(n), chosen = new Set();
-      for (let k = 0; k < coverage.length; k += 2) for (let i = coverage[k]; i < coverage[k + 1]; i += 1) {
-        const region = labels[i] && topology.regions.get(labels[i]);
-        if (region && !region.edge && region.count <= limit) chosen.add(labels[i]);
-      }
-      let stamp = 0;
-      const groups = new Map();   // "r,g,b,role" → labels, so each colour is assigned once
-      chosen.forEach(function(label) {
-        const r = topology.regions.get(label);
-        let head = 0, tail = 0, total = 0;
-        stamp += 1;
-        for (let y = r.y0; y <= r.y1; y += 1) for (let i = y * width + r.x0, end = y * width + r.x1; i <= end; i += 1) {
-          if (labels[i] !== label) continue;
-          // A gap crossing the user's selection is left whole, as the lasso's closed-area fill does.
-          if (assignment(label, i) || !paintFillPixelEmpty(base.data, i * 4, model.options.whiteAsEmpty) || !paintFillCovers(selection, i)) return;
-          seen[i] = stamp; steps[i] = 0; queue[tail++] = i;
-        }
-        const counts = new Map();
-        while (head < tail) {
-          const i = queue[head++], x = i % width;
-          for (let m = 0; m < 4; m += 1) {
-            const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-            if (j < 0 || j >= n || seen[j] === stamp) continue;
-            seen[j] = stamp;
-            if (d[j * 4 + 3] >= 250 && topology.classes[j] <= 0) {
-              const key = (d[j * 4] << 16) | (d[j * 4 + 1] << 8) | d[j * 4 + 2];
-              counts.set(key, (counts.get(key) || 0) + 1); total += 1;
-            } else if (steps[i] < 8) { steps[j] = steps[i] + 1; queue[tail++] = j; }
-          }
-        }
-        let best = -1, most = 0;
-        counts.forEach(function(count, key) { if (count > most || count === most && key < best) { most = count; best = key; } });
-        if (!total) return;
-        const rgb = [best >> 16 & 255, best >> 8 & 255, best & 255];
-        const same = model.assignments.find(function(a) { return a.color[0] === rgb[0] && a.color[1] === rgb[1] && a.color[2] === rgb[2]; });
-        const key = rgb.join(',') + ',' + (same ? same.role : 'base');
-        if (!groups.has(key)) groups.set(key, { rgb: rgb, role: same ? same.role : 'base', labels: new Set() });
-        groups.get(key).labels.add(label);
-      });
-      let next = model;
-      // The selection also bounds the write, so line pixels a gap owns outside it stay as they are.
-      groups.forEach(function(g) { next = paintFillAssignRegions(next, g.labels, g.rgb, g.role, selection); });
-      return next;
-    }
     function paintFillEnclosed(model, topology, coverage, color, role, base) {
       if (!coverage) return model;
-      const selected = new Set(), excluded = new Set(), assignment = paintFillAssignments(model);
+      const selected = new Set(), excluded = new Set(), assignment = paintFillAssignments(model, topology);
       // Test the complete source component, not the lasso-clipped fragment. An open area or a
       // partly enclosed component cannot become a falsely closed region at the lasso boundary.
       for (let i = 0; i < topology.labels.length; i += 1) {
@@ -84963,7 +85018,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         t.classes instanceof Int16Array && t.classes.length === n && t.alpha instanceof Uint8Array && t.alpha.length === n &&
         t.ambiguous instanceof Uint8Array && t.ambiguous.length === n && t.cover instanceof Uint8Array && t.cover.length === n &&
         t.under instanceof Uint8Array && t.under.length === n &&
-        t.labels instanceof Int32Array && t.labels.length === n &&
+        t.labels instanceof Int32Array && t.labels.length === n && t.slivers instanceof Map && t.climb instanceof Int32Array && t.climb.length === n && t.inkOwner instanceof Int32Array &&
         t.lineIndex instanceof Int32Array && t.lineIndex.length === n && t.lineOwners instanceof Int32Array &&
         t.lineDistances instanceof Int32Array && t.lineOwners.length === t.lineDistances.length && t.lineOwners.length % 4 === 0 && t.lineOwners.length <= n * 4;
     }
@@ -84976,13 +85031,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           !Number.isFinite(o.coreAlpha) || o.coreAlpha < 1 || o.coreAlpha > 255 || !Number.isFinite(o.tolerance) || o.tolerance < 0 || o.tolerance > 255 ||
           !Number.isFinite(o.gapClose) || o.gapClose < 0 || o.gapClose > 64 || !o.colors.length || o.colors.length > 32766 ||
           o.colors.some(function(c) { return !c || !/^#[0-9a-f]{6}$/i.test(c.color) || c.role !== 'line' && !PAINT_FILL_ROLES.includes(c.role); }) ||
-          !['fill', 'check', 'enclose', 'gaps'].includes(job.operation) || !Number.isInteger(job.index) || job.index < 0 || job.index >= n ||
+          !['fill', 'check', 'enclose'].includes(job.operation) || !Number.isInteger(job.index) || job.index < 0 || job.index >= n ||
           !paintFillImageValid(job.current, m.width, m.height) || !paintFillCacheValid(job.cache, m) ||
           !Array.isArray(job.images) || (!job.cache.topology && !job.images.length) ||
           job.images.some(function(image) { return !paintFillImageValid(image, m.width, m.height); })) throw new Error('Invalid animation calculation');
-      if (job.operation !== 'check' && job.operation !== 'gaps' && (!/^#[0-9a-f]{6}$/i.test(job.color) || !PAINT_FILL_ROLES.includes(job.role))) throw new Error('Invalid animation color');
-      if (job.operation === 'gaps' && (job.coverage == null || !Number.isSafeInteger(job.limit) || job.limit < 1 ||
-          job.selection != null && (!Array.isArray(job.selection) || job.selection.length % 2))) throw new Error('Invalid animation gap fill');
+      if (job.operation !== 'check' && (!/^#[0-9a-f]{6}$/i.test(job.color) || !PAINT_FILL_ROLES.includes(job.role))) throw new Error('Invalid animation color');
       if (job.coverage != null) {
         const runs = job.coverage;
         if (!Array.isArray(runs) || runs.length % 2) throw new Error('Invalid animation selection');
@@ -84999,26 +85052,29 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!cache.topology) cache.topology = paintFillTopology(job.images, model.width, model.height, model.options, model.sources.map(function(s, i) {
         return s.target ? 'target' : (targetAt >= 0 ? i < targetAt : model.reference === 'below') ? 'below' : 'above';
       }));
-      const topology = cache.topology, region = topology.labels[job.index];
+      // A press on a line or its faint rim fills the enclosed region that pixel belongs to, so a narrow wedge with
+      // no empty pixel, or a slightly missed click, still fills; only a press with no enclosed owner is refused.
+      const topology = cache.topology, at = topology.lineIndex[job.index] * 4;
+      let region = topology.labels[job.index];
+      if (!region && at >= 0) for (let rank = 0; rank < 4 && !region; rank += 1) {
+        const owner = topology.lineOwners[at + rank], r = owner && topology.regions.get(owner);
+        if (r && !r.edge) region = owner;
+      }
       let result = { changed: false };
       if (job.operation === 'check') result.inspection = paintFillInspect(model, topology, base);
       else {
-        let next = model;
-        if (job.operation === 'gaps') next = paintFillGaps(model, topology, job.coverage, job.selection, base, job.current, job.limit);
-        else {
-          if (job.operation !== 'enclose' && !region) throw new Error('paint.fill.boundary');
-          if (job.operation === 'enclose' || paintFillCovers(job.coverage, job.index)) {
-            const rgb = [1, 3, 5].map(function(offset) { return parseInt(job.color.slice(offset, offset + 2), 16); });
-            next = job.operation === 'enclose' ? paintFillEnclosed(model, topology, job.coverage, rgb, job.role, base) : paintFillAssignRegions(model, new Set([region]), rgb, job.role, job.coverage);
+        if (job.operation !== 'enclose' && !region) throw new Error('paint.fill.boundary');
+        if (job.operation === 'enclose' || paintFillCovers(job.coverage, job.index)) {
+          const rgb = [1, 3, 5].map(function(offset) { return parseInt(job.color.slice(offset, offset + 2), 16); });
+          const next = job.operation === 'enclose' ? paintFillEnclosed(model, topology, job.coverage, rgb, job.role, base) : paintFillAssignRegions(model, new Set([region]), rgb, job.role, job.coverage);
+          if (next !== model) {
+            const image = paintFillRender(next, topology, base);
+            const dirty = paintFillChangedRect(job.current, image);
+            if (dirty || JSON.stringify(next.assignments) !== JSON.stringify(model.assignments)) result = {
+              changed: true, model: next, image: image, dirty: dirty,
+              hasInk: gengaTileCellHasInk(image, 0, 0, { x: 0, y: 0, w: image.width, h: image.height })
+            };
           }
-        }
-        if (next !== model) {
-          const image = paintFillRender(next, topology, base);
-          const dirty = paintFillChangedRect(job.current, image);
-          if (dirty || JSON.stringify(next.assignments) !== JSON.stringify(model.assignments)) result = {
-            changed: true, model: next, image: image, dirty: dirty,
-            hasInk: gengaTileCellHasInk(image, 0, 0, { x: 0, y: 0, w: image.width, h: image.height })
-          };
         }
       }
       return { cache: cache, result: result };
@@ -85072,9 +85128,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintFillWorkerSource() {
       return 'const PAINT_FILL_ROLES = ' + JSON.stringify(PAINT_FILL_ROLES) + ';\n' +
-        [paintFillPixelEmpty, paintFillClassify, paintFillLineNeighbors, paintFillTopology, paintFloodRegion,
+        [paintFillPixelEmpty, paintFillClassify, paintFillLineNeighbors, paintFillSlivers, paintFillTopology, paintFloodRegion,
           paintGapVirtualBarrier, paintChamferDistance, paintFillCovers, paintFillAssignRegions, paintFillAssignments,
-          paintFillPixelAssignment, paintFillRender, paintFillInspect, paintFillEnclosed, paintFillGaps, paintFillCheckModel,
+          paintFillPixelAssignment, paintFillRender, paintFillInspect, paintFillEnclosed, paintFillCheckModel,
           paintFillCacheKey, paintFillImageValid, paintFillCacheValid, paintFillValidateJob, paintFillCompute,
           paintFillChangedRect, paintFillTransferables, gengaTileCellHasInk].map(function(fn) { return fn.toString(); }).join('\n') +
         '\n(' + paintFillWorkerMain.toString() + ')();';
@@ -85296,8 +85352,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Cache ownership travels with the job and returns with its result. No second worker cache.
       state.paintFillCache = null;
       const computed = await paintFillWorkerRun({ model: model, cache: cache, images: images, current: current,
-        index: index, coverage: coverage, color: input.color, role: input.options.role, operation: operation || 'fill', limit: input.gapLimit,
-        selection: input.gapSelection ? paintFillCoverage(input.gapSelection, width, height) : null });
+        index: index, coverage: coverage, color: input.color, role: input.options.role, operation: operation || 'fill' });
       if (computed.cancelled || !valid()) return { cancelled: true, changed: false };
       state.paintFillCache = computed.cache;
       const result = computed.result;
@@ -85634,7 +85689,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 거리 ≤ 3L 인 경로는 L 걸음이라 창을 벗어나지 않으므로 dIn 은 전면과 같다. dOut 은 창 밖 바깥 픽셀이면 거리가
     // 3(L+1) 을 넘어 dIn ≤ 3L 과의 비교가 바뀌지 않는다. 기본(領域拡張 1)의 작은 칸 채우기가 용지 전면을 두 번 돌지 않는다.
     // box = mask 의 상자(paintMaskBounds — 부르는 쪽이 이미 구했다).
-    function paintBucketGrowToRidge(mask, match, W, H, limitPx, box) {
+    // `rd` (reference RGBA) switches on "to the darkest pixel": a line pixel the other side reaches without
+    // stepping to a fainter pixel, and this fill does not, is left to it; where both or neither reach it that way
+    // (a faint pocket sealed inside overlapping ink), the distance ridge decides. A faint wedge sealed by a darker core then fills from its own side (CSP "to darkest pixel",
+    // Krita "stop growing at darker pixels"); plain distance would hand it to the nearer region across the core.
+    function paintBucketGrowToRidge(mask, match, W, H, limitPx, box, rd) {
       let x0 = 0, y0 = 0, x1 = W - 1, y1 = H - 1;
       if (Number.isFinite(limitPx)) {
         const margin = 2 * Math.ceil(limitPx) + 1;
@@ -85657,13 +85716,103 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const dIn = paintChamferDistance(inside, ww, wh);
       const dOut = hasOutside ? paintChamferDistance(outside, ww, wh) : null;
       const lim = limitPx * 3;   // chamfer 단위(직교 = 3)
+      const climb = function(seed, dist) {   // window pixels reached from `seed` without getting fainter
+        const up = new Uint8Array(ww * wh), queue = new Int32Array(ww * wh);
+        let head = 0, tail = 0;
+        const alpha = function(j) { return rd[((y0 + (j / ww | 0)) * W + x0 + j % ww) * 4 + 3]; };
+        const step = function(j, k) {
+          if (up[k] || seed[k] || dist[k] > lim || match[(y0 + (k / ww | 0)) * W + x0 + k % ww]) return;
+          if (j >= 0 && alpha(k) < alpha(j)) return;
+          up[k] = 1; queue[tail++] = k;
+        };
+        for (let j = 0; j < ww * wh; j += 1) if (seed[j]) {
+          const x = j % ww;
+          if (x > 0) step(-1, j - 1); if (x < ww - 1) step(-1, j + 1); if (j >= ww) step(-1, j - ww); if (j + ww < ww * wh) step(-1, j + ww);
+        }
+        while (head < tail) {
+          const j = queue[head++], x = j % ww;
+          if (x > 0) step(j, j - 1); if (x < ww - 1) step(j, j + 1); if (j >= ww) step(j, j - ww); if (j + ww < ww * wh) step(j, j + ww);
+        }
+        return up;
+      };
+      const upIn = rd ? climb(inside, dIn) : null, upOut = rd && dOut ? climb(outside, dOut) : null;
       const out = new Uint8Array(mask);
       for (let y = 0; y < wh; y += 1) {
         for (let x = 0, i = (y0 + y) * W + x0, j = y * ww; x < ww; x += 1, i += 1, j += 1) {
           if (mask[i] || match[i]) continue;        // 이미 채웠거나 애초에 선이 아니다
-          if (dIn[j] > lim) continue;               // 사용자가 정한 상한(px)
-          if (dOut && dIn[j] > dOut[j]) continue;   // 능선 너머 — 반대편이 더 가깝다
+          if (dIn[j] > lim) continue;               // 상한(px)
+          const mine = !upIn || upIn[j] === 1, theirs = Boolean(upOut && upOut[j]);
+          if (!mine && theirs) continue;            // 반대편만 오르막으로 닿는다 — 진한 선 너머다
+          if (mine === theirs && dOut && dIn[j] > dOut[j]) continue;   // 양쪽 다(또는 어느 쪽도 못) 닿으면 거리 능선
           out[i] = 1;
+        }
+      }
+      // With `rd`, a sliver — a thin empty pocket where lines meet (every pixel within 4 chamfer units of ink,
+      // inside the window) — joins it whole when, spreading from the sliver across the ink, this
+      // fill is met at least as often as any other empty area in the first layer that meets either (within 8
+      // steps). Without a fill record the first fill to win a sliver gives its colour; animation fill decides
+      // from finished assignments instead (paintFillSlivers).
+      if (rd && hasOutside) {
+        const ink = new Uint8Array(ww * wh);
+        for (let j = 0; j < ww * wh; j += 1) ink[j] = outside[j] ? 0 : 1;
+        const depth = paintChamferDistance(ink, ww, wh), seen = new Int32Array(ww * wh), part = [];
+        const visit = new Int32Array(ww * wh);
+        let stamp = 0;
+        const ours = function(q) { return out[(y0 + (q / ww | 0)) * W + x0 + q % ww] === 1; }, absorbed = [];
+        for (let j0 = 0; j0 < ww * wh; j0 += 1) {
+          if (!outside[j0] || seen[j0]) continue;
+          part.length = 0; part.push(j0); seen[j0] = j0 + 1;
+          let thin = true, edge = false;
+          for (let k = 0; k < part.length; k += 1) {
+            const j = part[k], x = j % ww, y = j / ww | 0;
+            if (depth[j] > 4) thin = false;
+            if (x === 0 || y === 0 || x === ww - 1 || y === wh - 1) edge = true;
+            for (let m = 0; m < 4; m += 1) {
+              const q = m === 0 ? (x > 0 ? j - 1 : -1) : m === 1 ? (x < ww - 1 ? j + 1 : -1) : m === 2 ? j - ww : j + ww;
+              if (q < 0 || q >= ww * wh) continue;
+              if (outside[q] && !seen[q]) { seen[q] = j0 + 1; part.push(q); }
+            }
+          }
+          if (!thin || edge) continue;
+          stamp += 1;
+          let ring = part.slice(), mine = 0, theirs = 0;
+          for (let k = 0; k < ring.length; k += 1) visit[ring[k]] = stamp;
+          for (let step = 0; step < 8 && !mine && !theirs && ring.length; step += 1) {
+            const next = [];
+            for (let k = 0; k < ring.length; k += 1) {
+              const j = ring[k], x = j % ww;
+              for (let m = 0; m < 4; m += 1) {
+                const q = m === 0 ? (x > 0 ? j - 1 : -1) : m === 1 ? (x < ww - 1 ? j + 1 : -1) : m === 2 ? j - ww : j + ww;
+                if (q < 0 || q >= ww * wh || visit[q] === stamp) continue;
+                visit[q] = stamp;
+                if (ours(q)) mine += 1;
+                else if (outside[q]) theirs += 1;
+                else next.push(q);
+              }
+            }
+            ring = next;
+          }
+          if (!mine || mine < theirs) continue;
+          for (let k = 0; k < part.length; k += 1) { const j = part[k]; out[(y0 + (j / ww | 0)) * W + x0 + j % ww] = 1; }
+          if (rd) for (let k = 0; k < part.length; k += 1) absorbed.push(part[k]);
+        }
+        // The absorbed pockets bring the line pixels they climb to (never stepping fainter): the valley between
+        // the converging strokes that enclose a pocket would otherwise go to the face beyond one core by distance,
+        // leaving two colours in one pocket. The climb stops at opaque pixels and at what a still unfilled region
+        // climbs to, so it does not run along the cores that other faces share.
+        if (absorbed.length) {
+          for (let k = 0; k < absorbed.length; k += 1) outside[absorbed[k]] = 0;
+          const upOther = climb(outside, dOut);
+          const at = function(q) { return (y0 + (q / ww | 0)) * W + x0 + q % ww; };
+          for (let k = 0; k < absorbed.length; k += 1) {
+            const j = absorbed[k], x = j % ww;
+            for (let m = 0; m < 4; m += 1) {
+              const q = m === 0 ? (x > 0 ? j - 1 : -1) : m === 1 ? (x < ww - 1 ? j + 1 : -1) : m === 2 ? j - ww : j + ww;
+              if (q < 0 || q >= ww * wh || out[at(q)] === 1 || match[at(q)] || upOther[q]) continue;
+              if (rd[at(q) * 4 + 3] >= 250 || rd[at(q) * 4 + 3] < rd[at(j) * 4 + 3]) continue;
+              out[at(q)] = 1; absorbed.push(q);
+            }
+          }
         }
       }
       return out;
@@ -85784,7 +85933,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return false;
     }
 
+    // Translucent ink the fill has just sealed in: a 4-connected group of see-through, non-fillable pixels next to
+    // `mask` whose every outer neighbour is in the mask or already opaque, and thin (each pixel touches a pixel
+    // outside the group, as in paintFillSlivers). Where stroke ends pile up against an outline the ridge rule gives
+    // such pixels to the far side and they stay as specks; painting under them cannot show anywhere else.
+    function paintBucketSealPinholes(mask, match, d, W, H, box) {
+      const x0 = Math.max(0, box.x0 - 10), y0 = Math.max(0, box.y0 - 10), x1 = Math.min(W - 1, box.x1 + 10), y1 = Math.min(H - 1, box.y1 + 10);
+      const kind = function(i) { return !mask[i] && !match[i] && d[i * 4 + 3] < 250; };
+      const seen = new Uint8Array(W * H), part = [];
+      for (let y = y0; y <= y1; y += 1) for (let i0 = y * W + x0, end = y * W + x1; i0 <= end; i0 += 1) {
+        if (seen[i0] || !kind(i0)) continue;
+        part.length = 0; part.push(i0); seen[i0] = 1;
+        let sealed = true, thin = true, touches = false;
+        for (let k = 0; k < part.length; k += 1) {
+          const i = part[k], x = i % W, py = (i - x) / W;
+          if (x <= x0 || x >= x1 || py <= y0 || py >= y1) { sealed = false; continue; }
+          let open = false;
+          for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+            if (!dx && !dy) continue;
+            const j = i + dy * W + dx, same = kind(j);
+            if (!same) open = true;
+            if (dx && dy) continue;
+            if (same) { if (!seen[j]) { seen[j] = 1; part.push(j); } }
+            else if (mask[j]) touches = true;
+            else if (d[j * 4 + 3] < 250) sealed = false;
+          }
+          if (!open) thin = false;
+        }
+        if (sealed && thin && touches) for (let k = 0; k < part.length; k += 1) mask[part[k]] = 1;
+      }
+    }
     function paintBucketFillCanvas(canvas, seedX, seedY, colorCss, opts, result) {
+      const PAINT_BUCKET_UNDER_LINE_PX = 8;   // how far an empty-seed fill reaches under lines, px
       if (result) result.dirty = null;
       const W = canvas ? canvas.width : 0, H = canvas ? canvas.height : 0;
       seedX = Math.floor(Number(seedX)); seedY = Math.floor(Number(seedY));
@@ -85823,6 +86003,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const underpaint = Boolean(contiguous && refCanvas && opts && opts.underpaint);
       if (underpaint) {
         mask = paintBucketGrowToRidge(mask, match, W, H, Infinity, box);
+        box = paintMaskBounds(mask, W, H);
+      } else if (seedEmpty && !refCanvas && contiguous && !erase && !(opts && opts.alphaLock)) {
+        // An empty seed paints behind the existing drawing (destination-over), so reaching under the lines cannot
+        // cover them: it always goes to the darkest pixel, up to PAINT_BUCKET_UNDER_LINE_PX. 領域拡張 still
+        // bounds a recolour, which paints over.
+        mask = paintBucketGrowToRidge(mask, match, W, H, Math.max(expand, PAINT_BUCKET_UNDER_LINE_PX), box, rd);
+        paintBucketSealPinholes(mask, match, d, W, H, box);
         box = paintMaskBounds(mask, W, H);
       } else if (expand > 0) {
         mask = paintBucketGrowToRidge(mask, match, W, H, expand, box);
@@ -85905,7 +86092,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintBucketWorkerSource() {
       return 'const document={createElement:function(){return new OffscreenCanvas(1,1);}};\n' +
         [paintFloodRegion, paintChamferDistance, paintGapVirtualBarrier, paintBucketMatchMask,
-          paintMaskBounds, paintBucketGrowToRidge, paintBucketRegionMask, paintBucketWriteMaskAlpha,
+          paintMaskBounds, paintBucketGrowToRidge, paintBucketSealPinholes, paintBucketRegionMask, paintBucketWriteMaskAlpha,
           paintBucketPixelsChanged, paintClipCanvasTo, paintBucketFillCanvas].map(function(fn) { return fn.toString(); }).join('\n') +
         '\n(' + paintBucketWorkerMain.toString() + ')();';
     }
@@ -88492,41 +88679,19 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       return input;
     }
     function paintFillEncloseRequest(input, points, target) {
-      if (points.length < 3) return Promise.resolve({ status: 'cancelled' });
-      return paintFillMaskRequest(input, 'enclose', target, function(ctx) {
-        ctx.fillStyle = '#000'; ctx.beginPath(); traceSmoothedLassoPath(ctx, points, true); ctx.fill();
-      });
-    }
-    // A gap is at most twice the brush disc and never over PAINT_GAP_MAX_AREA paper px, so zooming out does not
-    // let the stroke reach an area left empty on purpose. The brush mask only picks gaps; the user's selection
-    // travels separately (gapSelection) and excludes any gap that crosses it.
-    const PAINT_GAP_MAX_AREA = 256;
-    function paintFillGapsRequest(input, points, radius, target) {
-      if (!points.length) return Promise.resolve({ status: 'cancelled' });
-      input.options.animation = paintFillSettings();
-      input.gapLimit = Math.max(1, Math.min(PAINT_GAP_MAX_AREA, Math.round(Math.PI * radius * radius * 2)));
-      return paintFillMaskRequest(input, 'gaps', target, function(ctx) {
-        ctx.fillStyle = ctx.strokeStyle = '#000'; ctx.lineWidth = radius * 2; ctx.lineCap = ctx.lineJoin = 'round';
-        ctx.beginPath(); ctx.arc(points[0].x, points[0].y, radius, 0, Math.PI * 2); ctx.fill();
-        ctx.beginPath(); ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i += 1) ctx.lineTo(points[i].x, points[i].y);
-        ctx.stroke();
-      });
-    }
-    function paintFillMaskRequest(input, operation, target, draw) {
-      const request = paintFillCurrentRequest(input, operation, target);
-      if (!request) return Promise.resolve({ status: 'cancelled' });
+      const request = paintFillCurrentRequest(input, 'enclose', target);
+      if (!request || points.length < 3) return Promise.resolve({ status: 'cancelled' });
       input = request.input;
       const rect = request.rect || request.paper;
-      const mask = paintBucketCompositeCanvas([{ draw: draw }], rect);
+      const mask = paintBucketCompositeCanvas([{ draw: function(ctx) {
+        ctx.fillStyle = '#000'; ctx.beginPath(); traceSmoothedLassoPath(ctx, points, true); ctx.fill();
+      } }], rect);
       paintBinarizeCanvasAlpha(mask);
       if (input.clip) {
         // Only the lasso is binarized. A feathered selection must still reach the existing reject
         // path; turning it into a hard selection here would silently change the user's mask.
         const selection = paintBucketCompositeCanvas([{ draw: function(c) { c.drawImage(input.clip.canvas, input.clip.x, input.clip.y); } }], rect);
-        // Rect-local from the start: the engines rebase only `clip` to the calculation canvas.
-        if (operation === 'gaps') input.gapSelection = { canvas: selection, x: 0, y: 0 };
-        else paintClipCanvasTo(mask, { canvas: selection, x: 0, y: 0 });
+        paintClipCanvasTo(mask, { canvas: selection, x: 0, y: 0 });
       }
       input.clip = { canvas: mask, x: rect.x, y: rect.y };
       return paintFillSubmit(request);
@@ -92694,52 +92859,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // 탭 undo 를 하면 첫 손가락에서 통이 칠하고(빈 레이어면 전체) 탭의 undo 가 직전 작업 대신 그 칠을 지운다.
     // 통은 세션이 없어 첫 움직임까지 미룰 자리가 없고 출력이 한 방이라 손 뗄 때로 미룬다. 칠할 자리는 누를 때
     // 확정한다.
-    // state.paintPendingBucketFill: 뗄 때까지 미룬 통(손가락, 그리고 끌기를 구분하는 버킷 입력). state.paintBucketQueue: 두 엔진의 직렬 채우기 대기.
-    // 버킷 끌기 = 틈 메우기 브러시. 누른 채 화면에서 PAINT_GAP_DRAG_PX 넘게 움직이면 채우기 대신 지나간 자리
-    // (화면 지름 PAINT_GAP_BRUSH_PX, 필압 없음)의 작은 닫힌 미채색 칸을 각자 둘레 색으로 메운다(paintFillGaps).
-    // 끌기와 구분하려고 `gaps`가 있으면 마우스·펜도 뗄 때 정한다. 손가락은 원래 뗄 때 실행한다.
-    // gaps = { toPlane(event) → 대상 평면 px, submit(points, radius) }.
-    const PAINT_GAP_BRUSH_PX = 24, PAINT_GAP_DRAG_PX = 6;
-    function paintDeferBucketFill(event, run, gaps) {
+    // state.paintPendingBucketFill: 손가락 up 대기. state.paintBucketQueue: 두 엔진의 직렬 채우기 대기.
+    function paintDeferBucketFill(event, run) {
       if (typeof run !== 'function') return;
-      if (!event || event.pointerType !== 'touch' && !gaps) { run(); return; }   // 마우스·펜에는 두 손가락 탭이 없다
-      const pending = { pointerId: event.pointerId, run: run, gaps: gaps || null, x: event.clientX, y: event.clientY, points: null, trail: null, move: null };
-      if (gaps) {
-        pending.move = function(e) { if (e.pointerId === pending.pointerId) paintGapBrushMove(pending, e); };
-        document.addEventListener('pointermove', pending.move, true);
-      }
-      state.paintPendingBucketFill = pending;
+      if (!event || event.pointerType !== 'touch') { run(); return; }   // 마우스·펜에는 두 손가락 탭이 없다
+      state.paintPendingBucketFill = { pointerId: event.pointerId, run: run };
       // 유예했으면 포인터를 잡는다. 안 잡으면 손가락이 캔버스 밖에서 떨어질 때 up 이 안 와 아무 일도 안 일어난다.
       try { if (event.target && event.target.setPointerCapture) event.target.setPointerCapture(event.pointerId); } catch (e) {}
-    }
-    function paintGapBrushMove(pending, event) {
-      if (!pending.points) {
-        if (Math.hypot(event.clientX - pending.x, event.clientY - pending.y) <= PAINT_GAP_DRAG_PX) return;
-        const a = pending.gaps.toPlane({ clientX: pending.x, clientY: pending.y }), b = pending.gaps.toPlane({ clientX: pending.x + 100, clientY: pending.y });
-        if (!a || !b) return;
-        pending.radius = Math.max(1, Math.hypot(b.x - a.x, b.y - a.y) / 100 * PAINT_GAP_BRUSH_PX / 2);
-        pending.points = [a];
-        const dpr = window.devicePixelRatio || 1, trail = document.createElement('canvas');
-        trail.width = Math.round(window.innerWidth * dpr); trail.height = Math.round(window.innerHeight * dpr);
-        trail.style.cssText = 'position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483000';
-        const ctx = trail.getContext('2d');
-        ctx.scale(dpr, dpr); ctx.lineCap = ctx.lineJoin = 'round'; ctx.lineWidth = PAINT_GAP_BRUSH_PX;
-        ctx.strokeStyle = 'rgba(255,64,160,0.35)'; ctx.beginPath(); ctx.moveTo(pending.x, pending.y);
-        document.body.appendChild(trail);
-        pending.trail = { canvas: trail, ctx: ctx, x: pending.x, y: pending.y };
-      }
-      const p = pending.gaps.toPlane(event);
-      if (p) pending.points.push(p);
-      const t = pending.trail;
-      t.ctx.beginPath(); t.ctx.moveTo(t.x, t.y); t.ctx.lineTo(event.clientX, event.clientY); t.ctx.stroke();
-      t.x = event.clientX; t.y = event.clientY;
-      event.preventDefault();
-    }
-    function paintGapBrushEnd(pending) {
-      if (!pending) return;
-      if (pending.move) document.removeEventListener('pointermove', pending.move, true);
-      if (pending.trail) pending.trail.canvas.remove();
-      pending.move = null; pending.trail = null;
     }
     // 깨끗이 뗄 때만 칠한다. 취소·탈취는 파기다(cancel = drop 계약).
     // 두 손가락 후보가 살아 있으면 그리려던 손이 아니다 — 탭이면 아래 취소 커널이, 핀치면 확정 순간의 같은 커널이
@@ -92753,11 +92879,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (event && event.type === 'pointercancel' && !(state.project && state.project.kind === 'genga')) { paintDiscardPendingBucketFill(); return; }
       if (!pending) return;
       state.paintPendingBucketFill = null;
-      paintGapBrushEnd(pending);
       if (!event || event.type !== 'pointerup') return;
       if (twoFingerTapCandidate) return;
-      if (pending.points) pending.gaps.submit(pending.points, pending.radius);
-      else pending.run();
+      pending.run();
     }
     function paintDiscardPendingBucketFill() {
       state.paintFillInspection = null;
@@ -92765,7 +92889,6 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // 완료한 워커는 다음 채우기에 재사용하고 준비·실행 중인 작업만 중단한다.
       const pool = paintBucketWorkerPool;
       if (pool && (pool.jobs.size || pool.queue.length || pool.idle.length < pool.all.length)) paintBucketWorkerClose();
-      paintGapBrushEnd(state.paintPendingBucketFill);
       state.paintPendingBucketFill = null;
       state.paintBucketGeneration = (state.paintBucketGeneration || 0) + 1;
       const queue = state.paintBucketQueue;
@@ -96522,12 +96645,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       }
       if (state.paintTool === 'bucket') { // instant fill, no gesture session
         // 손가락이면 손 뗄 때 칠한다(두 손가락 탭 undo 가 통의 칠을 잡아먹지 않게).
-        const request = conteBucketCaptureRequest(layerTarget, rawPoint), gapTarget = Object.assign({}, layerTarget, { inputFx: request.inputFx });
-        const gapPaper = contePaperBitmapRectRuntime(state.project);
-        paintDeferBucketFill(event, function() { paintBucketApply(request); }, { toPlane: function(e) {
-          const q = contePaintInverseFxPoint(getVideoPaintPointFromEventRaw(e), request.inputFx, gapPaper);
-          return { x: conteNormToPlaneX(q.x, gapPaper), y: conteNormToPlaneY(q.y, gapPaper) };
-        }, submit: function(points, radius) { paintFillGapsRequest(paintBucketCaptureInput(request.sourceClip), points, radius, gapTarget); } });
+        const request = conteBucketCaptureRequest(layerTarget, rawPoint);
+        paintDeferBucketFill(event, function() { paintBucketApply(request); });
         state.videoPaintPointerCanvasRect = null;
         return;
       }
@@ -138691,10 +138810,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         paintBucketApply(Object.assign({}, request, { x: p.x, y: p.y, input: input, event: ev }),
           { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit });
-      }, { toPlane: gengaPreviewPointerXY, submit: function(points, radius) {
-        if (!gengaBucketRequestValid(request) || !gengaPrepareDrawTarget(ev, gengaLayerById(request.layerId), 0)) return;
-        paintFillGapsRequest(input, points, radius);
-      } });
+      });
       ev.preventDefault();
     }
 
