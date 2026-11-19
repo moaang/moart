@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3473</title>
+  <title>MoArt ver3474</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -112225,24 +112225,21 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return Math.round(x) === Math.round(Number(ts && ts.x) || 0) && Math.round(y) === Math.round(Number(ts && ts.y) || 0);
     }
     function gengaTileSetFromCanvas(cv, scanRect, prev, deferBake) {
-      // 직전 그림이 베이크 대기이고 아래 이월 조건(inheritBake)이 맞지 않으면 여기서 동기로 확정한다 — 안
-      // 하면 아래 물려받기가 직전 dirty 창의 칸을 못 받아 그 영역의 그림이 사라진다. 평시에는 커밋 직후의
-      // 인코드 펌프(setTimeout 0)가 획 사이 idle 에서 이미 구웠으므로, 이 그물은 펌프가 못 끼어든 극단
-      // 연타에서만 값을 낸다. 실패하면 물려받지 않는다(전부 재굽기 — 그림을 잃지 않는 쪽).
       const pw = Math.max(1, cv.width), ph = Math.max(1, cv.height);
       const g = gengaTileGrid(pw, ph);
-      // 직전 그림이 베이크 대기여도 이월 조건이 맞으면 여기서 굽지 않는다 — 그 창을 이번 창과 합쳐(union) 새
-      // 스냅으로 물려받는다. GPU→GPU 라 동기화가 0 이다. 여기서 동기 베이크를 강제하면 연타에서 획마다 리드백이
-      // 펜업에 실린다(iPad 에서 리드백 한 번이 초 단위). prev 는 손대지 않는다: prev 의 pendingBake·스냅·펌프 등록이
-      // 그대로 살아 잠잠할 때 구워지고(gd: 행), 그 전에는 trim 이 안 버린다(디스크에 없는 것은 버리지 않는다) —
-      // undo 가 옛 ref 로 돌아가도 그림이 온전하다. 격자·변경 창·빈 그림 방지 조건이 맞지 않으면 동기 확정.
+      // 미확정 창을 이어받으면 새 캔버스에서 한 번만 자른다. 직전 스냅은 Undo·저장의 원본으로 남는다.
       // Same paper size, not only the same grid count: a crop-local base (converted from a trimmed drawing) can
       // have the same 19x13 grid while its cells sit at a different origin.
       const sameGrid = gengaIsTileSet(prev) && prev.gw === g.gw && prev.gh === g.gh && prev.tile === GENGA_TILE_PX && prev.pw === pw && prev.ph === ph;   // base 와 inheritBake 가 같은 판정을 쓴다
       // hasInk is computed from the complete fill result; it does not assert additive drawing.
       const knownNonempty = Boolean(scanRect && scanRect.hasInk === true);
       const deferNonempty = deferBake && scanRect && scanRect.ink && (scanRect.addsInk || knownNonempty);
-      const inheritBake = (sameGrid && prev.pendingBake && deferNonempty) ? prev.pendingBake : null;
+      const dirtyWindow = sameGrid && scanRect && scanRect.ink ? gengaDirtyCellWindow(scanRect.ink, g) : null;
+      const pending = sameGrid && prev.pendingBake;
+      // The live canvas contains both edits. A contained edit can recut the pending window in one pass.
+      const covered = pending && dirtyWindow && dirtyWindow.c0 >= pending.c0 && dirtyWindow.c1 <= pending.c1
+        && dirtyWindow.r0 >= pending.r0 && dirtyWindow.r1 <= pending.r1;
+      const inheritBake = pending && (deferNonempty || covered) ? pending : null;
       if (!inheritBake && prev && prev.pendingBake && !gengaTileSetBakePending(prev)) prev = null;
       const base = (sameGrid && prev) ? prev : null;
       const ts = { tile: GENGA_TILE_PX, gw: g.gw, gh: g.gh, pw: pw, ph: ph, cells: new Map(), decoded: new Map(), x: 0, y: 0, w: 1, h: 1 };
@@ -112261,7 +112258,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 없다(없으면 창은 용지 전체다).
       let scanImg = null, sx0 = 0, sy0 = 0;
       if (dirty) {
-        const cw = gengaDirtyCellWindow(dirty, g);
+        const cw = dirtyWindow;
         if (cw) { c0 = cw.c0; r0 = cw.r0; c1 = cw.c1; r1 = cw.r1; }
         else { c0 = 0; r0 = 0; c1 = g.gw - 1; r1 = g.gh - 1; }  // 창이 뒤집혔다 = 못 믿는다
         if (inheritBake) {   // 직전 획의 미확정 창을 합친다 — 그 칸들은 base.cells 에 없고 prev 의 스냅에만 있다
@@ -112287,9 +112284,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // 칸 베이크 이월: dirty 창의 리드백·빈 판정·칸 자르기를 하지 않고,
         // 창 픽셀을 GPU→GPU drawImage 로 스냅 캔버스에 떠 두기만 한다(동기화 없음 — GPU 큐에
         // 명령만 쌓인다). 확정은 gengaTileSetBakePending 이 커밋 밖에서 한다.
-        // 물려받은 칸·inheritBake·계산 결과의 knownNonempty 중 하나가 빈 그림 방지를 보증한다.
+        // 창 밖의 칸, 잉크 추가가 보장된 이월, 또는 knownNonempty가 있어야 빈 그림 판정을 미룬다.
         // 어느 것도 없으면 동기로 빈 그림을 판정한다. 커밋 뒤에는 빈 그림의 Undo를 소급할 수 없다.
-        if (deferBake && (ts.cells.size || inheritBake || knownNonempty)) {
+        if (deferBake && (ts.cells.size || (inheritBake && deferNonempty) || knownNonempty)) {
           const wx0 = c0 * GENGA_TILE_PX, wy0 = r0 * GENGA_TILE_PX;
           const wx1 = Math.min(pw, (c1 + 1) * GENGA_TILE_PX), wy1 = Math.min(ph, (r1 + 1) * GENGA_TILE_PX);
           const snap = document.createElement('canvas');
