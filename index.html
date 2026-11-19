@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3460</title>
+  <title>MoArt ver3461</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -134357,6 +134357,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const store = sig.store;
       if (!store || store.belowCache !== sig.below || store.aboveCache !== sig.above || store.aboveFoldable !== true) return null;
       if (store !== gengaPreviewRender.stack) return null;
+      if (gengaPreviewRender.viewState?.session === sess && sess.previewScan) {
+        const changed = gengaScanClamp(sess.previewScan, sess.canvas);
+        if (changed) return changed;
+      }
       return gengaScanClamp(sess.inkScan, sess.canvas);
     }
     let gengaHydrateInFlight = false; // GengaHydrateDrawStore 진행 중 — 이 동안은 캐시를 쓰지도 굽지도 않는다(미수화 스택이 박제된다). 완료가 무효화+재렌더로 닫는다
@@ -134539,11 +134543,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       cv._pad = pad;
       cv._complete = !gengaHydrateInFlight;
       const cx2 = cv.getContext('2d');
-      // 획 중 더티 클립 — 직전 합성과 같은 구성(같은 스크래치·프레임·pad·세션 캔버스·얼어 있는 below/above
-      // 캐시)이면 이번 획의 누적 상자(inkScan)만 다시 그린다. 창 밖이 프레임 사이에 불변인 근거: 중심은
-      // sess.canvas 인데 펜 경로의 모든 붓질이 gengaScanMark 를 지나 창 안이고(누적이라 지난 프레임에 그렸던 것의
-      // 소거도 창 안), 비중심 레이어는 완비 캐시에서 오며, 표시되는 위 레이어가 없으면 위 합성은 생략한다.
-      // 디코드 준비나 구성이 달라지면 전체 경로로 돌아간다.
+      // Reuse the last composite only while its frame and frozen layer caches still match.
+      // Direct pens track sample bounds; buffered pens track the actual replacement, including erased tails.
       const clipInk = gengaCompositeClipCheck(cv, cw, ch, pad, frame, sess, scene);
       viewMipMark(cv, clipInk);   // 아래가 그 사각형만, 또는 전체를 다시 합성한다 — 축소 표시 사다리에 알린다
       if (!clipInk) gengaPreviewRender.clip = null; // 이 호출이 스크래치를 전체 경로로 덮는다 — 세션 전체 합성만이 아래에서 다시 세운다
@@ -136098,6 +136099,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           if (paintMarqueeBoxFrame === oldCanvas) paintMarqueeBoxFrame = canvas;
           if (paintMarqueeDeviceBox && paintMarqueeDeviceBox.canvas === oldCanvas) paintMarqueeDeviceBox.canvas = canvas;
         }
+        // History keeps the whole stroke. Only a published, complete view consumes its pending brush damage.
+        const sess = gengaPreviewRender.viewState?.session;
+        if (sess && result.surface._artComplete) sess.previewScan = gengaScanSeed(null);
       }
       updateSelectionUi(); // 원화의 선택은 이 렌더가 소유한다
       gengaLipsyncUpdateHud(); // 입 말풍선 — 입이 바뀔 때만 DOM 을 쓴다
@@ -136127,7 +136131,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (prev && surface.width === W && surface.height === H && prev.key === key && prev.stack === stack
           && prev.below === next.below && prev.above === next.above && prev.aboveSig === next.aboveSig && prev.aboveEmpty === next.aboveEmpty && prev.belowEmpty === next.belowEmpty) {
         if (sess && (prev.session === sess || (!prev.session && prev.drawingRef === sess.previewBaseRef))) {
-          ink = sess.pendingFirstDab ? null : gengaScanClamp(sess.inkScan, sess.canvas);
+          const scan = prev.session === sess && sess.previewScan ? sess.previewScan : sess.inkScan;
+          ink = sess.pendingFirstDab ? null : gengaScanClamp(scan, sess.canvas);
           unchanged = !ink; // 첫 dab 전의 동일한 시드에는 표시할 변경이 없다
         } else if (!sess && prev.session && gengaActiveCanvas && gengaActiveCanvas.canvas === prev.session.canvas) {
           const dr = gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
@@ -137009,7 +137014,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // gengaPenOutlineRedraw) — 세션을 소유자로 넘겨 마스크 사본 한 장을 다시 쓴다(매번 할당하면 재그리기가 무겁다).
       const boundedShape = sess.shape && !paintTipOrGrainActive(sess) && !sess.waterEdge && !sess.dualMask;
       const rect = changedRect || (((!sess.shape && (sess.penOutline || sess.penBufMode)) || boundedShape) ? gengaScanClamp(sess.inkScan, sess.canvas) : null);
-      gengaCaptureHistoryBefore(sess, rect || { x: 0, y: 0, w: sess.canvas.width, h: sess.canvas.height });
+      const changed = rect && rect.w > 0 && rect.h > 0 ? rect : { x: 0, y: 0, w: sess.canvas.width, h: sess.canvas.height };
+      if (sess.previewScan) {
+        gengaScanGrow(sess.previewScan, changed.x, changed.y, 0);
+        gengaScanGrow(sess.previewScan, changed.x + changed.w, changed.y + changed.h, 0);
+      }
+      gengaCaptureHistoryBefore(sess, changed);
       paintCompositeBufferOnto(sess.ctx, sess.shapeBase, sess.shapeBuf, {
         width: sess.canvas.width, height: sess.canvas.height,
         scratchOwner: sess,
@@ -137306,7 +137316,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Mark a drawn point: everything within `pad` of (x,y) may now hold ink. `pad` is the largest radius the
     // renderer can put there (half the stroke width for the AA paths, the stamp's half-extent for 2値化).
-    // 상자 하나를 점으로 키우는 부분. 아래 두 누적기가 같은 규칙으로 자라야 한다.
+    // 각 용도의 상자를 같은 점·반경으로 키운다.
     function gengaScanGrow(s, x, y, r) {
       if (x - r < s.x0) s.x0 = x - r;
       if (y - r < s.y0) s.y0 = y - r;
@@ -137408,7 +137418,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaScanMark(sess, x, y, pad) {
       const s = sess && sess.scan; if (!s) return;
-      if (!Number.isFinite(x) || !Number.isFinite(y)) { sess.scan = null; sess.inkScan = null; return; } // unbounded input → opt out, never guess
+      if (!Number.isFinite(x) || !Number.isFinite(y)) { sess.scan = null; sess.inkScan = null; sess.previewScan = null; return; } // unbounded input → opt out, never guess
       // Postprocessing can add pixels outside the dab. Grow both accumulators before
       // preview composition, history capture and tile commit consume the same bounds.
       const effectPad = paintWaterEdgeBlurPad(paintWaterEdgeFrom(sess));
@@ -137418,6 +137428,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 잉크를 안 자르게) 그림이 클수록 커진다. 칸 갱신은 그 창을 쓸 수 없다 — 그것으로 dirty 를 재면 매번
       // 전 칸이 dirty 가 된다.
       if (sess.inkScan) gengaScanGrow(sess.inkScan, x, y, r);
+      if (sess.previewScan && !sess.penBufMode) gengaScanGrow(sess.previewScan, x, y, r);
     }
     // 누적기 → 정수 사각형(캔버스로 클램프). 아무것도 안 모였으면 null.
     function gengaScanClamp(s, cv) {
