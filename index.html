@@ -28,7 +28,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <title>MoArt ver3434</title>
+  <title>MoArt ver3435</title>
 
   <!-- Dropbox sign-in returns to this page inside the sign-in window (?code&state from dropboxConnect). Hand the
        code to the MoArt window that asked for it (same-origin localStorage, read by dropboxWatchCallback) and stop
@@ -21633,7 +21633,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       updateGengaCelGroupsAfterEdit(before, state.project);
       gengaUpdateTvppRangesAfterEdit(before.gengaTimeline && before.gengaTimeline.layers, state.project.gengaTimeline && state.project.gengaTimeline.layers);
       normalizeProject(state.project);
-      if (gengaReconcileCameraInstrAfter(before, state.project) | gengaReconcileFxInstrAfter(before, state.project)) normalizeProject(state.project);
+      if (gengaReconcileCameraInstrAfter(before, state.project) | gengaReconcileFxInstrAfter(before.gengaTimeline, state.project.gengaTimeline)) normalizeProject(state.project);
       const after = snapshotProject();
       const genga = state.project && state.project.kind === 'genga';
       if (genga) gengaPreviewCachesAfterCommand(before, after); // 두 스냅숏을 같은 규칙으로 비교한다
@@ -21665,11 +21665,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return key(a) !== key(b) && gengaReconcileCameraInstr(b);
     }
     // FX 지시 행도 같은 자리에서 맞춘다 — 움직임 묶음(멤버·움직임·이름)이나 尺 이 바뀐 명령에서만(설계 F2).
-    function gengaReconcileFxInstrAfter(before, project) {
-      const a = before && before.gengaTimeline, b = project && project.gengaTimeline;
+    function gengaReconcileFxInstrAfter(a, b) {
       if (!a || !b) return false;
-      const groups = gengaInstrTargetLayers(b).groups;
-      return gengaFxInstrInputKey(a) !== gengaFxInstrInputKey(b, groups) && gengaReconcileFxInstr(b, groups);
+      return gengaApplyFxInstrPlan(b, gengaFxInstrPlanAfter(gengaFxInstrInputKey(a), b));
     }
     function captureCameraTimelineState(project) {
       return {
@@ -22944,6 +22942,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       { flag: 'targetTimeEdit', viewport: true, apply: function(command, payload) { applyTargetTimeHistoryState(payload); } },
       { flag: 'cameraTimelineEdit', viewport: true, apply: function(command, payload) { applyCameraTimelineHistoryState(payload); } },
       { flag: 'conteCutActionTextEdit', viewport: true, apply: function(command, payload) { applyConteCutActionTextHistoryState(payload); } },
+      { flag: 'gengaLayerInsertion', viewport: true, apply: function(command, payload, undoing) {
+        const gt = state.project.gengaTimeline, entry = command.after.layers[0];
+        const index = gt.layers.findIndex(function(l) { return l.id === entry.id; });
+        if (undoing && index >= 0) gt.layers.splice(index, 1);
+        if (!undoing && index < 0) gt.layers.splice(entry.index, 0, fastClone(entry.layer));
+        gengaRefreshLayerInsertion(false);
+      } },
       { flag: 'gengaCameraEdit', viewport: false, apply: function(command, payload) { applyGengaCameraHistoryState(payload); } },   // cameraWork 만
       { flag: 'gengaDialogueEdit', viewport: false, apply: function(command, payload) { applyGengaDialogueHistoryState(payload); } },   // 원화 대사만
       { flag: 'gengaKomaCreation', viewport: false, apply: function(command, payload, undoing) { applyGengaExposureCreationHistory(command, undoing); } },
@@ -128219,39 +128224,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // ## SECTION: GENGA: PROJECT / SETTINGS ......... normalize, create/settings dialogs, セリフ sheet
 
-    function normalizeGengaTimeline(project) {
-      const gt = project.gengaTimeline && typeof project.gengaTimeline === 'object' ? project.gengaTimeline : {};
-      const cam = gt.camera && typeof gt.camera === 'object' ? gt.camera : {};
-      const pap = gt.paper && typeof gt.paper === 'object' ? gt.paper : {};
-      const camW = Math.max(1, (Number.isFinite(Number(cam.w)) ? Number(cam.w) || 1920 : 1920));
-      const camH = Math.max(1, (Number.isFinite(Number(cam.h)) ? Number(cam.h) || 1080 : 1080));
-      const paperW = Math.max(camW, Math.round(Number(pap.w) || camW));
-      const paperH = Math.max(camH, Math.round(Number(pap.h) || camH));
-      let camX = Number(cam.x);
-      if (!isFinite(camX)) camX = Math.round((paperW - camW) / 2);
-      let camY = Number(cam.y);
-      if (!isFinite(camY)) camY = Math.round((paperH - camH) / 2);
-      camX = Math.max(0, Math.min(camX, paperW - camW));
-      camY = Math.max(0, Math.min(camY, paperH - camH));
-      const layers = Array.isArray(gt.layers) ? gt.layers.map(normalizeGengaLayer) : [];
-      // 「전역 키 표기」(gt.fxLabelStyle)가 없는 모델로 옮기며 낡은 프로젝트의 뜻은 지킨다. 'frame'(= 1k)인데
-      // 레이어에 제 labelStyle 이 없으면 각 레이어에 'frame' 을 옮겨 심는다. 필드만 지우면 1K 로 쓰던 프로젝트가
-      // 다음에 열 때 말없이 a,b,c 로 돌아간다. 여기인 이유: gt 와 레이어를 함께 보는 곳이고(normalizeGengaLayer 는
-      // gt 를 못 본다) 로드·임포트·되돌리기·모든 runCommand 가 지난다. 아래에서 gengaTimeline 을 새로 만들며
-      // fxLabelStyle 을 빼므로 이관은 프로젝트당 한 번만 걸리고, runCommand 의 before 스냅샷도 이미 이관된 상태라
-      // 히스토리에 안 실린다. 'alpha'/부재는 폴백('alpha')과 뜻이 같아 손대지 않는다 — 전 레이어에 필드를 박으면
-      // 프로젝트만 더러워진다(instrMode 이관을 하지 않는 것과 같은 판단).
-      if (gt.fxLabelStyle === 'frame') {
-        layers.forEach(function(l) { if (l.labelStyle !== 'alpha' && l.labelStyle !== 'frame') l.labelStyle = 'frame'; });
-      }
-      // A cellGroupId with fewer than 2 surviving members (sibling deleted, or stale/imported data) isn't a
-      // group — dissolve it to a plain independent layer. Runs on every edit path (load/import/undo), not just
-      // the runCommand sync hook below.
-      (function() {
-        const counts = {};
-        layers.forEach(function(l) { if (l.cellGroupId) counts[l.cellGroupId] = (counts[l.cellGroupId] || 0) + 1; });
-        layers.forEach(function(l) { if (l.cellGroupId && counts[l.cellGroupId] < 2) l.cellGroupId = ''; });
-      })();
+    function gengaNormalizeLayerOrder(layers) {
       // 用紙 layer is pinned to the very top or very bottom (user rule); re-seat it every normalize so no cel/BG
       // layer can end up outside it (drag/add/undo all funnel through here).
       (function() {
@@ -128304,6 +128277,41 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         });
         layers.length = 0; Array.prototype.push.apply(layers, ordered);
       }
+    }
+    function normalizeGengaTimeline(project) {
+      const gt = project.gengaTimeline && typeof project.gengaTimeline === 'object' ? project.gengaTimeline : {};
+      const cam = gt.camera && typeof gt.camera === 'object' ? gt.camera : {};
+      const pap = gt.paper && typeof gt.paper === 'object' ? gt.paper : {};
+      const camW = Math.max(1, (Number.isFinite(Number(cam.w)) ? Number(cam.w) || 1920 : 1920));
+      const camH = Math.max(1, (Number.isFinite(Number(cam.h)) ? Number(cam.h) || 1080 : 1080));
+      const paperW = Math.max(camW, Math.round(Number(pap.w) || camW));
+      const paperH = Math.max(camH, Math.round(Number(pap.h) || camH));
+      let camX = Number(cam.x);
+      if (!isFinite(camX)) camX = Math.round((paperW - camW) / 2);
+      let camY = Number(cam.y);
+      if (!isFinite(camY)) camY = Math.round((paperH - camH) / 2);
+      camX = Math.max(0, Math.min(camX, paperW - camW));
+      camY = Math.max(0, Math.min(camY, paperH - camH));
+      const layers = Array.isArray(gt.layers) ? gt.layers.map(normalizeGengaLayer) : [];
+      // 「전역 키 표기」(gt.fxLabelStyle)가 없는 모델로 옮기며 낡은 프로젝트의 뜻은 지킨다. 'frame'(= 1k)인데
+      // 레이어에 제 labelStyle 이 없으면 각 레이어에 'frame' 을 옮겨 심는다. 필드만 지우면 1K 로 쓰던 프로젝트가
+      // 다음에 열 때 말없이 a,b,c 로 돌아간다. 여기인 이유: gt 와 레이어를 함께 보는 곳이고(normalizeGengaLayer 는
+      // gt 를 못 본다) 로드·임포트·되돌리기·모든 runCommand 가 지난다. 아래에서 gengaTimeline 을 새로 만들며
+      // fxLabelStyle 을 빼므로 이관은 프로젝트당 한 번만 걸리고, runCommand 의 before 스냅샷도 이미 이관된 상태라
+      // 히스토리에 안 실린다. 'alpha'/부재는 폴백('alpha')과 뜻이 같아 손대지 않는다 — 전 레이어에 필드를 박으면
+      // 프로젝트만 더러워진다(instrMode 이관을 하지 않는 것과 같은 판단).
+      if (gt.fxLabelStyle === 'frame') {
+        layers.forEach(function(l) { if (l.labelStyle !== 'alpha' && l.labelStyle !== 'frame') l.labelStyle = 'frame'; });
+      }
+      // A cellGroupId with fewer than 2 surviving members (sibling deleted, or stale/imported data) isn't a
+      // group — dissolve it to a plain independent layer. Runs on every edit path (load/import/undo), not just
+      // the runCommand sync hook below.
+      (function() {
+        const counts = {};
+        layers.forEach(function(l) { if (l.cellGroupId) counts[l.cellGroupId] = (counts[l.cellGroupId] || 0) + 1; });
+        layers.forEach(function(l) { if (l.cellGroupId && counts[l.cellGroupId] < 2) l.cellGroupId = ''; });
+      })();
+      gengaNormalizeLayerOrder(layers);
       const outp = gt.output && typeof gt.output === 'object' ? gt.output : {};
       // camera (black) = fixed output/composition frame; cameraWork (red) = the editable camera-work frame
       const cwk = gt.cameraWork && typeof gt.cameraWork === 'object' ? gt.cameraWork : {};
@@ -129150,38 +129158,58 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       selectGengaLayer(id);
       gengaCenterLayerIntoView(id);
     }
+    function gengaSingleLayerInsertionIndex(gt, layer, anchorId) {
+      // Plan on layer headers. Placement may open the anchor's folder; fixed rows and art blocks
+      // use the same ordering as load/normalize. No exposure or drawing is copied here.
+      const planned = Object.assign({}, gt, { layers: gt.layers.map(function(l) { return Object.assign({}, l); }) });
+      gengaPlaceNewLayer(planned, layer, anchorId);
+      gengaNormalizeLayerOrder(planned.layers);
+      const others = planned.layers.filter(function(l) { return l !== layer; });
+      const labels = gengaAutoArtLabels(planned);
+      const compound = others.some(function(l, i) {
+        return l.id !== gt.layers[i].id || l.folderId !== gt.layers[i].folderId || (labels.has(l.id) && labels.get(l.id) !== l.artLabel);
+      }) || gengaFxInstrPlanAfter(gengaFxInstrInputKey(gt), planned);
+      return compound ? -1 : planned.layers.indexOf(layer);
+    }
     // 벡터 레이어를 만든다(CLIP 임포트 말고도 만들 길이 있어야 한다). 셀 레이어와 같은 뼈대에 vector 표식만
     // 세우고, 그림은 첫 획이 만든다. 셀·벡터 레이어는 이 몸을 함께 쓰며 이름 접두와 `vector` 플래그만 다르다.
     // 벡터가 못 담는 브러시 효과는 만든 뒤의 선택(gengaAdoptLayer → selectGengaLayer)이 끈다.
     function addGengaLayerOfKind(namePrefix, vector) {
       if (!state.project || state.project.kind !== 'genga' || !state.project.gengaTimeline) return;
       if (gengaTaggableLayerCount(state.project.gengaTimeline) >= 26) { alert(t('msg.genga.layer.limitReached')); return; }
-      const anchorId = state.gengaSelectedLayerId;
-      let newId = '';
-      runCommand('原画レイヤー追加', function(p) {
-        const gt = p.gengaTimeline; if (!gt) return;
-        gt.layers = Array.isArray(gt.layers) ? gt.layers : [];
-        const n = gt.layers.length;
-        newId = newPrefixedId('genga-layer');
-        // short default name
-        const layer = {
-          id: newId,
-          name: namePrefix + (n + 1),
-          color: gengaLayerColor(n),
-          opacity: 1, visible: true, locked: false, onion: false,
-          role: 'cel'
-        };
-        if (vector) layer.vector = true;   // 키 차례를 고정하려고 여기서 붙인다(저장 파일이 그 차례로 나간다)
-        // 새 프로젝트의 첫 레이어(applyGengaCreateResolution)와 같은 규칙 — 1프레임째 1코마를 갖고 만든다.
-        layer.exposures = [newGengaExposure(1)];
-        gengaPlaceNewLayer(gt, layer, anchorId);
-      }, { gengaRenderPlan: { scope: 'all', previewByCaller: true, reuseCelContent: true } });   // 레이어 목록이 바뀌어 어차피 전체 렌더다
+      paintInputFlushSync();
+      const gt = state.project.gengaTimeline, anchorId = state.gengaSelectedLayerId;
+      const n = gt.layers.length, newId = newPrefixedId('genga-layer');
+      const layer = normalizeGengaLayer({ id: newId, name: namePrefix + (n + 1), color: gengaLayerColor(n),
+        role: 'cel', vector: vector, exposures: [newGengaExposure(1)] });
+      const index = gengaSingleLayerInsertionIndex(gt, layer, anchorId);
+      if (index < 0) {
+        // A dependent row also changes. Keep the complete command, including normalization and FX reconciliation.
+        runCommand('原画レイヤー追加', function(p) { gengaPlaceNewLayer(p.gengaTimeline, layer, anchorId); },
+          { gengaRenderPlan: gengaLayerStructurePlan(true) });
+      } else {
+        // Folder expansion is view state; history carries its current value in both directions.
+        const folder = layer.folderId && gengaLayerById(layer.folderId);
+        if (folder) folder.collapsed = false;
+        gt.layers.splice(index, 0, layer);
+        pushUndoCommand({ name: '原画レイヤー追加', gengaLayerInsertion: true, recordingKind: 'appearance',
+          after: { layers: [{ id: newId, index: index, layer: fastClone(layer) }] } });
+        gengaRefreshLayerInsertion(true);
+      }
       // 만든 것을 고른다 — 다음 획이 새 레이어에 앉는다. 벡터면 selectGengaLayer 가 못 담는 효과를 바로 끈다.
       // 선택이 바뀌면 selectGengaLayer 가 미리보기를 그린다(위 previewByCaller). 렌더가 선택 없는 상태에서 이미 새 레이어를
       // 골랐으면(전부 지운 뒤 추가) 선택이 그대로라 그리지 않으므로, 그려지지 않았을 때만 여기서 그린다.
       const drawSeq = gengaPreviewDrawSeq;
       gengaAdoptLayer(newId);
       if (gengaPreviewDrawSeq === drawSeq) drawGengaPreview();
+    }
+    function gengaLayerStructurePlan(previewByCaller) {
+      return { scope: 'all', reuseCelContent: true, previewByCaller: previewByCaller };
+    }
+    function gengaRefreshLayerInsertion(previewByCaller) {
+      invalidateVideoTimelineCache();
+      gengaFrameStackInvalidate();
+      refresh({ gengaRenderPlan: gengaLayerStructurePlan(previewByCaller) });
     }
     function addGengaVectorLayer() {
       addGengaLayerOfKind('V', true);
@@ -129451,10 +129479,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       res.orphans.forEach(function(r) { if (gengaInstrLayerTouched(r)) order.push(r); });
       return fix.length || order.length !== before.length || order.some(function(r, k) { return r !== before[k]; }) ? { before: before, order: order, fix: fix } : null;
     }
+    function gengaFxInstrPlanAfter(previousKey, gt) {
+      const groups = gengaInstrTargetLayers(gt).groups;
+      return gengaFxInstrInputKey(gt, groups) !== previousKey ? gengaFxInstrPlan(gt, groups) : null;
+    }
     // 맞춘 결과 행을 넣거나 빼거나 고치거나 옮겼으면 true.
-    function gengaReconcileFxInstr(gt, groups) {
-      if (!gt || !Array.isArray(gt.layers)) return false;
-      const plan = gengaFxInstrPlan(gt, groups);
+    function gengaApplyFxInstrPlan(gt, plan) {
       if (!plan) return false;
       plan.fix.forEach(function(f) { f.row.instrTargets = f.ids; f.row.name = f.name; });
       plan.before.forEach(function(r) { gt.layers.splice(gt.layers.indexOf(r), 1); });
@@ -130953,7 +130983,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return gt ? (gt.layers || []).map(function(l) { const o = { id: l.id }; GENGA_LAYER_VIEW_FIELDS.forEach(function(f) { if (f in l) o[f] = l[f]; }); return o; }) : null;
     }
     // 원화 기록 payload 의 레이어들: 프로젝트 스냅샷(gengaTimeline.layers) 또는 레이어 단위 기록({id, layer}[] —
-    // 레이어 패치·코마 생성). 그 밖의 모양은 null.
+    // 레이어 패치·레이어 추가·코마 생성). 그 밖의 모양은 null.
     function gengaHistoryPayloadLayers(payload) {
       if (!payload || typeof payload !== 'object') return null;
       if (payload.gengaTimeline && Array.isArray(payload.gengaTimeline.layers)) return payload.gengaTimeline.layers;
@@ -141159,7 +141189,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { cameraWork: fastClone((gt && gt.cameraWork) || { keyframes: [] }) };
     }
     function gengaCameraRenderPlan(gt, structural) {
-      if (structural) return { scope: 'all', reason: 'camera-structure', reuseCelContent: true };
+      if (structural) return gengaLayerStructurePlan(false);
       const instr = gengaCameraInstrLayer(gt);
       return { scope: 'partial', layerIds: instr ? [String(instr.id)] : [], camera: true };
     }
@@ -141519,7 +141549,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const gt = state.project.gengaTimeline, isStrokeCommit = Boolean(refreshOptions && refreshOptions.gengaStrokeCommit);
       const fxInstrKey = isStrokeCommit ? '' : gengaFxInstrInputKey(gt);   // 획은 FX·보임을 바꾸지 않는다
       mutator(state.project);
-      if (fxInstrKey && gengaFxInstrInputKey(gt) !== fxInstrKey && gengaFxInstrPlan(gt)) {   // SCOPE RULE 3
+      if (fxInstrKey && gengaFxInstrPlanAfter(fxInstrKey, gt)) {   // SCOPE RULE 3
         // mutator 는 다시 돌리지 않는다(래스터화처럼 자산을 등록하는 편집이 있다) — 지금 상태에 바뀐 레이어만 전 값으로 되돌린 스냅숏이 before.
         const full = snapshotProject(), byId = new Map(before.layers.map(function(item) { return [item.id, item.layer]; }));
         full.gengaTimeline.layers = full.gengaTimeline.layers.map(function(l) { return byId.get(String(l.id)) || l; });
@@ -146364,8 +146394,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           // `genga-peek` 를 레인에도 붙인다 — 헤드에만 붙이면 헤드만 3px 로 눌리고 레인은 52px 그대로라
           // 둘이 어긋난다.
           lane += '<div class="genga-lane' + solo + hiddenRow + revisionEmpty + (peek ? ' genga-peek' : '') + '" data-genga-layer="' + escapeHtml(l.id) + '"' + rowStyle + '>' + cellSelHtml;
-          // Camera structure only adds/removes its instruction lane. Layer insertion also normalizes
-          // the project, so that command supplies the ids whose layer data survived unchanged.
+          // Single-row edits preserve other cells. A compound insertion normalizes the project and
+          // supplies only the ids whose layer data survived that pass unchanged.
           const node = rows && renderPlan && renderPlan.reuseCelContent &&
             (!renderPlan.reusableCelIds || renderPlan.reusableCelIds.has(l.id)) &&
             !(l.serifuSections && l.serifuSections.length) && rows.current.get(String(l.id));
