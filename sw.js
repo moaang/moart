@@ -13,12 +13,8 @@ function shellKey() { return new URL(SHELL[0], self.location.href).href; }
 const CACHE_PREFIX = 'conte-shell-';
 function isOldMoArtCache(name) { return name !== CACHE && name.indexOf(CACHE_PREFIX) === 0; }
 
-// ONE-TIME shell replacement, for clients already stuck on an old cached shell. The cache NAME stays
-// fixed (bumping it per release would force a full re-download every time — see CACHE above); instead a
-// token is stored IN the cache and compared on activate, so this runs once per token change and never
-// otherwise. Change the token only when stuck clients must be freed.
-// REPLACE, never delete: deleting would leave an offline iPad with no app at all if the refetch failed.
-// On failure the old shell stays AND the token is not written, so the next activate tries again.
+// Replace the offline shell once per token. Keep the old shell if the download fails.
+// Record the token after the replacement so a later request can retry.
 const PURGE_TOKEN = '2026-08-15-waituntil';
 const PURGE_KEY = './__shell-purge-token';   // not a real path — nothing ever fetches it
 
@@ -79,15 +75,12 @@ function runOneTimeShellPurge() {
       });
     });
   }).catch(function (err) {
-    console.error('[sw] one-time shell purge failed', err);     // never silent
+    console.error('[sw] one-time shell purge failed', err);
   });
 }
 
-// The purge must NOT sit in activate's waitUntil. claim() there does not help: the browser holds
-// navigations until the worker is ACTIVATED (measured in Chrome: reopening the app waited the whole shell
-// download, 3.9s for a 4s refetch). So activate only starts it, and every shell request keeps the one run alive
-// with its own waitUntil — which also retries a run cut short by worker shutdown (the token is still missing).
-// One run at a time; once it settles the next shell request just re-reads the token (one cache read).
+// Waiting for the download during activation blocks navigation. Start it on activation;
+// each shell request keeps the shared run alive with waitUntil and retries an interrupted run.
 let shellPurgeRun = null;
 function ensureShellPurge() {
   if (!shellPurgeRun) shellPurgeRun = runOneTimeShellPurge().then(function () { shellPurgeRun = null; });
@@ -143,45 +136,39 @@ self.addEventListener('fetch', function (e) {
   // Only the app shell is cached. Other same-origin GETs (the local server's /voicevox proxy, anything else)
   // go straight to the network: answering them from a cache would serve stale data.
   if (!isShellRequest(url)) return;
-  // **The background half of stale-while-revalidate is HELD OPEN.** The put is inside this chain and waitUntil
-  // keeps the worker alive until the chain settles. Otherwise the cached copy answers respondWith, the worker
-  // goes idle and the browser may kill it mid-download of the large shell: the put never lands, so every later
-  // launch stays stale, more certainly on a slow line.
-  // The store copy is split off the moment the response arrives, BEFORE a cache miss hands the original to the
-  // page: the queued writer may run only after the page has read that body, and cloning a consumed Response
-  // throws. Only this copy is stored, so the page's body is never touched.
-  // A shell request waits for a pending one-time purge before it fetches AND before it joins the write queue.
-  // Fetching first could race an old body over the purged one; queueing first deadlocks, because the purge
-  // enters the same queue only after its async token read. The cached copy still answers at once below — only a
-  // shell cache MISS waits. Shell requests waiting on one purge enter the queue in the order they arrived.
-  // Every alias and query variant reads and writes the one shell entry (see shellKey).
+  // Keep the refresh alive after a cache hit returns. Clone the network response before a
+  // cache miss gives its body to the page.
+  // Wait for the purge before fetching or joining the write queue. Fetching earlier can
+  // overwrite the replacement; joining earlier can deadlock with the purge's own write.
   const purge = ensureShellPurge();
   const net = purge.then(function () { return fetch(e.request); }).then(function (res) {
     return { res: res, copy: res && res.ok ? res.clone() : null };
   });
   // queued in request-start order, so shell writes commit in that order (see queueCacheWrite)
-  const write = function () { return net.then(function (got) {
-    const copy = got.copy;
-    if (!copy) return;
-    const fresh = shellStamp(copy);
-    return caches.open(CACHE).then(function (c) {
-      // read the OLD entry before overwriting it — that is the copy the user is looking at right now
-      return matchShell(c).then(function (old) {
-        const stale = shellStamp(old);
-        return putShellResponse(c, copy).then(function () {
-          // The shell must be stored before any window is told it is ready.
-          // no old entry = first visit, missing stamp = no grounds to judge -> stay quiet either way
-          // (a false "new version" banner would be worse than the delay it is fixing).
-          if (old && fresh && stale && fresh !== stale) return notifyShellUpdated();
+  const write = function () {
+    return net.then(function (got) {
+      const copy = got.copy;
+      if (!copy) return;
+      const fresh = shellStamp(copy);
+      return caches.open(CACHE).then(function (c) {
+        // read the OLD entry before overwriting it — that is the copy the user is looking at right now
+        return matchShell(c).then(function (old) {
+          const stale = shellStamp(old);
+          return putShellResponse(c, copy).then(function () {
+            // The shell must be stored before any window is told it is ready.
+            // no old entry = first visit, missing stamp = no grounds to judge -> stay quiet either way
+            // (a false "new version" banner would be worse than the delay it is fixing).
+            if (old && fresh && stale && fresh !== stale) return notifyShellUpdated();
+          });
         });
       });
     });
-  }); };
+  };
   const stored = purge.then(function () { return queueCacheWrite(write); }).catch(function (err) {
     // never silent: a failed cache write means the NEXT launch is still stale and nobody would know
     console.error('[sw] shell cache update failed', err);
   });
-  e.waitUntil(stored);   // MUST be called synchronously, while the event is still dispatching
+  e.waitUntil(stored);   // Register during event dispatch.
   e.respondWith(
     caches.open(CACHE).then(matchShell).then(function (hit) {
       if (hit) return hit;
