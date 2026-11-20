@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3502</title>
+  <title>MoArt ver3503</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -19461,6 +19461,874 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       <button id="projectLoadingCancelBtn" type="button" class="project-loading-cancel" data-i18n="ui.cancel" hidden>キャンセル</button>
     </div>
   </dialog>
+
+  <script id="moart-fill-kernel">
+    // One pure kernel source serves the worker and the no-Worker fallback. The worker has no
+    // project/store/DOM access and retains no second topology cache between messages.
+    const PAINT_FILL_ROLES = ['base', 'shadow', 'highlight'];
+
+    // Four-connected flood is shared with the ordinary bucket. A supplied label buffer avoids a
+    // whole-image allocation for every component; stable labels are their first pixel index + 1.
+    function paintFloodRegion(allowed, width, height, seed, labels, value, queue) {
+      if (!allowed[seed] || labels[seed]) return 0;
+      let head = 0, tail = 0;
+      const count = width * height;
+      // The caller's queue still contains every visited pixel once. Contiguous row runs
+      // share boundary checks; callers use membership/count, not the traversal order.
+      function appendRun(i) {
+        const rowStart = i - i % width, rowEnd = rowStart + width;
+        let left = i, right = i;
+        while (left > rowStart && allowed[left - 1] && !labels[left - 1]) left -= 1;
+        while (right + 1 < rowEnd && allowed[right + 1] && !labels[right + 1]) right += 1;
+        for (let p = left; p <= right; p += 1) { labels[p] = value; queue[tail++] = p; }
+        return right;
+      }
+      appendRun(seed);
+      while (head < tail) {
+        const start = queue[head++], rowEnd = start - start % width + width;
+        let end = start;
+        while (head < tail && end + 1 < rowEnd && queue[head] === end + 1) { end += 1; head += 1; }
+        for (let offset = -width; offset <= width; offset += width * 2) {
+          if (start + offset < 0 || end + offset >= count) continue;
+          for (let i = start + offset; i <= end + offset; i += 1) {
+            if (allowed[i] && !labels[i]) i = appendRun(i);
+          }
+        }
+      }
+      return tail;
+    }
+    // chamfer(3,4) 거리 지도 — 채우기 확장과 틈 닫기(아래)가 함께 쓴다. seed 픽셀 0, 나머지는 가장 가까운 seed
+    // 까지의 거리 ×3(직교 3 · 대각 4).
+    function paintChamferDistance(seed, W, H) {
+      const N = W * H;
+      const INF = 0x3fffffff;
+      const dist = new Int32Array(N);
+      for (let i = 0; i < N; i += 1) dist[i] = seed[i] ? 0 : INF;
+      for (let y = 0; y < H; y += 1) {          // 앞으로 한 번
+        const row = y * W;
+        for (let x = 0; x < W; x += 1) {
+          const i = row + x;
+          let v = dist[i];
+          if (y > 0) {
+            if (x > 0 && dist[i - W - 1] + 4 < v) v = dist[i - W - 1] + 4;
+            if (dist[i - W] + 3 < v) v = dist[i - W] + 3;
+            if (x < W - 1 && dist[i - W + 1] + 4 < v) v = dist[i - W + 1] + 4;
+          }
+          if (x > 0 && dist[i - 1] + 3 < v) v = dist[i - 1] + 3;
+          dist[i] = v;
+        }
+      }
+      for (let y = H - 1; y >= 0; y -= 1) {     // 뒤로 한 번
+        const row = y * W;
+        for (let x = W - 1; x >= 0; x -= 1) {
+          const i = row + x;
+          let v = dist[i];
+          if (y < H - 1) {
+            if (x < W - 1 && dist[i + W + 1] + 4 < v) v = dist[i + W + 1] + 4;
+            if (dist[i + W] + 3 < v) v = dist[i + W] + 3;
+            if (x > 0 && dist[i + W - 1] + 4 < v) v = dist[i + W - 1] + 4;
+          }
+          if (x < W - 1 && dist[i + 1] + 3 < v) v = dist[i + 1] + 3;
+          dist[i] = v;
+        }
+      }
+      return dist;
+    }
+    // 틈 닫기: 장벽을 팽창시키지 않고 끊어진 선의 끝을 가상 선으로 잇는다. 팽창법은 좁은 가지·통로까지
+    // 지우고(PaintMan 매뉴얼도 「狭い部分で塗り止まり」를 그 부작용으로 적는다), seed 가 마진에 먹히면 멈출 수밖에
+    // 없다. 여기서는 그림 픽셀을 바꾸지 않고 flood 가 못 지나갈 가상 장벽만 만든다.
+    // ① 선(!match)을 Zhang-Suen 으로 세선화 → 중심축. 겉 픽셀만 후보로 돌린다(안쪽은 이웃 8 이라 못 깎인다)
+    // ② 중심축에서 8-이웃이 하나뿐인 픽셀 = 끝점. 끝점마다 중심축을 거슬러 간 점으로 접선을 잡고, 분기점까지가
+    // 반두께 안이면 세선화 부산물(spur)이라 버린다 — 두꺼운 선의 모서리마다 생겨 옆 선과 오연결한다
+    // ③ 끝점 쌍: 선분을 따라 지나는 빈 칸 수가 gap 이하인 쌍을 틈이 작은 순으로 짝짓는다(끝점당 한 번).
+    // 틈 뒤에 선을 지나 다시 빈 칸이 나오면 다른 선을 가로지르는 것이라 버린다
+    // ④ 짝이 없는 끝점: 접선 방향으로 빈 칸 gap 개 안에 선이 있으면 거기까지 잇는다 — 다른 선의 «중간»에 못 닿은
+    // 틈(가장 흔한 틈)은 끝점이 한쪽뿐이라 ③ 으로는 못 잇는다
+    // ⑤ supercover 로 굽는다 — 4방향 flood 가 대각으로 못 새게 모서리 칸까지 찍는다
+    // 순수 함수(match, W, H, gap → Uint8Array | null). 이은 것이 없으면 null(= gap 0 과 같은 flood). 통로의 벽은
+    // 선의 «중간»이라 끝점이 없고, 허공에서 끝난 선 하나는 상대가 없어 그대로다(둘 다 팽창법은 못 가른다).
+    // 틈은 칸 수(Chebyshev)로 센다 — 「gap N = N 칸」(대각 한 칸도 한 칸).
+    function paintGapVirtualBarrier(match, W, H, gap) {
+      const N = W * H;
+      const sk = new Uint8Array(N);
+      let count = 0;
+      for (let i = 0; i < N; i += 1) if (!match[i]) { sk[i] = 1; count += 1; }
+      if (!count || count === N) return null;
+      const OFF = [-W, -W + 1, 1, W + 1, W, W - 1, -1, -W - 1];   // P2..P9 = N, NE, E, SE, S, SW, W, NW
+      const nb = new Int32Array(8);
+      const neighbors = function(i) {
+        const x = i % W, y = (i - x) / W;
+        const up = y > 0, dn = y < H - 1, lf = x > 0, rt = x < W - 1;
+        nb[0] = up ? sk[i - W] : 0;
+        nb[1] = (up && rt) ? sk[i - W + 1] : 0;
+        nb[2] = rt ? sk[i + 1] : 0;
+        nb[3] = (dn && rt) ? sk[i + W + 1] : 0;
+        nb[4] = dn ? sk[i + W] : 0;
+        nb[5] = (dn && lf) ? sk[i + W - 1] : 0;
+        nb[6] = lf ? sk[i - 1] : 0;
+        nb[7] = (up && lf) ? sk[i - W - 1] : 0;
+        return nb[0] + nb[1] + nb[2] + nb[3] + nb[4] + nb[5] + nb[6] + nb[7];
+      };
+      const crossings = function() {                      // nb 의 0→1 전이 수 = 이웃 «덩어리» 수. 1 이면 끝, 3 이상이면 분기
+        let a = 0;                                        // (이웃 «수»로 재면 코너 옆 픽셀이 대각 이웃 때문에 분기로 보인다)
+        for (let q = 0; q < 8; q += 1) if (!nb[q] && nb[(q + 1) & 7]) a += 1;
+        return a;
+      };
+      // ① Zhang-Suen — 깎인 픽셀의 이웃만 후보에 더해 가며, 한 라운드(두 반 반복)에 아무것도 안 깎일 때까지
+      let active = [];
+      const queued = new Uint8Array(N);
+      for (let i = 0; i < N; i += 1) if (sk[i] && neighbors(i) < 8) { active.push(i); queued[i] = 1; }
+      for (;;) {
+        let killed = 0;
+        for (let sub = 0; sub < 2; sub += 1) {
+          const kill = [];
+          for (let k = 0; k < active.length; k += 1) {
+            const i = active[k];
+            if (!sk[i]) continue;
+            const b = neighbors(i);
+            if (b < 2 || b > 6 || crossings() !== 1) continue;
+            const p2 = nb[0], p4 = nb[2], p6 = nb[4], p8 = nb[6];
+            if (sub === 0) { if ((p2 && p4 && p6) || (p4 && p6 && p8)) continue; }
+            else if ((p2 && p4 && p8) || (p2 && p6 && p8)) continue;
+            kill.push(i);
+          }
+          for (let k = 0; k < kill.length; k += 1) {
+            const i = kill[k];
+            sk[i] = 0;
+            neighbors(i);
+            for (let q = 0; q < 8; q += 1) if (nb[q] && !queued[i + OFF[q]]) { queued[i + OFF[q]] = 1; active.push(i + OFF[q]); }
+          }
+          killed += kill.length;
+        }
+        if (!killed) break;
+        const alive = [];
+        for (let k = 0; k < active.length; k += 1) if (sk[active[k]]) alive.push(active[k]);
+        active = alive;
+      }
+      // ② 끝점 · 접선 · spur
+      const dEmpty = paintChamferDistance(match, W, H);   // 선 픽셀 → 가장 가까운 빈 픽셀. 중심축에서 잰 반두께 = 그 거리 − ½
+      const ends = [];
+      const BACK = 8, TANGENT = 4;                          // 분기는 8 칸 안에서 찾고, 접선은 4 칸 뒤 점으로 잡는다(더 멀면 코너를 돌아 방향이 뒤집힌다)
+      const ORDER = [0, 2, 4, 6, 1, 3, 5, 7];               // 직교 이웃 먼저
+      const trail = [];
+      for (let i = 0; i < N; i += 1) {
+        if (!sk[i]) continue;
+        if (!neighbors(i) || crossings() !== 1) continue;
+        trail.length = 0;
+        trail.push(i);
+        let cur = i, branched = false;
+        while (trail.length <= BACK) {                      // 중심축을 거슬러 간다 — 분기점이나 BACK 칸에서 멈춘다
+          neighbors(cur);
+          if (trail.length > 1 && crossings() >= 3) { branched = true; break; }
+          let nxt = -1;
+          for (let k = 0; k < 8 && nxt < 0; k += 1) { const q = ORDER[k]; if (nb[q] && trail.indexOf(cur + OFF[q]) < 0) nxt = cur + OFF[q]; }
+          if (nxt < 0) break;
+          trail.push(nxt);
+          cur = nxt;
+        }
+        const steps = trail.length - 1;
+        const hw = Math.max(0, dEmpty[i] / 3 - 0.5);
+        if (branched && steps <= hw + 1.5) continue;       // spur
+        const tail = trail[Math.min(steps, TANGENT)];
+        const x = i % W, y = (i - x) / W, tx = tail % W, ty = (tail - tx) / W;
+        const len = Math.hypot(x - tx, y - ty) || 1;
+        ends.push({ i: i, x: x, y: y, ux: (x - tx) / len, uy: (y - ty) / len, hw: hw });
+      }
+      if (!ends.length) return null;
+      const maxHw = ends.reduce(function(maximum, e) { return Math.max(maximum, e.hw); }, 0);
+      // supercover Bresenham — 대각으로 한 칸 건널 때 모서리 두 칸을 corner 로 함께 방문한다. visit 가 false 면 중단
+      const walkLine = function(x0, y0, x1, y1, visit) {
+        const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+        let err = dx - dy, x = x0, y = y0;
+        if (visit(y * W + x, false) === false) return false;
+        while (x !== x1 || y !== y1) {
+          const e2 = 2 * err;
+          let mx = false, my = false;
+          if (e2 > -dy) { err -= dy; x += sx; mx = true; }
+          if (e2 < dx) { err += dx; y += sy; my = true; }
+          if (mx && my) { visit((y - sy) * W + x, true); visit(y * W + (x - sx), true); }
+          if (visit(y * W + x, false) === false) return false;
+        }
+        return true;
+      };
+      // ③ 쌍 — 틈이 작은 순 · 접선이 맞는 순 · 가까운 순 · 좌표 순으로 고정한다(같은 그림이면 같은 답)
+      const cand = [];
+      for (let a = 0; a < ends.length; a += 1) {
+        const A = ends[a];
+        for (let b = a + 1; b < ends.length; b += 1) {
+          const B = ends[b];
+          const dx = B.x - A.x, dy = B.y - A.y;
+          // Raster order makes later y nondecreasing; no later pair can pass the distance test below.
+          if (dy > gap + A.hw + maxHw + 2) break;
+          const cheb = Math.max(Math.abs(dx), Math.abs(dy));
+          if (cheb <= 1 || cheb > gap + A.hw + B.hw + 2) continue;
+          const dl = Math.hypot(dx, dy);
+          const faceA = (A.ux * dx + A.uy * dy) / dl, faceB = -(B.ux * dx + B.uy * dy) / dl;
+          if (faceA < -0.3 || faceB < -0.3) continue;       // 서로 등을 돌린 끝점 — 나란한 두 선의 끝은 틈이 아니다(접선 불일치)
+          let hole = 0, stage = 0, ok = true;                // 자기 몸통(0) → 틈(1) → 상대 몸통(2) → 또 빈 칸이면 가로지름
+          walkLine(A.x, A.y, B.x, B.y, function(j, corner) {
+            if (corner) return true;
+            if (match[j]) {
+              if (stage === 2) { ok = false; return false; }
+              stage = 1;
+              hole += 1;
+              return hole <= gap;
+            }
+            if (stage === 1) stage = 2;
+            return true;
+          });
+          if (!ok || hole > gap) continue;
+          cand.push({ a: a, b: b, hole: hole, miss: 2 - faceA - faceB, d2: dx * dx + dy * dy });
+        }
+      }
+      cand.sort(function(p, q) { return (p.hole - q.hole) || (p.miss - q.miss) || (p.d2 - q.d2) || (ends[p.a].i - ends[q.a].i) || (ends[p.b].i - ends[q.b].i); });
+      const used = new Uint8Array(ends.length);
+      const virt = new Uint8Array(N);
+      const stamp = function(j) { virt[j] = 1; return true; };
+      let drawn = 0;
+      for (let c = 0; c < cand.length; c += 1) {
+        const p = cand[c];
+        if (used[p.a] || used[p.b]) continue;
+        used[p.a] = 1;
+        used[p.b] = 1;
+        walkLine(ends[p.a].x, ends[p.a].y, ends[p.b].x, ends[p.b].y, stamp);
+        drawn += 1;
+      }
+      // ④ 짝 없는 끝점 — 접선 방향으로 나간다. 자기 몸통을 지나 빈 칸이 나오고, 빈 칸 gap 개 안에 선을 만나면 거기까지
+      for (let a = 0; a < ends.length; a += 1) {
+        if (used[a]) continue;
+        const E = ends[a];
+        const limit = Math.ceil((E.hw + gap + 2) * 1.5);
+        let px = E.x, py = E.y, seen = 0, hit = -1;
+        for (let t = 1; t <= limit; t += 1) {
+          const nx = Math.round(E.x + E.ux * t), ny = Math.round(E.y + E.uy * t);
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) break;
+          if (nx === px && ny === py) continue;
+          px = nx;
+          py = ny;
+          const j = ny * W + nx;
+          if (match[j]) { seen += 1; if (seen > gap) break; }
+          else if (seen) { hit = j; break; }
+        }
+        if (hit < 0) continue;
+        walkLine(E.x, E.y, hit % W, (hit - hit % W) / W, stamp);
+        used[a] = 1;
+        drawn += 1;
+      }
+      return drawn ? virt : null;
+    }
+    // 미리 읽은 ImageData 창에서 칸 하나의 잉크 유무 — alphaInkBoundsScan 의 minAlpha 기본(1)과 같은 판정.
+    function gengaTileCellHasInk(img, ox, oy, rect) {
+      const data = img.data, stride = img.width;
+      const x0 = rect.x - ox, y0 = rect.y - oy;
+      for (let y = 0; y < rect.h; y++) {
+        let off = ((y0 + y) * stride + x0) * 4 + 3;
+        for (let x = 0; x < rect.w; x++, off += 4) { if (data[off] >= 1) return true; }
+      }
+      return false;
+    }
+
+    // Line classification and region topology
+    function paintFillPixelEmpty(data, offset, whiteAsEmpty) {
+      return !data[offset + 3] || Boolean(whiteAsEmpty && data[offset] === 255 && data[offset + 1] === 255 && data[offset + 2] === 255);
+    }
+    // Unregistered ink that is dark and nearly neutral is the main line (class colors.length + 1), so lines
+    // in the default near-black pen or a dark grey need no registration — the same expectation as CSP's
+    // "to darkest pixel" and Krita's "stop growing at darker pixels". Other unregistered ink (colour
+    // already painted on the layer) stays a barrier that is neither filled under nor recoloured.
+    // `placement` gives each source's place relative to the fill target ('target' | 'below' | 'above').
+    // `cover` is the composite alpha of the sources that are not the target; the color check adds the
+    // target itself, so a reference to the current layer is not counted twice. `under` marks the core
+    // (alpha >= coreAlpha) of a main line on a layer below the target: paint there would hide the line, so it
+    // stays unpainted while the faint rim is painted over — CSP's "to darkest pixel" from above.
+    function paintFillClassify(images, width, height, settings, placement) {
+      const n = width * height, classes = new Int16Array(n), alpha = new Uint8Array(n), under = new Uint8Array(n);
+      const ambiguous = new Uint8Array(n), queue = new Int32Array(n), cover = new Uint8Array(n);
+      const colors = settings.colors.map(function(c) { return [parseInt(c.color.slice(1, 3), 16), parseInt(c.color.slice(3, 5), 16), parseInt(c.color.slice(5, 7), 16)]; });
+      const inkLine = colors.length + 1, lineRole = settings.colors.map(function(c) { return c.role === 'line'; });
+      const priorities = settings.colors.map(function(c) { return c.role === 'line' ? PAINT_FILL_ROLES.length : PAINT_FILL_ROLES.indexOf(c.role); }).concat(PAINT_FILL_ROLES.length);
+      images.forEach(function(image, source) {
+        if (image.width !== width || image.height !== height) throw new Error('Animation source dimensions changed');
+        const d = image.data, candidate = new Int16Array(n), connected = new Uint8Array(n);
+        const covers = !placement || placement[source] !== 'target',
+          below = Boolean(placement && placement[source] === 'below');
+        let head = 0, tail = 0;
+        for (let i = 0; i < n; i += 1) {
+          const j = i * 4, a = d[j + 3];
+          if (paintFillPixelEmpty(d, j, settings.whiteAsEmpty)) continue;
+          if (covers) cover[i] = 255 - Math.round((255 - cover[i]) * (255 - a) / 255);
+          let k = 0;
+          for (; k < colors.length; k += 1) {
+            const c = colors[k];
+            if (Math.abs(d[j] - c[0]) <= settings.tolerance && Math.abs(d[j + 1] - c[1]) <= settings.tolerance && Math.abs(d[j + 2] - c[2]) <= settings.tolerance) break;
+          }
+          // A faint rim pixel can round to a registered line colour while its core is another dark ink;
+          // both are the one main line, so they share a class instead of splitting into ambiguity.
+          const hi = Math.max(d[j], d[j + 1], d[j + 2]), dark = hi <= 64 && hi - Math.min(d[j], d[j + 1], d[j + 2]) <= 32;
+          const found = k < colors.length && !(dark && lineRole[k]) ? k + 1 : dark ? inkLine : -1;
+          candidate[i] = found;
+          if (found > 0 && a >= settings.coreAlpha) { connected[i] = 1; queue[tail++] = i; }
+        }
+        while (head < tail) {
+          const i = queue[head++], x = i % width, y = Math.floor(i / width);
+          for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+            if (!(dx || dy) || x + dx < 0 || x + dx >= width || y + dy < 0 || y + dy >= height) continue;
+            const j = i + dy * width + dx;
+            if (!connected[j] && candidate[j] === candidate[i]) { connected[j] = 1; queue[tail++] = j; }
+          }
+        }
+        for (let i = 0; i < n; i += 1) {
+          const k = candidate[i];
+          if (!k) continue;
+          if (k < 0 || !connected[i]) {
+            if (!classes[i]) classes[i] = -1;
+            if (k > 0 && classes[i] < 0) ambiguous[i] = 1;
+            continue;
+          }
+          const current = classes[i];
+          // Protected lines rank above the remaining roles in PAINT_FILL_ROLES order.
+          if (current > 0 && priorities[current - 1] > priorities[k - 1]) continue;
+          classes[i] = k;
+          alpha[i] = d[i * 4 + 3];
+          ambiguous[i] = 0;
+          under[i] = below && alpha[i] >= settings.coreAlpha && (k === inkLine || lineRole[k - 1]) ? 1 : 0;   // colour trace lines are still painted with Include
+        }
+      });
+      return { classes: classes, alpha: alpha, ambiguous: ambiguous, cover: cover, under: under };
+    }
+    // Propagation stays in one kind of line support, so a color line cannot claim another material
+    // through a protected line or through a different color at a junction. Local incident regions
+    // include tied junction candidates; ties use the stable region id, never click order.
+    function paintFillLineNeighbors(classes, labels, width, height) {
+      const n = width * height, index = new Int32Array(n), pixels = [];
+      index.fill(-1);
+      for (let i = 0; i < n; i += 1) if (classes[i] > 0) { index[i] = pixels.length; pixels.push(i); }
+      const owners = new Int32Array(pixels.length * 4), distances = new Int32Array(pixels.length * 4);
+      distances.fill(0x3fffffff);
+      // Distances are small chamfer integers (3/4 per step), so a bucket queue replaces the binary
+      // heap: entries are processed in nondecreasing distance with no per-entry object.
+      const buckets = [];
+      function push(i, owner, distance) {
+        if (!owner || index[i] < 0) return;
+        const start = index[i] * 4;
+        for (let rank = 0; rank < 4; rank += 1) {
+          if (owners[start + rank] !== owner) continue;
+          if (distances[start + rank] <= distance) return;
+          for (let k = rank; k < 3; k += 1) { owners[start + k] = owners[start + k + 1]; distances[start + k] = distances[start + k + 1]; }
+          owners[start + 3] = 0;
+          distances[start + 3] = 0x3fffffff;
+          break;
+        }
+        let rank = 0;
+        while (rank < 4 && (distances[start + rank] < distance || distances[start + rank] === distance && owners[start + rank] < owner)) rank += 1;
+        if (rank === 4) return;
+        for (let k = 3; k > rank; k -= 1) { owners[start + k] = owners[start + k - 1]; distances[start + k] = distances[start + k - 1]; }
+        owners[start + rank] = owner;
+        distances[start + rank] = distance;
+        (buckets[distance] || (buckets[distance] = [])).push(i, owner);
+      }
+      // Eight neighbours in row order; diagonal steps cost 4, straight steps 3.
+      const DX = [-1, 0, 1, -1, 1, -1, 0, 1], DY = [-1, -1, -1, 0, 0, 1, 1, 1], STEP = [4, 3, 4, 3, 3, 4, 3, 4];
+      for (let k = 0; k < pixels.length; k += 1) {
+        const i = pixels[k], x = i % width, y = (i - x) / width;
+        for (let m = 0; m < 8; m += 1) {
+          const xx = x + DX[m], yy = y + DY[m];
+          if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
+          const label = labels[yy * width + xx];
+          if (label) push(i, label, STEP[m]);
+        }
+      }
+      for (let distance = 0; distance < buckets.length; distance += 1) {
+        const bucket = buckets[distance];
+        if (!bucket) continue;
+        // Steps are at least 3, so pushes from this bucket never land in it.
+        for (let k = 0; k < bucket.length; k += 2) {
+          const i = bucket[k], owner = bucket[k + 1], start = index[i] * 4;
+          let live = false;
+          for (let r = 0; r < 4; r += 1) if (owners[start + r] === owner && distances[start + r] === distance) live = true;
+          if (!live) continue;
+          const x = i % width, y = (i - x) / width, kind = classes[i];
+          for (let m = 0; m < 8; m += 1) {
+            const xx = x + DX[m], yy = y + DY[m];
+            if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
+            const j = yy * width + xx;
+            if (classes[j] === kind && !labels[j]) push(j, owner, distance + STEP[m]);
+          }
+        }
+        buckets[distance] = null;
+      }
+      return { lineIndex: index, lineOwners: owners, lineDistances: distances };
+    }
+    // Slivers are the thin enclosed pockets left where lines meet: every pixel within 4 chamfer units (1.33 px) of
+    // the pocket's edge, whatever its length (a size cap leaves the longer pockets empty). Each keeps its neighbouring regions, reached across
+    // the line within 8 steps, in order of contact (ties by region id). An unassigned sliver takes the assignment of
+    // the first assigned neighbour (paintFillAssignments), so it follows its surroundings in any fill order, adds no
+    // saved data and yields to a click on the sliver itself. A pocket deeper than that — an eye highlight — is a
+    // region the painter fills on purpose.
+    function paintFillSlivers(labels, regions, width, height) {
+      const n = width * height, out = new Map(), small = new Set();
+      regions.forEach(function(r, label) { if (!r.edge) small.add(label); });
+      if (!small.size) return out;
+      const edge = new Uint8Array(n);
+      for (let i = 0; i < n; i += 1) edge[i] = labels[i] ? 0 : 1;
+      const dist = paintChamferDistance(edge, width, height), deep = new Set();
+      for (let i = 0; i < n; i += 1) if (small.has(labels[i]) && dist[i] > 4) deep.add(labels[i]);
+      const seen = new Int32Array(n), steps = new Uint8Array(n), queue = new Int32Array(n);
+      let stamp = 0;
+      small.forEach(function(label) {
+        if (deep.has(label)) return;
+        const r = regions.get(label), counts = new Map();
+        let head = 0, tail = 0;
+        stamp += 1;
+        for (let y = r.y0; y <= r.y1; y += 1) for (let i = y * width + r.x0, end = y * width + r.x1; i <= end; i += 1) {
+          if (labels[i] === label) { seen[i] = stamp; steps[i] = 0; queue[tail++] = i; }
+        }
+        while (head < tail) {
+          const i = queue[head++], x = i % width;
+          for (let m = 0; m < 4; m += 1) {
+            const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+            if (j < 0 || j >= n || seen[j] === stamp) continue;
+            seen[j] = stamp;
+            if (labels[j]) counts.set(labels[j], (counts.get(labels[j]) || 0) + 1);
+            else if (steps[i] < 8) { steps[j] = steps[i] + 1; queue[tail++] = j; }
+          }
+        }
+        const order = Array.from(counts.keys()).sort(function(a, b) { return counts.get(b) - counts.get(a) || a - b; });
+        if (order.length) out.set(label, Int32Array.from(order));
+      });
+      return out;
+    }
+    function paintFillTopology(images, width, height, settings, placement) {
+      const classification = paintFillClassify(images, width, height, settings, placement);
+      const n = width * height, allowed = new Uint8Array(n);
+      for (let i = 0; i < n; i += 1) allowed[i] = classification.classes[i] === 0 ? 1 : 0;
+      const virtual = settings.gapClose ? paintGapVirtualBarrier(allowed, width, height, settings.gapClose) : null;
+      // Only the empty pixels of a closed gap become virtual barrier. The segment starts on line end points, so ink on it
+      // keeps its own class (a protected line stays preserved, unregistered colour ink is not recoloured).
+      if (virtual) for (let i = 0; i < n; i += 1) if (virtual[i] && allowed[i]) { allowed[i] = 0; classification.classes[i] = settings.colors.length + 2; }
+      const labels = new Int32Array(n), queue = new Int32Array(n), regions = new Map();
+      for (let i = 0; i < n; i += 1) {
+        if (!allowed[i] || labels[i]) continue;
+        const count = paintFloodRegion(allowed, width, height, i, labels, i + 1, queue);
+        let edge = false, x0 = width, y0 = height, x1 = 0, y1 = 0;
+        // flood 큐의 같은 행에서 이어지는 구간은 양 끝만 경계 계산에 필요하다.
+        for (let k = 0; k < count;) {
+          const p = queue[k++], x = p % width, y = (p - x) / width, rowEnd = p - x + width;
+          let end = p;
+          while (k < count && end + 1 < rowEnd && queue[k] === end + 1) { end += 1; k += 1; }
+          const right = x + end - p;
+          edge = edge || x === 0 || right === width - 1 || y === 0 || y === height - 1;
+          x0 = Math.min(x0, x);
+          y0 = Math.min(y0, y);
+          x1 = Math.max(x1, right);
+          y1 = Math.max(y1, y);
+        }
+        regions.set(i + 1, { edge: edge, count: count, x0: x0, y0: y0, x1: x1, y1: y1 });
+      }
+      const neighbors = paintFillLineNeighbors(classification.classes, labels, width, height);
+      // Include every incident line support candidate, including ties. These bounds only restrict
+      // recomposition; connectivity and line ownership still use the complete image.
+      for (let i = 0; i < n; i += 1) {
+        const offset = neighbors.lineIndex[i] * 4;
+        if (offset < 0) continue;
+        const x = i % width, y = (i - x) / width;
+        for (let rank = 0; rank < 4; rank += 1) {
+          const r = regions.get(neighbors.lineOwners[offset + rank]);
+          if (r) {
+            r.x0 = Math.min(r.x0, x);
+            r.y0 = Math.min(r.y0, y);
+            r.x1 = Math.max(r.x1, x);
+            r.y1 = Math.max(r.y1, y);
+          }
+        }
+      }
+      const slivers = paintFillSlivers(labels, regions, width, height);
+      // The outside's slope of each outline: line pixels the outside reaches by never stepping to a fainter pixel
+      // (CSP "to darkest pixel", Krita "stop growing at darker pixels"). A darker core seals what lies beyond it.
+      const rim = new Uint8Array(n), alpha = classification.alpha, classes = classification.classes;
+      let head = 0, tail = 0;
+      for (let i = 0; i < n; i += 1) {
+        if (!labels[i] || !regions.get(labels[i]).edge) continue;
+        const x = i % width;
+        for (let m = 0; m < 4; m += 1) {
+          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j]) { rim[j] = 1; queue[tail++] = j; }
+        }
+      }
+      while (head < tail) {
+        const i = queue[head++], x = i % width;
+        for (let m = 0; m < 4; m += 1) {
+          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { rim[j] = 1; queue[tail++] = j; }
+        }
+      }
+      // climb: for a line pixel between enclosed regions, the region that reaches it without stepping to a fainter
+      // pixel (nearest first) when that is not its nearest region by distance; 0 elsewhere. Where two strokes
+      // converge, the valley between their cores keeps climbing from the pocket they enclose, so it belongs to
+      // that pocket, though the face beyond one core is nearer. Only line pixels are queued.
+      const climb = new Int32Array(n);
+      head = 0;
+      tail = 0;
+      for (let i = 0; i < n; i += 1) {
+        if (labels[i] || classes[i] <= 0) continue;
+        const x = i % width;
+        const from = i >= width && labels[i - width] || x > 0 && labels[i - 1] || x < width - 1 && labels[i + 1] || i + width < n && labels[i + width] || 0;
+        if (from) { climb[i] = from; queue[tail++] = i; }
+      }
+      while (head < tail) {
+        const i = queue[head++], x = i % width;
+        for (let m = 0; m < 4; m += 1) {
+          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+          if (j >= 0 && j < n && !climb[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { climb[j] = climb[i]; queue[tail++] = j; }
+        }
+      }
+      for (let k = 0; k < tail; k += 1) {
+        const i = queue[k], first = regions.get(neighbors.lineOwners[neighbors.lineIndex[i] * 4]);
+        const up = regions.get(climb[i]);
+        if (first && (first.edge || up === first) || up.edge) climb[i] = 0;
+      }
+      // inkOwner (per lineIndex): the region whose paint goes under an ink pixel, decided once here so that a
+      // render only reads it. Only the outside's own slope of an outline (rim) stays with the outside, so colour
+      // does not bleed past it; every other line pixel next to an enclosed region goes to that region, including a
+      // faint wedge that is nearer the outside by distance but sealed from it by a darker core. The ridge itself (a
+      // distance tie) goes inside, so a 1px translucent outline is not left see-through.
+      const owners = neighbors.lineOwners, distances = neighbors.lineDistances, inkOwner = new Int32Array(owners.length / 4);
+      for (let i = 0; i < n; i += 1) {
+        const at = neighbors.lineIndex[i];
+        if (at < 0) continue;
+        const first = owners[at * 4], second = owners[at * 4 + 1], f = regions.get(first), s = regions.get(second);
+        inkOwner[at] = f && f.edge && second && !(s && s.edge) && (!rim[i] || distances[at * 4 + 1] === distances[at * 4]) ? second : first;
+      }
+      return Object.assign(classification, neighbors, {
+        labels: labels,
+        regions: regions,
+        slivers: slivers,
+        climb: climb,
+        inkOwner: inkOwner,
+        width: width,
+        height: height
+      });
+    }
+
+    // Region assignment and rendering
+    function paintFillCovers(runs, index) {
+      if (!runs) return true;
+      let lo = 0, hi = runs.length / 2;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (runs[mid * 2 + 1] <= index) lo = mid + 1; else hi = mid; }
+      return lo * 2 < runs.length && runs[lo * 2] <= index;
+    }
+    function paintFillAssignRegions(model, regions, color, role, coverage) {
+      if (!regions.size) return model;
+      // A whole-region recolor supersedes its previous partial assignments. Partial assignments retain
+      // only nonoverlapping runs, so the final assignment set has no hidden click-order precedence.
+      const total = model.width * model.height;
+      const assignments = model.assignments.flatMap(function(a) {
+        if (!regions.has(a.region)) return [a];
+        if (!coverage) return [];
+        const source = a.coverage || [0, total], kept = [];
+        let ci = 0;
+        for (let k = 0; k < source.length; k += 2) {
+          let start = source[k], end = source[k + 1];
+          while (ci < coverage.length && coverage[ci + 1] <= start) ci += 2;
+          for (let j = ci; j < coverage.length && coverage[j] < end; j += 2) {
+            if (coverage[j] > start) kept.push(start, Math.min(end, coverage[j]));
+            start = Math.max(start, coverage[j + 1]);
+          }
+          if (start < end) kept.push(start, end);
+        }
+        return kept.length ? [Object.assign({}, a, { coverage: kept })] : [];
+      });
+      regions.forEach(function(region) { assignments.push({ region: region, anchor: region - 1, color: color, role: role, coverage: coverage }); });
+      assignments.sort(function(a, b) { return a.region - b.region || (a.coverage ? a.coverage[0] : 0) - (b.coverage ? b.coverage[0] : 0); });
+      return Object.assign({}, model, { assignments: assignments, state: 'active' });
+    }
+    function paintFillAssignments(model, topology) {
+      const grouped = new Map(), slivers = topology && topology.slivers;
+      model.assignments.forEach(function(a) { if (!grouped.has(a.region)) grouped.set(a.region, []); grouped.get(a.region).push(a); });
+      function own(region, pixel) {
+        const list = grouped.get(region);
+        if (list) for (let k = 0; k < list.length; k += 1) if (paintFillCovers(list[k].coverage, pixel)) return list[k];
+        return null;
+      }
+      function assignment(region, pixel) {
+        const a = own(region, pixel), order = !a && !grouped.has(region) && slivers && slivers.get(region);
+        if (order) for (let k = 0; k < order.length; k += 1) {
+          const b = own(order[k], pixel);   // the neighbour's own paint only: one hop, never borrowed through it
+          if (b) return b;
+        }
+        return a;
+      }
+      // An unrestricted first assignment wins at every pixel of this region, even if later
+      // assignments overlap it. A partial first assignment must still be resolved per pixel.
+      assignment.whole = function(region) {
+        const list = grouped.get(region);
+        return list && !list[0].coverage ? list[0] : null;
+      };
+      return assignment;
+    }
+    function paintFillPixelAssignment(model, topology, assignment, i) {
+      if (topology.labels[i]) return assignment(topology.labels[i], i);
+      if (topology.classes[i] <= 0) return null;
+      const line = model.options.colors[topology.classes[i] - 1];
+      const offset = topology.lineIndex[i] * 4;
+      if (!line || line.role === 'line') {
+        // Between enclosed regions the pixel follows the region that climbs to it (topology.climb), when painted;
+        // otherwise the region the topology chose for it (topology.inkOwner).
+        const climbed = topology.climb[i] ? assignment(topology.climb[i], i) : null;
+        return climbed || assignment(topology.inkOwner[topology.lineIndex[i]], i);
+      }
+      if (line.include) for (let rank = 0; rank < 4; rank += 1) {
+        if (rank > 1 && topology.lineDistances[offset + rank] > topology.lineDistances[offset + 1]) break;
+        const candidate = assignment(topology.lineOwners[offset + rank], i);
+        if (candidate && candidate.role === line.role) return candidate;
+      }
+      return null;
+    }
+    function paintFillRender(model, topology, base) {
+      const out = new ImageData(new Uint8ClampedArray(base.data), model.width, model.height);
+      const d = out.data, assignment = paintFillAssignments(model, topology);
+      const pixels = new Uint32Array(d.buffer), colors = new Map();
+      model.assignments.forEach(function(a) {
+        const rgba = new Uint8ClampedArray([a.color[0], a.color[1], a.color[2], 255]);
+        colors.set(a, new Uint32Array(rgba.buffer)[0]);
+      });
+      const preserveLines = model.sources.some(function(source) { return source.target; });
+      let x0 = model.width, y0 = model.height, x1 = -1, y1 = -1;
+      const painted = new Set();
+      model.assignments.forEach(function(a) {
+        const r = topology.regions.get(a.region);
+        painted.add(a.region);
+        if (r) { x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1); y1 = Math.max(y1, r.y1); }
+      });
+      topology.slivers.forEach(function(order, label) {
+        const r = topology.regions.get(label);
+        if (r && Array.prototype.some.call(order, function(nb) { return painted.has(nb); })) {
+          x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1);
+          y1 = Math.max(y1, r.y1);
+        }
+      });
+      for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
+        const i = y * model.width + x;
+        const a = !topology.under[i] && paintFillPixelAssignment(model, topology, assignment, i);
+        if (!a) continue;
+        const line = !topology.labels[i] && model.options.colors[topology.classes[i] - 1];
+        const j = i * 4, c = a.color;
+        const label = topology.labels[i];
+        if (label && !a.coverage && assignment.whole(label) === a) {
+          let end = i + 1;
+          const rowEnd = y * model.width + x1 + 1;
+          while (end < rowEnd && topology.labels[end] === label) end += 1;
+          if (end > i + 1) {
+            pixels.fill(colors.get(a), i, end);
+            x += end - i - 1;
+            continue;
+          }
+        }
+        if (!label && (!line || line.role === 'line') && preserveLines) {   // protected or dark-ink line: keep it over the fill
+          const alpha = base.data[j + 3] / 255;
+          for (let k = 0; k < 3; k += 1) d[j + k] = Math.round(base.data[j + k] * alpha + c[k] * (1 - alpha));
+        } else { d[j] = c[0]; d[j + 1] = c[1]; d[j + 2] = c[2]; }
+        d[j + 3] = 255;
+      }
+      return out;
+    }
+    // Red marks what still shows the background inside the drawing. A pixel is open when its own paint (this
+    // fill or the target's pixels) composited with the other sources lets more than 5/255 through. An open
+    // pixel is a hole when it belongs to an enclosed region (the region itself, or a line pixel whose nearest
+    // region is enclosed — a thin line can be translucent across its width) or when no open path leads from
+    // it to the canvas edge (a rim between colour already painted on the layer). The outer rim of a figure
+    // belongs to the outside and stays white.
+    function paintFillInspect(model, topology, base) {
+      const width = model.width, height = model.height, n = width * height;
+      const image = new ImageData(width, height), assignment = paintFillAssignments(model, topology), d = base.data;
+      const open = new Uint8Array(n), outside = new Int32Array(n), holes = new Uint8Array(n), queue = new Int32Array(n);
+      let regions = 0, unfilled = 0, ambiguous = 0;
+      for (let i = 0; i < n; i += 1) {
+        const own = paintFillPixelAssignment(model, topology, assignment, i) ? 255
+          : paintFillPixelEmpty(d, i * 4, model.options.whiteAsEmpty) ? 0
+          : d[i * 4 + 3];
+        open[i] = !topology.under[i] && (255 - own) * (255 - topology.cover[i]) > 5 * 255 ? 1 : 0;   // a lower line's core is the line itself
+      }
+      for (let i = 0; i < n; i += 1) {
+        const x = i % width;
+        if (x === 0 || x === width - 1 || i < width || i >= n - width) paintFloodRegion(open, width, height, i, outside, 1, queue);
+      }
+      for (let i = 0; i < n; i += 1) {
+        const label = topology.labels[i], offset = topology.lineIndex[i] * 4;
+        const owner = label || (offset >= 0 ? topology.lineOwners[offset] : 0), region = owner && topology.regions.get(owner);
+        const line = model.options.colors[topology.classes[i] - 1];
+        let r = 0, g = 0, b = 0;
+        if (open[i] && (region && !region.edge || !outside[i])) { r = 255; g = b = 48; holes[i] = 1; unfilled += 1; }
+        else if (open[i]) r = g = b = 255;
+        if (topology.ambiguous[i] || line && line.include && line.role !== 'line' && !paintFillPixelAssignment(model, topology, assignment, i)) { r = 255; g = 176; b = 0; ambiguous += 1; }
+        const j = i * 4;
+        image.data[j] = r;
+        image.data[j + 1] = g;
+        image.data[j + 2] = b;
+        image.data[j + 3] = 255;
+      }
+      outside.fill(0);
+      for (let i = 0; i < n; i += 1) if (holes[i] && !outside[i] && paintFloodRegion(holes, width, height, i, outside, 1, queue)) regions += 1;
+      return { image: image, regions: regions, unfilled: unfilled, ambiguous: ambiguous };
+    }
+    function paintFillEnclosed(model, topology, coverage, color, role, base) {
+      if (!coverage) return model;
+      const selected = new Set(), excluded = new Set(), assignment = paintFillAssignments(model, topology);
+      // Test the complete source component, not the lasso-clipped fragment. An open area or a
+      // partly enclosed component cannot become a falsely closed region at the lasso boundary.
+      for (let i = 0; i < topology.labels.length; i += 1) {
+        const label = topology.labels[i];
+        if (!label || topology.regions.get(label).edge) continue;
+        if (!paintFillCovers(coverage, i) || assignment(label, i) || base && !paintFillPixelEmpty(base.data, i * 4, model.options.whiteAsEmpty)) excluded.add(label);
+        else selected.add(label);
+      }
+      excluded.forEach(function(label) { selected.delete(label); });
+      return paintFillAssignRegions(model, selected, color, role, coverage);
+    }
+
+    // Model and job validation
+    function paintFillCheckModel(model) {
+      if (!model || model.version !== 1 || !Number.isInteger(model.width) || !Number.isInteger(model.height) || model.width < 1 || model.height < 1 ||
+          !model.options || !Array.isArray(model.options.colors) || !Array.isArray(model.sources) || !Array.isArray(model.assignments) || !model.base) throw new Error('paint.fill.version');
+      const count = model.width * model.height;
+      model.assignments.forEach(function(a) {
+        if (!a || !Number.isInteger(a.region) || a.region < 1 || a.region > count || !Array.isArray(a.color) || a.color.length !== 3 ||
+            a.color.some(function(v) { return !Number.isInteger(v) || v < 0 || v > 255; }) || !PAINT_FILL_ROLES.includes(a.role)) throw new Error('paint.fill.version');
+        if (a.coverage) {
+          if (!Array.isArray(a.coverage) || a.coverage.length % 2) throw new Error('paint.fill.version');
+          for (let i = 0; i < a.coverage.length; i += 2) if (!Number.isInteger(a.coverage[i]) || !Number.isInteger(a.coverage[i + 1]) ||
+              a.coverage[i] < 0 || a.coverage[i + 1] > count || a.coverage[i] >= a.coverage[i + 1] || i && a.coverage[i] < a.coverage[i - 1]) throw new Error('paint.fill.version');
+        }
+      });
+    }
+    function paintFillCacheKey(model) {
+      return JSON.stringify([model.id, model.x, model.y, model.width, model.height, model.base, model.sources, model.options]);
+    }
+    function paintFillImageValid(image, width, height) {
+      return Boolean(image && image.width === width && image.height === height && image.data instanceof Uint8ClampedArray && image.data.length === width * height * 4);
+    }
+    function paintFillCacheValid(cache, model) {
+      if (!cache || !paintFillImageValid(cache.base, model.width, model.height) || cache.key !== paintFillCacheKey(model)) return false;
+      const t = cache.topology, n = model.width * model.height;
+      if (!t) return true;
+      return t.width === model.width && t.height === model.height && t.regions instanceof Map &&
+        t.classes instanceof Int16Array && t.classes.length === n && t.alpha instanceof Uint8Array && t.alpha.length === n &&
+        t.ambiguous instanceof Uint8Array && t.ambiguous.length === n && t.cover instanceof Uint8Array && t.cover.length === n &&
+        t.under instanceof Uint8Array && t.under.length === n &&
+        t.labels instanceof Int32Array && t.labels.length === n && t.slivers instanceof Map && t.climb instanceof Int32Array && t.climb.length === n && t.inkOwner instanceof Int32Array &&
+        t.lineIndex instanceof Int32Array && t.lineIndex.length === n && t.lineOwners instanceof Int32Array &&
+        t.lineDistances instanceof Int32Array && t.lineOwners.length === t.lineDistances.length && t.lineOwners.length % 4 === 0 && t.lineOwners.length <= n * 4 &&
+        t.inkOwner.length * 4 === t.lineOwners.length;
+    }
+    function paintFillValidateJob(job) {
+      if (!job || !job.model) throw new Error('Invalid animation calculation');
+      const m = job.model, n = m.width * m.height;
+      paintFillCheckModel(m);
+      const o = m.options;
+      if (!Number.isSafeInteger(n) || n > 0x1fffffff || !Number.isFinite(m.x) || !Number.isFinite(m.y) ||
+          !Number.isFinite(o.coreAlpha) || o.coreAlpha < 1 || o.coreAlpha > 255 || !Number.isFinite(o.tolerance) || o.tolerance < 0 || o.tolerance > 255 ||
+          !Number.isFinite(o.gapClose) || o.gapClose < 0 || o.gapClose > 64 || !o.colors.length || o.colors.length > 32766 ||
+          o.colors.some(function(c) { return !c || !/^#[0-9a-f]{6}$/i.test(c.color) || c.role !== 'line' && !PAINT_FILL_ROLES.includes(c.role); }) ||
+          !['fill', 'check', 'enclose'].includes(job.operation) || !Number.isInteger(job.index) || job.index < 0 || job.index >= n ||
+          !paintFillImageValid(job.current, m.width, m.height) || !paintFillCacheValid(job.cache, m) ||
+          !Array.isArray(job.images) || (!job.cache.topology && !job.images.length) ||
+          job.images.some(function(image) { return !paintFillImageValid(image, m.width, m.height); })) throw new Error('Invalid animation calculation');
+      if (job.operation !== 'check' && (!/^#[0-9a-f]{6}$/i.test(job.color) || !PAINT_FILL_ROLES.includes(job.role))) throw new Error('Invalid animation color');
+      if (job.coverage != null) {
+        const runs = job.coverage;
+        if (!Array.isArray(runs) || runs.length % 2) throw new Error('Invalid animation selection');
+        for (let i = 0; i < runs.length; i += 2) if (!Number.isInteger(runs[i]) || !Number.isInteger(runs[i + 1]) ||
+          runs[i] < 0 || runs[i + 1] > n || runs[i] >= runs[i + 1] || i && runs[i] < runs[i - 1]) throw new Error('Invalid animation selection');
+      }
+    }
+
+    // Calculation and worker messages
+    function paintFillCompute(job) {
+      paintFillValidateJob(job);
+      const model = job.model, cache = job.cache, base = cache.base;
+      // Both engines list sources bottom to top, so entries before the target lie below it; without the
+      // target in the list, the reference mode says which side the sources are on.
+      const targetAt = model.sources.findIndex(function(s) { return s.target; });
+      if (!cache.topology) cache.topology = paintFillTopology(job.images, model.width, model.height, model.options, model.sources.map(function(s, i) {
+        return s.target ? 'target'
+          : (targetAt >= 0 ? i < targetAt : model.reference === 'below') ? 'below'
+          : 'above';
+      }));
+      // A press on a line or its faint rim fills the enclosed region that pixel belongs to, so a narrow wedge with
+      // no empty pixel, or a slightly missed click, still fills; only a press with no enclosed owner is refused.
+      const topology = cache.topology, at = topology.lineIndex[job.index] * 4;
+      let region = topology.labels[job.index];
+      if (!region && at >= 0) for (let rank = 0; rank < 4 && !region; rank += 1) {
+        const owner = topology.lineOwners[at + rank], r = owner && topology.regions.get(owner);
+        if (r && !r.edge) region = owner;
+      }
+      let result = { changed: false };
+      if (job.operation === 'check') result.inspection = paintFillInspect(model, topology, base);
+      else {
+        if (job.operation !== 'enclose' && !region) throw new Error('paint.fill.boundary');
+        if (job.operation === 'enclose' || paintFillCovers(job.coverage, job.index)) {
+          const rgb = [1, 3, 5].map(function(offset) { return parseInt(job.color.slice(offset, offset + 2), 16); });
+          const next = job.operation === 'enclose' ? paintFillEnclosed(model, topology, job.coverage, rgb, job.role, base) : paintFillAssignRegions(model, new Set([region]), rgb, job.role, job.coverage);
+          if (next !== model) {
+            const image = paintFillRender(next, topology, base);
+            const dirty = paintFillChangedRect(job.current, image);
+            if (dirty || JSON.stringify(next.assignments) !== JSON.stringify(model.assignments)) result = {
+              changed: true, model: next, image: image, dirty: dirty,
+              hasInk: gengaTileCellHasInk(image, 0, 0, { x: 0, y: 0, w: image.width, h: image.height })
+            };
+          }
+        }
+      }
+      return { cache: cache, result: result };
+    }
+    function paintFillChangedRect(before, after) {
+      const pixels = function(image) {
+        const data = image.data;
+        return data.byteOffset % 4 ? new Uint32Array(data.slice().buffer) : new Uint32Array(data.buffer, data.byteOffset, data.length / 4);
+      };
+      const a = pixels(before), b = pixels(after), width = before.width;
+      let x0 = width, y0 = before.height, x1 = -1, y1 = -1;
+      // The first and last differing pixel of each row bound every change in that row, so broad recolors
+      // skip per-pixel coordinates.
+      for (let y = 0; y < before.height; y += 1) {
+        const start = y * width;
+        let left = 0, right = width - 1;
+        while (left < width && a[start + left] === b[start + left]) left += 1;
+        if (left === width) continue;
+        while (right > left && a[start + right] === b[start + right]) right -= 1;
+        x0 = Math.min(x0, left);
+        x1 = Math.max(x1, right);
+        y0 = Math.min(y0, y);
+        y1 = y;
+      }
+      return x1 < 0 ? null : { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+    }
+    function paintFillTransferables(value) {
+      const buffers = new Set(), visited = new Set();
+      function visit(item) {
+        if (!item || typeof item !== 'object' || visited.has(item)) return;
+        visited.add(item);
+        if (ArrayBuffer.isView(item)) { if (item.buffer.byteLength) buffers.add(item.buffer); return; }
+        if (item instanceof ImageData) { visit(item.data); return; }
+        Object.keys(item).forEach(function(key) { visit(item[key]); });
+      }
+      visit(value);
+      return Array.from(buffers);
+    }
+    function paintFillWorkerMain() {
+      'use strict';
+      self.onmessage = function(event) {
+        const m = event.data;
+        try {
+          if (!m || !Number.isSafeInteger(m.seq) || m.seq < 1) throw new Error('Invalid animation request identity');
+          const value = paintFillCompute(m.job);
+          self.postMessage({ seq: m.seq, value: value }, paintFillTransferables(value));
+        } catch (error) { self.postMessage({ seq: m && m.seq, error: String(error.message || error) }); }
+      };
+    }
+
+    if ('importScripts' in self) paintFillWorkerMain();
+  </script>
 
   <script>
     // ================================================================================================
@@ -93886,7 +94754,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       { color: '#0000ff', role: 'shadow', include: true },
       { color: '#ff0000', role: 'highlight', include: true }
     ];
-    const PAINT_FILL_ROLES = ['base', 'shadow', 'highlight'];
     function paintFillSettings() {
       const raw = state.project && state.project.settings && state.project.settings.animationFill;
       const colors = raw && Array.isArray(raw.colors) ? raw.colors : PAINT_FILL_DEFAULT_COLORS;
@@ -93900,316 +94767,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         whiteAsEmpty: paintBucketOptionVal('whiteAsEmpty') === '1',
         gapClose: paintBucketGapVal()
       };
-    }
-    // Four-connected flood is shared with the ordinary bucket. A supplied label buffer avoids a
-    // whole-image allocation for every component; stable labels are their first pixel index + 1.
-    function paintFloodRegion(allowed, width, height, seed, labels, value, queue) {
-      if (!allowed[seed] || labels[seed]) return 0;
-      let head = 0, tail = 0;
-      const count = width * height;
-      // The caller's queue still contains every visited pixel once. Contiguous row runs
-      // share boundary checks; callers use membership/count, not the traversal order.
-      function appendRun(i) {
-        const rowStart = i - i % width, rowEnd = rowStart + width;
-        let left = i, right = i;
-        while (left > rowStart && allowed[left - 1] && !labels[left - 1]) left -= 1;
-        while (right + 1 < rowEnd && allowed[right + 1] && !labels[right + 1]) right += 1;
-        for (let p = left; p <= right; p += 1) { labels[p] = value; queue[tail++] = p; }
-        return right;
-      }
-      appendRun(seed);
-      while (head < tail) {
-        const start = queue[head++], rowEnd = start - start % width + width;
-        let end = start;
-        while (head < tail && end + 1 < rowEnd && queue[head] === end + 1) { end += 1; head += 1; }
-        for (let offset = -width; offset <= width; offset += width * 2) {
-          if (start + offset < 0 || end + offset >= count) continue;
-          for (let i = start + offset; i <= end + offset; i += 1) {
-            if (allowed[i] && !labels[i]) i = appendRun(i);
-          }
-        }
-      }
-      return tail;
-    }
-    function paintFillPixelEmpty(data, offset, whiteAsEmpty) {
-      return !data[offset + 3] || Boolean(whiteAsEmpty && data[offset] === 255 && data[offset + 1] === 255 && data[offset + 2] === 255);
-    }
-    // Unregistered ink that is dark and nearly neutral is the main line (class colors.length + 1), so lines
-    // in the default near-black pen or a dark grey need no registration — the same expectation as CSP's
-    // "to darkest pixel" and Krita's "stop growing at darker pixels". Other unregistered ink (colour
-    // already painted on the layer) stays a barrier that is neither filled under nor recoloured.
-    // `placement` gives each source's place relative to the fill target ('target' | 'below' | 'above').
-    // `cover` is the composite alpha of the sources that are not the target; the color check adds the
-    // target itself, so a reference to the current layer is not counted twice. `under` marks the core
-    // (alpha >= coreAlpha) of a main line on a layer below the target: paint there would hide the line, so it
-    // stays unpainted while the faint rim is painted over — CSP's "to darkest pixel" from above.
-    function paintFillClassify(images, width, height, settings, placement) {
-      const n = width * height, classes = new Int16Array(n), alpha = new Uint8Array(n), under = new Uint8Array(n);
-      const ambiguous = new Uint8Array(n), queue = new Int32Array(n), cover = new Uint8Array(n);
-      const colors = settings.colors.map(function(c) { return [parseInt(c.color.slice(1, 3), 16), parseInt(c.color.slice(3, 5), 16), parseInt(c.color.slice(5, 7), 16)]; });
-      const inkLine = colors.length + 1, lineRole = settings.colors.map(function(c) { return c.role === 'line'; });
-      const priorities = settings.colors.map(function(c) { return c.role === 'line' ? PAINT_FILL_ROLES.length : PAINT_FILL_ROLES.indexOf(c.role); }).concat(PAINT_FILL_ROLES.length);
-      images.forEach(function(image, source) {
-        if (image.width !== width || image.height !== height) throw new Error('Animation source dimensions changed');
-        const d = image.data, candidate = new Int16Array(n), connected = new Uint8Array(n);
-        const covers = !placement || placement[source] !== 'target',
-          below = Boolean(placement && placement[source] === 'below');
-        let head = 0, tail = 0;
-        for (let i = 0; i < n; i += 1) {
-          const j = i * 4, a = d[j + 3];
-          if (paintFillPixelEmpty(d, j, settings.whiteAsEmpty)) continue;
-          if (covers) cover[i] = 255 - Math.round((255 - cover[i]) * (255 - a) / 255);
-          let k = 0;
-          for (; k < colors.length; k += 1) {
-            const c = colors[k];
-            if (Math.abs(d[j] - c[0]) <= settings.tolerance && Math.abs(d[j + 1] - c[1]) <= settings.tolerance && Math.abs(d[j + 2] - c[2]) <= settings.tolerance) break;
-          }
-          // A faint rim pixel can round to a registered line colour while its core is another dark ink;
-          // both are the one main line, so they share a class instead of splitting into ambiguity.
-          const hi = Math.max(d[j], d[j + 1], d[j + 2]), dark = hi <= 64 && hi - Math.min(d[j], d[j + 1], d[j + 2]) <= 32;
-          const found = k < colors.length && !(dark && lineRole[k]) ? k + 1 : dark ? inkLine : -1;
-          candidate[i] = found;
-          if (found > 0 && a >= settings.coreAlpha) { connected[i] = 1; queue[tail++] = i; }
-        }
-        while (head < tail) {
-          const i = queue[head++], x = i % width, y = Math.floor(i / width);
-          for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
-            if (!(dx || dy) || x + dx < 0 || x + dx >= width || y + dy < 0 || y + dy >= height) continue;
-            const j = i + dy * width + dx;
-            if (!connected[j] && candidate[j] === candidate[i]) { connected[j] = 1; queue[tail++] = j; }
-          }
-        }
-        for (let i = 0; i < n; i += 1) {
-          const k = candidate[i];
-          if (!k) continue;
-          if (k < 0 || !connected[i]) {
-            if (!classes[i]) classes[i] = -1;
-            if (k > 0 && classes[i] < 0) ambiguous[i] = 1;
-            continue;
-          }
-          const current = classes[i];
-          // Protected lines rank above the remaining roles in PAINT_FILL_ROLES order.
-          if (current > 0 && priorities[current - 1] > priorities[k - 1]) continue;
-          classes[i] = k;
-          alpha[i] = d[i * 4 + 3];
-          ambiguous[i] = 0;
-          under[i] = below && alpha[i] >= settings.coreAlpha && (k === inkLine || lineRole[k - 1]) ? 1 : 0;   // colour trace lines are still painted with Include
-        }
-      });
-      return { classes: classes, alpha: alpha, ambiguous: ambiguous, cover: cover, under: under };
-    }
-    // Propagation stays in one kind of line support, so a color line cannot claim another material
-    // through a protected line or through a different color at a junction. Local incident regions
-    // include tied junction candidates; ties use the stable region id, never click order.
-    function paintFillLineNeighbors(classes, labels, width, height) {
-      const n = width * height, index = new Int32Array(n), pixels = [];
-      index.fill(-1);
-      for (let i = 0; i < n; i += 1) if (classes[i] > 0) { index[i] = pixels.length; pixels.push(i); }
-      const owners = new Int32Array(pixels.length * 4), distances = new Int32Array(pixels.length * 4);
-      distances.fill(0x3fffffff);
-      // Distances are small chamfer integers (3/4 per step), so a bucket queue replaces the binary
-      // heap: entries are processed in nondecreasing distance with no per-entry object.
-      const buckets = [];
-      function push(i, owner, distance) {
-        if (!owner || index[i] < 0) return;
-        const start = index[i] * 4;
-        for (let rank = 0; rank < 4; rank += 1) {
-          if (owners[start + rank] !== owner) continue;
-          if (distances[start + rank] <= distance) return;
-          for (let k = rank; k < 3; k += 1) { owners[start + k] = owners[start + k + 1]; distances[start + k] = distances[start + k + 1]; }
-          owners[start + 3] = 0;
-          distances[start + 3] = 0x3fffffff;
-          break;
-        }
-        let rank = 0;
-        while (rank < 4 && (distances[start + rank] < distance || distances[start + rank] === distance && owners[start + rank] < owner)) rank += 1;
-        if (rank === 4) return;
-        for (let k = 3; k > rank; k -= 1) { owners[start + k] = owners[start + k - 1]; distances[start + k] = distances[start + k - 1]; }
-        owners[start + rank] = owner;
-        distances[start + rank] = distance;
-        (buckets[distance] || (buckets[distance] = [])).push(i, owner);
-      }
-      // Eight neighbours in row order; diagonal steps cost 4, straight steps 3.
-      const DX = [-1, 0, 1, -1, 1, -1, 0, 1], DY = [-1, -1, -1, 0, 0, 1, 1, 1], STEP = [4, 3, 4, 3, 3, 4, 3, 4];
-      for (let k = 0; k < pixels.length; k += 1) {
-        const i = pixels[k], x = i % width, y = (i - x) / width;
-        for (let m = 0; m < 8; m += 1) {
-          const xx = x + DX[m], yy = y + DY[m];
-          if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
-          const label = labels[yy * width + xx];
-          if (label) push(i, label, STEP[m]);
-        }
-      }
-      for (let distance = 0; distance < buckets.length; distance += 1) {
-        const bucket = buckets[distance];
-        if (!bucket) continue;
-        // Steps are at least 3, so pushes from this bucket never land in it.
-        for (let k = 0; k < bucket.length; k += 2) {
-          const i = bucket[k], owner = bucket[k + 1], start = index[i] * 4;
-          let live = false;
-          for (let r = 0; r < 4; r += 1) if (owners[start + r] === owner && distances[start + r] === distance) live = true;
-          if (!live) continue;
-          const x = i % width, y = (i - x) / width, kind = classes[i];
-          for (let m = 0; m < 8; m += 1) {
-            const xx = x + DX[m], yy = y + DY[m];
-            if (xx < 0 || xx >= width || yy < 0 || yy >= height) continue;
-            const j = yy * width + xx;
-            if (classes[j] === kind && !labels[j]) push(j, owner, distance + STEP[m]);
-          }
-        }
-        buckets[distance] = null;
-      }
-      return { lineIndex: index, lineOwners: owners, lineDistances: distances };
-    }
-    // Slivers are the thin enclosed pockets left where lines meet: every pixel within 4 chamfer units (1.33 px) of
-    // the pocket's edge, whatever its length (a size cap leaves the longer pockets empty). Each keeps its neighbouring regions, reached across
-    // the line within 8 steps, in order of contact (ties by region id). An unassigned sliver takes the assignment of
-    // the first assigned neighbour (paintFillAssignments), so it follows its surroundings in any fill order, adds no
-    // saved data and yields to a click on the sliver itself. A pocket deeper than that — an eye highlight — is a
-    // region the painter fills on purpose.
-    function paintFillSlivers(labels, regions, width, height) {
-      const n = width * height, out = new Map(), small = new Set();
-      regions.forEach(function(r, label) { if (!r.edge) small.add(label); });
-      if (!small.size) return out;
-      const edge = new Uint8Array(n);
-      for (let i = 0; i < n; i += 1) edge[i] = labels[i] ? 0 : 1;
-      const dist = paintChamferDistance(edge, width, height), deep = new Set();
-      for (let i = 0; i < n; i += 1) if (small.has(labels[i]) && dist[i] > 4) deep.add(labels[i]);
-      const seen = new Int32Array(n), steps = new Uint8Array(n), queue = new Int32Array(n);
-      let stamp = 0;
-      small.forEach(function(label) {
-        if (deep.has(label)) return;
-        const r = regions.get(label), counts = new Map();
-        let head = 0, tail = 0;
-        stamp += 1;
-        for (let y = r.y0; y <= r.y1; y += 1) for (let i = y * width + r.x0, end = y * width + r.x1; i <= end; i += 1) {
-          if (labels[i] === label) { seen[i] = stamp; steps[i] = 0; queue[tail++] = i; }
-        }
-        while (head < tail) {
-          const i = queue[head++], x = i % width;
-          for (let m = 0; m < 4; m += 1) {
-            const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-            if (j < 0 || j >= n || seen[j] === stamp) continue;
-            seen[j] = stamp;
-            if (labels[j]) counts.set(labels[j], (counts.get(labels[j]) || 0) + 1);
-            else if (steps[i] < 8) { steps[j] = steps[i] + 1; queue[tail++] = j; }
-          }
-        }
-        const order = Array.from(counts.keys()).sort(function(a, b) { return counts.get(b) - counts.get(a) || a - b; });
-        if (order.length) out.set(label, Int32Array.from(order));
-      });
-      return out;
-    }
-    function paintFillTopology(images, width, height, settings, placement) {
-      const classification = paintFillClassify(images, width, height, settings, placement);
-      const n = width * height, allowed = new Uint8Array(n);
-      for (let i = 0; i < n; i += 1) allowed[i] = classification.classes[i] === 0 ? 1 : 0;
-      const virtual = settings.gapClose ? paintGapVirtualBarrier(allowed, width, height, settings.gapClose) : null;
-      // Only the empty pixels of a closed gap become virtual barrier. The segment starts on line end points, so ink on it
-      // keeps its own class (a protected line stays preserved, unregistered colour ink is not recoloured).
-      if (virtual) for (let i = 0; i < n; i += 1) if (virtual[i] && allowed[i]) { allowed[i] = 0; classification.classes[i] = settings.colors.length + 2; }
-      const labels = new Int32Array(n), queue = new Int32Array(n), regions = new Map();
-      for (let i = 0; i < n; i += 1) {
-        if (!allowed[i] || labels[i]) continue;
-        const count = paintFloodRegion(allowed, width, height, i, labels, i + 1, queue);
-        let edge = false, x0 = width, y0 = height, x1 = 0, y1 = 0;
-        // flood 큐의 같은 행에서 이어지는 구간은 양 끝만 경계 계산에 필요하다.
-        for (let k = 0; k < count;) {
-          const p = queue[k++], x = p % width, y = (p - x) / width, rowEnd = p - x + width;
-          let end = p;
-          while (k < count && end + 1 < rowEnd && queue[k] === end + 1) { end += 1; k += 1; }
-          const right = x + end - p;
-          edge = edge || x === 0 || right === width - 1 || y === 0 || y === height - 1;
-          x0 = Math.min(x0, x);
-          y0 = Math.min(y0, y);
-          x1 = Math.max(x1, right);
-          y1 = Math.max(y1, y);
-        }
-        regions.set(i + 1, { edge: edge, count: count, x0: x0, y0: y0, x1: x1, y1: y1 });
-      }
-      const neighbors = paintFillLineNeighbors(classification.classes, labels, width, height);
-      // Include every incident line support candidate, including ties. These bounds only restrict
-      // recomposition; connectivity and line ownership still use the complete image.
-      for (let i = 0; i < n; i += 1) {
-        const offset = neighbors.lineIndex[i] * 4;
-        if (offset < 0) continue;
-        const x = i % width, y = (i - x) / width;
-        for (let rank = 0; rank < 4; rank += 1) {
-          const r = regions.get(neighbors.lineOwners[offset + rank]);
-          if (r) {
-            r.x0 = Math.min(r.x0, x);
-            r.y0 = Math.min(r.y0, y);
-            r.x1 = Math.max(r.x1, x);
-            r.y1 = Math.max(r.y1, y);
-          }
-        }
-      }
-      const slivers = paintFillSlivers(labels, regions, width, height);
-      // The outside's slope of each outline: line pixels the outside reaches by never stepping to a fainter pixel
-      // (CSP "to darkest pixel", Krita "stop growing at darker pixels"). A darker core seals what lies beyond it.
-      const rim = new Uint8Array(n), alpha = classification.alpha, classes = classification.classes;
-      let head = 0, tail = 0;
-      for (let i = 0; i < n; i += 1) {
-        if (!labels[i] || !regions.get(labels[i]).edge) continue;
-        const x = i % width;
-        for (let m = 0; m < 4; m += 1) {
-          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j]) { rim[j] = 1; queue[tail++] = j; }
-        }
-      }
-      while (head < tail) {
-        const i = queue[head++], x = i % width;
-        for (let m = 0; m < 4; m += 1) {
-          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { rim[j] = 1; queue[tail++] = j; }
-        }
-      }
-      // climb: for a line pixel between enclosed regions, the region that reaches it without stepping to a fainter
-      // pixel (nearest first) when that is not its nearest region by distance; 0 elsewhere. Where two strokes
-      // converge, the valley between their cores keeps climbing from the pocket they enclose, so it belongs to
-      // that pocket, though the face beyond one core is nearer. Only line pixels are queued.
-      const climb = new Int32Array(n);
-      head = 0;
-      tail = 0;
-      for (let i = 0; i < n; i += 1) {
-        if (labels[i] || classes[i] <= 0) continue;
-        const x = i % width;
-        const from = i >= width && labels[i - width] || x > 0 && labels[i - 1] || x < width - 1 && labels[i + 1] || i + width < n && labels[i + width] || 0;
-        if (from) { climb[i] = from; queue[tail++] = i; }
-      }
-      while (head < tail) {
-        const i = queue[head++], x = i % width;
-        for (let m = 0; m < 4; m += 1) {
-          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-          if (j >= 0 && j < n && !climb[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { climb[j] = climb[i]; queue[tail++] = j; }
-        }
-      }
-      for (let k = 0; k < tail; k += 1) {
-        const i = queue[k], first = regions.get(neighbors.lineOwners[neighbors.lineIndex[i] * 4]);
-        const up = regions.get(climb[i]);
-        if (first && (first.edge || up === first) || up.edge) climb[i] = 0;
-      }
-      // inkOwner (per lineIndex): the region whose paint goes under an ink pixel, decided once here so that a
-      // render only reads it. Only the outside's own slope of an outline (rim) stays with the outside, so colour
-      // does not bleed past it; every other line pixel next to an enclosed region goes to that region, including a
-      // faint wedge that is nearer the outside by distance but sealed from it by a darker core. The ridge itself (a
-      // distance tie) goes inside, so a 1px translucent outline is not left see-through.
-      const owners = neighbors.lineOwners, distances = neighbors.lineDistances, inkOwner = new Int32Array(owners.length / 4);
-      for (let i = 0; i < n; i += 1) {
-        const at = neighbors.lineIndex[i];
-        if (at < 0) continue;
-        const first = owners[at * 4], second = owners[at * 4 + 1], f = regions.get(first), s = regions.get(second);
-        inkOwner[at] = f && f.edge && second && !(s && s.edge) && (!rim[i] || distances[at * 4 + 1] === distances[at * 4]) ? second : first;
-      }
-      return Object.assign(classification, neighbors, {
-        labels: labels,
-        regions: regions,
-        slivers: slivers,
-        climb: climb,
-        inkOwner: inkOwner,
-        width: width,
-        height: height
-      });
     }
     function paintFillCoverage(clip, width, height) {
       if (!clip) return null;
@@ -94225,317 +94782,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return runs;
     }
-    function paintFillCovers(runs, index) {
-      if (!runs) return true;
-      let lo = 0, hi = runs.length / 2;
-      while (lo < hi) { const mid = (lo + hi) >> 1; if (runs[mid * 2 + 1] <= index) lo = mid + 1; else hi = mid; }
-      return lo * 2 < runs.length && runs[lo * 2] <= index;
-    }
-    function paintFillAssignRegions(model, regions, color, role, coverage) {
-      if (!regions.size) return model;
-      // A whole-region recolor supersedes its previous partial assignments. Partial assignments retain
-      // only nonoverlapping runs, so the final assignment set has no hidden click-order precedence.
-      const total = model.width * model.height;
-      const assignments = model.assignments.flatMap(function(a) {
-        if (!regions.has(a.region)) return [a];
-        if (!coverage) return [];
-        const source = a.coverage || [0, total], kept = [];
-        let ci = 0;
-        for (let k = 0; k < source.length; k += 2) {
-          let start = source[k], end = source[k + 1];
-          while (ci < coverage.length && coverage[ci + 1] <= start) ci += 2;
-          for (let j = ci; j < coverage.length && coverage[j] < end; j += 2) {
-            if (coverage[j] > start) kept.push(start, Math.min(end, coverage[j]));
-            start = Math.max(start, coverage[j + 1]);
-          }
-          if (start < end) kept.push(start, end);
-        }
-        return kept.length ? [Object.assign({}, a, { coverage: kept })] : [];
-      });
-      regions.forEach(function(region) { assignments.push({ region: region, anchor: region - 1, color: color, role: role, coverage: coverage }); });
-      assignments.sort(function(a, b) { return a.region - b.region || (a.coverage ? a.coverage[0] : 0) - (b.coverage ? b.coverage[0] : 0); });
-      return Object.assign({}, model, { assignments: assignments, state: 'active' });
-    }
-    function paintFillAssignments(model, topology) {
-      const grouped = new Map(), slivers = topology && topology.slivers;
-      model.assignments.forEach(function(a) { if (!grouped.has(a.region)) grouped.set(a.region, []); grouped.get(a.region).push(a); });
-      function own(region, pixel) {
-        const list = grouped.get(region);
-        if (list) for (let k = 0; k < list.length; k += 1) if (paintFillCovers(list[k].coverage, pixel)) return list[k];
-        return null;
-      }
-      function assignment(region, pixel) {
-        const a = own(region, pixel), order = !a && !grouped.has(region) && slivers && slivers.get(region);
-        if (order) for (let k = 0; k < order.length; k += 1) {
-          const b = own(order[k], pixel);   // the neighbour's own paint only: one hop, never borrowed through it
-          if (b) return b;
-        }
-        return a;
-      }
-      // An unrestricted first assignment wins at every pixel of this region, even if later
-      // assignments overlap it. A partial first assignment must still be resolved per pixel.
-      assignment.whole = function(region) {
-        const list = grouped.get(region);
-        return list && !list[0].coverage ? list[0] : null;
-      };
-      return assignment;
-    }
-    function paintFillPixelAssignment(model, topology, assignment, i) {
-      if (topology.labels[i]) return assignment(topology.labels[i], i);
-      if (topology.classes[i] <= 0) return null;
-      const line = model.options.colors[topology.classes[i] - 1];
-      const offset = topology.lineIndex[i] * 4;
-      if (!line || line.role === 'line') {
-        // Between enclosed regions the pixel follows the region that climbs to it (topology.climb), when painted;
-        // otherwise the region the topology chose for it (topology.inkOwner).
-        const climbed = topology.climb[i] ? assignment(topology.climb[i], i) : null;
-        return climbed || assignment(topology.inkOwner[topology.lineIndex[i]], i);
-      }
-      if (line.include) for (let rank = 0; rank < 4; rank += 1) {
-        if (rank > 1 && topology.lineDistances[offset + rank] > topology.lineDistances[offset + 1]) break;
-        const candidate = assignment(topology.lineOwners[offset + rank], i);
-        if (candidate && candidate.role === line.role) return candidate;
-      }
-      return null;
-    }
-    function paintFillRender(model, topology, base) {
-      const out = new ImageData(new Uint8ClampedArray(base.data), model.width, model.height);
-      const d = out.data, assignment = paintFillAssignments(model, topology);
-      const pixels = new Uint32Array(d.buffer), colors = new Map();
-      model.assignments.forEach(function(a) {
-        const rgba = new Uint8ClampedArray([a.color[0], a.color[1], a.color[2], 255]);
-        colors.set(a, new Uint32Array(rgba.buffer)[0]);
-      });
-      const preserveLines = model.sources.some(function(source) { return source.target; });
-      let x0 = model.width, y0 = model.height, x1 = -1, y1 = -1;
-      const painted = new Set();
-      model.assignments.forEach(function(a) {
-        const r = topology.regions.get(a.region);
-        painted.add(a.region);
-        if (r) { x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1); y1 = Math.max(y1, r.y1); }
-      });
-      topology.slivers.forEach(function(order, label) {
-        const r = topology.regions.get(label);
-        if (r && Array.prototype.some.call(order, function(nb) { return painted.has(nb); })) {
-          x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1);
-          y1 = Math.max(y1, r.y1);
-        }
-      });
-      for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
-        const i = y * model.width + x;
-        const a = !topology.under[i] && paintFillPixelAssignment(model, topology, assignment, i);
-        if (!a) continue;
-        const line = !topology.labels[i] && model.options.colors[topology.classes[i] - 1];
-        const j = i * 4, c = a.color;
-        const label = topology.labels[i];
-        if (label && !a.coverage && assignment.whole(label) === a) {
-          let end = i + 1;
-          const rowEnd = y * model.width + x1 + 1;
-          while (end < rowEnd && topology.labels[end] === label) end += 1;
-          if (end > i + 1) {
-            pixels.fill(colors.get(a), i, end);
-            x += end - i - 1;
-            continue;
-          }
-        }
-        if (!label && (!line || line.role === 'line') && preserveLines) {   // protected or dark-ink line: keep it over the fill
-          const alpha = base.data[j + 3] / 255;
-          for (let k = 0; k < 3; k += 1) d[j + k] = Math.round(base.data[j + k] * alpha + c[k] * (1 - alpha));
-        } else { d[j] = c[0]; d[j + 1] = c[1]; d[j + 2] = c[2]; }
-        d[j + 3] = 255;
-      }
-      return out;
-    }
-    // Red marks what still shows the background inside the drawing. A pixel is open when its own paint (this
-    // fill or the target's pixels) composited with the other sources lets more than 5/255 through. An open
-    // pixel is a hole when it belongs to an enclosed region (the region itself, or a line pixel whose nearest
-    // region is enclosed — a thin line can be translucent across its width) or when no open path leads from
-    // it to the canvas edge (a rim between colour already painted on the layer). The outer rim of a figure
-    // belongs to the outside and stays white.
-    function paintFillInspect(model, topology, base) {
-      const width = model.width, height = model.height, n = width * height;
-      const image = new ImageData(width, height), assignment = paintFillAssignments(model, topology), d = base.data;
-      const open = new Uint8Array(n), outside = new Int32Array(n), holes = new Uint8Array(n), queue = new Int32Array(n);
-      let regions = 0, unfilled = 0, ambiguous = 0;
-      for (let i = 0; i < n; i += 1) {
-        const own = paintFillPixelAssignment(model, topology, assignment, i) ? 255
-          : paintFillPixelEmpty(d, i * 4, model.options.whiteAsEmpty) ? 0
-          : d[i * 4 + 3];
-        open[i] = !topology.under[i] && (255 - own) * (255 - topology.cover[i]) > 5 * 255 ? 1 : 0;   // a lower line's core is the line itself
-      }
-      for (let i = 0; i < n; i += 1) {
-        const x = i % width;
-        if (x === 0 || x === width - 1 || i < width || i >= n - width) paintFloodRegion(open, width, height, i, outside, 1, queue);
-      }
-      for (let i = 0; i < n; i += 1) {
-        const label = topology.labels[i], offset = topology.lineIndex[i] * 4;
-        const owner = label || (offset >= 0 ? topology.lineOwners[offset] : 0), region = owner && topology.regions.get(owner);
-        const line = model.options.colors[topology.classes[i] - 1];
-        let r = 0, g = 0, b = 0;
-        if (open[i] && (region && !region.edge || !outside[i])) { r = 255; g = b = 48; holes[i] = 1; unfilled += 1; }
-        else if (open[i]) r = g = b = 255;
-        if (topology.ambiguous[i] || line && line.include && line.role !== 'line' && !paintFillPixelAssignment(model, topology, assignment, i)) { r = 255; g = 176; b = 0; ambiguous += 1; }
-        const j = i * 4;
-        image.data[j] = r;
-        image.data[j + 1] = g;
-        image.data[j + 2] = b;
-        image.data[j + 3] = 255;
-      }
-      outside.fill(0);
-      for (let i = 0; i < n; i += 1) if (holes[i] && !outside[i] && paintFloodRegion(holes, width, height, i, outside, 1, queue)) regions += 1;
-      return { image: image, regions: regions, unfilled: unfilled, ambiguous: ambiguous };
-    }
-    function paintFillEnclosed(model, topology, coverage, color, role, base) {
-      if (!coverage) return model;
-      const selected = new Set(), excluded = new Set(), assignment = paintFillAssignments(model, topology);
-      // Test the complete source component, not the lasso-clipped fragment. An open area or a
-      // partly enclosed component cannot become a falsely closed region at the lasso boundary.
-      for (let i = 0; i < topology.labels.length; i += 1) {
-        const label = topology.labels[i];
-        if (!label || topology.regions.get(label).edge) continue;
-        if (!paintFillCovers(coverage, i) || assignment(label, i) || base && !paintFillPixelEmpty(base.data, i * 4, model.options.whiteAsEmpty)) excluded.add(label);
-        else selected.add(label);
-      }
-      excluded.forEach(function(label) { selected.delete(label); });
-      return paintFillAssignRegions(model, selected, color, role, coverage);
-    }
 
-    // One pure kernel source serves the worker and the no-Worker fallback. The worker has no
-    // project/store/DOM access and retains no second topology cache between messages.
-    function paintFillImageValid(image, width, height) {
-      return Boolean(image && image.width === width && image.height === height && image.data instanceof Uint8ClampedArray && image.data.length === width * height * 4);
-    }
-    function paintFillCacheValid(cache, model) {
-      if (!cache || !paintFillImageValid(cache.base, model.width, model.height) || cache.key !== paintFillCacheKey(model)) return false;
-      const t = cache.topology, n = model.width * model.height;
-      if (!t) return true;
-      return t.width === model.width && t.height === model.height && t.regions instanceof Map &&
-        t.classes instanceof Int16Array && t.classes.length === n && t.alpha instanceof Uint8Array && t.alpha.length === n &&
-        t.ambiguous instanceof Uint8Array && t.ambiguous.length === n && t.cover instanceof Uint8Array && t.cover.length === n &&
-        t.under instanceof Uint8Array && t.under.length === n &&
-        t.labels instanceof Int32Array && t.labels.length === n && t.slivers instanceof Map && t.climb instanceof Int32Array && t.climb.length === n && t.inkOwner instanceof Int32Array &&
-        t.lineIndex instanceof Int32Array && t.lineIndex.length === n && t.lineOwners instanceof Int32Array &&
-        t.lineDistances instanceof Int32Array && t.lineOwners.length === t.lineDistances.length && t.lineOwners.length % 4 === 0 && t.lineOwners.length <= n * 4 &&
-        t.inkOwner.length * 4 === t.lineOwners.length;
-    }
-    function paintFillValidateJob(job) {
-      if (!job || !job.model) throw new Error('Invalid animation calculation');
-      const m = job.model, n = m.width * m.height;
-      paintFillCheckModel(m);
-      const o = m.options;
-      if (!Number.isSafeInteger(n) || n > 0x1fffffff || !Number.isFinite(m.x) || !Number.isFinite(m.y) ||
-          !Number.isFinite(o.coreAlpha) || o.coreAlpha < 1 || o.coreAlpha > 255 || !Number.isFinite(o.tolerance) || o.tolerance < 0 || o.tolerance > 255 ||
-          !Number.isFinite(o.gapClose) || o.gapClose < 0 || o.gapClose > 64 || !o.colors.length || o.colors.length > 32766 ||
-          o.colors.some(function(c) { return !c || !/^#[0-9a-f]{6}$/i.test(c.color) || c.role !== 'line' && !PAINT_FILL_ROLES.includes(c.role); }) ||
-          !['fill', 'check', 'enclose'].includes(job.operation) || !Number.isInteger(job.index) || job.index < 0 || job.index >= n ||
-          !paintFillImageValid(job.current, m.width, m.height) || !paintFillCacheValid(job.cache, m) ||
-          !Array.isArray(job.images) || (!job.cache.topology && !job.images.length) ||
-          job.images.some(function(image) { return !paintFillImageValid(image, m.width, m.height); })) throw new Error('Invalid animation calculation');
-      if (job.operation !== 'check' && (!/^#[0-9a-f]{6}$/i.test(job.color) || !PAINT_FILL_ROLES.includes(job.role))) throw new Error('Invalid animation color');
-      if (job.coverage != null) {
-        const runs = job.coverage;
-        if (!Array.isArray(runs) || runs.length % 2) throw new Error('Invalid animation selection');
-        for (let i = 0; i < runs.length; i += 2) if (!Number.isInteger(runs[i]) || !Number.isInteger(runs[i + 1]) ||
-          runs[i] < 0 || runs[i + 1] > n || runs[i] >= runs[i + 1] || i && runs[i] < runs[i - 1]) throw new Error('Invalid animation selection');
-      }
-    }
-    function paintFillCompute(job) {
-      paintFillValidateJob(job);
-      const model = job.model, cache = job.cache, base = cache.base;
-      // Both engines list sources bottom to top, so entries before the target lie below it; without the
-      // target in the list, the reference mode says which side the sources are on.
-      const targetAt = model.sources.findIndex(function(s) { return s.target; });
-      if (!cache.topology) cache.topology = paintFillTopology(job.images, model.width, model.height, model.options, model.sources.map(function(s, i) {
-        return s.target ? 'target'
-          : (targetAt >= 0 ? i < targetAt : model.reference === 'below') ? 'below'
-          : 'above';
-      }));
-      // A press on a line or its faint rim fills the enclosed region that pixel belongs to, so a narrow wedge with
-      // no empty pixel, or a slightly missed click, still fills; only a press with no enclosed owner is refused.
-      const topology = cache.topology, at = topology.lineIndex[job.index] * 4;
-      let region = topology.labels[job.index];
-      if (!region && at >= 0) for (let rank = 0; rank < 4 && !region; rank += 1) {
-        const owner = topology.lineOwners[at + rank], r = owner && topology.regions.get(owner);
-        if (r && !r.edge) region = owner;
-      }
-      let result = { changed: false };
-      if (job.operation === 'check') result.inspection = paintFillInspect(model, topology, base);
-      else {
-        if (job.operation !== 'enclose' && !region) throw new Error('paint.fill.boundary');
-        if (job.operation === 'enclose' || paintFillCovers(job.coverage, job.index)) {
-          const rgb = [1, 3, 5].map(function(offset) { return parseInt(job.color.slice(offset, offset + 2), 16); });
-          const next = job.operation === 'enclose' ? paintFillEnclosed(model, topology, job.coverage, rgb, job.role, base) : paintFillAssignRegions(model, new Set([region]), rgb, job.role, job.coverage);
-          if (next !== model) {
-            const image = paintFillRender(next, topology, base);
-            const dirty = paintFillChangedRect(job.current, image);
-            if (dirty || JSON.stringify(next.assignments) !== JSON.stringify(model.assignments)) result = {
-              changed: true, model: next, image: image, dirty: dirty,
-              hasInk: gengaTileCellHasInk(image, 0, 0, { x: 0, y: 0, w: image.width, h: image.height })
-            };
-          }
-        }
-      }
-      return { cache: cache, result: result };
-    }
-    function paintFillChangedRect(before, after) {
-      const pixels = function(image) {
-        const data = image.data;
-        return data.byteOffset % 4 ? new Uint32Array(data.slice().buffer) : new Uint32Array(data.buffer, data.byteOffset, data.length / 4);
-      };
-      const a = pixels(before), b = pixels(after), width = before.width;
-      let x0 = width, y0 = before.height, x1 = -1, y1 = -1;
-      // The first and last differing pixel of each row bound every change in that row, so broad recolors
-      // skip per-pixel coordinates.
-      for (let y = 0; y < before.height; y += 1) {
-        const start = y * width;
-        let left = 0, right = width - 1;
-        while (left < width && a[start + left] === b[start + left]) left += 1;
-        if (left === width) continue;
-        while (right > left && a[start + right] === b[start + right]) right -= 1;
-        x0 = Math.min(x0, left);
-        x1 = Math.max(x1, right);
-        y0 = Math.min(y0, y);
-        y1 = y;
-      }
-      return x1 < 0 ? null : { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
-    }
-    function paintFillTransferables(value) {
-      const buffers = new Set(), visited = new Set();
-      function visit(item) {
-        if (!item || typeof item !== 'object' || visited.has(item)) return;
-        visited.add(item);
-        if (ArrayBuffer.isView(item)) { if (item.buffer.byteLength) buffers.add(item.buffer); return; }
-        if (item instanceof ImageData) { visit(item.data); return; }
-        Object.keys(item).forEach(function(key) { visit(item[key]); });
-      }
-      visit(value);
-      return Array.from(buffers);
-    }
     function paintFillInspectionCanvas(inspection) {
       const canvas = document.createElement('canvas');
       canvas.width = inspection.image.width; canvas.height = inspection.image.height;
       canvas.getContext('2d').putImageData(inspection.image, 0, 0);
       return { canvas: canvas, regions: inspection.regions, unfilled: inspection.unfilled, ambiguous: inspection.ambiguous };
-    }
-    function paintFillWorkerMain() {
-      'use strict';
-      self.onmessage = function(event) {
-        const m = event.data;
-        try {
-          if (!m || !Number.isSafeInteger(m.seq) || m.seq < 1) throw new Error('Invalid animation request identity');
-          const value = paintFillCompute(m.job);
-          self.postMessage({ seq: m.seq, value: value }, paintFillTransferables(value));
-        } catch (error) { self.postMessage({ seq: m && m.seq, error: String(error.message || error) }); }
-      };
-    }
-    function paintFillWorkerSource() {
-      return 'const PAINT_FILL_ROLES = ' + JSON.stringify(PAINT_FILL_ROLES) + ';\n' +
-        [paintFillPixelEmpty, paintFillClassify, paintFillLineNeighbors, paintFillSlivers, paintFillTopology, paintFloodRegion,
-          paintGapVirtualBarrier, paintChamferDistance, paintFillCovers, paintFillAssignRegions, paintFillAssignments,
-          paintFillPixelAssignment, paintFillRender, paintFillInspect, paintFillEnclosed, paintFillCheckModel,
-          paintFillCacheKey, paintFillImageValid, paintFillCacheValid, paintFillValidateJob, paintFillCompute,
-          paintFillChangedRect, paintFillTransferables, gengaTileCellHasInk].map(function(fn) { return fn.toString(); }).join('\n') +
-        '\n(' + paintFillWorkerMain.toString() + ')();';
     }
     function paintFillWorkerCancel() {
       if (!state.paintFillWorkerJob) return;
@@ -94562,7 +94814,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (state.paintFillWorker == null) {
         let url;
         try {
-          url = URL.createObjectURL(new Blob([paintFillWorkerSource()], { type: 'text/javascript' }));
+          const source = document.getElementById('moart-fill-kernel').textContent;
+          url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
           state.paintFillWorker = new Worker(url);
         } catch (error) {
           state.paintFillWorker = false;
@@ -94653,23 +94906,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return [String(source.key || ''), canvas.width, canvas.height, hex];
       }));
       return JSON.stringify(signatures);
-    }
-    function paintFillCheckModel(model) {
-      if (!model || model.version !== 1 || !Number.isInteger(model.width) || !Number.isInteger(model.height) || model.width < 1 || model.height < 1 ||
-          !model.options || !Array.isArray(model.options.colors) || !Array.isArray(model.sources) || !Array.isArray(model.assignments) || !model.base) throw new Error('paint.fill.version');
-      const count = model.width * model.height;
-      model.assignments.forEach(function(a) {
-        if (!a || !Number.isInteger(a.region) || a.region < 1 || a.region > count || !Array.isArray(a.color) || a.color.length !== 3 ||
-            a.color.some(function(v) { return !Number.isInteger(v) || v < 0 || v > 255; }) || !PAINT_FILL_ROLES.includes(a.role)) throw new Error('paint.fill.version');
-        if (a.coverage) {
-          if (!Array.isArray(a.coverage) || a.coverage.length % 2) throw new Error('paint.fill.version');
-          for (let i = 0; i < a.coverage.length; i += 2) if (!Number.isInteger(a.coverage[i]) || !Number.isInteger(a.coverage[i + 1]) ||
-              a.coverage[i] < 0 || a.coverage[i + 1] > count || a.coverage[i] >= a.coverage[i + 1] || i && a.coverage[i] < a.coverage[i - 1]) throw new Error('paint.fill.version');
-        }
-      });
-    }
-    function paintFillCacheKey(model) {
-      return JSON.stringify([model.id, model.x, model.y, model.width, model.height, model.base, model.sources, model.options]);
     }
     async function paintFillPrepareModel(model, input, context) {
       if (!model) return null;
@@ -94869,226 +95105,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         transparent: Boolean(state.paintTransparent),   // 透明色: 영역을 지운다. 두 진입점 공용
         underpaint: paintBucketUnderpaintOn()           // 参照가 다른 레이어일 때만 커널이 읽는다
       };
-    }
-    // chamfer(3,4) 거리 지도 — 채우기 확장과 틈 닫기(아래)가 함께 쓴다. seed 픽셀 0, 나머지는 가장 가까운 seed
-    // 까지의 거리 ×3(직교 3 · 대각 4).
-    function paintChamferDistance(seed, W, H) {
-      const N = W * H;
-      const INF = 0x3fffffff;
-      const dist = new Int32Array(N);
-      for (let i = 0; i < N; i += 1) dist[i] = seed[i] ? 0 : INF;
-      for (let y = 0; y < H; y += 1) {          // 앞으로 한 번
-        const row = y * W;
-        for (let x = 0; x < W; x += 1) {
-          const i = row + x;
-          let v = dist[i];
-          if (y > 0) {
-            if (x > 0 && dist[i - W - 1] + 4 < v) v = dist[i - W - 1] + 4;
-            if (dist[i - W] + 3 < v) v = dist[i - W] + 3;
-            if (x < W - 1 && dist[i - W + 1] + 4 < v) v = dist[i - W + 1] + 4;
-          }
-          if (x > 0 && dist[i - 1] + 3 < v) v = dist[i - 1] + 3;
-          dist[i] = v;
-        }
-      }
-      for (let y = H - 1; y >= 0; y -= 1) {     // 뒤로 한 번
-        const row = y * W;
-        for (let x = W - 1; x >= 0; x -= 1) {
-          const i = row + x;
-          let v = dist[i];
-          if (y < H - 1) {
-            if (x < W - 1 && dist[i + W + 1] + 4 < v) v = dist[i + W + 1] + 4;
-            if (dist[i + W] + 3 < v) v = dist[i + W] + 3;
-            if (x > 0 && dist[i + W - 1] + 4 < v) v = dist[i + W - 1] + 4;
-          }
-          if (x < W - 1 && dist[i + 1] + 3 < v) v = dist[i + 1] + 3;
-          dist[i] = v;
-        }
-      }
-      return dist;
-    }
-    // 틈 닫기: 장벽을 팽창시키지 않고 끊어진 선의 끝을 가상 선으로 잇는다. 팽창법은 좁은 가지·통로까지
-    // 지우고(PaintMan 매뉴얼도 「狭い部分で塗り止まり」를 그 부작용으로 적는다), seed 가 마진에 먹히면 멈출 수밖에
-    // 없다. 여기서는 그림 픽셀을 바꾸지 않고 flood 가 못 지나갈 가상 장벽만 만든다.
-    // ① 선(!match)을 Zhang-Suen 으로 세선화 → 중심축. 겉 픽셀만 후보로 돌린다(안쪽은 이웃 8 이라 못 깎인다)
-    // ② 중심축에서 8-이웃이 하나뿐인 픽셀 = 끝점. 끝점마다 중심축을 거슬러 간 점으로 접선을 잡고, 분기점까지가
-    // 반두께 안이면 세선화 부산물(spur)이라 버린다 — 두꺼운 선의 모서리마다 생겨 옆 선과 오연결한다
-    // ③ 끝점 쌍: 선분을 따라 지나는 빈 칸 수가 gap 이하인 쌍을 틈이 작은 순으로 짝짓는다(끝점당 한 번).
-    // 틈 뒤에 선을 지나 다시 빈 칸이 나오면 다른 선을 가로지르는 것이라 버린다
-    // ④ 짝이 없는 끝점: 접선 방향으로 빈 칸 gap 개 안에 선이 있으면 거기까지 잇는다 — 다른 선의 «중간»에 못 닿은
-    // 틈(가장 흔한 틈)은 끝점이 한쪽뿐이라 ③ 으로는 못 잇는다
-    // ⑤ supercover 로 굽는다 — 4방향 flood 가 대각으로 못 새게 모서리 칸까지 찍는다
-    // 순수 함수(match, W, H, gap → Uint8Array | null). 이은 것이 없으면 null(= gap 0 과 같은 flood). 통로의 벽은
-    // 선의 «중간»이라 끝점이 없고, 허공에서 끝난 선 하나는 상대가 없어 그대로다(둘 다 팽창법은 못 가른다).
-    // 틈은 칸 수(Chebyshev)로 센다 — 「gap N = N 칸」(대각 한 칸도 한 칸).
-    function paintGapVirtualBarrier(match, W, H, gap) {
-      const N = W * H;
-      const sk = new Uint8Array(N);
-      let count = 0;
-      for (let i = 0; i < N; i += 1) if (!match[i]) { sk[i] = 1; count += 1; }
-      if (!count || count === N) return null;
-      const OFF = [-W, -W + 1, 1, W + 1, W, W - 1, -1, -W - 1];   // P2..P9 = N, NE, E, SE, S, SW, W, NW
-      const nb = new Int32Array(8);
-      const neighbors = function(i) {
-        const x = i % W, y = (i - x) / W;
-        const up = y > 0, dn = y < H - 1, lf = x > 0, rt = x < W - 1;
-        nb[0] = up ? sk[i - W] : 0;
-        nb[1] = (up && rt) ? sk[i - W + 1] : 0;
-        nb[2] = rt ? sk[i + 1] : 0;
-        nb[3] = (dn && rt) ? sk[i + W + 1] : 0;
-        nb[4] = dn ? sk[i + W] : 0;
-        nb[5] = (dn && lf) ? sk[i + W - 1] : 0;
-        nb[6] = lf ? sk[i - 1] : 0;
-        nb[7] = (up && lf) ? sk[i - W - 1] : 0;
-        return nb[0] + nb[1] + nb[2] + nb[3] + nb[4] + nb[5] + nb[6] + nb[7];
-      };
-      const crossings = function() {                      // nb 의 0→1 전이 수 = 이웃 «덩어리» 수. 1 이면 끝, 3 이상이면 분기
-        let a = 0;                                        // (이웃 «수»로 재면 코너 옆 픽셀이 대각 이웃 때문에 분기로 보인다)
-        for (let q = 0; q < 8; q += 1) if (!nb[q] && nb[(q + 1) & 7]) a += 1;
-        return a;
-      };
-      // ① Zhang-Suen — 깎인 픽셀의 이웃만 후보에 더해 가며, 한 라운드(두 반 반복)에 아무것도 안 깎일 때까지
-      let active = [];
-      const queued = new Uint8Array(N);
-      for (let i = 0; i < N; i += 1) if (sk[i] && neighbors(i) < 8) { active.push(i); queued[i] = 1; }
-      for (;;) {
-        let killed = 0;
-        for (let sub = 0; sub < 2; sub += 1) {
-          const kill = [];
-          for (let k = 0; k < active.length; k += 1) {
-            const i = active[k];
-            if (!sk[i]) continue;
-            const b = neighbors(i);
-            if (b < 2 || b > 6 || crossings() !== 1) continue;
-            const p2 = nb[0], p4 = nb[2], p6 = nb[4], p8 = nb[6];
-            if (sub === 0) { if ((p2 && p4 && p6) || (p4 && p6 && p8)) continue; }
-            else if ((p2 && p4 && p8) || (p2 && p6 && p8)) continue;
-            kill.push(i);
-          }
-          for (let k = 0; k < kill.length; k += 1) {
-            const i = kill[k];
-            sk[i] = 0;
-            neighbors(i);
-            for (let q = 0; q < 8; q += 1) if (nb[q] && !queued[i + OFF[q]]) { queued[i + OFF[q]] = 1; active.push(i + OFF[q]); }
-          }
-          killed += kill.length;
-        }
-        if (!killed) break;
-        const alive = [];
-        for (let k = 0; k < active.length; k += 1) if (sk[active[k]]) alive.push(active[k]);
-        active = alive;
-      }
-      // ② 끝점 · 접선 · spur
-      const dEmpty = paintChamferDistance(match, W, H);   // 선 픽셀 → 가장 가까운 빈 픽셀. 중심축에서 잰 반두께 = 그 거리 − ½
-      const ends = [];
-      const BACK = 8, TANGENT = 4;                          // 분기는 8 칸 안에서 찾고, 접선은 4 칸 뒤 점으로 잡는다(더 멀면 코너를 돌아 방향이 뒤집힌다)
-      const ORDER = [0, 2, 4, 6, 1, 3, 5, 7];               // 직교 이웃 먼저
-      const trail = [];
-      for (let i = 0; i < N; i += 1) {
-        if (!sk[i]) continue;
-        if (!neighbors(i) || crossings() !== 1) continue;
-        trail.length = 0;
-        trail.push(i);
-        let cur = i, branched = false;
-        while (trail.length <= BACK) {                      // 중심축을 거슬러 간다 — 분기점이나 BACK 칸에서 멈춘다
-          neighbors(cur);
-          if (trail.length > 1 && crossings() >= 3) { branched = true; break; }
-          let nxt = -1;
-          for (let k = 0; k < 8 && nxt < 0; k += 1) { const q = ORDER[k]; if (nb[q] && trail.indexOf(cur + OFF[q]) < 0) nxt = cur + OFF[q]; }
-          if (nxt < 0) break;
-          trail.push(nxt);
-          cur = nxt;
-        }
-        const steps = trail.length - 1;
-        const hw = Math.max(0, dEmpty[i] / 3 - 0.5);
-        if (branched && steps <= hw + 1.5) continue;       // spur
-        const tail = trail[Math.min(steps, TANGENT)];
-        const x = i % W, y = (i - x) / W, tx = tail % W, ty = (tail - tx) / W;
-        const len = Math.hypot(x - tx, y - ty) || 1;
-        ends.push({ i: i, x: x, y: y, ux: (x - tx) / len, uy: (y - ty) / len, hw: hw });
-      }
-      if (!ends.length) return null;
-      const maxHw = ends.reduce(function(maximum, e) { return Math.max(maximum, e.hw); }, 0);
-      // supercover Bresenham — 대각으로 한 칸 건널 때 모서리 두 칸을 corner 로 함께 방문한다. visit 가 false 면 중단
-      const walkLine = function(x0, y0, x1, y1, visit) {
-        const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
-        let err = dx - dy, x = x0, y = y0;
-        if (visit(y * W + x, false) === false) return false;
-        while (x !== x1 || y !== y1) {
-          const e2 = 2 * err;
-          let mx = false, my = false;
-          if (e2 > -dy) { err -= dy; x += sx; mx = true; }
-          if (e2 < dx) { err += dx; y += sy; my = true; }
-          if (mx && my) { visit((y - sy) * W + x, true); visit(y * W + (x - sx), true); }
-          if (visit(y * W + x, false) === false) return false;
-        }
-        return true;
-      };
-      // ③ 쌍 — 틈이 작은 순 · 접선이 맞는 순 · 가까운 순 · 좌표 순으로 고정한다(같은 그림이면 같은 답)
-      const cand = [];
-      for (let a = 0; a < ends.length; a += 1) {
-        const A = ends[a];
-        for (let b = a + 1; b < ends.length; b += 1) {
-          const B = ends[b];
-          const dx = B.x - A.x, dy = B.y - A.y;
-          // Raster order makes later y nondecreasing; no later pair can pass the distance test below.
-          if (dy > gap + A.hw + maxHw + 2) break;
-          const cheb = Math.max(Math.abs(dx), Math.abs(dy));
-          if (cheb <= 1 || cheb > gap + A.hw + B.hw + 2) continue;
-          const dl = Math.hypot(dx, dy);
-          const faceA = (A.ux * dx + A.uy * dy) / dl, faceB = -(B.ux * dx + B.uy * dy) / dl;
-          if (faceA < -0.3 || faceB < -0.3) continue;       // 서로 등을 돌린 끝점 — 나란한 두 선의 끝은 틈이 아니다(접선 불일치)
-          let hole = 0, stage = 0, ok = true;                // 자기 몸통(0) → 틈(1) → 상대 몸통(2) → 또 빈 칸이면 가로지름
-          walkLine(A.x, A.y, B.x, B.y, function(j, corner) {
-            if (corner) return true;
-            if (match[j]) {
-              if (stage === 2) { ok = false; return false; }
-              stage = 1;
-              hole += 1;
-              return hole <= gap;
-            }
-            if (stage === 1) stage = 2;
-            return true;
-          });
-          if (!ok || hole > gap) continue;
-          cand.push({ a: a, b: b, hole: hole, miss: 2 - faceA - faceB, d2: dx * dx + dy * dy });
-        }
-      }
-      cand.sort(function(p, q) { return (p.hole - q.hole) || (p.miss - q.miss) || (p.d2 - q.d2) || (ends[p.a].i - ends[q.a].i) || (ends[p.b].i - ends[q.b].i); });
-      const used = new Uint8Array(ends.length);
-      const virt = new Uint8Array(N);
-      const stamp = function(j) { virt[j] = 1; return true; };
-      let drawn = 0;
-      for (let c = 0; c < cand.length; c += 1) {
-        const p = cand[c];
-        if (used[p.a] || used[p.b]) continue;
-        used[p.a] = 1;
-        used[p.b] = 1;
-        walkLine(ends[p.a].x, ends[p.a].y, ends[p.b].x, ends[p.b].y, stamp);
-        drawn += 1;
-      }
-      // ④ 짝 없는 끝점 — 접선 방향으로 나간다. 자기 몸통을 지나 빈 칸이 나오고, 빈 칸 gap 개 안에 선을 만나면 거기까지
-      for (let a = 0; a < ends.length; a += 1) {
-        if (used[a]) continue;
-        const E = ends[a];
-        const limit = Math.ceil((E.hw + gap + 2) * 1.5);
-        let px = E.x, py = E.y, seen = 0, hit = -1;
-        for (let t = 1; t <= limit; t += 1) {
-          const nx = Math.round(E.x + E.ux * t), ny = Math.round(E.y + E.uy * t);
-          if (nx < 0 || ny < 0 || nx >= W || ny >= H) break;
-          if (nx === px && ny === py) continue;
-          px = nx;
-          py = ny;
-          const j = ny * W + nx;
-          if (match[j]) { seen += 1; if (seen > gap) break; }
-          else if (seen) { hit = j; break; }
-        }
-        if (hit < 0) continue;
-        walkLine(E.x, E.y, hit % W, (hit - hit % W) / W, stamp);
-        used[a] = 1;
-        drawn += 1;
-      }
-      return drawn ? virt : null;
     }
     function paintBucketMatchMask(rd, N, si, tol, seedEmpty) {
       const sr = rd[si], sg = rd[si + 1], sb = rd[si + 2], sa = rd[si + 3];
@@ -124229,16 +124245,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       t.height = rect.h;
       t.getContext('2d').drawImage(cv, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
       return t;
-    }
-    // 미리 읽은 ImageData 창에서 칸 하나의 잉크 유무 — alphaInkBoundsScan 의 minAlpha 기본(1)과 같은 판정.
-    function gengaTileCellHasInk(img, ox, oy, rect) {
-      const data = img.data, stride = img.width;
-      const x0 = rect.x - ox, y0 = rect.y - oy;
-      for (let y = 0; y < rect.h; y++) {
-        let off = ((y0 + y) * stride + x0) * 4 + 3;
-        for (let x = 0; x < rect.w; x++, off += 4) { if (data[off] >= 1) return true; }
-      }
-      return false;
     }
     // 자른 칸의 RGBA8 버퍼로 단색을 증명한다. 크기·알파까지 같아야 같은 PNG를 쓸 수 있다.
     // 추가 readback 없이 검사하며, 픽셀 버퍼는 보관하지 않는다.
