@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3515</title>
+  <title>MoArt ver3516</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -27281,7 +27281,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.penInputSeen = true;
       try { localStorage.setItem(PEN_SEEN_STORAGE_KEY, '1'); } catch (error) {}
       if (!wasDrawing || fingerDrawingEnabled()) return;
-      if (gengaDrawSession && fingerPointersDown.has(gengaDrawSession.pointerId)) gengaCancelSingleFingerOps();
+      // A finger owns the genga stroke: drop the single-finger ops as a pinch does (only the open engine has any).
+      if (gengaDrawSession && fingerPointersDown.has(gengaDrawSession.pointerId)) paintCancelSingleFingerOps();
       if (state.paintRasterOp && fingerPointersDown.has(state.paintPointerId)) discardActivePaintStrokeForGesture();
       if (state.paintPendingBucketFill && fingerPointersDown.has(state.paintPendingBucketFill.pointerId)) paintDiscardPendingBucketFill();   // 손가락을 뗄 때 칠할 통
     }
@@ -60982,8 +60983,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    // The conte twin of gengaCancelSingleFingerOps. A confirmed pinch takes over whatever single-finger op
-    // finger 1 started, and on conte that is two things: the raster stroke and the parapara margin flip
+    // paintCancelSingleFingerOps (both engines). A confirmed pinch takes over whatever single-finger op
+    // finger 1 started; on conte that is two things: the raster stroke and the parapara margin flip
     // (state.previewPanelFlipTouch, begun inside beginVideoPaintStroke). Cancelling only the stroke would let a
     // margin flip keep stepping frames (continueVideoPaintStroke still routes finger 1 to
     // continuePreviewPanelFlipTouch) while the pinch zooms and pans. Likewise a camera-frame drag: finger 1 on the
@@ -60994,9 +60995,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // pointerId + currentTarget and we are holding finger 2's move here, so it would early-return anyway. The
     // browser releases capture on that pointer's up/cancel, and until then it keeps finger 1 retargeted to
     // #conteVideoStage, where the pinch listens.
-    function conteCancelSingleFingerOpsForGesture() {
-      discardActivePaintStrokeForGesture();
+    // Both engines drop the same set: whichever engine is open owns only its own pieces, the rest are already empty.
+    function paintCancelSingleFingerOps() {
+      gengaEndDrawSession();                // genga stroke/shape session
+      discardActivePaintStrokeForGesture(); // conte / 用紙 raster stroke
       paintDiscardPendingBucketFill();      // 아직 안 칠한 통도 여기서 버린다
+      if (gengaFlipTouch) { gengaFlipTouch = null; gengaSetParaparaFrame(null); }
       if (state.previewPanelFlipTouch) {
         state.previewPanelFlipTouch = null;
         clearParaparaPreviewOverlay();
@@ -61038,7 +61042,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       twoFingerUnpin();   // 다음 제스처는 제 짝을 새로 고른다
       // a cancelled gesture is never a tap; a clean lift may be one
       if (evType === 'pointercancel') twoFingerGestureClear();
-      else twoFingerGestureEndDraining(videoPreviewPointers, conteCancelSingleFingerOpsForGesture);
+      else twoFingerGestureEndDraining(videoPreviewPointers, paintCancelSingleFingerOps);
       saveEditorUiState();
     }
     // 손가락 중점이 용지 중심에서 얼마나 떨어졌나(local px). 회전·반전·확대된 용지의 화면 상자 중심이 곧 용지 중심이다.
@@ -61086,7 +61090,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               startWidth: videoPreviewWidthPx(), startRotEff: videoViewRotEff(),
               d0: videoPinchAnchorOffset(v.mx, v.my)
             };
-            twoFingerGestureBegin(v, conteCancelSingleFingerOpsForGesture); // 기하 전체
+            twoFingerGestureBegin(v, paintCancelSingleFingerOps); // 기하 전체
           }
         }
       }, true);
@@ -61098,8 +61102,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const v = videoPreviewPinchVals();
         if (v) {
           // Only a gesture that actually moved gets to eat the in-progress single-finger op — stroke and flip
-          // (see conteCancelSingleFingerOpsForGesture).
-          if (twoFingerGestureMove(v)) conteCancelSingleFingerOpsForGesture();
+          // (see paintCancelSingleFingerOps).
+          if (twoFingerGestureMove(v)) paintCancelSingleFingerOps();
           if (twoFingerPinchDisarmed()) return; // 탭·롱프레스가 살아 있으면 화면을 안 움직인다
           const p = videoPreviewPinch;
           state.videoPreviewZoom = clampVideoPreviewZoom(p.startZoom * v.d / Math.max(1, p.startDist), p.startZoom);
@@ -62501,7 +62505,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       event.stopPropagation();
     }
     // Drop an armed camera-frame drag without committing (the cancel rule) and redraw the frame from the
-    // committed transform. Window blur and a confirmed two-finger gesture (conteCancelSingleFingerOpsForGesture).
+    // committed transform. Window blur and a confirmed two-finger gesture (paintCancelSingleFingerOps).
     function discardCameraFrameDrag() {
       if (!state.cameraFrameDrag) return;
       cameraFrameDragLatest = null;
@@ -81488,6 +81492,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         default: return 'source-over';
       }
     }
+    // How a stroke buffer lands on its layer, for both engines: eraser (or 透明色) cuts, 透明度保護 paints only where
+    // pixels are, otherwise the brush mode the stroke started with; replace-alpha only when nothing of that wins.
+    function paintStrokeCompositeSpec(src, erase, alphaLock) {
+      return {
+        gco: erase ? 'destination-out' : alphaLock ? 'source-atop' : paintBrushModeCompositeOp(src.mode),
+        replaceAlpha: !erase && !alphaLock && paintStrokeReplacesAlpha(src)
+      };
+    }
     function paintStrokeReplacesAlpha(src) {
       if (!src) return false;
       // CSP 혼색은 층의 RGBA 를 직접 정한다(알파가 줄 수도 있다) — 닿은 픽셀을 coverage 로 대체하는 합성을 탄다.
@@ -96807,7 +96819,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // threshold applies. Only runs when a modeBaseCanvas was snapshotted at begin.
     // One composite recipe for both engines (conte's paintRecompositeStrokeForMode and genga's
     // gengaStrokeComposite): clear → base → GCO(eraser/alphaLock/blend) → alpha → buf. It is pure
-    // canvas-on-canvas with no coordinate knowledge, so the two engines cannot drift apart.
+    // canvas-on-canvas with no coordinate knowledge; the GCO and replace-alpha come from paintStrokeCompositeSpec.
     // `clip` is where an active selection lands: masking the buffer (not the target) applies blend / eraser /
     // alpha once, to the part of the stroke inside the selection — what "the brush only paints inside the
     // selection" means in the paint and sheet tools (there via the stencil a selection switches on). Callers
@@ -97045,13 +97057,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           && sameSize && ink && ink.box ? paintStrokeScratchBox(ink.box, null, null, w, h) : null);
       op.compositeBounds = currentBounds;
       const surface = op.canvas.isConnected ? paintScratchCanvas(op.canvas, 'preview', w, h, rect) : op.canvas;
+      const spec = paintStrokeCompositeSpec(stroke, paintStrokeErases(stroke), false);   // eraser rides too (partial erase) / 透明色도
       paintCompositeBufferOnto(surface.getContext('2d'), op.modeBaseCanvas, buf, {
         width: w,
         height: h,
         rect: rect,
-        gco: paintStrokeErases(stroke) ? 'destination-out' : paintBrushModeCompositeOp(stroke.mode), // eraser rides too (partial erase) / 透明色도
+        gco: spec.gco,
         alpha: stroke.opacity,
-        replaceAlpha: !options.skipStroke && !paintStrokeErases(stroke) && paintStrokeReplacesAlpha(stroke),
+        replaceAlpha: !options.skipStroke && spec.replaceAlpha,
         clip: paintStrokeClipForOp(op), // An active selection confines the stroke to its inside
         scratchOwner: op // 마스크 사본도 제스처당 한 장
       });
@@ -98741,7 +98754,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     }
     function gengaBucketPrepare(request) {
       if (!request.input.options.animation) {
-        const layer = gengaLayerById(request.layerId), target = gengaPrepareDrawTarget(request.event, layer, 0);
+        const layer = gengaLayerById(request.layerId), target = gengaPrepareDrawTarget(request.event, layer);
         if (!target) return { blocked: true };
         const canvas = cloneCanvas(target.cv);
         const ref = gengaBucketReferenceCanvas(layer, request.frame, request.input.mode, canvas);
@@ -105818,7 +105831,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       twoFingerUnpin();   // 다음 제스처는 제 짝을 새로 고른다
       // a cancelled gesture is never a tap; a clean lift may be one
       if (evType === 'pointercancel') twoFingerGestureClear();
-      else twoFingerGestureEndDraining(paperPointers, conteCancelSingleFingerOpsForGesture);
+      else twoFingerGestureEndDraining(paperPointers, paintCancelSingleFingerOps);
       saveEditorUiState();
     }
     function stepPaperZoom(direction) {
@@ -105952,7 +105965,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             // The half-drawn stroke is dropped once this is a confirmed pinch (see the move handler), not here:
             // killing it on the second pointerdown would let a two-finger tap, or a stray resting finger, destroy
             // whatever was being drawn.
-            twoFingerGestureBegin(v, conteCancelSingleFingerOpsForGesture); // 기하 전체
+            twoFingerGestureBegin(v, paintCancelSingleFingerOps); // 기하 전체
           }
         }
       }, { passive: true, capture: true });
@@ -105964,7 +105977,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         const v = paperPinchVals();
         if (v) {
           // Crossing the tap threshold is what makes this a pinch — and only then does it own the stroke
-          if (twoFingerGestureMove(v)) conteCancelSingleFingerOpsForGesture(); // One cancel path for both conte surfaces (the flip branch is provably inert here — previewPanelFlipStartZone requires state.videoEditMode)
+          if (twoFingerGestureMove(v)) paintCancelSingleFingerOps(); // One cancel path for both conte surfaces (the flip branch is provably inert here — previewPanelFlipStartZone requires state.videoEditMode)
           if (twoFingerPinchDisarmed()) return; // 데드존 — video/genga 와 같은 순서
           // Math per event, apply once per frame. setPaperRotation/setPaperZoom each write the DOM then read
           // layout; two forced layouts per pointermove would lag on iPad. The pending slot holds the latest values.
@@ -154899,15 +154912,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaScanGrow(sess.previewScan, changed.x + changed.w, changed.y + changed.h, 0);
       }
       gengaCaptureHistoryBefore(sess, changed);
+      const spec = paintStrokeCompositeSpec(sess, sess.shapeEraser, sess.shapeAlphaLock);   // the mode taken at press (sess.mode)
       paintCompositeBufferOnto(sess.ctx, sess.shapeBase, sess.shapeBuf, {
         width: sess.canvas.width,
         height: sess.canvas.height,
         scratchOwner: sess,
-        // Honor the 合成モード selector for line/curve/rect/ellipse/lasso-fill (conte parity — eraser and
-        // 透明度保護(alphaLock) still win, exactly like conte's twin of this composite).
-        gco: sess.shapeEraser ? 'destination-out' : (sess.shapeAlphaLock ? 'source-atop' : paintBrushModeCompositeOp(paintBrushModeVal())),
+        gco: spec.gco,
         alpha: sess.shapeOpacity,
-        replaceAlpha: !sess.shapeEraser && !sess.shapeAlphaLock && paintStrokeReplacesAlpha(sess),
+        replaceAlpha: spec.replaceAlpha,
         clip: gengaStrokeClipFor(sess),
         // Retained outlines supply the changed output rectangle, including erased tail pixels.
         // Plain shapes use the accumulated scan, including every previous preview. Material effects keep full composition.
@@ -155705,7 +155717,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const fill = function() {
         // 애니메이션의 기존 준비·떠 있는 선택 확정은 큐에 들어가기 전에 끝낸다.
         if (input.options.animation || (gengaSelLifted(gengaSel) && String(gengaSel.layerId) === request.layerId && gengaSel.frame === frame)) {
-          if (!gengaPrepareDrawTarget(ev, gengaLayerById(request.layerId), 0)) return;
+          if (!gengaPrepareDrawTarget(ev, gengaLayerById(request.layerId))) return;
         }
         paintBucketApply(Object.assign({}, request, { x: p.x, y: p.y, input: input, event: ev }));
       };
@@ -155755,6 +155767,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         vector: vectorDraw,   // 이 도형을 스트로크로 남길 것인가(위에서 못 담는 것은 이미 걸렀다)
         shapeEraser: eraser,
         shapeAlphaLock: Boolean(!eraser && layer.alphaLock),
+        mode: paintBrushModeVal(),   // 合成モード at press, as conte's stroke.mode
         shapeColor: eraser ? '#000000' : activePaintColor(),
         shapeLineWidth: c.lineWidth,
         shapeOpacity: paintBrushOpacityVal(), // Shapes honor the brush opacity too
@@ -155928,7 +155941,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // same product — so half the wider of {base, start} is the largest radius this session can produce.
       gengaScanMark(gengaDrawSession, p.x, p.y, Math.max(startSize, c.lineWidth) / 2 + 1);
       let gengaFirstDab = null;   // 세 갈래 중 하나가 담긴다
-      if (penOpacity < 1 || penOutlineMode || gengaStrokeClipFor(gengaDrawSession) || (!eraser && paintBrushModeIsBlend(paintBrushModeVal())) || paintGrainActive(gengaDrawSession)) { // 그레인도 버퍼 경로를 강제
+      if (penOpacity < 1 || penOutlineMode || gengaStrokeClipFor(gengaDrawSession) || (!eraser && paintBrushModeIsBlend(paintBrushModeVal()))) { // 그레인은 penOutlineMode 가 이미 포함한다
         // A real blend mode (multiply/screen/dodge/colorize) also forces the buffer path — otherwise a plain
         // opaque non-pressure genga pen would draw source-over and drop the blend. gengaStrokeComposite applies
         // paintBrushModeCompositeOp; this is the exact trigger conte's beginPaintRasterDraw uses
@@ -155955,6 +155968,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaDrawSession.shapeBuf = penBuf;
         gengaDrawSession.shapeEraser = eraser;
         gengaDrawSession.shapeAlphaLock = Boolean(!eraser && layer.alphaLock);
+        gengaDrawSession.mode = paintBrushModeVal();   // 合成モード at press, as conte's stroke.mode
         gengaDrawSession.shapeOpacity = penOpacity;
         gengaDrawSession.penColor = pb.fillStyle;
         gengaFirstDab = function() {
@@ -156235,7 +156249,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       twoFingerUnpin();   // 다음 제스처는 제 짝을 새로 고른다
       // clean lift → two-finger tap (undo) / double-tap (redo); a cancel is never a tap
       if (evType === 'pointercancel') twoFingerGestureClear();
-      else twoFingerGestureEndDraining(gengaPointers, gengaCancelSingleFingerOps);
+      else twoFingerGestureEndDraining(gengaPointers, paintCancelSingleFingerOps);
       scheduleGengaPreviewRedraw(); // Finish the view gesture with full smoothing.
     }
     function gengaPreviewPointerEnd(ev) {
@@ -156275,8 +156289,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         if (gengaDrawSession.shape) { gengaShapePointerEnd(ev, gengaDrawSession); return; }
         const sess0 = gengaDrawSession;
-        // 손 뗀 자리까지 선을 끌어온다(catch-up). conte 는 endPaintStroke 가 pointerup 을 continuePaintStroke
-        // 로 replay 해서 이 일이 저절로 일어나고(「TVPaint 의 Catch Up」), 원화는 여기서 replay 한다. 없으면
+        // 손 뗀 자리까지 선을 끌어온다(catch-up, 「TVPaint 의 Catch Up」). 콘티·用紙도 끝에서 같은 커널
+        // paintStabilizeCatchupReplay 를 부른다. 없으면
         // 손떨림 보정을 켰을 때 pulled string 의 반경만큼 선 끝이 커서에 못 미친 채 확정되고, 보정을 크게
         // 할수록 「선이 제대로 안 그어지는」 조작감이 된다. 커널(paintStabilizePoint)은 공용이고 pointerup 을
         // 받으면 raw 좌표를 돌려준다 — 필요한 것은 호출부 파리티다. 도형은 gengaShapePointerEnd 의
@@ -156403,7 +156417,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // ユビパラ(손가락 flip)도 같은 클래스 — gengaFlipTouchEnd는 캔버스 핸들러라 손가락이 마진
         // 밖에서 떨어지면 실행되지 않고, 위 touch 분기는 gengaPointers만 지운다. 그러면 파라파라 프리뷰
         // 프레임이 stuck. (양성: 소비처가 전부 pointerId 매칭이라 새 포인터를 삼키진 않고 다음 flip/pinch의
-        // gengaCancelSingleFingerOps가 자가치유한다 — 그래도 그때까지 화면이 남는다.)
+        // paintCancelSingleFingerOps가 자가치유한다 — 그래도 그때까지 화면이 남는다.)
         if (gengaFlipTouch && gengaFlipTouch.pointerId === id) {
           const owner = gengaFlipTouch;
           requestAnimationFrame(function() {
@@ -156414,7 +156428,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // 핸들러(endVideoPaintStroke/cancelActivePaintRasterStroke 경유)라 end 이벤트가 스테이지에 배달되지
         // 않으면 실행되지 않고 오버레이 프레임이 stuck. 정상 종료는 자기 pointerId + currentTarget(capture
         // 해제)을 요구하므로 여기서는 직접 종료 대신 상태 드랍+오버레이 클리어만
-        // 한다(conteCancelSingleFingerOpsForGesture와 같은 2줄; capture는 그 포인터의 up/cancel에서 브라우저가
+        // 한다(paintCancelSingleFingerOps와 같은 2줄; capture는 그 포인터의 up/cancel에서 브라우저가
         // 암묵 해제). 정상 경로가 먼저면 rAF 재확인이 no-op, 여기가 먼저면 정상 경로가 pointerId 가드로 no-op —
         // 어느 순서로 이중 실행돼도 무해.
         if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === id) {
@@ -160418,7 +160432,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaPinchStart() {
       const v = gengaPinchVals();
       if (!v) return;
-      twoFingerGestureBegin(v, gengaCancelSingleFingerOps); // 후보는 제스처와 함께 열린다 · 기하 전체
+      twoFingerGestureBegin(v, paintCancelSingleFingerOps); // 후보는 제스처와 함께 열린다 · 기하 전체
       if (!gengaPreviewXform) return;
       const f = gengaPreviewFit();
       if (!f) return;
@@ -160446,7 +160460,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const v = gengaPinchVals();
       if (!v) return;
       // Crossing the tap threshold confirms a pinch — only then does it take finger 1's draw/flip
-      if (twoFingerGestureMove(v)) gengaCancelSingleFingerOps();
+      if (twoFingerGestureMove(v)) paintCancelSingleFingerOps();
       if (twoFingerPinchDisarmed()) return; // 데드존
       const f = gengaPreviewFit();
       if (!f) return;
@@ -160466,12 +160480,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       state.gengaPanY = mcy - gengaPinch.anchorY * newScale - newCenY;
       scheduleGengaPreviewRedraw();
       updateGengaZoomLabel(); // parity with wheel/pan — a synchronous draw per pointermove lags the pinch on iPad
-    }
-    // a 2nd finger arriving cancels whatever single-finger op finger 1 started (no stray stroke / stuck flip)
-    function gengaCancelSingleFingerOps() {
-      gengaEndDrawSession();
-      paintDiscardPendingBucketFill();      // 아직 안 칠한 통도 여기서 버린다
-      if (gengaFlipTouch) { gengaFlipTouch = null; gengaSetParaparaFrame(null); }
     }
     // iPad Apple Pencil fires pen PointerEvents and TouchEvents; touch-action:none doesn't suppress the
     // pencil's touchmove, so WebKit's scroll/gesture decision eats the stroke + scrolls. Cancel it ourselves.
