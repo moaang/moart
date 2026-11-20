@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3503</title>
+  <title>MoArt ver3504</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -69176,6 +69176,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       audioStretchQueue = run.then(function() {}, function() {});
       return run;
     }
+    function timeStretchWorkerSource() {
+      return timeStretchChannelData.toString() + ';onmessage=function(e){try{var d=e.data,o=timeStretchChannelData(d.input,d.factor,d.sampleRate);postMessage({output:o},[o.buffer]);}catch(e){postMessage({error:String(e)});}}';
+    }
     async function timeStretchBufferJob(ctx, buffer, startSample, lenSample, factor, check) {
       const ch = Math.max(1, buffer.numberOfChannels), total = buffer.length;
       const s0 = Math.max(0, Math.min(total, startSample));
@@ -69186,7 +69189,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try {
         // Serialize the actual pure kernel; there is no second algorithm to keep in sync.
         try {
-          const code = timeStretchChannelData.toString() + ';onmessage=function(e){try{var d=e.data,o=timeStretchChannelData(d.input,d.factor,d.sampleRate);postMessage({output:o},[o.buffer]);}catch(e){postMessage({error:String(e)});}}';
+          const code = timeStretchWorkerSource();
           url = URL.createObjectURL(new Blob([code], {type: 'text/javascript'}));
           worker = new Worker(url);
         } catch (error) { console.warn('[wsola] worker unavailable; using identical local kernel', error); }
@@ -89136,17 +89139,44 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 디코드·재인코딩은 전용 워커에서 한다. 원화 썸네일 풀과 섞지 않는다 — 그 풀은 오류 응답 하나에 풀 전체를
     // 끄므로 깨진 파일 한 장이 원화 썸네일까지 멈춘다. 파일 단위 실패는 ok:false 결과값으로 돌아온다.
     // WebP 인코드가 없는 브라우저(Safari)는 예외 없이 PNG 를 돌려주므로 결과 type 으로 판정한다.
+    function refsWorkerMain() {
+      async function enc(c, type, q) {
+        const b = await c.convertToBlob({ type: type, quality: q });
+        return b.type === type ? b : null;
+      }
+      self.onmessage = async function(e) {
+        const d = e.data;
+        let bmp = null;
+        try {
+          bmp = await createImageBitmap(d.blob);
+          const w = bmp.width, h = bmp.height;
+          let out = null;
+          if (d.encode) {
+            const c = new OffscreenCanvas(w, h);
+            c.getContext('2d').drawImage(bmp, 0, 0);
+            out = await enc(c, 'image/webp', 0.8);
+            c.width = c.height = 0;
+            if (out && out.size >= d.blob.size) out = null;
+          }
+          const s = Math.min(1, REFS_THUMB_PX / Math.max(w, h)),
+            tw = Math.max(1, Math.round(w * s)),
+            th = Math.max(1, Math.round(h * s));
+          const tc = new OffscreenCanvas(tw, th),
+            tx = tc.getContext('2d');
+          tx.imageSmoothingQuality = 'high';
+          tx.drawImage(bmp, 0, 0, tw, th);
+          const thumb = (await enc(tc, 'image/webp', 0.75)) || (await tc.convertToBlob({ type: 'image/png' }));
+          postMessage({ id: d.id, ok: true, w: w, h: h, blob: out, thumb: thumb });
+        } catch (err) {
+          postMessage({ id: d.id, ok: false, message: String((err && err.message) || err) });
+        } finally {
+          if (bmp) bmp.close();
+        }
+      };
+    }
     function refsWorkerSource() {
-      return 'const PX=' + REFS_THUMB_PX + ';\n'
-        + 'async function enc(c,type,q){const b=await c.convertToBlob({type:type,quality:q});return b.type===type?b:null;}\n'
-        + 'onmessage=async function(e){const d=e.data;let bmp=null;try{'
-        + 'bmp=await createImageBitmap(d.blob);const w=bmp.width,h=bmp.height;let out=null;'
-        + 'if(d.encode){const c=new OffscreenCanvas(w,h);c.getContext("2d").drawImage(bmp,0,0);out=await enc(c,"image/webp",0.8);c.width=c.height=0;if(out&&out.size>=d.blob.size)out=null;}'
-        + 'const s=Math.min(1,PX/Math.max(w,h)),tw=Math.max(1,Math.round(w*s)),th=Math.max(1,Math.round(h*s));'
-        + 'const tc=new OffscreenCanvas(tw,th),tx=tc.getContext("2d");tx.imageSmoothingQuality="high";tx.drawImage(bmp,0,0,tw,th);'
-        + 'const thumb=await enc(tc,"image/webp",0.75)||await tc.convertToBlob({type:"image/png"});'
-        + 'postMessage({id:d.id,ok:true,w:w,h:h,blob:out,thumb:thumb});'
-        + '}catch(err){postMessage({id:d.id,ok:false,message:String(err&&err.message||err)});}finally{if(bmp)bmp.close();}};';
+      return 'const REFS_THUMB_PX=' + REFS_THUMB_PX + ';\n'
+        + workerEntrySource(refsWorkerMain);
     }
     // → { ok, w, h, blob(WebP 0.8, 원본보다 작을 때만), thumb } | { ok:false, message }
     function refsDecode(blob, encode) {
@@ -92263,18 +92293,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const gl = paintMeshGl();
       postMessage({ ready: Boolean(gl && gl.minmax) });
     }
+    function paintMaterialWorkerSource() {
+      return 'const document={createElement:()=>new OffscreenCanvas(1,1)},paintMaterialMeshSources=new WeakMap(),paintMeshInkShader=true,PAINT_DIR_LEAD_PX=' + JSON.stringify(PAINT_DIR_LEAD_PX) + ';let paintMeshGlState=null,paintMeshGlFailed=false,paintGrainBakedCanvas=null,paintGrainBakedKey="",paintGrainBakedTile=null;\n' +
+          [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore,
+            paintRibbonMeshBatch, paintMaterialMeshAdd, paintMeshTipLevel, paintMaterialMeshSource, paintGrainBakedFull, paintGrainPatternTransform, paintMaterialWalk, paintWalkTipDabs, paintInkDabAlphaFor,
+            paintDabThickness, paintNativeDabSize, paintDabSize, paintTipSmallDab, paintDabPressure, paintCurveEvalPts,
+            paintLerpSmooth, paintLerpAngleDeg, paintJitterUnit, paintStrokeScratchBox, paintBoxUnion].map(fn => fn.toString()).join('\n') +
+          '\n(' + paintMaterialWorkerBoot.toString() + ')();';
+    }
     function paintMaterialWorkerEnsure() {
       if (paintMaterialWorkerFailed || paintMaterialWorkerPolicy === 'off') return null;
       if (paintMaterialWorkerState) return paintMaterialWorkerState;
       if (typeof Worker !== 'function' || typeof OffscreenCanvas !== 'function' || typeof createImageBitmap !== 'function') return null;
       let url;
       try {
-        const body = 'const document={createElement:()=>new OffscreenCanvas(1,1)},paintMaterialMeshSources=new WeakMap(),paintMeshInkShader=true,PAINT_DIR_LEAD_PX=' + JSON.stringify(PAINT_DIR_LEAD_PX) + ';let paintMeshGlState=null,paintMeshGlFailed=false,paintGrainBakedCanvas=null,paintGrainBakedKey="",paintGrainBakedTile=null;\n' +
-          [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore,
-            paintRibbonMeshBatch, paintMaterialMeshAdd, paintMeshTipLevel, paintMaterialMeshSource, paintGrainBakedFull, paintGrainPatternTransform, paintMaterialWalk, paintWalkTipDabs, paintInkDabAlphaFor,
-            paintDabThickness, paintNativeDabSize, paintDabSize, paintTipSmallDab, paintDabPressure, paintCurveEvalPts,
-            paintLerpSmooth, paintLerpAngleDeg, paintJitterUnit, paintStrokeScratchBox, paintBoxUnion].map(fn => fn.toString()).join('\n') +
-          '\n(' + paintMaterialWorkerBoot.toString() + ')();';
+        const body = paintMaterialWorkerSource();
         url = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
         const st = { worker: new Worker(url), ready: false, jobs: new Map() };
         paintMaterialWorkerState = st;
@@ -115528,12 +115561,32 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Workers run pixel conversion, PackBits and deflate (heavy main-thread work on large pages) in parallel while
     // the main thread draws the next image. Queued RGBA is transferred; BGRA and packed buffers are worker-local.
     const TVPP_EXPORT_INFLIGHT = 3;
+    function exportTvppWorkerMain() {
+      const scratch = { buffer: null };
+      self.onmessage = function(e) {
+        var d = e.data;
+        Promise.resolve()
+          .then(function() {
+            return exportTvppEncodeImage(new Uint8Array(d.buf), d.w, d.h, d.first, d.box, scratch);
+          })
+          .then(
+            function(b) {
+              postMessage({ id: d.id, blob: b });
+            },
+            function(err) {
+              postMessage({ id: d.id, error: String(err), buf: d.buf }, [d.buf]);
+            }
+          );
+      };
+    }
+    function exportTvppWorkerSource() {
+      return [exportBe32, asciiBytes, exportTvppChunk, exportTvppPixels, exportTvppPack, exportTvppSraw, exportTvppImage, exportTvppEncodeImage]
+        .map(function(fn) { return fn.toString(); }).join('\n') + '\nconst TVPP_TS=' + TVPP_TS + ';\n'
+        + workerEntrySource(exportTvppWorkerMain);
+    }
     function exportTvppPoolOpen() {
       if (typeof CompressionStream !== 'function') return null;
-      const src = [exportBe32, asciiBytes, exportTvppChunk, exportTvppPixels, exportTvppPack, exportTvppSraw, exportTvppImage, exportTvppEncodeImage]
-        .map(function(fn) { return fn.toString(); }).join('\n') + '\nconst TVPP_TS=' + TVPP_TS + ';\n'
-        + 'const scratch={buffer:null};onmessage=function(e){var d=e.data;Promise.resolve().then(function(){return exportTvppEncodeImage(new Uint8Array(d.buf),d.w,d.h,d.first,d.box,scratch);})'
-        + '.then(function(b){postMessage({id:d.id,blob:b});},function(err){postMessage({id:d.id,error:String(err),buf:d.buf},[d.buf]);});};';
+      const src = exportTvppWorkerSource();
       return tvppWorkerPoolOpen(src, TVPP_EXPORT_INFLIGHT, 'image encode');
     }
     function exportTvppEncodeQueued(pool, rgba, width, height, first, box) {
@@ -123898,10 +123951,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     let drawingThumbBakeEpoch = 0;            // 썸 소유 해제·프로젝트 교체마다 오른다 — 늦은 워커 답을 거른다
     // 200px 축소 — 칸 썸·벡터 썸·커밋 썸이 같은 산수를 쓴다(sx,sy 는 크롭 원점, 기본 0).
     function gengaThumbCanvasFrom(src, sw, sh, sx, sy, createCanvas) {
+      return gengaThumbRender(src, sw, sh, sx, sy, createCanvas || (() => document.createElement('canvas')));
+    }
+    function gengaThumbRender(src, sw, sh, sx, sy, createCanvas) {
       const w = Math.max(1, Math.round(Number(sw) || src.width || 1));
       const h = Math.max(1, Math.round(Number(sh) || src.height || 1));
       const tw = GENGA_THUMB_PX, th = Math.max(1, Math.round(GENGA_THUMB_PX * h / w));
-      const cv = createCanvas ? createCanvas(tw, th) : document.createElement('canvas');
+      const cv = createCanvas(tw, th);
       cv.width = tw;
       cv.height = th;
       cv.getContext('2d').drawImage(src, Number(sx) || 0, Number(sy) || 0, w, h, 0, 0, tw, th);
@@ -123992,19 +124048,41 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     const GENGA_THUMB_BAKE_WORKERS = 3;   // 동시 디코드+인코드 상한 — 시트 첫 렌더의 다건 미스가 한꺼번에 몰려도 메인 스레드는 비운다
     let gengaThumbWorkerPool;             // undefined: 미시도, null: 미지원/실패(이후 항상 메인 경로), 그 외: 이 프로젝트의 풀
     // 워커 쪽은 createImageBitmap 으로 디코드해 메인 스레드 Image 디코드를 비우고, 축소·인코드는 바로
-    // 위 gengaThumbCanvasFrom 을 그대로 문자열로 심어 쓴다 — 칸 썸·커밋 썸과 같은 산수라 결과 픽셀이 같다
+    // 위 gengaThumbRender 를 공유한다 — 칸 썸·커밋 썸과 같은 산수라 결과 픽셀이 같다
     // (tvppPngWorkerSource 가 이미 같은 방식으로 재사용 중). 실패/미지원은 호출부가 메인 경로로 떨어진다.
+    function gengaThumbWorkerMain() {
+      self.onmessage = async function(e) {
+        const d = e.data;
+        let bmp, tc, sourceCanvas;
+        try {
+          bmp = await createImageBitmap(d.blob);
+          sourceCanvas = new OffscreenCanvas(bmp.width, bmp.height);
+          sourceCanvas.getContext('2d').drawImage(bmp, 0, 0);
+          bmp.close();
+          bmp = null;
+          tc = gengaThumbRender(sourceCanvas, sourceCanvas.width, sourceCanvas.height, 0, 0, (w, h) => new OffscreenCanvas(w, h));
+          sourceCanvas.width = sourceCanvas.height = 0;
+          const thumb = await tc.convertToBlob({ type: 'image/png' });
+          postMessage({ id: d.id, thumb: thumb });
+        } catch (err) {
+          postMessage({ id: d.id, error: String(err) });
+        } finally {
+          if (sourceCanvas) {
+            sourceCanvas.width = sourceCanvas.height = 0;
+          }
+          if (bmp) bmp.close();
+          if (tc) {
+            tc.width = tc.height = 1;
+          }
+        }
+      };
+    }
+    function gengaThumbWorkerProgram(entry) {
+      return 'const GENGA_THUMB_PX=' + GENGA_THUMB_PX + ';\n' + gengaThumbRender.toString() + '\n'
+        + workerEntrySource(entry);
+    }
     function gengaThumbWorkerSource() {
-      return 'const GENGA_THUMB_PX=' + GENGA_THUMB_PX + ';\n' + gengaThumbCanvasFrom.toString() + '\n'
-        + 'onmessage=async function(e){const d=e.data;let bmp,tc,sourceCanvas;try{'
-        + 'bmp=await createImageBitmap(d.blob);'
-        + 'sourceCanvas=new OffscreenCanvas(bmp.width,bmp.height);sourceCanvas.getContext("2d").drawImage(bmp,0,0);bmp.close();bmp=null;'
-        + 'tc=gengaThumbCanvasFrom(sourceCanvas,sourceCanvas.width,sourceCanvas.height,0,0,function(w,h){return new OffscreenCanvas(w,h);});'
-        + 'sourceCanvas.width=sourceCanvas.height=0;'
-        + 'const thumb=await tc.convertToBlob({type:"image/png"});'
-        + 'postMessage({id:d.id,thumb:thumb});'
-        + '}catch(err){postMessage({id:d.id,error:String(err)});}'
-        + 'finally{if(sourceCanvas){sourceCanvas.width=sourceCanvas.height=0;}if(bmp)bmp.close();if(tc){tc.width=tc.height=1;}}};';
+      return gengaThumbWorkerProgram(gengaThumbWorkerMain);
     }
     function gengaThumbWorkerPoolEnsure() {
       if (gengaThumbWorkerPool === undefined) {
@@ -124292,22 +124370,72 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         timer = setTimeout(function() { if (onTimeout) onTimeout(); resolve(null); }, GENGA_TILE_ENCODE_TIMEOUT_MS);
       })]).then(function(v) { clearTimeout(timer); return v; });
     }
+    function gengaTileEncodeWorkerMain() {
+      self.onmessage = async function(e) {
+        const d = e.data;
+        let c;
+        const out = [];
+        try {
+          c = new OffscreenCanvas(d.bmp.width, d.bmp.height);
+          const g = c.getContext('2d');
+          g.drawImage(d.bmp, 0, 0);
+          d.bmp.close();
+          if (!d.cells) {
+            postMessage({ id: d.id, blob: await c.convertToBlob({ type: 'image/png' }) });
+            return;
+          }
+          const img = g.getImageData(0, 0, c.width, c.height),
+            src = img.data,
+            W = img.width;
+          for (const r of d.cells) {
+            let ink = false;
+            for (let y = 0; y < r.h && !ink; y++) {
+              let o = ((r.y + y) * W + r.x) * 4 + 3;
+              for (let x = 0; x < r.w; x++, o += 4) {
+                if (src[o] >= 1) {
+                  ink = true;
+                  break;
+                }
+              }
+            }
+            if (!ink) continue;
+            const t = new OffscreenCanvas(r.w, r.h),
+              tg = t.getContext('2d'),
+              cell = tg.createImageData(r.w, r.h),
+              rb = r.w * 4;
+            for (let y = 0; y < r.h; y++) {
+              const so = ((r.y + y) * W + r.x) * 4;
+              cell.data.set(src.subarray(so, so + rb), y * rb);
+            }
+            tg.putImageData(cell, 0, 0);
+            const blob = await t.convertToBlob({ type: 'image/png' });
+            out.push({ idx: r.idx, blob: blob, bmp: t.transferToImageBitmap() });
+          }
+          postMessage(
+            { id: d.id, cells: out },
+            out.map(function(o) {
+              return o.bmp;
+            })
+          );
+        } catch (err) {
+          out.forEach(function(o) {
+            o.bmp.close();
+          });
+          postMessage({ id: d.id, error: String(err) });
+        } finally {
+          if (c) {
+            c.width = c.height = 0;
+          }
+        }
+      };
+    }
+    function gengaTileEncodeWorkerSource() {
+      return workerEntrySource(gengaTileEncodeWorkerMain);
+    }
     function gengaTileEncodePoolEnsure() {
       if (gengaTileEncodePool === undefined) {
         gengaTileEncodePool = offscreenWorkerSupported() ? tvppWorkerPoolOpen(
-          'onmessage=async function(e){const d=e.data;let c;const out=[];try{c=new OffscreenCanvas(d.bmp.width,d.bmp.height);'
-          + 'const g=c.getContext("2d");g.drawImage(d.bmp,0,0);d.bmp.close();'
-          + 'if(!d.cells){postMessage({id:d.id,blob:await c.convertToBlob({type:"image/png"})});return;}'
-          + 'const img=g.getImageData(0,0,c.width,c.height),src=img.data,W=img.width;'
-          + 'for(const r of d.cells){let ink=false;'
-          + 'for(let y=0;y<r.h&&!ink;y++){let o=((r.y+y)*W+r.x)*4+3;for(let x=0;x<r.w;x++,o+=4){if(src[o]>=1){ink=true;break;}}}'
-          + 'if(!ink)continue;'
-          + 'const t=new OffscreenCanvas(r.w,r.h),tg=t.getContext("2d"),cell=tg.createImageData(r.w,r.h),rb=r.w*4;'
-          + 'for(let y=0;y<r.h;y++){const so=((r.y+y)*W+r.x)*4;cell.data.set(src.subarray(so,so+rb),y*rb);}'
-          + 'tg.putImageData(cell,0,0);const blob=await t.convertToBlob({type:"image/png"});'
-          + 'out.push({idx:r.idx,blob:blob,bmp:t.transferToImageBitmap()});}'
-          + 'postMessage({id:d.id,cells:out},out.map(function(o){return o.bmp;}));'
-          + '}catch(err){out.forEach(function(o){o.bmp.close();});postMessage({id:d.id,error:String(err)});}finally{if(c){c.width=c.height=0;}}};',
+          gengaTileEncodeWorkerSource(),
           GENGA_TILE_ENCODE_WORKERS, 'genga tile encode') : null;
       }
       return gengaTileEncodePool;
@@ -124838,12 +124966,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaPersistWorkerJobs.clear();
       jobs.forEach(function(job) { clearTimeout(job.timer); job.settle(false, reason); });
     }
+    function gengaPersistWorkerSource() {
+      return gengaTileBlobAssemble.toString() + '\n(' + gengaPersistWorkerMain.toString() + ')()';
+    }
     function gengaPersistWorkerGet() {
       if (gengaPersistWorker === false) return null;
       if (gengaPersistWorker) return gengaPersistWorker;
       try {
         // 순수 조립 함수를 선언 그대로 앞에 싣는다 — 워커 안에서 이름으로 부르고 컨테이너 문법이 메인과 같게 유지된다.
-        const src = gengaTileBlobAssemble.toString() + '\n(' + gengaPersistWorkerMain.toString() + ')()';
+        const src = gengaPersistWorkerSource();
         const workerUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
         let w = null;
         try { w = new Worker(workerUrl); } finally { URL.revokeObjectURL(workerUrl); }   // 워커는 생성 때 스크립트를 읽는다 — 생성이 던져도 놓는다
@@ -142708,6 +142839,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return typeof Worker === 'function' && typeof OffscreenCanvas === 'function'
         && typeof OffscreenCanvas.prototype.convertToBlob === 'function' && typeof createImageBitmap === 'function';
     }
+    function workerEntrySource(entry) {
+      return '\n(' + entry.toString() + ')();';
+    }
     function tvppWorkerPoolOpen(src, size, label) {
       if (typeof Worker !== 'function') return null;
       let url = null;
@@ -142812,16 +142946,36 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 같은 putImageData → PNG 이고, 그 Blob 을 디스크 값으로 그대로 넘긴다. 지연 인코딩 경로
     // (gengaPutDrawingCanvas)를 쓰지 않는 이유: 임포트 직후 prune·자동저장이 flush 해 결국 동기로 몰린다.
     const TVPP_ENCODE_INFLIGHT = 4;   // 동시 PNG 작업 수. prev/hist 칸과 완료된 PNG·문자열까지 포함한 총 메모리 상한은 아니다.
+    function tvppPngWorkerMain() {
+      self.onmessage = async function(e) {
+        const d = e.data;
+        let oc, tc;
+        try {
+          oc = new OffscreenCanvas(d.w, d.h);
+          oc.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(d.buf), d.w, d.h), 0, 0);
+          const blob = await oc.convertToBlob({ type: 'image/png' });
+          let thumb = null;
+          try {
+            tc = gengaThumbRender(oc, d.w, d.h, 0, 0, (w, h) => new OffscreenCanvas(w, h));
+            thumb = await tc.convertToBlob({ type: 'image/png' });
+          } catch (err) {
+            console.warn('[tvpp] thumbnail failed - original fallback', err);
+          }
+          postMessage({ id: d.id, blob: blob, thumb: thumb });
+        } catch (err) {
+          postMessage({ id: d.id, error: String(err), buf: d.buf }, [d.buf]);
+        } finally {
+          if (tc) {
+            tc.width = tc.height = 1;
+          }
+          if (oc) {
+            oc.width = oc.height = 1;
+          }
+        }
+      };
+    }
     function tvppPngWorkerSource() {
-      return 'const GENGA_THUMB_PX=' + GENGA_THUMB_PX + ';\n' + gengaThumbCanvasFrom.toString() + '\n'
-        + 'onmessage=async function(e){const d=e.data;let oc,tc;try{oc=new OffscreenCanvas(d.w,d.h);'
-        + 'oc.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(d.buf),d.w,d.h),0,0);'
-        + 'const blob=await oc.convertToBlob({type:"image/png"});let thumb=null;'
-        + 'try{tc=gengaThumbCanvasFrom(oc,d.w,d.h,0,0,function(w,h){return new OffscreenCanvas(w,h);});'
-        + 'thumb=await tc.convertToBlob({type:"image/png"});}catch(err){console.warn("[tvpp] thumbnail failed - original fallback",err);}'
-        + 'postMessage({id:d.id,blob:blob,thumb:thumb});}'
-        + 'catch(err){postMessage({id:d.id,error:String(err),buf:d.buf},[d.buf]);}'
-        + 'finally{if(tc){tc.width=tc.height=1;}if(oc){oc.width=oc.height=1;}}};';
+      return gengaThumbWorkerProgram(tvppPngWorkerMain);
     }
     function tvppPngPoolOpen() {
       if (typeof OffscreenCanvas !== 'function' || typeof OffscreenCanvas.prototype.convertToBlob !== 'function') return null;
