@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3510</title>
+  <title>MoArt ver3511</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -19729,6 +19729,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // Line classification and region topology
+    function paintFillHexRgb(hex) {   // '#rrggbb' → [r, g, b]
+      return [1, 3, 5].map(function(offset) { return parseInt(hex.slice(offset, offset + 2), 16); });
+    }
     function paintFillPixelEmpty(data, offset, whiteAsEmpty) {
       return !data[offset + 3] || Boolean(whiteAsEmpty && data[offset] === 255 && data[offset + 1] === 255 && data[offset + 2] === 255);
     }
@@ -19744,7 +19747,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintFillClassify(images, width, height, settings, placement) {
       const n = width * height, classes = new Int16Array(n), alpha = new Uint8Array(n), under = new Uint8Array(n);
       const ambiguous = new Uint8Array(n), queue = new Int32Array(n), cover = new Uint8Array(n);
-      const colors = settings.colors.map(function(c) { return [parseInt(c.color.slice(1, 3), 16), parseInt(c.color.slice(3, 5), 16), parseInt(c.color.slice(5, 7), 16)]; });
+      const colors = settings.colors.map(function(c) { return paintFillHexRgb(c.color); });
       const inkLine = colors.length + 1, lineRole = settings.colors.map(function(c) { return c.role === 'line'; });
       const priorities = settings.colors.map(function(c) { return c.role === 'line' ? PAINT_FILL_ROLES.length : PAINT_FILL_ROLES.indexOf(c.role); }).concat(PAINT_FILL_ROLES.length);
       images.forEach(function(image, source) {
@@ -19946,7 +19949,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // The outside's slope of each outline: line pixels the outside reaches by never stepping to a fainter pixel
       // (CSP "to darkest pixel", Krita "stop growing at darker pixels"). A darker core seals what lies beyond it.
       const rim = new Uint8Array(n), alpha = classification.alpha, classes = classification.classes;
-      let head = 0, tail = 0;
+      // Spreads mark[i] over the line pixels reached from queue[0..tail) without stepping to a fainter pixel (4-connected,
+      // first come first served); returns the new tail, so queue[0..tail) then lists every marked pixel.
+      const spread = function(mark, tail) {
+        for (let head = 0; head < tail;) {
+          const i = queue[head++], x = i % width;
+          for (let m = 0; m < 4; m += 1) {
+            const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
+            if (j >= 0 && j < n && !mark[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { mark[j] = mark[i]; queue[tail++] = j; }
+          }
+        }
+        return tail;
+      };
+      let tail = 0;
       for (let i = 0; i < n; i += 1) {
         if (!labels[i] || !regions.get(labels[i]).edge) continue;
         const x = i % width;
@@ -19955,19 +19970,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j]) { rim[j] = 1; queue[tail++] = j; }
         }
       }
-      while (head < tail) {
-        const i = queue[head++], x = i % width;
-        for (let m = 0; m < 4; m += 1) {
-          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-          if (j >= 0 && j < n && !rim[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { rim[j] = 1; queue[tail++] = j; }
-        }
-      }
+      spread(rim, tail);
       // climb: for a line pixel between enclosed regions, the region that reaches it without stepping to a fainter
       // pixel (nearest first) when that is not its nearest region by distance; 0 elsewhere. Where two strokes
       // converge, the valley between their cores keeps climbing from the pocket they enclose, so it belongs to
       // that pocket, though the face beyond one core is nearer. Only line pixels are queued.
       const climb = new Int32Array(n);
-      head = 0;
       tail = 0;
       for (let i = 0; i < n; i += 1) {
         if (labels[i] || classes[i] <= 0) continue;
@@ -19975,13 +19983,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const from = i >= width && labels[i - width] || x > 0 && labels[i - 1] || x < width - 1 && labels[i + 1] || i + width < n && labels[i + width] || 0;
         if (from) { climb[i] = from; queue[tail++] = i; }
       }
-      while (head < tail) {
-        const i = queue[head++], x = i % width;
-        for (let m = 0; m < 4; m += 1) {
-          const j = m === 0 ? (x > 0 ? i - 1 : -1) : m === 1 ? (x < width - 1 ? i + 1 : -1) : m === 2 ? i - width : i + width;
-          if (j >= 0 && j < n && !climb[j] && classes[j] > 0 && !labels[j] && alpha[j] >= alpha[i]) { climb[j] = climb[i]; queue[tail++] = j; }
-        }
-      }
+      tail = spread(climb, tail);
       for (let k = 0; k < tail; k += 1) {
         const i = queue[k], first = regions.get(neighbors.lineOwners[neighbors.lineIndex[i] * 4]);
         const up = regions.get(climb[i]);
@@ -20088,24 +20090,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const out = new ImageData(new Uint8ClampedArray(base.data), model.width, model.height);
       const d = out.data, assignment = paintFillAssignments(model, topology);
       const pixels = new Uint32Array(d.buffer), colors = new Map();
-      model.assignments.forEach(function(a) {
-        const rgba = new Uint8ClampedArray([a.color[0], a.color[1], a.color[2], 255]);
-        colors.set(a, new Uint32Array(rgba.buffer)[0]);
-      });
       const preserveLines = model.sources.some(function(source) { return source.target; });
+      // Each assignment's packed colour, and the box of the painted regions and of the slivers that follow one of them.
       let x0 = model.width, y0 = model.height, x1 = -1, y1 = -1;
-      const painted = new Set();
-      model.assignments.forEach(function(a) {
-        const r = topology.regions.get(a.region);
-        painted.add(a.region);
+      const painted = new Set(), take = function(r) {
         if (r) { x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1); y1 = Math.max(y1, r.y1); }
+      };
+      model.assignments.forEach(function(a) {
+        colors.set(a, new Uint32Array(new Uint8ClampedArray([a.color[0], a.color[1], a.color[2], 255]).buffer)[0]);
+        painted.add(a.region);
+        take(topology.regions.get(a.region));
       });
       topology.slivers.forEach(function(order, label) {
-        const r = topology.regions.get(label);
-        if (r && Array.prototype.some.call(order, function(nb) { return painted.has(nb); })) {
-          x0 = Math.min(x0, r.x0); y0 = Math.min(y0, r.y0); x1 = Math.max(x1, r.x1);
-          y1 = Math.max(y1, r.y1);
-        }
+        if (Array.prototype.some.call(order, function(nb) { return painted.has(nb); })) take(topology.regions.get(label));
       });
       for (let y = y0; y <= y1; y += 1) for (let x = x0; x <= x1; x += 1) {
         const i = y * model.width + x;
@@ -20142,9 +20139,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const width = model.width, height = model.height, n = width * height;
       const image = new ImageData(width, height), assignment = paintFillAssignments(model, topology), d = base.data;
       const open = new Uint8Array(n), outside = new Int32Array(n), holes = new Uint8Array(n), queue = new Int32Array(n);
+      const assigned = new Uint8Array(n);
       let regions = 0, unfilled = 0, ambiguous = 0;
       for (let i = 0; i < n; i += 1) {
-        const own = paintFillPixelAssignment(model, topology, assignment, i) ? 255
+        assigned[i] = paintFillPixelAssignment(model, topology, assignment, i) ? 1 : 0;
+        const own = assigned[i] ? 255
           : paintFillPixelEmpty(d, i * 4, model.options.whiteAsEmpty) ? 0
           : d[i * 4 + 3];
         open[i] = !topology.under[i] && (255 - own) * (255 - topology.cover[i]) > 5 * 255 ? 1 : 0;   // a lower line's core is the line itself
@@ -20160,7 +20159,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let r = 0, g = 0, b = 0;
         if (open[i] && (region && !region.edge || !outside[i])) { r = 255; g = b = 48; holes[i] = 1; unfilled += 1; }
         else if (open[i]) r = g = b = 255;
-        if (topology.ambiguous[i] || line && line.include && line.role !== 'line' && !paintFillPixelAssignment(model, topology, assignment, i)) { r = 255; g = 176; b = 0; ambiguous += 1; }
+        if (topology.ambiguous[i] || line && line.include && line.role !== 'line' && !assigned[i]) { r = 255; g = 176; b = 0; ambiguous += 1; }
         const j = i * 4;
         image.data[j] = r;
         image.data[j + 1] = g;
@@ -20267,7 +20266,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       else {
         if (job.operation !== 'enclose' && !region) throw new Error('paint.fill.boundary');
         if (job.operation === 'enclose' || paintFillCovers(job.coverage, job.index)) {
-          const rgb = [1, 3, 5].map(function(offset) { return parseInt(job.color.slice(offset, offset + 2), 16); });
+          const rgb = paintFillHexRgb(job.color);
           const next = job.operation === 'enclose' ? paintFillEnclosed(model, topology, job.coverage, rgb, job.role, base) : paintFillAssignRegions(model, new Set([region]), rgb, job.role, job.coverage);
           if (next !== model) {
             const image = paintFillRender(next, topology, base);
@@ -94883,9 +94882,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return new Promise(function(resolve, reject) {
         const pending = { resolve: resolve, reject: reject, timer: null };
         state.paintFillWorkerJob = pending;
-        const fail = function(error) {
+        const settle = function() { clearTimeout(pending.timer); state.paintFillWorkerJob = null; };
+        const fail = function(error) {   // the worker is not trusted again this session
           if (state.paintFillWorkerJob !== pending) return;
-          clearTimeout(pending.timer); state.paintFillWorkerJob = null;
+          settle();
           worker.terminate(); state.paintFillWorker = false;
           reject(error);
         };
@@ -94895,16 +94895,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (state.paintFillWorkerJob !== pending) return;
           const m = event.data;
           if (!m || m.seq !== seq) { fail(new Error('Animation calculation reply identity changed')); return; }
-          if (typeof m.error === 'string') {
-            clearTimeout(pending.timer); state.paintFillWorkerJob = null;
-            reject(new Error(m.error));
-            return;
-          }
+          if (typeof m.error === 'string') { settle(); reject(new Error(m.error)); return; }
           const value = m.value;
           if (!paintFillReplyValid(value, job)) {
             fail(new Error('Invalid animation calculation reply')); return;
           }
-          clearTimeout(pending.timer); state.paintFillWorkerJob = null;
+          settle();
           resolve(value);
         };
         pending.timer = setTimeout(function() { fail(new Error('Animation calculation timed out')); }, 30000);
@@ -94921,7 +94917,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return askActionChoice(t('paint.fill.stale'), choices);
     }
     async function paintFillReadAsset(asset, engine, project, rect) {
-      let image, placement;
+      let image, placement, draw = null;
       if (engine === 'conte') {
         const drawing = project.layerDrawings && project.layerDrawings[asset.drawingRef];
         if (!drawing) throw new Error('Animation source asset is missing');
@@ -94937,20 +94933,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (ready.status === 'pending' && ready.promise) await ready.promise;
         drawing = gengaResolveDrawing(asset);
         ready = gengaPrepareDrawing(drawing, null);
-        if (ready.status !== 'ready') {
+        if (ready.status === 'ready') draw = function(ctx) {
+          if (!gengaDrawDrawingInto(ctx, drawing, rect.w, rect.h, null)) throw new Error('Animation source decode failed');
+        };
+        else {
           const url = gengaDrawingUrl(asset);
           if (!url) throw new Error(t('paint.bucketRef.pending'));
           image = await loadImageAsync(url);
           placement = gengaDrawingPlacement(asset, rect.w, rect.h);
-        } else {
-          const canvas = paintBucketCompositeCanvas([{ draw: function(ctx) {
-            if (!gengaDrawDrawingInto(ctx, drawing, rect.w, rect.h, null)) throw new Error('Animation source decode failed');
-          } }], rect);
-          return canvas.getContext('2d').getImageData(0, 0, rect.w, rect.h);
         }
       }
-      const canvas = paintBucketCompositeCanvas([{ draw: function(ctx) { ctx.drawImage(image, placement.x, placement.y); } }], rect);
-      return canvas.getContext('2d').getImageData(0, 0, rect.w, rect.h);
+      if (!draw) draw = function(ctx) { ctx.drawImage(image, placement.x, placement.y); };
+      return paintBucketCompositeCanvas([{ draw: draw }], rect).getContext('2d').getImageData(0, 0, rect.w, rect.h);
     }
     async function paintFillSourceSignature(sources, sourcePixels) {
       const signatures = await Promise.all(sources.filter(function(source) { return !source.target; }).map(async function(source) {
