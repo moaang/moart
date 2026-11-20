@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3514</title>
+  <title>MoArt ver3515</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -77028,7 +77028,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
             if (changes.length) {
               handedToSave = true; // The save owns cleanup from its first await through JSON publication.
-              if (!await persistWorkspaceProject(owner, changes)) throw new Error(t('msg.err.workFolderWriteDenied'));
+              if (!await persistWorkspaceProjectInWriteQueue(owner, changes)) throw new Error(t('msg.err.workFolderWriteDenied'));
               refresh();
             }
             const message = changes.length ? t('settings.compress.done', counts.audio, counts.layers) : (!failures.length && !notes.length ? t('settings.compress.nothingToCompress') : '');
@@ -78015,6 +78015,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return stats;
     }
 
+    // Use runWorkspaceWrite for folder saves: it queues writes and takes an origin-wide lock when Web Locks is available.
     async function saveProjectToWorkspace(owner, options) {
       owner = owner || projectIoOwner();
       // Defensive fallback for callers without a working folder. Media imports must test owner.handle
@@ -78022,7 +78023,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!owner.handle) {
         return saveJsonDownload(owner);
       }
-      return runWorkspaceWrite(owner, function() { return persistWorkspaceProject(owner, null, options); });
+      return runWorkspaceWrite(owner, function() {
+        return persistWorkspaceProjectInWriteQueue(owner, null, options);
+      });
     }
 
     // Folder provenance is session-only. Project refs identify immutable pixels/audio, not filenames.
@@ -78219,7 +78222,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return choice === 'overwrite';
     }
 
-    async function persistWorkspaceProject(owner, compressed, options) {
+    // Call inside runWorkspaceWrite. Re-entering the queue from here would wait on this write.
+    // compressedAssetChanges lists replacement media already written to the folder, or is null for a regular save.
+    // Compression saves stop on external JSON edits without prompting for overwrite.
+    async function persistWorkspaceProjectInWriteQueue(owner, compressedAssetChanges, options) {
       const prepared = [], gengaPrepared = [];
       let published = false, jsonStarted = false, backup = null, attemptedPayload = null;
       try {
@@ -78236,10 +78242,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         await externalizeVideoMediaToWorkspace(owner);
         await prepareWorkspaceLayerDrawings(owner, prepared);
         await externalizeAudioToWorkspace(owner);
-        if (!options || options.cleanup !== false) await prepareWorkspaceAudioOptimization(owner, prepared, new Set((compressed || []).filter(function(item) { return item.kind === 'audio'; }).map(function(item) { return item.key; })));
+        if (!options || options.cleanup !== false) await prepareWorkspaceAudioOptimization(owner, prepared, new Set((compressedAssetChanges || []).filter(function(item) { return item.kind === 'audio'; }).map(function(item) { return item.key; })));
         assertProjectIoOwner(owner);
         // Freeze a consistent model after preparation. No earlier pixels may be attached to a newer edit.
-        const changes = prepared.concat(compressed || []);
+        const changes = prepared.concat(compressedAssetChanges || []);
         let copy = projectForJsonStorage({ portable: false });
         const beforeWrite = serializedProjectJson(null, copy);
         // Nonfatal projection flush can fail after async preparation admits an edit. Preserve its second retry.
@@ -78268,7 +78274,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const payload = serializedProjectJson(null, copy), blob = new Blob([payload], { type: 'application/json' });
         const fileName = owner.settings.projectFileName || 'project.conte.json';
         // 직접 저장 = options 없음(첫 저장의 retire 포함). cleanup:false 저장과 압축 뒤 저장은 사용자가 누른 저장이 아니다.
-        const passive = !!compressed || !!(options && options.cleanup === false);
+        const passive = !!compressedAssetChanges || !!(options && options.cleanup === false);
         if (!await confirmWorkspaceJsonUnchanged(owner, fileName, passive)) return false;
         backup = await backupExistingWorkspaceProject(fileName, owner);
         assertProjectIoOwner(owner);
@@ -78322,7 +78328,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         return true;
       } finally {
-        const owned = prepared.concat(compressed || [], gengaPrepared);
+        const owned = prepared.concat(compressedAssetChanges || [], gengaPrepared);
         if (!published && jsonStarted) {
           try {
             const current = await readBlobFromWorkspace('', owner.settings.projectFileName || 'project.conte.json', owner.handle);
