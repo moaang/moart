@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3506</title>
+  <title>MoArt ver3507</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -118781,8 +118781,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function openConteExportDialog() {
       if (state.project && state.project.kind === 'genga') { openGengaExportDialog(); return; }
-      exportSyncKindIcons(document.getElementById('exportDialog'));
       const dialog = document.getElementById('exportDialog');
+      if (dialog.open && exportDialogBusy(dialog)) return;
+      exportSyncKindIcons(dialog);
       const status = document.getElementById('exportStatus');
       // 「형식을 고르세요」는 창 맨 위 문구가 말하므로 상태줄은 비워 두 번 나오지 않게 한다. 원화(openGengaExportDialog)도
       // 여기서 비운다.
@@ -118817,28 +118818,55 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         document.getElementById('exportPaperPreviewNext').addEventListener('click', function() { stepExportPaperPreview(1); });
       }
       updateExportDialogVideoOptions();
+      stopTimelinePlayback();
+      if (!exportOpenSession(dialog, 'conte')) return;
       state.lastCutExportRetry = null;
       state.lastCtExportRetry = null;
-      updateExportRetryButtonVisibility();
-      stopTimelinePlayback();
-      if (exportOpenSession(dialog, 'conte')) openModal(dialog);
+      updateExportRetryButtons();
+      openModal(dialog);
     }
 
-    // Shown after a "カット別一括書き出し" (video-cuts) or "CT素材一括書き出し" (ct-material) run leaves
-    // 1+ cuts unwritten (encode error, or a File System Access write error, most often the OS/cloud-sync/AV
-    // briefly touching the just-created file mid-write). These are usually transient per-file races, so retrying
-    // only the failed cuts is the practical remedy. The two batch kinds keep independent retry state/buttons
-    // (state.lastCutExportRetry vs state.lastCtExportRetry) so one never clobbers the other's pending retry.
-    function updateExportRetryButtonVisibility() {
-      const btn = document.getElementById('exportRetryFailedBtn');
-      if (btn) {
-        const retry = state.lastCutExportRetry;
-        btn.hidden = !(retry && retry.groups && retry.groups.length);
+    // Keep the two retry lists independent, but neither can run while the dialog owns an export.
+    function updateExportRetryButtons() {
+      const dialog = document.getElementById('exportDialog');
+      const session = exportSessions.get(dialog);
+      const running = Boolean(session && session.running);
+      const buttons = [
+        ['exportRetryFailedBtn', state.lastCutExportRetry],
+        ['exportRetryFailedCtBtn', state.lastCtExportRetry]
+      ];
+      for (const [id, retry] of buttons) {
+        const button = document.getElementById(id);
+        if (!button) continue;
+        button.hidden = !(retry && retry.groups && retry.groups.length);
+        button.disabled = running;
       }
-      const ctBtn = document.getElementById('exportRetryFailedCtBtn');
-      if (ctBtn) {
-        const ctRetry = state.lastCtExportRetry;
-        ctBtn.hidden = !(ctRetry && ctRetry.groups && ctRetry.groups.length);
+    }
+
+    // Claim before permission or picker waits, so every entry shares one running export.
+    async function runConteExportSession(dialog, run) {
+      const session = exportSessions.get(dialog);
+      if (!session || session.closed || session.running || session.delivering) return;
+      const closeButton = document.getElementById('exportDialogCloseBtn');
+      session.running = true;
+      try {
+        closeButton.disabled = true;
+        exportResultControls(dialog).run.disabled = true;
+        updateExportRetryButtons();
+        await run();
+      } catch (error) {
+        setExportDialogBusy(false, t('msg.err.outputFailed', error.message || String(error)));
+      } finally {
+        session.running = false;
+        closeButton.disabled = false;
+        updateExportRetryButtons();
+        if (!dialog.open) exportCloseSession(dialog);
+        else if (session.refreshPending) exportRefreshResult(dialog);
+        else {
+          const ui = exportResultControls(dialog);
+          ui.run.disabled = ui.kind === 'image' && !session.result;
+          if (ui.kind === 'image') ui.run.textContent = t('action.export');
+        }
       }
     }
 
@@ -120671,43 +120699,47 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const fileParts = assignCutExportFileParts(groups, cutExportVideoFilePart);
       const result = await writeCutExportGroups(dirHandle, groups, opts, onStatus, fileParts);
       state.lastCutExportRetry = result.failedGroups.length ? { dirHandle: dirHandle, groups: result.failedGroups, opts: opts, fileParts: fileParts } : null;
-      updateExportRetryButtonVisibility();
+      updateExportRetryButtons();
       return result;
     }
 
     function exportBatchFailuresText(failures) {
       return failures.length ? ('  ' + t('export.video.status.failuresTailPrefix') + failures.length + t('export.video.unit.items') + ': ' + failures.slice(0, 3).join(' / ')) : '';
     }
-    // "失敗分のみ再試行" button — re-runs the batch writer against only the groups that failed on the last run,
-    // reusing the same folder handle + export settings. Most failures are transient per-file races (AV/cloud-sync
-    // touching a just-created file, a stale File System Access handle, etc.), so retrying tends to succeed without
-    // re-encoding the cuts that already wrote. 컷 영상과 CT 소재가 함께 쓰며, 다른 것은 재시도 상태를 담는 state
-    // 필드·쓰기 함수(인자 차례가 서로 다르다)·남은 실패를 다시 담을 때 `opts` 를 물고 가는가뿐이다.
-    async function retryFailedExportGroups(retryField, run, keepOpts) {
+    // A retry keeps the first run's folder, names and render options for cuts still unwritten.
+    async function retryFailedExportGroups(retryField, run) {
       const retry = state[retryField];
       if (!retry || !retry.groups || !retry.groups.length) return;
-      try {
-        if (!await ensureWorkspacePermission(retry.dirHandle, true)) {
-          alert(t('export.video.err.retryPermission'));
-          return;
+      const dialog = document.getElementById('exportDialog');
+      const owner = projectIoOwner();
+
+      await runConteExportSession(dialog, async function() {
+        try {
+          const allowed = await ensureWorkspacePermission(retry.dirHandle, true);
+          if (!dialog.open || !projectIoOwnerCurrent(owner)) return;
+          if (!allowed) {
+            alert(t('export.video.err.retryPermission'));
+            return;
+          }
+
+          state.videoExportCancel = false;
+          setExportDialogBusy(true, t('export.video.status.retryPreparing'));
+          const result = await run(retry, function(message) { setExportDialogBusy(true, message); });
+          state[retryField] = result.failedGroups.length
+            ? Object.assign({}, retry, { groups: result.failedGroups })
+            : null;
+          const status = result.canceled ? 'export.video.status.retryCanceled' : 'export.video.status.retryDone';
+          const count = result.written + '/' + result.total + ' ' + t('export.video.unit.films');
+          setExportDialogBusy(false, t(status) + ' ' + count + exportBatchFailuresText(result.failures));
+        } catch (error) {
+          setExportDialogBusy(false, t('export.video.err.retryFailedPrefix') + (error && error.message ? error.message : error));
         }
-        state.videoExportCancel = false;
-        setExportDialogBusy(true, t('export.video.status.retryPreparing'));
-        const r = await run(retry, function(msg) { setExportDialogBusy(true, msg); });
-        const next = { dirHandle: retry.dirHandle, groups: r.failedGroups, fileParts: retry.fileParts };   // later retries keep the first run's names
-        if (keepOpts) next.opts = retry.opts;
-        state[retryField] = r.failedGroups.length ? next : null;
-        updateExportRetryButtonVisibility();
-        const tail = exportBatchFailuresText(r.failures);
-        setExportDialogBusy(false, (r.canceled ? t('export.video.status.retryCanceled') : t('export.video.status.retryDone')) + ' ' + r.written + '/' + r.total + ' ' + t('export.video.unit.films') + tail);
-      } catch (error) {
-        setExportDialogBusy(false, t('export.video.err.retryFailedPrefix') + (error && error.message ? error.message : error));
-      }
+      });
     }
     async function retryFailedCutExports() {
       await retryFailedExportGroups('lastCutExportRetry', function(retry, onMsg) {
         return writeCutExportGroups(retry.dirHandle, retry.groups, retry.opts, onMsg, retry.fileParts);
-      }, true);
+      });
     }
 
     // ---- コンテ撮 (conte cutting-material sheet) export ----
@@ -121415,16 +121447,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const fileParts = assignCutExportFileParts(groups, cutExportCtFilePart);
       const result = await writeCtMaterialExportGroups(state.project, groups, dirHandle, onStatus, fileParts);
       state.lastCtExportRetry = result.failedGroups.length ? { dirHandle: dirHandle, groups: result.failedGroups, fileParts: fileParts } : null;
-      updateExportRetryButtonVisibility();
+      updateExportRetryButtons();
       return result;
     }
 
-    // "失敗分のみ再試行" (CT素材) — independent retry state (see updateExportRetryButtonVisibility's comment
-    // for why the two batch kinds never share one).
     async function retryFailedCtExports() {
       await retryFailedExportGroups('lastCtExportRetry', function(retry, onMsg) {
         return writeCtMaterialExportGroups(state.project, retry.groups, retry.dirHandle, onMsg, retry.fileParts);
-      }, false);
+      });
     }
 
     // 실패 보고에 붙일 환경 요약 — 어느 기능이 있고 무엇이 잡혔나가 없으면 실패 제보를 받아도 원인을 좁힐 수 없다.
@@ -121555,13 +121585,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return dir;
     }
     async function runConteExportFromDialog() {
-      const project = state.project;
-      const dialog = document.getElementById('exportDialog'), session = exportSessions.get(dialog);
-      if (!session || session.running || session.delivering) return;
+      const dialog = document.getElementById('exportDialog');
       const mode = selectedExportMode();
-      if (mode === 'image') { exportRunResult(document.getElementById('exportDialog')); return; }
-      session.running = true;
-      try {
+      if (mode === 'image') return exportRunResult(dialog);
+      await runConteExportSession(dialog, function() { return runConteExportMode(mode); });
+    }
+
+    async function runConteExportMode(mode) {
+      const project = state.project;
       // Mirror openConteExportDialog's genga guard — without it a genga project reaching this run path exports
       // silently blank pages (conte renderers see no cuts[]).
       if (state.project && state.project.kind === 'genga') {
@@ -121632,7 +121663,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           state.videoExportCancel = false;
           rememberConteExportOutput(conteExportOutputDims(project), project); // Same remembered resolution as 映像（全体）
           setExportDialogBusy(true, t('export.video.status.cutBatchPreparing'));
-            const r = await runConteExportCutsBatch(dir, function(msg) { setExportDialogBusy(true, msg); }, project);
+          const r = await runConteExportCutsBatch(dir, function(msg) { setExportDialogBusy(true, msg); }, project);
           const tail = exportBatchFailuresText(r.failures);
           setExportDialogBusy(false, (r.canceled ? t('export.video.status.cutBatchCanceledShort') : t('export.video.status.cutBatchDone')) + ' ' + r.written + '/' + r.total + ' ' + t('export.video.unit.films') + tail);
         } catch (error) {
@@ -121650,7 +121681,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         try {
           state.videoExportCancel = false;
           setExportDialogBusy(true, t('export.video.status.cutBatchPreparing'));
-            const r = await runConteExportCtBatch(ctDir, function(msg) { setExportDialogBusy(true, msg); });
+          const r = await runConteExportCtBatch(ctDir, function(msg) { setExportDialogBusy(true, msg); });
           const tail = exportBatchFailuresText(r.failures);
           setExportDialogBusy(false, (r.canceled ? t('export.video.status.cutBatchCanceledShort') : t('export.video.status.cutBatchDone')) + ' ' + r.written + '/' + r.total + tail);
         } catch (error) {
@@ -121696,10 +121727,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const message = t('msg.err.outputFailed', (error && error.message ? error.message : error));
         setExportDialogBusy(false, message);
         alert(message);
-      }
-      } finally {
-        session.running = false;
-        if (dialog.open) exportRefreshResult(dialog); else exportCloseSession(dialog);
       }
     }
 
@@ -131489,7 +131516,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaBatchMotionHideTimer = setTimeout(function() { overlay.hidden = true; }, 2600);
     }
     // 'layers' branch of the genga 書き出し dialog: pick a folder, run the batch, toggle the run button to
-    // 中止. 콘티의 updateExportRetryButtonVisibility 와 같은 일 — 남은 실패가 있을 때만 보인다.
+    // 中止. 콘티의 updateExportRetryButtons 와 같은 일 — 남은 실패가 있을 때만 보인다.
     function updateGengaExportRetryButtonVisibility() {
       const btn = document.getElementById('gengaExportRetryFailedBtn');
       if (!btn) return;
@@ -171884,7 +171911,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       document.getElementById('exportBtn').addEventListener('click', openConteExportDialog);
       document.getElementById('exportDialogCloseBtn').addEventListener('click', function() {
         const dialog = document.getElementById('exportDialog');
-        if (dialog) dialog.close();
+        if (dialog && !exportDialogBusy(dialog)) dialog.close();
       });
       document.getElementById('exportChooseFolderBtn').addEventListener('click', runConteExportFromDialog);
       bindFloatWindowRaise(); // 떠 있는 도구창의 상하관계(누른 순서가 위)
