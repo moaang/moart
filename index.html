@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3512</title>
+  <title>MoArt ver3513</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -98561,21 +98561,18 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       if (changed) ctx.putImageData(image, 0, 0);
       return { changed: changed, model: paintFillModelState(model, 'stale'), assets: [] };
     }
+    // The request fields a bucket press on the genga paper carries (layer, frame, paper, and the generation/project
+    // that its validity is checked against).
+    function gengaBucketRequest(layerId) {
+      const paper = state.project.gengaTimeline.paper;
+      return { project: state.project, generation: state.paintBucketGeneration || 0, layerId: String(layerId || ''),
+        frame: gengaCurrentFrame(), paper: { x: 0, y: 0, w: paper.w, h: paper.h } };
+    }
     function paintFillCurrentRequest(input, operation, target) {
       if (state.project.kind === 'genga') {
-        const paper = state.project.gengaTimeline.paper, layer = gengaLayerById(state.gengaSelectedLayerId);
+        const layer = gengaLayerById(state.gengaSelectedLayerId);
         input.options.alphaLock = Boolean(layer && layer.alphaLock);
-        return {
-          project: state.project,
-          generation: state.paintBucketGeneration || 0,
-          layerId: String(state.gengaSelectedLayerId || ''),
-          frame: gengaCurrentFrame(),
-          x: 0,
-          y: 0,
-          input: input,
-          operation: operation,
-          paper: { x: 0, y: 0, w: paper.w, h: paper.h }
-        };
+        return Object.assign(gengaBucketRequest(state.gengaSelectedLayerId), { x: 0, y: 0, input: input, operation: operation });
       }
       const found = findConteLayerById(state.project, target ? target.layerId : state.selectedConteLayerId);
       if (!found) return null;
@@ -98587,8 +98584,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     }
     function paintFillSubmit(request) {
       if (!request) return Promise.resolve({ status: 'cancelled' });
-      return paintBucketApply(request, request.project.kind === 'genga' ?
-        { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit } : null);
+      return paintBucketApply(request);
     }
     function paintRemoveRegisteredTraces() {
       const input = paintBucketCaptureInput(state.project.kind === 'genga' ? gengaSelectionClip() : null);
@@ -98598,7 +98594,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     function paintFillInspectionCurrent() {
       const check = state.paintFillInspection;
       if (!check) return null;
-      const valid = check.historySeq === paintHistorySeqLast && (check.request.project.kind === 'genga' ? gengaBucketRequestValid(check.request) : conteBucketRequestValid(check.request));
+      const valid = check.historySeq === paintHistorySeqLast && paintBucketEngine(check.request.project).valid(check.request);
       if (!valid) { state.paintFillInspection = null; return null; }
       return check;
     }
@@ -98660,12 +98656,34 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       return paintFillSubmit(request);
     }
 
+    function paintBucketCloneClip(clip) {
+      return clip ? { canvas: cloneCanvas(clip.canvas), x: clip.x, y: clip.y } : null;
+    }
     function paintBucketCaptureInput(clip, extraOptions) {
       return {
         color: activePaintColor(), mode: paintBucketOptionVal('ref'),
         options: Object.assign(paintBucketOptions(), extraOptions),
-        clip: clip ? { canvas: cloneCanvas(clip.canvas), x: clip.x, y: clip.y } : null
+        clip: paintBucketCloneClip(clip)
       };
+    }
+    // The input as seen from a canvas placed at rect.x/rect.y: the selection moves with it (原화's paper rect is at 0, 0).
+    function paintBucketLocalInput(input, rect) {
+      const clip = input.clip;
+      return Object.assign({}, input, { clip: clip ? { canvas: clip.canvas, x: clip.x - rect.x, y: clip.y - rect.y } : null });
+    }
+    // An ordinary fill of `canvas` (placed at rect) at the request's paper point, through the worker when it can.
+    function paintBucketPrepareOrdinary(request, canvas, reference, rect) {
+      const input = paintBucketLocalInput(request.input, rect);
+      return paintBucketPrepareCanvas(canvas, request.x - rect.x, request.y - rect.y, input.color,
+        Object.assign({}, input.options, { clip: input.clip, reference: reference }));
+    }
+    // The request was made in this project and no bucket reset (generation bump) came since.
+    function paintBucketRequestCurrent(request) {
+      return request.project === state.project && request.generation === (state.paintBucketGeneration || 0);
+    }
+    // The queue a prepared request belongs to is still the live one, with no history step since it was opened.
+    function paintBucketQueueCurrent(queue) {
+      return state.paintBucketQueue === queue && queue.historySeq === paintHistorySeqLast;
     }
 
     function paintBucketCompositeCanvas(items, rect) {
@@ -98678,10 +98696,9 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     }
 
     function gengaBucketRequestValid(request, queue) {
-      if (request.project !== state.project || request.generation !== (state.paintBucketGeneration || 0) ||
-          state.project.kind !== 'genga' || gengaDrawSession ||
+      if (!paintBucketRequestCurrent(request) || state.project.kind !== 'genga' || gengaDrawSession ||
           request.frame !== gengaCurrentFrame() || request.layerId !== String(state.gengaSelectedLayerId || '')) return false;
-      if (queue && (state.paintBucketQueue !== queue || queue.historySeq !== paintHistorySeqLast)) return false;
+      if (queue && !paintBucketQueueCurrent(queue)) return false;
       const layer = gengaLayerById(request.layerId), paper = state.project.gengaTimeline.paper;
       if (layer && !gengaExposureAt(layer, request.frame) && !autoCreateKomaOnDrawEnabled(state.project)) return false;
       return Boolean(layer && !gengaLayerEffLocked(layer) && !gengaLayerDrawsVector(layer) && gengaLayerDrawsInComposite(layer) && paper.w === request.paper.w && paper.h === request.paper.h);
@@ -98721,8 +98738,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
           drawGengaPreview();
           return { blocked: true };
         }
-        const prepared = paintBucketPrepareCanvas(canvas, request.x, request.y, request.input.color,
-          Object.assign({}, request.input.options, { clip: request.input.clip, reference: ref ? ref.canvas : null }));
+        const prepared = paintBucketPrepareOrdinary(request, canvas, ref ? ref.canvas : null, request.paper);
         const current = gengaExposureDrawing(layer, gengaExposureAt(layer, request.frame));
         prepared.beforeRef = current && current.ref || null;
         return prepared;
@@ -98840,7 +98856,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const rect = layerDrawingHasInk(drawing, target.drawingRef) ? paintUnionLayerRect(area, layerDrawingBitmapRect(drawing)) : area;
       const fallback = paintStrokeClipForOp({ drawingRef: target.drawingRef });
       input = input || paintBucketCaptureInput(fallback);
-      const sourceClip = input.clip || paintBucketCaptureInput(fallback).clip;
+      const sourceClip = input.clip || paintBucketCloneClip(fallback);
       let clip = sourceClip;
       if (clip && inputFx) {
         const mapped = contePaintFxCanvas({ image: clip.canvas, x: clip.x, y: clip.y }, inputFx, true);
@@ -98876,11 +98892,10 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     }
 
     function conteBucketRequestValid(request, queue) {
-      if (request.project !== state.project || request.generation !== (state.paintBucketGeneration || 0) ||
-          !state.videoEditMode || state.paintRasterOp || state.paintCurrentStroke ||
+      if (!paintBucketRequestCurrent(request) || !state.videoEditMode || state.paintRasterOp || state.paintCurrentStroke ||
           request.frame !== state.videoPlayheadFrames || request.cutId !== currentPicturePanelId() ||
           request.layerId !== String(state.selectedConteLayerId || '')) return false;
-      if (queue && (state.paintBucketQueue !== queue || queue.historySeq !== paintHistorySeqLast)) return false;
+      if (queue && !paintBucketQueueCurrent(queue)) return false;
       const paper = contePaperBitmapRectRuntime(request.project);
       if (paper.w !== request.paper.w || paper.h !== request.paper.h) return false;
       const found = findConteLayerById(state.project, request.layerId);
@@ -98947,12 +98962,11 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
           });
           await paintBucketPrepareAnimation(request, prepared, prepared.fillSources, { engine: 'conte', rect: rect,
             isCurrent: function() { return conteBucketRequestValid(request, queue); } }, function() { return target.drawing.fillModel; }, function() {
-            const clip = request.input.clip;
             return {
               canvas: paintBucketCompositeCanvas([conteBucketSourceItem(target)], rect),
               x: request.x - rect.x,
               y: request.y - rect.y,
-              input: Object.assign({}, request.input, { clip: clip ? { canvas: clip.canvas, x: clip.x - rect.x, y: clip.y - rect.y } : null })
+              input: paintBucketLocalInput(request.input, rect)
             };
           });
         });
@@ -98961,13 +98975,11 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         const ready = prepared.ready;
         const compute = function() {
           if (!conteBucketRequestValid(request, queue)) return;
-          const rect = request.rect, target = sources.find(function(s) { return s.target; }), clip = request.input.clip;
+          const rect = request.rect, target = sources.find(function(s) { return s.target; });
           const canvas = paintBucketCompositeCanvas([conteBucketSourceItem(target)], rect);
           const reference = request.input.mode === 'current' ? null :
             paintBucketCompositeCanvas(sources.filter(function(s) { return s.reference; }).map(conteBucketSourceItem), rect);
-          const fill = paintBucketPrepareCanvas(canvas, request.x - rect.x, request.y - rect.y, request.input.color,
-            Object.assign({}, request.input.options, { reference: reference,
-              clip: clip ? { canvas: clip.canvas, x: clip.x - rect.x, y: clip.y - rect.y } : null }));
+          const fill = paintBucketPrepareOrdinary(request, canvas, reference, rect);
           prepared.canvas = canvas;
           prepared.fill = fill;
           prepared.flush = fill.flush;
@@ -98991,10 +99003,9 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       const target = sources.find(function(s) { return s.target; });
       const rect = request.rect;
       const canvas = prepared.canvas || paintBucketCompositeCanvas([conteBucketSourceItem(target)], rect);
-      const clip = request.input.clip;
       if (request.input.options.animation) {
         return paintBucketCommitAnimation(request, prepared, { canvas: canvas, model: target.drawing.fillModel, rect: rect,
-          input: Object.assign({}, request.input, { clip: clip ? { canvas: clip.canvas, x: clip.x - rect.x, y: clip.y - rect.y } : null }) },
+          input: paintBucketLocalInput(request.input, rect) },
           function(result) { return conteFillCommit(request, canvas, rect, result); });
       }
       if (!prepared.fill.changed) return { status: 'unchanged' };
@@ -99070,8 +99081,14 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
         queue = state.paintBucketQueue;
       }
     }
-    function paintBucketApply(request, adapter) {
-      adapter = adapter || { valid: conteBucketRequestValid, prepare: conteBucketPrepare, commit: conteBucketCommit };
+    // Each drawing engine resolves its own pixels and commit; the queue, worker and animation fill are shared.
+    function paintBucketEngine(project) {
+      return project.kind === 'genga'
+        ? { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit }
+        : { valid: conteBucketRequestValid, prepare: conteBucketPrepare, commit: conteBucketCommit };
+    }
+    function paintBucketApply(request) {
+      const adapter = paintBucketEngine(request.project);
       if (!adapter.valid(request)) return Promise.resolve({ status: 'cancelled' });
       let queue = state.paintBucketQueue;
       if (!queue) {
@@ -155661,15 +155678,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaBeginBucketFill(ev, layer, vectorDraw) {
       const p = gengaPreviewPointerXY(ev);
       if (!p) return;
-      const frame = gengaCurrentFrame(), project = state.project;
-      const paper = project.gengaTimeline.paper;
-      const request = {
-        project: project,
-        generation: state.paintBucketGeneration || 0,
-        layerId: String(layer.id),
-        frame: frame,
-        paper: { x: 0, y: 0, w: paper.w, h: paper.h }
-      };
+      const request = gengaBucketRequest(layer.id), frame = request.frame;
       // Raster-only operation. A touch waits for up before acquiring the current drawing's canvas.
       if (vectorDraw) {
         gengaShowStatus(t('status.genga.vector.rasterBlocked'), { warn: true });
@@ -155686,8 +155695,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (input.options.animation || (gengaSelLifted(gengaSel) && String(gengaSel.layerId) === request.layerId && gengaSel.frame === frame)) {
           if (!gengaPrepareDrawTarget(ev, gengaLayerById(request.layerId), 0)) return;
         }
-        paintBucketApply(Object.assign({}, request, { x: p.x, y: p.y, input: input, event: ev }),
-          { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit });
+        paintBucketApply(Object.assign({}, request, { x: p.x, y: p.y, input: input, event: ev }));
       };
       paintDeferBucketFill(ev, function() {
         if (!gengaBucketRequestValid(request)) return;
