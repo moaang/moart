@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3524</title>
+  <title>MoArt ver3525</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -96930,11 +96930,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       for (let i = start; i < points.length; i += 1) {
         const pt = points[i];
-        ctx.globalAlpha = strokeOpacity * paintPressureAlphaFactor(stroke, pt.p, pt.t); // the factor returns 1 when pressureAlpha is off, and tilt must survive that case
         const r = paintHardRadius(stroke, pt.p, pt.t);
         const x = pt.x * width - ox, y = pt.y * height - oy;
-        if (i === 0) paintHardDisc(ctx, x, y, r);
-        else paintHardSegment(ctx, lastX, lastY, lastR, x, y, r);
+        // the alpha factor returns 1 when pressureAlpha is off, and tilt must survive that case
+        paintDrawSegmentMark(ctx, i === 0 ? null : lastX, lastY, lastR, x, y, r, strokeOpacity * paintPressureAlphaFactor(stroke, pt.p, pt.t), true);
         lastX = x;
         lastY = y;
         lastR = r;
@@ -97086,43 +97085,29 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const oy = Number(offsetY) || 0;
       ctx.save();
       applyPaintStrokeStyle(ctx, stroke); // raw px, width/height are position-only
+      const x = toPoint.x * width - ox;
+      const y = toPoint.y * height - oy;
+      const x0 = fromPoint ? fromPoint.x * width - ox : null;
+      const y0 = fromPoint ? fromPoint.y * height - oy : null;
       if (stroke.aa === false) { // hard edge stamps the final pixels live (same renderer as commit — raster-consistency invariant)
         // 알파를 필압 게이트 밖에서 커밋과 같은 식으로 세운다 — `if (stroke.pressure)` 안에 두면
         // 筆圧→不透明度를 끄고 傾き→不透明度만 켠 2値化 획이 라이브에서 알파 1로 그려지고,
         // 커밋(paintHardStrokeInto)은 틸트 팩터를 곱해 손 떼는 순간 농도가 튄다.
         // paintPressureAlphaFactor는 필압이 꺼져 있어도 틸트 몫을 돌려주므로 양쪽이 같다.
-        ctx.globalAlpha = paintPressureAlphaFactor(stroke, toPoint.p, toPoint.t);
         ctx.fillStyle = stroke.color || '#111111';
-        const hx = toPoint.x * width - ox;
-        const hy = toPoint.y * height - oy;
-        const r = paintHardRadius(stroke, toPoint.p, toPoint.t);
-        if (!fromPoint) paintHardDisc(ctx, hx, hy, r);
-        else paintHardSegment(ctx, fromPoint.x * width - ox, fromPoint.y * height - oy, paintHardRadius(stroke, fromPoint.p, fromPoint.t), hx, hy, r);
+        paintDrawSegmentMark(ctx, x0, y0, fromPoint ? paintHardRadius(stroke, fromPoint.p, fromPoint.t) : 0,
+          x, y, paintHardRadius(stroke, toPoint.p, toPoint.t), paintPressureAlphaFactor(stroke, toPoint.p, toPoint.t), true);
         ctx.restore();
         return;
       }
+      let markWidth = ctx.lineWidth, markAlpha = ctx.globalAlpha;
       if (stroke.pressure || paintStrokeUsesTilt(stroke)) { // Live pen segment — width/alpha follow the pen (opacity itself stays opaque until commit)
-        const segmentWidth = ctx.lineWidth * paintPressureWidthFactor(stroke, toPoint.p, toPoint.t);
-        if (!(segmentWidth > 0)) { ctx.restore(); return; }
-        ctx.lineWidth = segmentWidth; // Tilt
-        ctx.globalAlpha = paintPressureAlphaFactor(stroke, toPoint.p, toPoint.t);
+        markWidth = ctx.lineWidth * paintPressureWidthFactor(stroke, toPoint.p, toPoint.t);
+        if (!(markWidth > 0)) { ctx.restore(); return; }
+        markAlpha = paintPressureAlphaFactor(stroke, toPoint.p, toPoint.t);
       }
-      ctx.beginPath();
-      const x = toPoint.x * width - ox;
-      const y = toPoint.y * height - oy;
-      if (!fromPoint) {
-        const radius = ctx.lineWidth / 2;
-        ctx.arc(x, y, radius, 0, Math.PI * 2);
-        if (paintStrokeErases(stroke)) ctx.fill();
-        else {
-          ctx.fillStyle = stroke.color || '#111111';
-          ctx.fill();
-        }
-      } else {
-        ctx.moveTo(fromPoint.x * width - ox, fromPoint.y * height - oy);
-        ctx.lineTo(x, y);
-        ctx.stroke();
-      }
+      if (!paintStrokeErases(stroke)) ctx.fillStyle = stroke.color || '#111111';   // 첫 점의 원(지우개는 기본 칠로 잘라 낸다)
+      paintDrawSegmentMark(ctx, x0, y0, 0, x, y, markWidth / 2, markAlpha, false);
       ctx.restore();
     }
 
@@ -154899,6 +154884,27 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       ctx.fill(path);
     }
+    // 세그먼트 렌더의 한 마디 — 원화·콘티의 실시간 선분·첫 점과 콘티 2値化 확정 렌더가 함께 쓴다. ctx 픽셀 좌표이고
+    // 색·합성·lineCap 은 부르는 쪽이 세운다(save/restore 도). x0 가 null 이면 첫 점이다. hard(2値化)는 r0 에서 r 로 잇는
+    // 픽셀 캡슐 / 원판, 아니면 지름 2r 의 둥근 선 / 원. alpha 는 이 마디의 globalAlpha(절대값).
+    function paintDrawSegmentMark(ctx, x0, y0, r0, x, y, r, alpha, hard) {
+      ctx.globalAlpha = alpha;
+      if (hard) {
+        if (x0 == null) paintHardDisc(ctx, x, y, r);
+        else paintHardSegment(ctx, x0, y0, r0, x, y, r);
+        return;
+      }
+      ctx.beginPath();
+      if (x0 == null) {
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.lineWidth = r * 2;
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+      }
+    }
     // (x0,y0,r0) → (x1,y1,r1) 선분. 시작 원 안은 칠하지 않는다(앞에서 칠했다).
     function paintHardSegment(ctx, x0, y0, r0, x1, y1, r1) {
       if (!(Math.max(r0, r1) >= PAINT_HARD_THIN_R)) {
@@ -155972,15 +155978,22 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (gengaDrawSession.arc) gengaDrawSession.arc.p = startPressure;
       // 획 머리도 몸통과 같은 식으로 굵어진다 — 곡선을 곱해 반올림하고 그 정수에 틸트를 또 곱하면 두 번
       // 반올림이 되고, 제어점 곡선(pCurvePts)을 안 넘기면 그것이 머리에서만 빠진다. 세션이 정본 필드를 들었으므로
-      // 그대로 커널에 넘긴다 — 세 경로 모두 paintPressureWidthFactor 로 굵기를 정한다.
-      const startSize = gengaDrawSession.penBaseWidth * paintPressureWidthFactor(gengaDrawSession, downPressure, downTilt);
+      // 그대로 커널에 넘긴다 — 세 경로 모두 paintPressureWidthFactor 로 굵기를 정한다. 첫 점도 캡을 지난 startPressure 로
+      // 굵기·알파를 정한다 — 콘티의 첫 점(points[0].p)·2値化 확정 렌더와 같은 값이다(원값이면 2値化 필압 획의 머리만 굵다).
+      const startSize = gengaDrawSession.penBaseWidth * paintPressureWidthFactor(gengaDrawSession, startPressure, downTilt);
+      const startAlpha = paintPressureAlphaFactor(gengaDrawSession, startPressure, downTilt);   // 2値化 필압·기울기 → 불투명도도 첫 점부터
       const startHard = Boolean(gengaDrawSession.hardEdge);
       gengaDrawSession.hardR = startSize / 2;   // 다음 선분의 시작 반지름(필압 굵기를 선분 안에서 잇는다)
       // The start dot. penBaseWidth bounds every later mark too — paintVariableWidthRadii caps each
       // radius at baseWidth/2 (paintPressureCurve returns ≤ 1) and a per-segment width is at most the rounded
       // same product — so half the wider of {base, start} is the largest radius this session can produce.
       gengaScanMark(gengaDrawSession, p.x, p.y, Math.max(startSize, c.lineWidth) / 2 + 1);
-      let gengaFirstDab = null;   // 세 갈래 중 하나가 담긴다
+      function gengaDrawStartMark(ctx) {   // 버퍼든 레이어든 같은 첫 점
+        ctx.save();
+        paintDrawSegmentMark(ctx, null, 0, 0, p.x, p.y, startSize / 2, ctx.globalAlpha * startAlpha, startHard);
+        ctx.restore();
+      }
+      let gengaFirstDab = null;   // 두 갈래 중 하나가 담긴다
       if (penOpacity < 1 || penOutlineMode || gengaStrokeClipFor(gengaDrawSession) || (!eraser && paintBrushModeIsBlend(paintBrushModeVal()))) { // 그레인은 penOutlineMode 가 이미 포함한다
         // A real blend mode (multiply/screen/dodge/colorize) also forces the buffer path — otherwise a plain
         // opaque non-pressure genga pen would draw source-over and drop the blend. gengaStrokeComposite applies
@@ -156014,23 +156027,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaFirstDab = function() {
           if (penOutlineMode) gengaPenOutlineRedraw(gengaDrawSession);
           else {
-            if (startHard) paintHardDisc(pb, p.x, p.y, startSize / 2);
-            else {
-              pb.beginPath();
-              pb.arc(p.x, p.y, startSize / 2, 0, Math.PI * 2);
-              pb.fill();
-            }
+            gengaDrawStartMark(pb);
             gengaStrokeComposite(gengaDrawSession);
           }
         };
-      } else if (startHard) {
-        gengaFirstDab = function() { paintHardDisc(c, p.x, p.y, startSize / 2); };
       } else {
-        gengaFirstDab = function() {
-          c.beginPath();
-          c.arc(p.x, p.y, startSize / 2, 0, Math.PI * 2);
-          c.fill();
-        };
+        gengaFirstDab = function() { gengaDrawStartMark(c); };
       }
       // 입력은 즉시, 출력만 유예 — 호출부의 setPointerCapture·preventDefault 는 이 프레임에서 끝난다(iOS 의 터치 소유권 판정 창을 놓치지 않는다). 화면에 찍는 첫 dab 만
       // 첫 move 까지 미룬다. 두 손가락 탭이면 그 사이 세션이 폐기되어 그린 적이 없다.
@@ -156237,17 +156239,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaCaptureHistoryBefore(penSess, segmentRect);
         if (penSess.penBufMode) penSess.penCompositeRect = paintUnionLayerRect(penSess.penCompositeRect, segmentRect);
         target.save();
-        target.globalAlpha = target.globalAlpha * segAlpha;
-        if (penSess.hardEdge) { // AA off: 실수 좌표·연속 반지름 캡슐(시작 반지름은 앞 선분의 끝)
-          paintHardSegment(target, penSess.lastX, penSess.lastY, penSess.hardR, p.x, p.y, segWidth / 2);
-          penSess.hardR = segWidth / 2;
-        } else {
-          target.lineWidth = segWidth;
-          target.beginPath();
-          target.moveTo(penSess.lastX, penSess.lastY);
-          target.lineTo(p.x, p.y);
-          target.stroke();
-        }
+        // 2値化(hard)면 실수 좌표·연속 반지름 캡슐(시작 반지름은 앞 선분의 끝), 아니면 둥근 선
+        paintDrawSegmentMark(target, penSess.lastX, penSess.lastY, penSess.hardR, p.x, p.y, segWidth / 2, target.globalAlpha * segAlpha, penSess.hardEdge);
+        if (penSess.hardEdge) penSess.hardR = segWidth / 2;
         target.restore();
         penSess.lastX = p.x;
         penSess.lastY = p.y;
