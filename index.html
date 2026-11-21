@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3523</title>
+  <title>MoArt ver3524</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -30523,6 +30523,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         gengaCarryLayerViewState(viewBefore, gengaHistoryPayloadLayers(command.after));
       }
 
+      const timelineSelection = command.gengaTimelineSelection;
+      const restoreSelection = timelineSelection && gengaTimelineSelectionMatches(undoing ? timelineSelection.after : timelineSelection.before);
       const restoredPixels = gengaApplyHistoryPixels(command, undoing);
       applyHistoryCommandPayload(command, undoing, pushOther);
       revealHistoryCommand(command, false); // Structural edits may change the frame range; retain payload selection.
@@ -30549,6 +30551,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       applySelectionRider(command, undoing);
       if (command.conteGeometryUi) restoreConteGeometryUi(undoing ? command.conteGeometryUi.before : command.conteGeometryUi.after);
       if (command.gengaGeometryUi) restoreGengaGeometryUi(undoing ? command.gengaGeometryUi.before : command.gengaGeometryUi.after);
+      if (restoreSelection) restoreGengaTimelineSelection(undoing ? timelineSelection.before : timelineSelection.after);
       restoreGengaDrawingEditContext(command.gengaDrawingContext);
       if (state.project && state.project.kind === 'genga') gengaNoteMove(); // 선택 규칙: 사라진 것을 가리키는 선택을 내린다
       drawingRecordingNotifyCommand(command, true);
@@ -146389,6 +146392,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 세우고, 그림은 첫 획이 만든다. 셀·벡터 레이어는 이 몸을 함께 쓰며 이름 접두와 `vector` 플래그만 다르다.
     // 벡터가 못 담는 브러시 효과는 만든 뒤의 선택(gengaAdoptLayer → selectGengaLayer)이 끈다.
     function addGengaLayerOfKind(namePrefix, vector) {
+      recordGengaTimelineSelection(() => insertGengaLayerOfKind(namePrefix, vector));
+    }
+    function insertGengaLayerOfKind(namePrefix, vector) {
       if (!state.project || state.project.kind !== 'genga' || !state.project.gengaTimeline) return;
       if (gengaTaggableLayerCount(state.project.gengaTimeline) >= 26) { alert(t('msg.genga.layer.limitReached')); return; }
       paintInputFlushSync();
@@ -146426,6 +146432,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // 골랐으면(전부 지운 뒤 추가) 선택이 그대로라 그리지 않으므로, 그려지지 않았을 때만 여기서 그린다.
       const drawSeq = gengaPreviewDrawSeq;
       gengaAdoptLayer(newId);
+      gengaDropUnfitSelections();
       if (gengaPreviewDrawSeq === drawSeq) drawGengaPreview();
     }
     function gengaLayerStructurePlan(previewByCaller) {
@@ -147469,6 +147476,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       deleteGengaLayers(Array.from(gengaSelectedLayerIdSet()).concat(state.gengaSelectedLayerId || []));
     }
     function deleteGengaLayers(ids) {
+      recordGengaTimelineSelection(() => removeGengaLayerRows(ids));
+    }
+    function removeGengaLayerRows(ids) {
       if (!state.project || state.project.kind !== 'genga') return;
       const layers = state.project.gengaTimeline && state.project.gengaTimeline.layers;
       // 지시 레이어는 지우지 않는다(숨긴다) — 카메라 지시가 있는 한 다음 카메라 편집에 다시 생긴다.
@@ -147503,6 +147513,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           if (next) set.add(String(next.id));
         }
       });
+      gengaDropUnfitSelections();
       gengaCenterLayerIntoView(state.gengaSelectedLayerId);   // 행은 이 명령의 렌더로 이미 있다
     }
     // inline-edit the layer name in place (dblclick → editable text, like the koma instance-value edit).
@@ -148128,6 +148139,46 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // pattern (see selectCameraKeyframe). state.gengaSelectedLayerId stays the single "primary" layer (FX window,
     // inspector-style single-target actions and solo view keep using it); the Set also drives grouping,
     // multi-layer deletion, and the multi-select highlight.
+    function gengaTimelineSelectionSnapshot() {
+      return {
+        layer: state.gengaSelectedLayerId,
+        layers: Array.from(gengaSelectedLayerIdSet()),
+        anchor: state.gengaLayerAnchorId,
+        cells: state.gengaCellSel && { ...state.gengaCellSel },
+        cellAnchor: state.gengaCellSel && state.gengaCellSelAnchor && { ...state.gengaCellSelAnchor }
+      };
+    }
+
+    function recordGengaTimelineSelection(edit) {
+      paintInputFlushSync();
+      const previous = state.undoStack.at(-1);
+      const before = gengaTimelineSelectionSnapshot();
+      edit();
+      const command = state.undoStack.at(-1);
+      if (!command || command === previous) return;
+      const after = gengaTimelineSelectionSnapshot();
+      if (!jsonDeepEquals(before, after)) command.gengaTimelineSelection = { before, after };
+    }
+
+    function gengaTimelineSelectionMatches(selection) {
+      const current = gengaTimelineSelectionSnapshot();
+      if (jsonDeepEquals(current, selection)) return true;
+      // 이력 이동 뒤 현재 코마 밖의 범위는 해제된다. 같은 명령을 다시 되돌릴 때도 그 상태를 인식한다.
+      const cells = selection.cells, frame = gengaCurrentFrame();
+      return !current.cells && cells && (frame < cells.start || frame > cells.end)
+        && jsonDeepEquals(current, { ...selection, cells: null, cellAnchor: null });
+    }
+
+    function restoreGengaTimelineSelection(selection) {
+      if (state.gengaSelectedLayerId !== selection.layer) selectGengaLayer(selection.layer);
+      state.gengaSelectedLayerIds = new Set(selection.layers);
+      state.gengaLayerAnchorId = selection.anchor;
+      state.gengaCellSel = selection.cells && { ...selection.cells };
+      state.gengaCellSelAnchor = selection.cellAnchor && { ...selection.cellAnchor };
+      if (state.gengaSoloView) { onionClearGhostCache(); drawGengaPreview(); }
+      gengaUpdateLayerSelectionDom();
+      updateGengaCellSelDom();
+    }
     function gengaSelectedLayerIdSet() {
       if (!state.gengaSelectedLayerIds) state.gengaSelectedLayerIds = new Set();
       return state.gengaSelectedLayerIds;
@@ -148262,6 +148313,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const set = gengaSelectedLayerIdSet();
       let layersChanged = false;
       set.forEach(function(id) { if (!gengaLayerById(id)) { set.delete(id); layersChanged = true; } });
+      if (!state.gengaCellSel) state.gengaCellSelAnchor = null;
       if (state.gengaLayerAnchorId && !gengaLayerById(state.gengaLayerAnchorId)) state.gengaLayerAnchorId = null;
       if (layersChanged) gengaUpdateLayerSelectionDom();
       let standalone = false;
@@ -163067,10 +163119,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // head/tail handles resize in place).
       if (d.mode === 'move' && d.targetLayerId && String(d.targetLayerId) !== String(d.layerId)) {
         gengaMoveExposuresToLayer(d.layerId, [d.expId], d.nextStart - d.origStart, d.targetLayerId);
-        // 레이어가 바뀌는 이동이라 선택 규칙의 「이동」에 든다 — 옛 레이어의 선택을 내리고 새로 세우지 않는다
-        // (세워도 레이어 전환의 맞음 검사가 현재 칸 밖이면 내리고, 이동이 거절되면 엉뚱한 칸을 가리킨다).
-        if (state.gengaCellSel) { state.gengaCellSel = null; updateGengaCellSelDom(); }
-        selectGengaLayer(String(d.targetLayerId));
         return;
       }
       // A press on a koma that moved and resized nothing is a plain click — how you pick an instance — so the
@@ -163101,10 +163149,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       } else if (d.mode === 'move') {
         const target = gengaMoveDropStart(layer, d, d.nextStart);   // 미리보기가 이미 같은 수를 보였다
         if (target === d.origStart) { rerenderGengaLayerRows(d.layerId); return; } // nowhere free to go → settle back
-        runCommand('原画インスタンス移動', function(proj) {
-          const e = gengaFindExposure(proj, d.layerId, d.expId);
-          if (e) e.startFrame = Math.max(1, target);
+        recordGengaTimelineSelection(function() {
+          runCommand('原画インスタンス移動', function(proj) {
+            const e = gengaFindExposure(proj, d.layerId, d.expId);
+            if (e) e.startFrame = Math.max(1, target);
+          });
+          gengaSelectKoma(d.layerId, d.expId);
         });
+        return;
       }
       gengaSelectKoma(d.layerId, d.expId);   // 옮기거나 늘인 코마도 클릭과 같이 보이는 선택이 된다
     }
@@ -163971,6 +164023,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // single-koma body drag can call it. exposureIds are exposure ids in the srcLayerId layer; delta is the horizontal shift.
     function gengaMoveExposuresToLayer(srcLayerId, exposureIds, delta, tgtLayerId) {
       if (!gengaCrossLayerMoveAllowed(srcLayerId, tgtLayerId)) return;
+      recordGengaTimelineSelection(function() {
+        gengaTransferExposures(srcLayerId, exposureIds, delta, tgtLayerId);
+        state.gengaCellSel = null;
+        state.gengaCellSelAnchor = null;
+        updateGengaCellSelDom();
+        selectGengaLayer(String(tgtLayerId));
+      });
+    }
+    function gengaTransferExposures(srcLayerId, exposureIds, delta, tgtLayerId) {
       const idset = new Set((exposureIds || []).map(String));
       runCommand('原画コマレイヤー移動', function(proj) {
         const layers = (proj.gengaTimeline && proj.gengaTimeline.layers) || [];
@@ -164116,28 +164177,25 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       const delta = d.delta, idset = d.idset;
       if (crossLayer) {
-        // Move the dragged komas' drawings into the layer under the pointer, with cel-group
-        // semantics — see gengaMoveExposuresToLayer. 레이어가 바뀌는 이동이라 선택 규칙의 「이동」에 든다 — 선택을
-        // 내린다(대상 레이어에 세워도 레이어 전환의 맞음 검사가 현재 칸 밖이면 내리고, 이동이 거절되면 엉뚱한 칸을 가리킨다).
         gengaMoveExposuresToLayer(d.layerId, Array.from(idset), delta, d.targetLayerId);
-        if (state.gengaCellSel) { state.gengaCellSel = null; updateGengaCellSelDom(); }
-        selectGengaLayer(String(d.targetLayerId));
         return;
       }
-      // 같은 레이어: 후보가 정한 대로 선택을 옮기거나(범위 앵커도 함께 — 남으면 다음 Shift·Ctrl+클릭이 옛 칸에서
-      // 잡힌다) 내린다.
-      if (state.gengaCellSel && String(state.gengaCellSel.layerId) === String(d.layerId)) {
-        if (d.dropSel) state.gengaCellSel = null;
-        else if (d.selStart != null) {
-          state.gengaCellSel = { layerId: d.layerId, start: d.selStart + delta, end: d.selEnd + delta };
-          const a = state.gengaCellSelAnchor;
-          if (a && String(a.layerId) === String(d.layerId)) state.gengaCellSelAnchor = { layerId: String(d.layerId), frame: a.frame + delta };
+      recordGengaTimelineSelection(function() {
+        // 같은 레이어: 후보가 정한 대로 선택을 옮기거나(범위 앵커도 함께 — 남으면 다음 Shift·Ctrl+클릭이 옛 칸에서
+        // 잡힌다) 내린다.
+        if (state.gengaCellSel && String(state.gengaCellSel.layerId) === String(d.layerId)) {
+          if (d.dropSel) state.gengaCellSel = null;
+          else if (d.selStart != null) {
+            state.gengaCellSel = { layerId: d.layerId, start: d.selStart + delta, end: d.selEnd + delta };
+            const a = state.gengaCellSelAnchor;
+            if (a && String(a.layerId) === String(d.layerId)) state.gengaCellSelAnchor = { layerId: String(d.layerId), frame: a.frame + delta };
+          }
         }
-      }
-      runCommand(d.kind === 'ripple' ? '原画コマリップル移動' : '原画コマ一括移動', function(proj) {
-        const L = (proj.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(d.layerId); });
-        if (!L) return;
-        (L.exposures || []).forEach(function(e) { if (idset.has(String(e.id))) e.startFrame = Math.max(1, e.startFrame + delta); });
+        runCommand(d.kind === 'ripple' ? '原画コマリップル移動' : '原画コマ一括移動', function(proj) {
+          const L = (proj.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(d.layerId); });
+          if (!L) return;
+          (L.exposures || []).forEach(function(e) { if (idset.has(String(e.id))) e.startFrame = Math.max(1, e.startFrame + delta); });
+        });
       });
     }
     // pointerdown on an empty cell (koma bodies/number strip stop propagation) → maybe start a batch drag; else
@@ -165323,6 +165381,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
     }
     function deleteGengaExposure(layerId, expId) {
+      recordGengaTimelineSelection(() => removeGengaExposure(layerId, expId));
+    }
+    function removeGengaExposure(layerId, expId) {
       const target = gengaLayerById(layerId);
       if (!target || gengaLayerEffLocked(target)) return;
       runCommand('原画インスタンス削除', function(proj) {
@@ -165330,6 +165391,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!gt) return;
         const layer = (gt.layers || []).find(function(l) { return String(l.id) === String(layerId); });
         if (!layer || !Array.isArray(layer.exposures)) return;
+        const exposure = gengaFindExposure(proj, layerId, expId);
+        const cells = state.gengaCellSel;
+        if (exposure && cells && cells.layerId === String(layerId) && cells.start === exposure.startFrame
+          && cells.end === exposure.startFrame + exposure.holdFrames - 1) {
+          state.gengaCellSel = null;
+          state.gengaCellSelAnchor = null;
+        }
         layer.exposures = layer.exposures.filter(function(e) { return String(e.id) !== String(expId); });
       });
     }
