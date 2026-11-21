@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3518</title>
+  <title>MoArt ver3519</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -57107,7 +57107,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Math.max(min, Math.min(max, Number.isFinite(n) && n > 0 ? n : fallback));
     }
 
-    function conteTimelineFramePx() { return timelineZoomValue(state.timelineFramePx, 1, 6, 5); }
+    function conteTimelineZoom(value, fallback) { return timelineZoomValue(value, 1, 6, fallback); }
+    function conteTimelineFramePx() { return conteTimelineZoom(state.timelineFramePx, 5); }
 
     function timelineScrollbarThumbHtml(attributes) {
       return '<div class="timeline-scrollbar-thumb" ' + attributes + '>' +
@@ -169405,16 +169406,19 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return values;
     }
 
+    function savedTimelinePosition(ui, fallback = {}) {
+      const { timelineScrollLeft = fallback.timelineScrollLeft, videoPlayheadFrames = fallback.videoPlayheadFrames } = ui || {};
+      return {
+        timelineScrollLeft: Math.max(0, Math.round(Number(timelineScrollLeft) || 0)),
+        videoPlayheadFrames: Math.max(0, Math.round(Number(videoPlayheadFrames) || 0))
+      };
+    }
+
     function editorUiStatePayload() {
       return {
         ...panelWindowGeometry(state),
         timelineFramePx: conteTimelineFramePx(),
-        timelineScrollLeft: Math.max(0, Math.round(Number(state.timelineScrollLeft) || 0)),
-        // Playhead position (video-edit timeline scrub/seek). Persisted the same way as scroll position
-        // (settle-point save, not every frame during playback) -- see the scheduleEditorUiStateSave calls in
-        // seekTimelineFromPointer/stopTimelinePlayback. No clamping here: every render path already re-clamps
-        // against the live project's own total frames (clampTimelinePlayheadFrame), same as scroll's restore.
-        videoPlayheadFrames: Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0)),
+        ...savedTimelinePosition(state),
         timelineTracksHeight: state.timelineTracksHeight == null ? null : clampTimelineTracksHeight(state.timelineTracksHeight),
         // 아래 구역(영상+오디오) 몫 — 옛 판이 같은 이름·같은 뜻으로 읽는 키라 그대로 둔다(높이가 아직 자동일 때의 아래 몫)
         timelineLowerPanelHeight: Math.round(Number(state.timelineTracksLowerSeed) || TIMELINE_LOWER_DEFAULT_HEIGHT),
@@ -169567,10 +169571,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
       });
       // Project kind owns the stage mode; UI preferences only restore view geometry and controls.
-      state.timelineFramePx = timelineZoomValue(ui.timelineFramePx, 1, 6, state.timelineFramePx || conteTimelineFramePx());
-      // A partial app preference must not erase the project's restored viewport. Explicit zero still wins.
-      if (Object.prototype.hasOwnProperty.call(ui, 'timelineScrollLeft')) state.timelineScrollLeft = Math.max(0, Math.round(Number(ui.timelineScrollLeft) || 0));
-      if (Object.prototype.hasOwnProperty.call(ui, 'videoPlayheadFrames')) state.videoPlayheadFrames = Math.max(0, Math.round(Number(ui.videoPlayheadFrames) || 0));
       // 세 구역 합(사용자가 끈 값) + 아래 몫. 옛 파일은 아래 몫만 있어 합은 자동(콘티 레인 제 높이 + 그 몫)이 된다.
       if (Object.prototype.hasOwnProperty.call(ui, 'timelineTracksHeight') || Object.prototype.hasOwnProperty.call(ui, 'timelineLowerPanelHeight')) {
         state.timelineTracksHeight = Number(ui.timelineTracksHeight) > 0 ? Number(ui.timelineTracksHeight) : null;
@@ -169833,19 +169833,19 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (Array.isArray(weights) && weights.length === 3 && weights.every(function(v) { return Number.isFinite(v) && v >= 0; })) state.timelineSectionWeights = weights;
       } catch (error) { console.warn('[timeline layout]', error); }
       const projectUi = state.project && state.project.settings && state.project.settings.editorUi;
+      // A history snapshot restores the edit. Its viewport stays live until any command-specific navigation.
+      if (openedProject !== false) {
+        state.timelineFramePx = conteTimelineZoom(projectUi?.timelineFramePx, conteTimelineFramePx());
+        Object.assign(state, savedTimelinePosition(projectUi, openedProject ? undefined : state));
+      }
       if (projectUi) applyEditorUiState(projectUi);
       try {
         const saved = JSON.parse(localStorage.getItem(EDITOR_UI_STORAGE_KEY) || '{}');
+        if (openedProject !== false) state.timelineFramePx = conteTimelineZoom(saved?.timelineFramePx, conteTimelineFramePx());
+        // Only initial startup takes position from the device. An opened file owns its position.
+        if (openedProject === undefined) Object.assign(state, savedTimelinePosition(saved, state));
         applyEditorUiState(saved);
       } catch (error) {}
-      // 보던 자리(재생 위치·타임라인 스크롤)는 그 프로젝트의 것이다(사용자 결정 2026-11-15). 기기 값이 앞 프로젝트에서 보던
-      // 자리로 덮으므로 마지막에 프로젝트 값으로 다시 쓰고, 저장한 적 없는 프로젝트는 처음에서 연다. 나머지 화면 배치는 기기 값이 이긴다.
-      // 같은 프로젝트의 Undo/Redo(openedProject 아님)는 스냅숏의 옛 자리로 튀지 않게 그대로 둔다.
-      if (openedProject) {
-        const projectSpot = function(key) { return Math.max(0, Math.round(Number(projectUi && projectUi[key]) || 0)); };
-        state.timelineScrollLeft = projectSpot('timelineScrollLeft');
-        state.videoPlayheadFrames = projectSpot('videoPlayheadFrames');
-      }
       updateProjectEditorUiState();
       // Push the restored geometry to the DOM. bindEvents() runs the apply*WindowState pass before this
       // function loads anything, so without this the floating windows stay at their stylesheet fallback (TOOLS
