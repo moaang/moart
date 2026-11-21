@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3532</title>
+  <title>MoArt ver3533</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -134192,11 +134192,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // 클립의 코마별 음량(미리보기와 같은 분석·음역). 들리는 구간(트림 안)만 값이 있다. 분석 중이면 { pending }.
     function gengaDialogueAlignLevel(gt, clip) {
-      const settings = gengaLipsyncSettings(gt), db = gengaEnsureLipsyncAudioDb(gt, clip, settings);
-      if (!db) {
-        const hit = gengaLipsyncAudioCache.get(gengaLipsyncAudioKey(clip, gengaMediaFps(gt), settings));
-        return { pending: hit && hit.promise ? hit.promise : null, failed: !!(hit && hit.failed) };
-      }
+      const settings = gengaLipsyncSettings(gt);
+      const { db, promise, failed } = gengaLipsyncAudioJob(gt, clip, settings);
+      if (!db) return { pending: promise || null, failed: !!failed };
       const sp = gengaDialogueClipSpan(gt, clip);
       return { level: function(f) {
         if (f < sp.from || f > sp.to) return null;
@@ -137592,15 +137590,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       return mono;
     }
-    // 분석 캐시 한 항목의 수명(음량·모음 공용). 결과가 있으면 그 값, 없으면 run(source, span) 을 시작하고 null(진행 중·실패 구분은
-    // cache.get(key) 의 pending·failed). span 은 들어올 때 떠 둔 클립 구간이다 — 분석 중 분할·트림이 같은 클립 객체를 고쳐도 키와
-    // 계산 입력이 어긋나지 않는다. 실패는 기록하고, 프로젝트 전환(AbortError)은 이 불변 원본의 실패로 남기지 않는다.
+    // 분석을 시작하거나 캐시의 현재 항목을 돌려준다. span 은 들어올 때 떠 둔 클립 구간이다 — 분석 중 분할·트림이
+    // 같은 클립 객체를 고쳐도 키와 계산 입력이 어긋나지 않는다. 프로젝트 전환(AbortError)은 원본의 실패로 남기지 않는다.
     function gengaLipsyncCachedJob(cache, key, clip, field, label, run) {
       const hit = cache.get(key);
       if (hit) {
         cache.delete(key);
         cache.set(key, hit);
-        return hit[field] || null;
+        return hit;
       }
       const span = { ref: clip.ref, sourceOffsetSec: clip.sourceOffsetSec, durationSec: clip.durationSec };
       const promise = gengaLipsyncSource(span.ref).then(function(source) {
@@ -137622,8 +137619,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaLipsyncPruneCache(cache, key);
         console.warn('[lipsync] ' + label + ' analysis failed', error);
       });
-      cache.set(key, { pending: true, promise: promise });
-      return null;
+      const pending = { pending: true, promise: promise };
+      cache.set(key, pending);
+      return pending;
     }
     // 해독된 원본 버퍼 전체에 거는 필터·다시 뜨기 결과는 구간(분할 조각)마다 같다 — 같은 버퍼·같은 입력의 진행 중 작업끼리
     // 한 번만 계산해 나눠 쓴다. 쓰는 작업이 모두 끝나면 놓는다(메모리를 쥐어 두지 않는다). 키는 버퍼 신원 아래 입력 이름.
@@ -137637,7 +137635,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const release = function() { job.users -= 1; if (!job.users && jobs.get(key) === job) jobs.delete(key); };
       return job.promise.then(use).finally(release);
     }
-    function gengaEnsureLipsyncAudioDb(gt, clip, settings) {
+    // 분포 그래프는 대기가 끝난 시점의 클립 구간으로 결과를 찾는다. 그 사이 트림이 바뀌거나 캐시에서 빠질 수 있다.
+    function gengaLipsyncAudioResult(gt, clip, settings) {
+      const fps = gengaMediaFps(gt);
+      const { promise } = gengaLipsyncAudioJob(gt, clip, settings);
+      return Promise.resolve(promise).then(function() {
+        return gengaLipsyncAudioCache.get(gengaLipsyncAudioKey(clip, fps, settings))?.db;
+      });
+    }
+    function gengaLipsyncAudioJob(gt, clip, settings) {
       const fps = gengaMediaFps(gt);
       return gengaLipsyncCachedJob(gengaLipsyncAudioCache, gengaLipsyncAudioKey(clip, fps, settings), clip, 'db', 'audio', function(source, span) {
         return source.pcm ? gengaLipsyncPcmLevels(source.pcm, span, fps, settings)
@@ -137661,9 +137667,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     const GENGA_LIPSYNC_MFCC = { rate: 16000, win: 400, hop: 160, nfft: 512, mel: 26, lo: 80, hi: 7600, ceps: 12 };
     const gengaLipsyncVowelCache = new Map();   // 클립 원본 구간·fps 키 → { pending, promise } | { vowels } | { failed }
     function gengaLipsyncVowelKey(clip, fps) { return [clip.ref, fps, Number(clip.sourceOffsetSec) || 0, Number(clip.durationSec) || 0].join('|'); }
-    // 코마별 [{ v, p }|null]. 분석 전이면 null(음량만으로 먼저 그린다), 끝나면 말풍선을 다시 쓴다. 기본 입
+    // 코마별 [{ v, p }|null]. 분석이 끝나기 전에는 음량만으로 그리고, 끝나면 말풍선을 다시 쓴다. 기본 입
     // 판정에 늘 쓴다(사람 녹음에서 음량만보다 입 3 종이 더 맞는다).
-    function gengaEnsureLipsyncVowels(gt, clip, settings) {
+    function gengaLipsyncVowelJob(gt, clip, settings) {
       if (!settings.audio) return null;
       const fps = gengaMediaFps(gt);
       return gengaLipsyncCachedJob(gengaLipsyncVowelCache, gengaLipsyncVowelKey(clip, fps), clip, 'vowels', 'vowel', function(source, span) {
@@ -137843,7 +137849,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const settings = gengaLipsyncSettings(gt);
       if (!settings.estimate || !settings.audio) return;
       // 음성 추정을 쓰는 클립만: 대사에 링크되지 않은 클립과 글자 없는 대사의 클립(글자 있는 대사는 글자 입 열만 쓴다).
-      const fps = gengaMediaFps(gt), waits = [], entries = (gt.dialogue && gt.dialogue.entries) || [];
+      const waits = [], entries = (gt.dialogue && gt.dialogue.entries) || [];
       const linked = new Set(), byAudio = new Set();
       entries.forEach(function(e) {
         if (!e.audioClipId) return;
@@ -137853,12 +137859,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       (gt.audioClips || []).forEach(function(clip) {
         const id = String(clip.id);
         if (linked.has(id) && !byAudio.has(id)) return;
-        gengaEnsureLipsyncAudioDb(gt, clip, settings);
-        const hit = gengaLipsyncAudioCache.get(gengaLipsyncAudioKey(clip, fps, settings));
-        if (hit && hit.promise) waits.push(hit.promise);
-        gengaEnsureLipsyncVowels(gt, clip, settings);
-        const vh = gengaLipsyncVowelCache.get(gengaLipsyncVowelKey(clip, fps));
-        if (vh && vh.promise) waits.push(vh.promise);
+        const audio = gengaLipsyncAudioJob(gt, clip, settings);
+        const vowel = gengaLipsyncVowelJob(gt, clip, settings);
+        if (audio.promise) waits.push(audio.promise);
+        if (vowel?.promise) waits.push(vowel.promise);
       });
       await Promise.all(waits);
     }
@@ -138117,9 +138121,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // 대사에 링크되지 않은 음성 클립의 코마별 입(음량 + 사용 가능한 모음 추정, 클립 첫 코마부터 정렬). 분석 전이면 null.
     const gengaLipsyncClipTracks = new Map();   // 음성 키 + 설정 → 입 배열(설정이 바뀌면 새 키)
     function gengaLipsyncClipTrack(gt, clip, settings) {
-      const db = gengaEnsureLipsyncAudioDb(gt, clip, settings);
+      const { db } = gengaLipsyncAudioJob(gt, clip, settings);
       if (!db) return null;
-      const vow = gengaEnsureLipsyncVowels(gt, clip, settings);
+      const vow = gengaLipsyncVowelJob(gt, clip, settings)?.vowels;
       const key = gengaLipsyncAudioKey(clip, gengaMediaFps(gt), settings) + '|' + JSON.stringify(settings) + (vow ? '|v' : '');
       let track = gengaLipsyncClipTracks.get(key);
       if (!track) {
@@ -138144,8 +138148,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaLipsyncEntryTrack(gt, entry, settings) {
       const hasKana = settings.kana && gengaDialogueChars(entry.text).length > 0;
       const clip = !hasKana && settings.audio && entry.audioClipId ? (gt.audioClips || []).find(function(c) { return String(c.id) === entry.audioClipId; }) : null;
-      const db = clip ? gengaEnsureLipsyncAudioDb(gt, clip, settings) : null;
-      const vow = clip ? gengaEnsureLipsyncVowels(gt, clip, settings) : null;
+      const db = clip ? (gengaLipsyncAudioJob(gt, clip, settings).db || null) : null;
+      const vow = clip ? (gengaLipsyncVowelJob(gt, clip, settings)?.vowels || null) : null;
       const hit = gengaLipsyncEntryTrackCache.get(entry);
       if (hit && hit.settings === settings && hit.clip === clip && hit.db === db && hit.vow === vow) return hit.track;
       const track = hasKana ? gengaLipsyncTextTrack(entry, settings).shapes : gengaLipsyncEntryAudioTrack(entry, settings, clip, db, vow);
@@ -139106,14 +139110,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       };
       // 무음 분포: 클립마다 지금 음역의 코마별 dB(판정과 같은 캐시) → 2 dB 칸. 디지털 무음(−80 아래)은 뺀다.
       const loadLevels = function() {
-        const mine = ++seq, settings = { bandLo: val('bandLo'), bandHi: val('bandHi') }, fps = gengaMediaFps(gt);
+        const mine = ++seq, settings = { bandLo: val('bandLo'), bandHi: val('bandHi') };
         const waits = (gt.audioClips || []).map(function(clip) {
-          gengaEnsureLipsyncAudioDb(gt, clip, settings);
-          const hit = gengaLipsyncAudioCache.get(gengaLipsyncAudioKey(clip, fps, settings));
-          return Promise.resolve(hit && hit.promise).then(function() {
-            const h = gengaLipsyncAudioCache.get(gengaLipsyncAudioKey(clip, fps, settings));
-            return h && h.db;
-          });
+          return gengaLipsyncAudioResult(gt, clip, settings);
         });
         Promise.all(waits).then(function(list) {
           if (!alive || mine !== seq) return;
