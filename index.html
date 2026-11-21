@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3541</title>
+  <title>MoArt ver3542</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -7957,7 +7957,7 @@
     }
 
     /* Selecting a dialog block in the Inspector highlights its linked audio clip here (dialogGlow class,
-       set from state.selectedDialogBlockLinkedClipIds) — a static warm gold ring, distinct from the red
+       derived from the selected dialogue block) — a static warm gold ring, distinct from the red
        conflict pulse (declared after .audio-clip.selected, see there) so "linked & in focus" doesn't read as an error. No
        animation: a still ring is enough emphasis. */
     .audio-clip.dialog-block-glow {
@@ -25229,6 +25229,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintToolPaletteWindowX: 300, paintToolPaletteWindowY: 120,
       paintEditToolWindowX: 1010, paintEditToolWindowY: 44
     };
+    const timelineLayerThumbnails = {
+      queue: [],
+      pending: new Set(),
+      cancelFlush: null,
+      refreshTimer: 0,
+      observer: null,
+      deferUntil: 0
+    };
+
     const state = {
       ...TIMELINE_COLLAPSE_DEFAULTS,
       ...PAINT_PANEL_FLAG_DEFAULTS,
@@ -25238,7 +25247,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       selectedPicturePanelId: 'slot-1',
       selectedBlockId: '',
       selectedDialogBlockId: '',       // UI-only: which dialog block row is highlighted in the Inspector
-      selectedDialogBlockLinkedClipIds: [], // its linked audio clips (dialogBlockLinkedClips) — they glow in the timeline
       selectedAudioClipId: '',            // Primary media selection from `setTimelineMediaSelection`, also present in `selectedAudioClipIds`.
       selectedAudioClipIds: new Set(),
       selectedAudioTrackId: '',
@@ -25256,12 +25264,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       selectedPicturePanelIds: new Set(),
       activeConteSelectionType: 'layer',
       conteLayerClipboard: null,
-      timelineLayerThumbnailQueue: [],
-      timelineLayerThumbnailPending: new Set(),
-      timelineLayerThumbnailIdleHandle: 0,
-      timelineLayerThumbnailRefreshTimer: 0,
-      timelineLayerThumbnailObserver: null,
-      timelineLayerThumbnailDeferUntil: 0,
       timelinePlayheadDragging: false,
       timelineScrollbarDragging: false,
       timelineScrollbarRaf: 0,
@@ -25330,8 +25332,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintViewHoldCode: '',
       paintSpacePanDrag: null,
       paintSelectFeather: null,   // `null` defers the `localStorage` read.
-      twoFingerTapWhy: '',        // Last two-finger tap verdict, for diagnostics.
-      startRecentPinnedWhy: '',   // Diagnostic flag for whether the start screen loaded the pinned list.
       redoGesture: null,          // `null` defers the `localStorage` read.
       paperZoom: 1,          // 用紙 zoom (layout width scale on .conte-paper-stage)
     contePaperWindowOpen: false, // Session state for opening 用紙 alongside video editing in a separate window.
@@ -25341,12 +25341,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // 用紙 view mirror — display only and, like the rotation, not persisted. Working for an hour without noticing a mirrored view is the failure reference apps guard against with a visible indicator; surviving a reload would spring that trap with the indicator missed on the way in.
       paperViewFlipX: false,
       paperViewFlipY: false,  // Vertical display mirroring, session-only like horizontal mirroring.
-      gengaViewFlipY: false,
-      gengaViewFlipX: false,  // Same display-only mirror for the genga preview. Also session-only.
-      gengaViewRot: 0,        // Genga preview rotation in radians. Display only, session-only, like the rest.
-      videoViewFlipY: false,
-      videoViewFlipX: false,  // The third surface's mirror. Display only, session-only, same as the other two.
-      videoViewRot: 0,        // Rotation of the third view surface, in radians. Corresponds to `paperRotation` for 用紙. Zero is upright.
+      // Display-only orientation for the active preview. The Storyboard paper has its own view.
+      previewViewRot: 0,
+      previewViewFlipX: false,
+      previewViewFlipY: false,
       // Video-edit preview overlays toggle from the margin context menu and persist in `editorUiStatePayload()`. 書き出し controls export overlays separately.
       previewOverlays: { cutInfo: true, locationTag: true, bold: true },
       uiHidden: false,        // Master 「キャンバス以外を畳む」; session-only (never persisted)
@@ -25421,9 +25419,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       videoPreloadFrame: -1,
       playbackCompositorBroken: false,
       videoPreviewZoom: 1,
-      videoTimelineCacheKey: '',
       videoTimelineCache: null,
-      videoTimelineCacheProject: null,
       memoRedrawRaf: 0,
       layerCanvasRedrawRaf: 0,
       activeLayerCanvasRedrawRaf: 0,
@@ -29864,8 +29860,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       clipSelector: '.audio-clip[data-audio-clip-id]', clipIdKey: 'audioClipId', defaultTrackId: 'dialog-main',
       tracks: function() { return audioTimelineTracks(state.project); },
       clips: function() { return audioTimelineDisplayClips(state.project); },
-      prepare: function(ctx, clips) { ctx.continuationIds = audioContinuationClipIds(clips, ctx.video.groups); },
-      trackHtml: function(track, clips, ctx) { return audioTimelineTrackHtml(track, clips, ctx.totalFrames, ctx.continuationIds); }
+      prepare: function(ctx, clips) {
+        ctx.continuationIds = audioContinuationClipIds(clips, ctx.video.groups);
+        ctx.dialogGlowIds = selectedDialogBlockClipIds(state.project);
+      },
+      trackHtml: function(track, clips, ctx) { return audioTimelineTrackHtml(track, clips, ctx.totalFrames, ctx.continuationIds, ctx.dialogGlowIds); }
     };
     const VIDEO_MEDIA_LANE_SPEC = {
       trackSelector: '.media-video-track[data-video-media-track-id]', trackIdKey: 'videoMediaTrackId',
@@ -32786,6 +32785,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function resetProjectTransientRuntime() {
+      state.selectedDialogBlockId = '';
       twoFingerLastTapAt = 0;
       twoFingerLastTapUndid = false;
       if (paraparaKeyHold) paraparaClear();
@@ -32821,17 +32821,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.videoPreviewZoom = 1;
       state.paintViewportPanX = 0;
       state.paintViewportPanY = 0;
-      state.videoViewRot = 0;
-      state.videoViewFlipX = false;
-      state.videoViewFlipY = false;
+      resetPreviewViewOrientation();
       state.videoPaintPointerCanvasRect = null;
-      const videoStage = document.getElementById('conteVideoStage');
-      if (videoStage) {
-        videoStage.style.setProperty('--video-flip-x', 1);
-        videoStage.style.setProperty('--video-rot', '0rad');
-        videoStage.classList.remove('paper-mirrored-x');
-      }
-      ['videoViewFlipBtn', 'videoViewFlipYBtn'].forEach(function(id) { const b = document.getElementById(id); if (b) b.classList.remove('active'); });
+      applyVideoPreviewViewDom();
       // Call the Animation reset hook because those transients are module-scoped `let` bindings.
       // Boot can call this before Animation bindings initialize. A `typeof` check cannot bypass their temporal dead zone.
       // Suppress that expected `ReferenceError` and report other failures.
@@ -32864,7 +32856,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try { videoPreviewPointers.clear(); } catch (error) {}
       videoPreviewPinch = null;
       try { clearActiveLayerCanvasTargets(); } catch (error) { state.paintActiveLayerCanvasEls = []; }
-      try { resetTimelineLayerThumbnailScheduler(); } catch (error) {}
+      resetTimelineLayerThumbnailScheduler();
       invalidateVideoTimelineCache(); // pure state write, cannot throw
     }
 
@@ -44545,9 +44537,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (project === state.project) bumpVideoClipCycle();   // Every V1 command passes here (normalizeProject), so the caches re-key
     }
     function invalidateVideoTimelineCache() {
-      state.videoTimelineCacheKey = '';
       state.videoTimelineCache = null;
-      state.videoTimelineCacheProject = null;
     }
 
     function videoTimelineSignature(project) {
@@ -44563,12 +44553,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function buildVideoTimelineCached(project) {
       const activeProject = project || state.project;
       const signature = videoTimelineSignature(activeProject);
-      if (state.videoTimelineCache && state.videoTimelineCacheProject === activeProject &&
-          state.videoTimelineCacheKey === signature) return state.videoTimelineCache;
-      state.videoTimelineCacheProject = activeProject;
-      state.videoTimelineCacheKey = signature;
-      state.videoTimelineCache = buildVideoTimeline(activeProject);
-      return state.videoTimelineCache;
+      const cache = state.videoTimelineCache;
+      if (cache && cache.project === activeProject && cache.signature === signature) return cache.timeline;
+      const timeline = buildVideoTimeline(activeProject);
+      state.videoTimelineCache = { project: activeProject, signature, timeline };
+      return timeline;
     }
 
     function buildVideoTimeline(project) {
@@ -48292,25 +48281,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       '</div>';
     }
 
-    // Selecting a dialog block (bindDialogBlocks' click handler) glows its linked audio clip in the
-    // timeline (audioTimelineClipHtml reads selectedDialogBlockLinkedClipIds). Self-healing: if the
-    // selected block id doesn't belong to this cut's blocks (block deleted, or the user switched to a
-    // different cut/panel), the selection is dropped instead of glowing a stale/wrong clip.
-    function updateSelectedDialogBlockLinkedClip(project, blocks) {
-      const blockId = state.selectedDialogBlockId;
-      if (!blockId) { state.selectedDialogBlockLinkedClipIds = []; return; }
-      const block = (blocks || []).find(function(b) { return b.id === blockId; });
-      if (!block) {
-        state.selectedDialogBlockId = '';
-        state.selectedDialogBlockLinkedClipIds = [];
-        return;
-      }
-      // Same relation as the ♪ count and the in-place toggle — audioClipId alone cannot hold several clips.
-      state.selectedDialogBlockLinkedClipIds = dialogBlockLinkedClips(project, block).map(function(c) { return c.id; });
+    function selectedDialogBlockClipIds(project) {
+      const selectedId = state.selectedDialogBlockId;
+      if (!selectedId) return new Set();
+      const cut = project.cuts.find(function(c) { return c.id === currentPicturePanelId(); });
+      const block = cut && dialogBlocksForDisplay(project, cut).find(function(b) { return b.id === selectedId; });
+      return new Set(block ? dialogBlockLinkedClips(project, block).map(function(clip) { return clip.id; }) : []);
     }
+
     function renderDialogBlocksHtml(project, cut) {
       const blocks = dialogBlocksForDisplay(project, cut);
-      updateSelectedDialogBlockLinkedClip(project, blocks);
+      if (state.selectedDialogBlockId && !blocks.some(function(b) { return b.id === state.selectedDialogBlockId; })) {
+        state.selectedDialogBlockId = '';
+      }
       const rows = blocks.map(function(b) { return renderDialogBlockRowHtml(b, project); }).join('');
       return '<div class="dialog-blocks" data-cut-id="' + escapeAttr(cut.id) + '">' +
         (rows || '<div class="dialog-blocks-empty">' + t('dialog.blocksEmpty') + '</div>') +
@@ -48327,7 +48310,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const selectedId = state.selectedDialogBlockId || '';
       const hit = selectedId && findDialogBlockAnywhere(state.project, selectedId);
       const group = hit && dialogueGroupForBlock(state.project, hit.block);
-      const clipIds = new Set(selectedId ? state.selectedDialogBlockLinkedClipIds : []);
+      const clipIds = selectedDialogBlockClipIds(state.project);
       document.querySelectorAll('.dialog-block[data-dlgblk-id]').forEach(function(el) {
         el.classList.toggle('selected', Boolean(selectedId) && (el.dataset.dlgblkId === selectedId || group && el.dataset.dialogueGroup === group.id));
       });
@@ -48515,15 +48498,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (e.target.closest('.dlgblk-del, .dlgblk-drag, .dlgblk-follow, [data-charsel], [data-suffix], [data-audiolink]')) return;
           const nextId = state.selectedDialogBlockId === id ? '' : id;
           state.selectedDialogBlockId = nextId;
-          // Compute the glow target eagerly here (not lazily inside renderDialogBlocksHtml) — refresh()
-          // renders the timing dashboard before the inspector, so a lazy compute would glow one click late.
-          let linkedClipIds = [];
-          if (nextId) {
-            const blocks = dialogBlocksForDisplay(state.project, cut) || [];
-            const block = blocks.find(function(b) { return b.id === nextId; });
-            if (block) linkedClipIds = dialogBlockLinkedClips(state.project, block).map(function(c) { return c.id; });
-          }
-          state.selectedDialogBlockLinkedClipIds = linkedClipIds;
           // Targeted class toggles only: a full refresh() here rebuilds the inspector's innerHTML, destroying the
           // input/textarea the user just clicked/focused along with focus and any IME composition, so typing into a
           // clicked block would be impossible. updateCameraTrackSelectionDom uses the same targeted-toggle pattern.
@@ -48707,6 +48681,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // sibling column (.timeline-label-col). Content x=0 is frame 0.
       const innerStyle = 'width:' + innerWidth + 'px;--timeline-label-width:0px';
       const continuationIds = audioContinuationClipIds(audioClips, video.groups);
+      const dialogGlowIds = selectedDialogBlockClipIds(state.project);
       const audioTracks = audioTimelineTracks(state.project);
       const videoMediaClips = videoTimelineDisplayClips(state.project);
       const videoMediaTracks = videoMediaDisplayTracks(state.project);   // Top = highest V
@@ -48779,7 +48754,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               '</div>',
               '<div class="timeline-scroll-section timeline-audio-scroll-section" data-timeline-scroll-section="audio">',
                 '<div class="timeline-scroll-section-content">',
-                  audioTracks.map(function(track) { return audioTimelineTrackHtml(track, clipsByTrack.get(track.id) || [], totalFrames, continuationIds); }).join(''),
+                  audioTracks.map(function(track) { return audioTimelineTrackHtml(track, clipsByTrack.get(track.id) || [], totalFrames, continuationIds, dialogGlowIds); }).join(''),
                   state.timelineAudioTracksCollapsed ? '' : audioNewTrackDropHtml(state.project),
                 '</div>',
               '</div>',
@@ -51384,7 +51359,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Media lanes and waveform rendering
-    function audioTimelineTrackHtml(track, clips, totalFrames, continuationIds) {
+    function audioTimelineTrackHtml(track, clips, totalFrames, continuationIds, dialogGlowIds) {
       const locked = track.id === 'dialog-main';
       const classes = 'timeline-track audio-track'
         + (state.timelineAudioTracksCollapsed ? ' timeline-group-collapsed' : '')
@@ -51394,7 +51369,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return '<div class="' + classes + '" data-audio-track-id="' + escapeAttr(track.id) + '">' +
         timelineTrackLabelHtml(track) +
         '<div class="timeline-lane">' +
-          clips.map(function(clip) { return audioTimelineClipHtml(clip, totalFrames, continuationIds); }).join('') +
+          clips.map(function(clip) { return audioTimelineClipHtml(clip, totalFrames, continuationIds, dialogGlowIds); }).join('') +
         '</div>' +
       '</div>';
     }
@@ -51530,13 +51505,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return [audioClipDialogueLabel(project, clip), audioClipDisplayBody(project, clip)].filter(Boolean).join(' · ') + link
         + (clip.audioDurationFrames ? '\nsource ' + framesToTimeInput(clip.audioDurationFrames) + ' / trim ' + framesToTimeInput(clip.audioTrimDurationFrames || clip.durationFrames) : '');
     }
-    function audioTimelineClipHtml(clip, totalFrames, continuationIds) {
+    function audioTimelineClipHtml(clip, totalFrames, continuationIds, dialogGlowIds) {
       const left = framePercent(clip.startFrame, totalFrames);
       const width = Math.max(0.01, framePercent(clip.durationFrames, totalFrames));
       const continuation = continuationIds && continuationIds.has(clip.id) ? ' continuation' : '';
       const active = state.activeSpeechClipId === clip.id ? ' active' : '';
       const selected = timelineMediaClipSelected('audio', clip.id) ? ' selected' : '';
-      const dialogGlow = state.selectedDialogBlockLinkedClipIds.indexOf(clip.id) >= 0 ? ' dialog-block-glow' : '';
+      const dialogGlow = dialogGlowIds.has(clip.id) ? ' dialog-block-glow' : '';
       const conflict = state.audioConflictClipIds && state.audioConflictClipIds.has(clip.id) ? ' conflict' : '';
       const color = audioClipColor(clip.characterName || clip.id);
       // PERF: the waveform data:URL (tens of KB × hundreds of clips) is not inlined in the style attribute — it
@@ -53516,7 +53491,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           const mx = uiPointerLocalX(me.clientX), my = uiPointerLocalY(me.clientY); // local px — cx/cy/startX/startY/moveFactor all live there
           if (mode === 'rot') {
-            const d = (Math.atan2(my - cy, mx - cx) - startAng) * 180 / Math.PI * videoViewFlipSign(); // the view mirror reverses a screen turn
+            const d = (Math.atan2(my - cy, mx - cx) - startAng) * 180 / Math.PI * previewViewFlipSign(); // the view mirror reverses a screen turn
             let r = fxRoundRot(startRot + d);
             if (me.shiftKey) r = snapAngleDeg(r);
             target.rot = r;
@@ -53527,7 +53502,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             // Convert screen movement to layer coordinates. A horizontal screen delta becomes diagonal in a rotated view.
             // Rotation and scale already use angles and distances from the center.
             // `viewInverseOffset` is the identity at zero view rotation.
-            const dmv = viewInverseOffset(mx - startX, my - startY, videoViewRotEff(), videoViewFlipSign());
+            const dmv = viewInverseOffset(mx - startX, my - startY, previewViewRotEff(), previewViewFlipSign());
             target.tx = Math.round(startTx + dmv.x * moveFactor);
             target.ty = Math.round(startTy + dmv.y * moveFactor);
           }
@@ -57628,14 +57603,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         begin: function() {
           state.timelineScrollbarDragging = true;
           updateTimelineThumbnailSuspensionClass(root);
-          resetTimelineLayerThumbnailScheduler();
+          clearTimelineLayerThumbnailTargets();
           deferTimelineLayerThumbnails(1200);
         },
         cleanup: function() {
           state.timelineScrollbarDragging = false;
           updateTimelineThumbnailSuspensionClass(root);
-          state.timelineLayerThumbnailDeferUntil = timelineNow() + 180;
-          scheduleTimelineLayerThumbnailRefresh(root, 180);
+          resumeTimelineLayerThumbnails(root);
         },
         end: function() { scheduleEditorUiStateSave(260); scheduleTimelineScrollbarDomUpdate(root); }
       };
@@ -59735,7 +59709,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.videoPlaybackStartToken = playbackToken;
       state.videoPlaybackStarting = true;
       updateTimelineThumbnailSuspensionClass(document);
-      resetTimelineLayerThumbnailScheduler();
+      clearTimelineLayerThumbnailTargets();
       const totalFrames = runtimeTimelineTotalFrames(document.getElementById('timingDashboard'), null, videoTimelineDisplayTotalFrames(state.project)); // positioning scale = the drawn strip
       const playRange = contePlayRange(state.project);   // Use In and Out when set, otherwise play from the beginning to the end of content.
       const playbackEnd = playRange.hi; // Playback stops at content end (or Out), not the padded strip end
@@ -59746,7 +59720,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.videoPlaying = true;
       warmVideoCachesAroundFrame(state.project, startFrame, { force: true, seconds: 12, layerLimit: 72 });
       updateTimelineThumbnailSuspensionClass(document);
-      resetTimelineLayerThumbnailScheduler();
+      clearTimelineLayerThumbnailTargets();
       updateTransportRuntimeDom(document);
       updateTimelineRuntimeDom(totalFrames, { lightweight: true, updateTimecode: true, skipAutoScroll: true });
       const playbackAudibleClips = audioTimelineAudibleClips(state.project).slice().sort(function(left, right) {
@@ -60978,12 +60952,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // the next press does the fit (user rule: a common fix covers every surface, both 用紙 and video, genga
       // included). This surface has pinch-twist rotation as well as the mirror, so the button straightens both
       // under the same condition as 用紙's resetPaperZoom — otherwise there would be no way out of a tilted view.
-      if (state.videoViewFlipX || state.videoViewFlipY || Math.abs(videoViewRotValue()) > 1e-6) {
-        state.videoViewFlipX = false;
-        state.videoViewFlipY = false;
-        state.videoViewRot = 0;
-        applyVideoViewFlipDom();
-        applyVideoViewRotDom();
+      if (state.previewViewFlipX || state.previewViewFlipY || Math.abs(previewViewRotValue()) > 1e-6) {
+        resetPreviewViewOrientation();
+        videoPreviewViewChanged();
         saveEditorUiState();
         return;
       }
@@ -61080,7 +61051,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // applying accumulated wobble or release slip as zoom, pan, or rotation.
         c.fired = true;
         if (c.cancel) c.cancel();           // Cancel the active stroke first so it cannot leave a line between the fingers.
-        state.twoFingerTapWhy = 'long-press-redo:' + Math.round(c.maxMove) + 'px';
         runPrimaryRedo();
       }, TWO_FINGER_LONG_PRESS_MS);
     }
@@ -61149,21 +61119,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const c = twoFingerTapCandidate;
       twoFingerTapCandidate = null;
       twoFingerLongPressCancel();
-      // Keep the rejection reason for diagnosing inconsistent tap recognition.
-      if (!c) { state.twoFingerTapWhy = 'no-candidate'; return null; }
-      if (c.fired) return null;   // Preserve the recorded long-press Redo reason when it already fired.
+      if (!c || c.fired || c.moved) return null;
       const now = Date.now();
-      if (c.moved) {
-        // Write diagnostics without a toast. Normal pinches also cross the movement threshold
-        // and should not warn.
-        state.twoFingerTapWhy = 'moved:' + Math.round(c.maxMove) + 'px';
-        return null;
-      }
-      if (now - c.t > TWO_FINGER_TAP_MAX_MS) {
-        state.twoFingerTapWhy = 'slow:' + (now - c.t) + 'ms';
-        return null;
-      }
-      state.twoFingerTapWhy = 'tap';
+      if (now - c.t > TWO_FINGER_TAP_MAX_MS) return null;
       // Cancel the first finger's stroke after recognizing the tap and before Undo.
       // On iOS, touch ownership is decided when synchronous `touchstart` handling ends.
       // `pointerdown.preventDefault()` cannot block browser viewport gestures,
@@ -61175,7 +61133,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // iOS opens its editing menu and Windows can reserve the gesture through its multi-finger touch setting.
       // Keep two-finger Undo available on devices that cannot deliver three-finger taps.
       if (redoGestureMode() === 'three-finger' && c.maxPoints >= 3) {
-        state.twoFingerTapWhy = 'three-finger-redo';
         twoFingerLastTapAt = 0;
         runPrimaryRedo();
         return 'redo';
@@ -61345,12 +61302,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             videoPreviewPinch = {
               startDist: v.d,
               // Share twist handling with 用紙 and Animation. Add integer turns to the starting angle to avoid accumulating drift.
-              startAngle: v.a, lastRaw: v.a, turns: 0, startRot: videoViewRotValue(),
+              startAngle: v.a, lastRaw: v.a, turns: 0, startRot: previewViewRotValue(),
               startZoom: videoPreviewZoomValue(),
               // Keep the initial anchor for absolute pan calculation. Rounding pan on every increment would compound error.
               startMidX: v.mx, startMidY: v.my,
               basePanX: Number(state.paintViewportPanX) || 0, basePanY: Number(state.paintViewportPanY) || 0,
-              startWidth: videoPreviewWidthPx(), startRotEff: videoViewRotEff(),
+              startWidth: videoPreviewWidthPx(), startRotEff: previewViewRotEff(),
               d0: videoPinchAnchorOffset(v.mx, v.my)
             };
             twoFingerGestureBegin(v, paintCancelSingleFingerOps); // Full two-contact geometry.
@@ -61373,12 +61330,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           updateVideoPreviewZoomDom(document);
           // Twist rotates the view and snaps upright. Mirroring reverses the angle input, as for 用紙.
           // Camera dragging, gizmo movement, zoom anchoring, and touch hit testing must all account for rotation.
-          setVideoViewRot(snapViewRotToQuarter(p.startRot + pinchTwistSince(p, v.a) * videoViewFlipSign()));
+          setVideoViewRot(snapViewRotToQuarter(p.startRot + pinchTwistSince(p, v.a) * previewViewFlipSign()));
           // Keep the same paper point under the fingers as in 用紙 and Animation.
           // With scale and rotation around the paper center and pan outermost, compute pan from the initial center-relative offset `d0`:
           //   pan = basePan + (M − S) + d0 − k·R(dθ)·d0
           // Recalculate from the starting values on every frame because pan is rounded.
-          const k = videoPreviewWidthPx() / p.startWidth, dθ = videoViewRotEff() - p.startRotEff;
+          const k = videoPreviewWidthPx() / p.startWidth, dθ = previewViewRotEff() - p.startRotEff;
           const c = Math.cos(dθ) * k, s = Math.sin(dθ) * k;
           state.paintViewportPanX = p.basePanX + uiPointerLocalX(v.mx - p.startMidX) + p.d0.x - (p.d0.x * c - p.d0.y * s);
           state.paintViewportPanY = p.basePanY + uiPointerLocalY(v.my - p.startMidY) + p.d0.y - (p.d0.x * s + p.d0.y * c);
@@ -61438,9 +61395,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const vFlipBtn = scope.querySelector('#videoViewFlipBtn') || document.getElementById('videoViewFlipBtn');
       if (vFlipBtn && vFlipBtn.dataset.viewFlipBound !== 'true') {
         vFlipBtn.dataset.viewFlipBound = 'true';
-        vFlipBtn.addEventListener('click', function() { setVideoViewFlipX(!state.videoViewFlipX); });
+        vFlipBtn.addEventListener('click', function() { setVideoViewFlipX(!state.previewViewFlipX); });
         const vFlipYBtn = document.getElementById('videoViewFlipYBtn');
-        if (vFlipYBtn) vFlipYBtn.addEventListener('click', function() { setVideoViewFlipY(!state.videoViewFlipY); });
+        if (vFlipYBtn) vFlipYBtn.addEventListener('click', function() { setVideoViewFlipY(!state.previewViewFlipY); });
       }
       scope.querySelectorAll('[data-video-preview-zoom]').forEach(function(button) {
         if (button.dataset.previewZoomBound === 'true') return;
@@ -61759,7 +61716,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Undo rotation and test normalized 0–1 coordinates, as in 用紙.
       const paperEl = videoPaperEl();
       const nrm = paperEl ? viewClientToLocalNorm(paperEl, drawableRect, event.clientX, event.clientY,
-        videoViewRotEff(), videoViewFlipSign()) : null;
+        previewViewRotEff(), previewViewFlipSign()) : null;
       if (nrm && nrm.x >= 0 && nrm.x <= 1 && nrm.y >= 0 && nrm.y <= 1) return null;
       if (nrm) return { side: nrm.x < 0.5 ? 'left' : 'right' };
       if (pointInsideClientRect(x, y, drawableRect)) return null;
@@ -62101,7 +62058,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const raw = screen.getBoundingClientRect();
       // A rotated client rectangle is larger than the paper. Recover the pre-rotation dimensions before deriving camera coordinates.
       // Keep the measured center and use layout size when rotated. At zero rotation, use the raw box.
-      const vrot = videoViewRotEff();
+      const vrot = previewViewRotEff();
       let rect = raw;
       if (vrot && screen.offsetWidth > 0 && screen.offsetHeight > 0) {
         const uz = uiReadScale() || 1;
@@ -63116,7 +63073,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         e.stopPropagation();
         const cutId = boldLayerEl.dataset.cutId || '';
         const key = plate.dataset.boldKey || '';
-        const rot = videoViewRotEff(), flip = videoViewFlipSign();
+        const rot = previewViewRotEff(), flip = previewViewFlipSign();
         const start = viewClientToLocalNorm(boldLayerEl, null, e.clientX, e.clientY, rot, flip);
         const pw = plate.offsetWidth, ph = plate.offsetHeight;
         let initialX = plate.offsetLeft, initialY = plate.offsetTop;
@@ -64152,13 +64109,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       drawLayerDrawingPreviewCanvases(root, '.picture-layer-canvas[data-layer-drawing-ref]', null, painted);
     }
 
-    function timelineLayerThumbnailPendingSet() {
-      if (!(state.timelineLayerThumbnailPending instanceof Set)) {
-        state.timelineLayerThumbnailPending = new Set(Array.isArray(state.timelineLayerThumbnailPending) ? state.timelineLayerThumbnailPending : []);
-      }
-      return state.timelineLayerThumbnailPending;
-    }
-
     function timelineNow() {
       return typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
     }
@@ -64166,9 +64116,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function deferTimelineLayerThumbnails(ms) {
       const delay = Math.max(0, Math.round(Number(ms) || 0));
       const next = timelineNow() + delay;
-      const current = Math.max(0, Number(state.timelineLayerThumbnailDeferUntil) || 0);
+      const current = timelineLayerThumbnails.deferUntil;
       if (current >= next - 80) return;
-      state.timelineLayerThumbnailDeferUntil = Math.max(current, next);
+      timelineLayerThumbnails.deferUntil = Math.max(current, next);
     }
 
     function timelineLayerThumbnailsSuspended() {
@@ -64215,47 +64165,58 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       updateTimelineThumbnailSuspensionClass(targetRoot);
       if (timelineLayerThumbnailsSuspended()) {
-        resetTimelineLayerThumbnailScheduler();
+        clearTimelineLayerThumbnailTargets();
         deferTimelineLayerThumbnails(1200);
         return;
       }
-      state.timelineLayerThumbnailDeferUntil = timelineNow() + 180;
-      scheduleTimelineLayerThumbnailRefresh(targetRoot, 180);
+      resumeTimelineLayerThumbnails(targetRoot);
+    }
+
+    function resumeTimelineLayerThumbnails(root) {
+      timelineLayerThumbnails.deferUntil = timelineNow() + 180;
+      scheduleTimelineLayerThumbnailRefresh(root, 180);
+    }
+
+    // Redraws can reuse a scheduled flush. Only project replacement retires its reservation and delay.
+    function clearTimelineLayerThumbnailTargets() {
+      const scheduler = timelineLayerThumbnails;
+      window.clearTimeout(scheduler.refreshTimer);
+      scheduler.refreshTimer = 0;
+      scheduler.observer?.disconnect();
+      scheduler.observer = null;
+      scheduler.queue.length = 0;
+      scheduler.pending.clear();
     }
 
     function resetTimelineLayerThumbnailScheduler() {
-      if (state.timelineLayerThumbnailRefreshTimer) {
-        window.clearTimeout(state.timelineLayerThumbnailRefreshTimer);
-        state.timelineLayerThumbnailRefreshTimer = 0;
-      }
-      if (state.timelineLayerThumbnailObserver && typeof state.timelineLayerThumbnailObserver.disconnect === 'function') {
-        state.timelineLayerThumbnailObserver.disconnect();
-      }
-      state.timelineLayerThumbnailObserver = null;
-      state.timelineLayerThumbnailQueue = [];
-      state.timelineLayerThumbnailPending = new Set();
+      const scheduler = timelineLayerThumbnails;
+      clearTimelineLayerThumbnailTargets();
+      scheduler.cancelFlush?.();
+      scheduler.cancelFlush = null;
+      scheduler.deferUntil = 0;
     }
 
     function scheduleTimelineLayerThumbnailRefresh(root, delayMs) {
-      if (state.timelineLayerThumbnailRefreshTimer) window.clearTimeout(state.timelineLayerThumbnailRefreshTimer);
+      if (timelineLayerThumbnails.refreshTimer) window.clearTimeout(timelineLayerThumbnails.refreshTimer);
       const targetRoot = root || document.getElementById('timingDashboard') || document;
       const delay = Math.max(0, Math.round(Number(delayMs) || 0));
-      state.timelineLayerThumbnailRefreshTimer = window.setTimeout(function() {
-        state.timelineLayerThumbnailRefreshTimer = 0;
+      timelineLayerThumbnails.refreshTimer = window.setTimeout(function() {
+        timelineLayerThumbnails.refreshTimer = 0;
         if (timelineLayerThumbnailsSuspended()) return;
-        state.timelineLayerThumbnailDeferUntil = 0;
+        timelineLayerThumbnails.deferUntil = 0;
         queueTimelineLayerKomaThumbnails(targetRoot);
       }, delay);
     }
 
     function timelineLayerThumbnailObserver() {
       if (timelineLayerThumbnailsSuspended()) return null;
-      if (state.timelineLayerThumbnailObserver) return state.timelineLayerThumbnailObserver;
+      if (timelineLayerThumbnails.observer) return timelineLayerThumbnails.observer;
       if (typeof IntersectionObserver !== 'function') return null;
-      state.timelineLayerThumbnailObserver = new IntersectionObserver(function(entries) {
+      const observer = new IntersectionObserver(function(entries) {
+        if (timelineLayerThumbnails.observer !== observer) return;
         entries.forEach(function(entry) {
           if (!entry || !(entry.isIntersecting || entry.intersectionRatio > 0)) return;
-          if (state.timelineLayerThumbnailObserver) state.timelineLayerThumbnailObserver.unobserve(entry.target);
+          observer.unobserve(entry.target);
           queueTimelineLayerThumbnail(entry.target);
         });
       }, {
@@ -64263,7 +64224,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         rootMargin: '640px 1200px',
         threshold: 0.01
       });
-      return state.timelineLayerThumbnailObserver;
+      timelineLayerThumbnails.observer = observer;
+      return observer;
     }
 
     function timelineLayerThumbnailIsNearViewport(canvas) {
@@ -64281,33 +64243,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function scheduleTimelineLayerThumbnailFlush(delayMs) {
-      if (state.timelineLayerThumbnailIdleHandle) return;
+      const scheduler = timelineLayerThumbnails;
+      if (scheduler.cancelFlush) return;
       const run = function(deadline) {
-        state.timelineLayerThumbnailIdleHandle = 0;
+        scheduler.cancelFlush = null;
         flushTimelineLayerThumbnailQueue(deadline);
       };
       const delay = Math.max(0, Math.round(Number(delayMs) || 0));
-      if (delay > 0) {
-        state.timelineLayerThumbnailIdleHandle = window.setTimeout(function() {
-          run({ timeRemaining: function() { return 8; } });
-        }, delay);
-        return;
-      }
-      if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
-        state.timelineLayerThumbnailIdleHandle = window.requestIdleCallback(run, { timeout: 300 });
+      if (!delay && typeof window.requestIdleCallback === 'function' && typeof window.cancelIdleCallback === 'function') {
+        const handle = window.requestIdleCallback(run, { timeout: 300 });
+        scheduler.cancelFlush = function() { window.cancelIdleCallback(handle); };
       } else {
-        state.timelineLayerThumbnailIdleHandle = window.setTimeout(function() {
+        const handle = window.setTimeout(function() {
           run({ timeRemaining: function() { return 8; } });
-        }, 16);
+        }, delay || 16);
+        scheduler.cancelFlush = function() { window.clearTimeout(handle); };
       }
     }
 
     function flushTimelineLayerThumbnailQueue(deadline) {
-      const queue = Array.isArray(state.timelineLayerThumbnailQueue) ? state.timelineLayerThumbnailQueue : [];
-      state.timelineLayerThumbnailQueue = queue;
-      const pending = timelineLayerThumbnailPendingSet();
+      const { queue, pending, deferUntil } = timelineLayerThumbnails;
       const start = timelineNow();
-      const deferUntil = Math.max(0, Number(state.timelineLayerThumbnailDeferUntil) || 0);
       if (timelineLayerThumbnailsSuspended()) {
         return;
       }
@@ -64332,11 +64288,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function queueTimelineLayerThumbnail(canvas) {
       if (timelineLayerThumbnailsSuspended()) return;
       if (!canvas || !canvas.isConnected) return;
-      const pending = timelineLayerThumbnailPendingSet();
+      const { queue, pending } = timelineLayerThumbnails;
       if (pending.has(canvas)) return;
       pending.add(canvas);
-      if (!Array.isArray(state.timelineLayerThumbnailQueue)) state.timelineLayerThumbnailQueue = [];
-      state.timelineLayerThumbnailQueue.push(canvas);
+      queue.push(canvas);
       scheduleTimelineLayerThumbnailFlush();
     }
 
@@ -64353,12 +64308,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function queueTimelineLayerKomaThumbnails(root) {
       if (timelineLayerThumbnailsSuspended()) {
-        resetTimelineLayerThumbnailScheduler();
+        clearTimelineLayerThumbnailTargets();
         updateTimelineThumbnailSuspensionClass(root);
         return;
       }
       const scope = root && root.querySelectorAll ? root : document;
-      const deferUntil = Math.max(0, Number(state.timelineLayerThumbnailDeferUntil) || 0);
+      const deferUntil = timelineLayerThumbnails.deferUntil;
       const now = timelineNow();
       if (deferUntil > now) {
         restoreTimelineLayerKomaThumbnailPlaceholders(scope);
@@ -64367,7 +64322,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       const canvases = Array.from(scope.querySelectorAll('.conte-layer-thumbnail-canvas[data-layer-drawing-ref]'));
       if (!canvases.length) return;
-      resetTimelineLayerThumbnailScheduler();
+      clearTimelineLayerThumbnailTargets();
       const observer = timelineLayerThumbnailObserver();
       canvases.forEach(function(canvas) {
         const ref = canvas.dataset.layerDrawingRef || '';
@@ -73318,16 +73273,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Report a pinned-list read failure separately from disabled pins.
       // Otherwise the pinned entries could appear as backups.
       let pinnedIdSet = new Set();
-      if (!pinnedProjectSlotsEnabled()) {
-        state.startRecentPinnedWhy = 'disabled';
-      } else {
+      if (pinnedProjectSlotsEnabled()) {
         try {
           pinnedIdSet = new Set(await loadPinnedProjectSlots());
           if (seq !== projectStartRecentRenderSeq) return;
-          state.startRecentPinnedWhy = 'ok:' + pinnedIdSet.size;
         } catch (error) {
           if (seq !== projectStartRecentRenderSeq) return;
-          state.startRecentPinnedWhy = 'load-failed';
           console.warn('[start] Slot list unavailable; preserving recent rows', error);
           showToast(t('msg.workspace.saveFailed', error.message), { warn: true });
           return;
@@ -98962,7 +98913,7 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
     // Invert the transform of the actual canvas surface: .conte-paper identifies video editing,
     // and the other surface is 用紙.
     function viewRotFlipForEl(el) {
-      if (el && el.closest && el.closest('.conte-paper')) return { rot: videoViewRotEff(), flip: videoViewFlipSign() };
+      if (el && el.closest && el.closest('.conte-paper')) return { rot: previewViewRotEff(), flip: previewViewFlipSign() };
       return { rot: paperRotationEff(), flip: paperViewFlipSign() };
     }
     function getPaintPointFromEventRaw(event) {
@@ -101359,9 +101310,9 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             zoom: state.gengaZoom,
             panX: state.gengaPanX,
             panY: state.gengaPanY,
-            rot: state.gengaViewRot,
-            flipX: state.gengaViewFlipX,
-            flipY: state.gengaViewFlipY
+            rot: state.previewViewRot,
+            flipX: state.previewViewFlipX,
+            flipY: state.previewViewFlipY
           },
           drawTool: state.paintTool,   // Restore the user's drawing tool on exit. setActivePaintTool can switch it to pen for an editing exercise.
         compact: state.gengaCompactRows,
@@ -101425,9 +101376,12 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       state.gengaZoom = s.view.zoom;
       state.gengaPanX = s.view.panX;
       state.gengaPanY = s.view.panY;
-      state.gengaViewRot = s.view.rot;
-      state.gengaViewFlipX = s.view.flipX;
-      state.gengaViewFlipY = s.view.flipY;
+      // The inline tutorial can borrow the stage from Storyboard, which returns with a reset preview.
+      if (state.project.kind === 'genga') {
+        state.previewViewRot = s.view.rot;
+        state.previewViewFlipX = s.view.flipX;
+        state.previewViewFlipY = s.view.flipY;
+      }
       setActivePaintTool(s.tool || s.drawTool || '');
       invalidateVideoTimelineCache();
       tlTutUnmountCanvasMini(); // Return the canvas before restoring the stage layout.
@@ -101781,7 +101735,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       // A rotated bounding client rect is larger than the paper. Using its dimensions would shift the selection,
       // transform box, and stamp overlays. Rotation preserves the center,
       // so take the center from that rect and the untransformed dimensions from offsetWidth and offsetHeight.
-      const vrot = memo ? paperRotationEff() : videoViewRotEff();
+      const vrot = memo ? paperRotationEff() : previewViewRotEff();
       const uzo = uiReadScale() || 1;
       const viewZoom = memo ? paperZoomValue() : 1;
       const fpw = (paperEl.offsetWidth || paperRect.width / uzo) * uzo * viewZoom,
@@ -101801,7 +101755,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       } else {
         ctx.setTransform(sx, 0, 0, sy, 0, 0);
         ctx.translate(fcx - oRect.left, fcy - oRect.top);
-        if (videoViewFlipSign() < 0) ctx.scale(-1, 1);
+        if (previewViewFlipSign() < 0) ctx.scale(-1, 1);
         if (vrot) ctx.rotate(vrot);
         ctx.translate(-fpw / 2, -fph / 2);
         ctx.scale(scaleX, scaleY);
@@ -105313,7 +105267,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Pass only the resulting angle and sign to viewInverseOffset, viewClientToLocalNorm, CSS, and canvas drawing.
     // Display, edit, and reset the original angle from *RotationValue or *RotValue.
     // 用紙, video preview, and genga share these helpers and setViewFlag.
-    // Only their state keys and update handlers differ.
+    // 用紙 keeps its own orientation, and each surface updates its own presentation.
     function viewFlipSign(flipX, flipY) { return Boolean(flipX) !== Boolean(flipY) ? -1 : 1; }
     function viewRotEff(rot, flipY) { return clampPaperRotation(rot + (flipY ? Math.PI : 0), 0); }
     function setViewFlag(key, on, apply) {
@@ -105321,6 +105275,14 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (next === Boolean(state[key])) return;
       state[key] = next;
       apply();
+    }
+    function previewViewFlipSign() { return viewFlipSign(state.previewViewFlipX, state.previewViewFlipY); }
+    function previewViewRotEff() { return viewRotEff(previewViewRotValue(), state.previewViewFlipY); }
+    function previewViewRotValue() { return clampPaperRotation(state.previewViewRot, 0); }
+    function resetPreviewViewOrientation() {
+      state.previewViewRot = 0;
+      state.previewViewFlipX = false;
+      state.previewViewFlipY = false;
     }
     function paperViewFlipSign() { return viewFlipSign(state.paperViewFlipX, state.paperViewFlipY); }
     function paperRotationEff() { return viewRotEff(paperRotationValue(), state.paperViewFlipY); }
@@ -105806,7 +105768,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       });
       return sameKey.length === 1 ? sameKey[0] : '';
     }
-    // The three view surfaces are 用紙 (paperRotation), storyboard video (videoViewRot), and genga (gengaViewRot).
+    // Use independent orientation for 用紙 and the active preview (Storyboard video or Animation).
     // Support pinch twist and Shift+Space rotation on each one.
     // Share rotation, zoom, flip, and reset handlers through this table.
     // Routing each shortcut by videoEditMode would always choose video in storyboard,
@@ -105831,8 +105793,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       },
       video: {
         stage: '#conteVideoStage',
-        rotGet: function() { return videoViewRotValue(); },
-        rotFlipSign: function() { return videoViewFlipSign(); },
+        rotGet: previewViewRotValue,
+        rotFlipSign: previewViewFlipSign,
         rotSet: function(v) { setVideoViewRot(v); },
         zoomGet: videoPreviewZoomValue,
         zoomSet: setVideoPreviewZoom,
@@ -105845,13 +105807,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           setVideoPreviewZoom(viewZoomActualFrom(videoPreviewZoomValue(), r));
           saveEditorUiState();
         },
-        flipToggle: function() { setVideoViewFlipX(!state.videoViewFlipX); }, // The third surface
-               flipYToggle: function() { setVideoViewFlipY(!state.videoViewFlipY); }
+        flipToggle: function() { setVideoViewFlipX(!state.previewViewFlipX); }, // The third surface
+               flipYToggle: function() { setVideoViewFlipY(!state.previewViewFlipY); }
       },
       genga: {
         stage: '#gengaStage',
-        rotGet: function() { return gengaViewRotValue(); },
-        rotFlipSign: function() { return gengaViewFlipSign(); },
+        rotGet: previewViewRotValue,
+        rotFlipSign: previewViewFlipSign,
         rotSet: function(v) { setGengaViewRot(v); },
         zoomGet: function() { return gengaClampZoom(state.gengaZoom); },
         zoomSet: gengaSetZoomAt,
@@ -105861,8 +105823,8 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           const r = gengaZoomRatio();
           if (r > 0) gengaSetZoom(viewZoomActualFrom(gengaClampZoom(state.gengaZoom), r));
         },
-        flipToggle: function() { setGengaViewFlipX(!state.gengaViewFlipX); },
-        flipYToggle: function() { setGengaViewFlipY(!state.gengaViewFlipY); }
+        flipToggle: function() { setGengaViewFlipX(!state.previewViewFlipX); },
+        flipYToggle: function() { setGengaViewFlipY(!state.previewViewFlipY); }
       }
     };
     // Use these surface checks for zoom, flip, pan, and rotation.
@@ -106077,7 +106039,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         // Pan is inside the mirror-then-rotate transform in drawGengaPreviewInner.
         // Invert that transform on the screen delta so panning follows the pointer
         // under rotation and vertical flip.
-        const d = viewInverseOffset(dx, dy, gengaViewRotEff(), gengaViewFlipSign());
+        const d = viewInverseOffset(dx, dy, previewViewRotEff(), previewViewFlipSign());
         state.gengaPanX = drag.baseX + d.x;
         state.gengaPanY = drag.baseY + d.y;
         scheduleGengaPreviewRedraw();
@@ -106251,9 +106213,13 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       return true;
     }
 
-    // The caller names fields to clear. Keep each surface's rect and the canceled stroke's lifetime distinct.
-    function clearPaintPointerSession(fields) {
-      fields.forEach(function(field) { state[field] = null; });
+    // Only one Storyboard pointer session is active. Both surfaces measure a new rect at pointerdown.
+    function clearPaintPointerSession() {
+      state.paintPointerId = null;
+      state.paintCurrentStroke = null;
+      state.paintRasterOp = null;
+      state.paintPointerCanvasRect = null;
+      state.videoPaintPointerCanvasRect = null;
     }
 
     // Only a replacement tap clears selection. Add and subtract leave it in place.
@@ -106272,7 +106238,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       continuePaintTransformDocument(event);
       const canvas = op.target && op.target.type === 'video-conte-layer' ? document.getElementById('conteVideoStage') : document.getElementById('memoCanvas');
       safeReleasePointerCapture(canvas, event.pointerId);
-      clearPaintPointerSession(['paintPointerId', 'paintCurrentStroke', 'paintRasterOp', 'paintPointerCanvasRect', 'videoPaintPointerCanvasRect']);
+      clearPaintPointerSession();
       finishPaintTransformOp(op);
       clearActiveLayerCanvasTargets();
       updatePaintUndoRedoButtonsOnly();
@@ -106522,7 +106488,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         paintFlushPendingFirstDab(); // Finish a stationary tap by drawing one dot.
         const op = state.paintRasterOp;
         const pointerId = event.pointerId;
-        clearPaintPointerSession(['paintPointerId', 'paintCurrentStroke', 'paintRasterOp', 'paintPointerCanvasRect']);
+        clearPaintPointerSession();
         safeReleasePointerCapture(canvas, pointerId);
         if (op.type === 'page-draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
           // Page curve phase 1: the chord stroke stays in page.strokes as the visible ghost;
@@ -106581,50 +106547,39 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (!el || !el.releasePointerCapture || pointerId == null) return;
       try { el.releasePointerCapture(pointerId); } catch (error) {}
     }
-    // +1 upright, -1 mirrored — the same one-sign shape the other two surfaces use.
-    function videoViewFlipSign() { return viewFlipSign(state.videoViewFlipX, state.videoViewFlipY); }
-    function videoViewRotEff() { return viewRotEff(videoViewRotValue(), state.videoViewFlipY); }
-    // Share the 用紙 normalization kernel to keep rotation in radians in (-PI, PI]
-    // across surfaces.
-    function videoViewRotValue() { return clampPaperRotation(state.videoViewRot, 0); }
     function applyVideoPaperViewTransform(stage) {
       if (!stage) return;
-      const flip = videoViewFlipSign(), rot = videoViewRotEff();
+      const flip = previewViewFlipSign(), rot = previewViewRotEff();
       stage.style.setProperty('--video-flip-x', flip);
       stage.style.setProperty('--video-rot', rot + 'rad');
       stage.classList.toggle('paper-mirrored-x', flip < 0 && rot === 0);
     }
-    // The applier owns every piece of DOM this feature touches, including the indicator. That is deliberate: an
-    // indicator synced from updatePaintUI goes stale on any mirror path that does not call it (e.g. a reset),
-    // leaving the button lit over an unmirrored sheet. Every path that changes the mirror ends here instead.
-    function applyVideoViewFlipDom() {
+    // Sync the mirror indicators with the same orientation as the preview CSS.
+    function applyVideoPreviewViewDom() {
       const stage = document.getElementById('conteVideoStage');
       applyVideoPaperViewTransform(stage);
       const btn = document.getElementById('videoViewFlipBtn');
-      if (btn) btn.classList.toggle('active', Boolean(state.videoViewFlipX));
+      if (btn) btn.classList.toggle('active', Boolean(state.previewViewFlipX));
       const btnY = document.getElementById('videoViewFlipYBtn');
-      if (btnY) btnY.classList.toggle('active', Boolean(state.videoViewFlipY));
-      state.videoPaintPointerCanvasRect = null; // a rect captured under the old handedness would decode mirrored
-      if (state.videoEditMode) drawPaintStageOverlay();
+      if (btnY) btnY.classList.toggle('active', Boolean(state.previewViewFlipY));
     }
-    // Vertical flip also adds a half turn to the display angle, so refresh rotation CSS too.
-    function setVideoViewFlipY(on) { setViewFlag('videoViewFlipY', on, function() { applyVideoViewFlipDom(); applyVideoViewRotDom(); }); }
-    function setVideoViewFlipX(on) { setViewFlag('videoViewFlipX', on, applyVideoViewFlipDom); }
+    function setVideoViewFlipY(on) { setViewFlag('previewViewFlipY', on, videoPreviewViewChanged); }
+    function setVideoViewFlipX(on) { setViewFlag('previewViewFlipX', on, videoPreviewViewChanged); }
     // Keep the element as well as its rect. A rotated bounding box cannot supply untransformed dimensions.
     // offsetWidth gives transform-independent layout pixels.
     // Map pointers on the rotated video surface to paper-local pixels for the camera and gizmo.
     // Use uiPointerLocalX/Y when there is no rotation or mirroring. Take the center from getBoundingClientRect
     // and the layout size from offsetWidth.
     function videoPointerLocal(clientX, clientY) {
-      const rot = videoViewRotEff();
+      const rot = previewViewRotEff();
       // Undo mirroring as in getVideoPaintPointFromEventRaw so dragging a flipped camera frame follows the finger.
       // Use the default mapping only when both rotation and mirror are absent.
-      const el = (rot || videoViewFlipSign() < 0) ? videoPaperEl() : null;
+      const el = (rot || previewViewFlipSign() < 0) ? videoPaperEl() : null;
       if (!el || !(el.offsetWidth > 0) || !(el.offsetHeight > 0)) {
         return { x: uiPointerLocalX(clientX), y: uiPointerLocalY(clientY) };
       }
       const uz = uiReadScale() || 1;
-      const n = viewClientToLocalNorm(el, null, clientX, clientY, rot, videoViewFlipSign());
+      const n = viewClientToLocalNorm(el, null, clientX, clientY, rot, previewViewFlipSign());
       const raw = el.getBoundingClientRect();
       const w = el.offsetWidth, h = el.offsetHeight; // Already in local pixels.
       const cx = (raw.left + raw.width / 2) / uz, cy = (raw.top + raw.height / 2) / uz;
@@ -106642,17 +106597,16 @@ const MARQUEE_COLOR_PENDING = '#e02424';
       if (gengaPointerGestureOpen) videoPaperElGesture = el;
       return el;
     }
-    function applyVideoViewRotDom() {
-      const stage = document.getElementById('conteVideoStage');
-      applyVideoPaperViewTransform(stage);
-      state.videoPaintPointerCanvasRect = null; // Invalidate the cached bounding box when rotation changes.
+    function videoPreviewViewChanged() {
+      applyVideoPreviewViewDom();
+      state.videoPaintPointerCanvasRect = null; // A new orientation invalidates the cached pointer rect.
       if (state.videoEditMode) drawPaintStageOverlay();
     }
     function setVideoViewRot(value) {
-      const next = clampPaperRotation(value, videoViewRotValue());
-      if (Math.abs(next - videoViewRotValue()) < 1e-6) return;
-      state.videoViewRot = next;
-      applyVideoViewRotDom();
+      const next = clampPaperRotation(value, previewViewRotValue());
+      if (Math.abs(next - previewViewRotValue()) < 1e-6) return;
+      state.previewViewRot = next;
+      videoPreviewViewChanged();
     }
     function videoPaintBaseRect() {
       // The pointer/display anchor is the paper (norm 0..1 = paper edges), taken directly off .conte-paper (not
@@ -106669,7 +106623,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
     // Use the same conversion as 用紙, which also handles zero rotation.
     function getVideoPaintPointFromEventRaw(event) {
       return viewClientToLocalNorm(videoPaperEl(), state.videoPaintPointerCanvasRect,
-        event.clientX, event.clientY, videoViewRotEff(), videoViewFlipSign());
+        event.clientX, event.clientY, previewViewRotEff(), previewViewFlipSign());
     }
 
     function beginVideoPaintStroke(event) {
@@ -106917,7 +106871,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         paintFlushPendingFirstDab(); // Finish a stationary tap by drawing one dot.
         const op = state.paintRasterOp;
         const pointerId = event.pointerId;
-        clearPaintPointerSession(['paintPointerId', 'paintCurrentStroke', 'paintRasterOp', 'videoPaintPointerCanvasRect']);
+        clearPaintPointerSession();
         safeReleasePointerCapture(canvas, pointerId);
         if (op.type === 'draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
           // Curve phase 1 done: keep the op alive as a pending chord (the ghost stays painted). paintPointerId
@@ -107015,7 +106969,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
             state.memoPageCurvePending = null;
             scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);   // The chord may have reached saved data while waiting, as in cancelPendingCurvePage.
           }
-          clearPaintPointerSession(['paintPointerId', 'paintCurrentStroke', 'paintRasterOp', 'paintPointerCanvasRect']);
+          clearPaintPointerSession();
           redrawMemoCanvas(); // Consume the pending redraw.
           updatePaintUndoRedoButtonsOnly();
           return true;
@@ -107023,7 +106977,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
         if (op.target && op.target.type === 'memo-page') {
           // Page changes and OS cancellation discard an unfinished selection/transform, never finish it on another page.
           const canvas = document.getElementById('memoCanvas');
-          clearPaintPointerSession(['paintRasterOp', 'paintPointerId', 'paintPointerCanvasRect']);
+          clearPaintPointerSession();
           state.paintLassoPreview = null;
           if (op.type === 'transform-edit') { state.paintTransformBox = null; state.paintTransformPreview = null; }
           if (event.type !== 'lostpointercapture') safeReleasePointerCapture(canvas, event.pointerId);
@@ -107039,7 +106993,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           : document.getElementById('memoCanvas');
         if (event.type !== 'lostpointercapture') safeReleasePointerCapture(canvas, event.pointerId);
         const drawingRef = op.drawingRef;
-        clearPaintPointerSession(['paintPointerId', 'paintCurrentStroke', 'paintRasterOp', 'paintPointerCanvasRect', 'videoPaintPointerCanvasRect']);
+        clearPaintPointerSession();
         cancelScheduledMemoCanvasRedraw();
         redrawActiveLayerCanvasTargets(drawingRef);
         clearActiveLayerCanvasTargets();
@@ -111133,11 +111087,7 @@ const MARQUEE_COLOR_PENDING = '#e02424';
           scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
         }
       }
-      state.paintPointerId = null;
-      state.paintCurrentStroke = null;
-      state.paintRasterOp = null;
-      state.paintPointerCanvasRect = null;
-      state.videoPaintPointerCanvasRect = null;
+      clearPaintPointerSession();
       // The dropped op may already have drawn on its edit surface (a half stroke, a pending curve ghost) — put the
       // committed drawing back, as cancelActivePaintRasterStroke does for an OS cancel.
       if (abandoned && abandoned.type === 'page-draw') redrawMemoCanvas();
@@ -153808,7 +153758,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const box = (boxHint && boxHint.el === wrap) ? boxHint : { w: wrap.clientWidth, h: wrap.clientHeight };
       const W = Math.max(40, box.w), H = Math.max(40, box.h);
       attachGengaStageScrollbars({ w: W, h: H });
-      const vrot = gengaViewRotEff(), vfl = gengaViewFlipSign();
+      const vrot = previewViewRotEff(), vfl = previewViewFlipSign();
       const gt = state.project && state.project.gengaTimeline;
       if (!gt) return;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
@@ -154639,7 +154589,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       })();
       if (!r) return null;
       const view = batch && (batch.view || (batch.view = { scale: uiReadScale() || 1,
-        pointerScale: uiPointerToRectScale(), rotation: gengaViewRotEff(), flip: gengaViewFlipSign() }));
+        pointerScale: uiPointerToRectScale(), rotation: previewViewRotEff(), flip: previewViewFlipSign() }));
       const uz = view ? view.scale : uiReadScale() || 1;
       // Rotate and mirror around the visible W×H center. The backing canvas can outgrow the viewport.
       const xf = gengaPreviewXform;
@@ -154650,8 +154600,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const d = viewInverseOffset(
         px - w / 2,
         py - h / 2,
-        view ? view.rotation : gengaViewRotEff(),
-        view ? view.flip : gengaViewFlipSign()
+        view ? view.rotation : previewViewRotEff(),
+        view ? view.flip : previewViewFlipSign()
       );
       return { x: d.x + w / 2, y: d.y + h / 2, w: w, h: h };
     }
@@ -154659,7 +154609,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // full-canvas rect; once the canvas is rotated, (0,0,W,H) in transformed space no longer reaches the screen
     // corners and four bright triangles survive. The circumscribing square always does. Identity at rot 0.
     function gengaViewCoverRect(W, H) {
-      if (!gengaViewRotEff()) return { x: 0, y: 0, w: W, h: H };
+      if (!previewViewRotEff()) return { x: 0, y: 0, w: W, h: H };
       const r = Math.hypot(W, H) / 2;
       return { x: W / 2 - r, y: H / 2 - r, w: r * 2, h: r * 2 };
     }
@@ -157181,13 +157131,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       state.gengaTimelineLayerScrollTop = 0;
       state.gengaTimelineAudioScrollTop = 0;
       gengaTimelineViewportPending = true;
-      // Reset zoom, pan, rotation, and mirroring to their initial values.
+      // Reset the Animation-specific zoom and pan.
       state.gengaZoom = gengaClampZoom(1);
       state.gengaPanX = 0;
       state.gengaPanY = 0;
-      state.gengaViewRot = 0;
-      state.gengaViewFlipX = false;
-      state.gengaViewFlipY = false;
       gengaPointerCanvasRect = null;
       gengaStopRecording(gengaRecSession, true);
       const preview = document.getElementById('gengaPreviewCanvas');
@@ -160031,7 +159978,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function updateGengaZoomLabel() {
       // The label doubles as the rotation readout. The badge shows only when the view is actually turned, so a
       // turned view is never mistaken for a plain one.
-      const rotDeg = Math.round(gengaViewRotValue() * 180 / Math.PI);
+      const rotDeg = Math.round(previewViewRotValue() * 180 / Math.PI);
       const el = document.getElementById('gengaZoomResetBtn');
       if (el) {
         const label = viewZoomPercentText(gengaZoomRatio()) + (rotDeg ? ' ' + (rotDeg > 0 ? '+' : '') + rotDeg + '°' : '');
@@ -160041,23 +159988,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // every path that changes the genga view ends up refreshing this, so it cannot be left lit over an
       // unmirrored canvas.
       const fb = document.getElementById('gengaViewFlipBtn');
-      if (fb) fb.classList.toggle('active', Boolean(state.gengaViewFlipX));
+      if (fb) fb.classList.toggle('active', Boolean(state.previewViewFlipX));
       const fby = document.getElementById('gengaViewFlipYBtn');
-      if (fby) fby.classList.toggle('active', Boolean(state.gengaViewFlipY));
+      if (fby) fby.classList.toggle('active', Boolean(state.previewViewFlipY));
     }
-    function gengaViewFlipSign() { return viewFlipSign(state.gengaViewFlipX, state.gengaViewFlipY); }
-    function gengaViewRotEff() { return viewRotEff(gengaViewRotValue(), state.gengaViewFlipY); }
-    // clampPaperRotation is not paper-specific — it normalises radians to (-PI, PI] so repeated turns never
-    // accumulate. Shared rather than copied, same reasoning as viewInverseOffset.
-    function gengaViewRotValue() { return clampPaperRotation(state.gengaViewRot, 0); }
     function setGengaViewRot(rad) {
       const next = clampPaperRotation(rad, 0);
-      if (Math.abs(next - gengaViewRotValue()) < 1e-6) return;
-      state.gengaViewRot = next;
+      if (Math.abs(next - previewViewRotValue()) < 1e-6) return;
+      state.previewViewRot = next;
       gengaViewChanged();
     }
-    function setGengaViewFlipY(on) { setViewFlag('gengaViewFlipY', on, gengaViewChanged); }
-    function setGengaViewFlipX(on) { setViewFlag('gengaViewFlipX', on, gengaViewChanged); }
+    function setGengaViewFlipY(on) { setViewFlag('previewViewFlipY', on, gengaViewChanged); }
+    function setGengaViewFlipX(on) { setViewFlag('previewViewFlipX', on, gengaViewChanged); }
     function gengaViewChanged() {
       gengaPointerCanvasRect = null; // a rect cached at the old angle or handedness would decode rotated or mirrored
       drawGengaPreview();
@@ -160121,10 +160063,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaZoomReset() {
       // First reset clears rotation and mirroring while preserving zoom and pan. The next reset fits the view.
-      if ((Number(state.gengaViewRot) || 0) !== 0 || state.gengaViewFlipX || state.gengaViewFlipY) {
-        state.gengaViewRot = 0;
-        state.gengaViewFlipX = false;
-        state.gengaViewFlipY = false;
+      if ((Number(state.previewViewRot) || 0) !== 0 || state.previewViewFlipX || state.previewViewFlipY) {
+        resetPreviewViewOrientation();
         drawGengaPreview();
         updateGengaZoomLabel();
         return;
@@ -160404,7 +160344,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         startAngle: v.a,
         lastRaw: v.a,
         turns: 0,
-        startRot: gengaViewRotValue(),
+        startRot: previewViewRotValue(),
         anchorX: (mcx - gengaPreviewXform.ox) / gengaPreviewXform.scale, // paper point under the fingers — kept fixed
         anchorY: (mcy - gengaPreviewXform.oy) / gengaPreviewXform.scale
       };
@@ -160424,7 +160364,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // The twist turns the view, as the 用紙 pinch already does. It must be written before the midpoint
       // is resolved: gengaClientToCanvasXY un-rotates with the live angle, so reading it first would place the
       // anchor using the previous frame's rotation and the paper would crawl under the fingers.
-      state.gengaViewRot = clampPaperRotation(snapViewRotToQuarter(gengaPinch.startRot + pinchTwistSince(gengaPinch, v.a) * gengaViewFlipSign()), 0); // Mirroring reverses angle handedness. Snap to the neutral position.
+      state.previewViewRot = clampPaperRotation(snapViewRotToQuarter(gengaPinch.startRot + pinchTwistSince(gengaPinch, v.a) * previewViewFlipSign()), 0); // Mirroring reverses angle handedness. Snap to the neutral position.
       const newScale = f.fit * newZoom; // same scale drawGengaPreview will use → anchor holds through resizes
       const newCenX = (f.W - f.pw * newScale) / 2, newCenY = (f.H - f.ph * newScale) / 2;
       const mid = gengaClientToCanvasXY(v.mx, v.my, f.rect); // The pinch midpoint goes through the same choke point
@@ -167262,7 +167202,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           ev.preventDefault();
           if (wheelIsTrackpadPan(ev)) {   // A two-finger swipe pans in the gesture direction using screen deltas with mirroring and rotation undone.
             const uz = uiReadScale(),
-              dd = viewInverseOffset(-ev.deltaX / uz, -ev.deltaY / uz, gengaViewRotEff(), gengaViewFlipSign());
+              dd = viewInverseOffset(-ev.deltaX / uz, -ev.deltaY / uz, previewViewRotEff(), previewViewFlipSign());
             state.gengaPanX += dd.x;
             state.gengaPanY += dd.y;
             scheduleGengaPreviewRedraw();
@@ -170316,7 +170256,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const scale = f.fit * gengaClampZoom(state.gengaZoom);
           // Tracks use screen axes while pan is inside mirror and rotation transforms. Horizontal mirror flips x.
           // Vertical mirror flips y because mirror plus a half-turn flips x twice. Other rotations outside the quarter-turn cases keep the sign.
-          const sx = state.gengaViewFlipX ? -1 : 1, sy = state.gengaViewFlipY ? -1 : 1;
+          const sx = state.previewViewFlipX ? -1 : 1, sy = state.previewViewFlipY ? -1 : 1;
           return {
             viewW: f.W,
             viewH: f.H,
@@ -170327,8 +170267,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           };
         },
         setPan: function(x, y) {
-          state.gengaPanX = x * (state.gengaViewFlipX ? -1 : 1);
-          state.gengaPanY = y * (state.gengaViewFlipY ? -1 : 1);
+          state.gengaPanX = x * (state.previewViewFlipX ? -1 : 1);
+          state.gengaPanY = y * (state.previewViewFlipY ? -1 : 1);
           scheduleGengaPreviewRedraw(); // Drawing owns clamping.
         }
       }, box);
@@ -171780,9 +171720,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const zr = document.getElementById('gengaZoomResetBtn');
         if (zr) zr.addEventListener('click', gengaZoomReset);
         const gfb = document.getElementById('gengaViewFlipBtn');
-        if (gfb) gfb.addEventListener('click', function() { setGengaViewFlipX(!state.gengaViewFlipX); });
+        if (gfb) gfb.addEventListener('click', function() { setGengaViewFlipX(!state.previewViewFlipX); });
         const gfby = document.getElementById('gengaViewFlipYBtn');
-        if (gfby) gfby.addEventListener('click', function() { setGengaViewFlipY(!state.gengaViewFlipY); });
+        if (gfby) gfby.addEventListener('click', function() { setGengaViewFlipY(!state.previewViewFlipY); });
         const glb = document.getElementById('gengaLipsyncBtn');   // Toggle mouth bubbles. Right-click opens 口パク settings.
         if (glb) {
           glb.addEventListener('click', function() { setGengaLipsyncHud(!state.gengaLipsyncHud); });
