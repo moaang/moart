@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3533</title>
+  <title>MoArt ver3534</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -20332,7 +20332,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
   <script>
     // FILE MAP — application script
     // Search for "## SECTION: " followed by a title. Entries follow source order.
-    // Storyboard = 絵コンテ (conte); key animation = 原画 (genga); timesheet = タイムシート.
+    // Production terms (Storyboard, Animation, Timesheet) follow the glossary in docs/product_spec.md#naming.
     //
     // Application
     //   Startup settings and dialogs
@@ -20347,6 +20347,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   Scenario import
     //   Project replacement and recovery
     //   Release notes
+    //   Project startup
     //   Project creation and settings
     //   Dialogue sources and cut assignments
     //   Storyboard layer data and selection
@@ -20360,6 +20361,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   Audio playback and transport controls
     //   Playback compositor
     //   Storyboard preview and camera controls
+    //
+    // Storyboard sheets, scenario and voice
     //   Storyboard sheets and media import
     //   Scenario source view and voice settings
     //   Speech synthesis and audio editing
@@ -20385,16 +20388,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   Paint targets and coordinates
     //   Canvas drawing and page notes
     //
-    // Editor interface
+    // Help and training
     //   Feedback, sharing and guidebook
     //   Timeline Dojo
+    //
+    // Editor controls
     //   Selection overlays and transforms
     //   Canvas navigation and tool windows
     //   Paint tools and palettes
     //   Keyboard shortcuts and preferences
+    //
+    // Media export
     //   Video and image export
     //
-    // Key animation
+    // Animation drawings and timesheets
     //   Drawing storage, audio and batch export
     //   Timesheet data and interchange
     //   Timesheet view and dialogue timing
@@ -20403,13 +20410,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   CLIP STUDIO PAINT import
     //   TVPaint import
     //   Exposure and layer data
-    //   Key animation settings and layer creation
-    //   Key animation timeline editing
+    //   Animation settings and layer creation
+    //   Animation timeline editing
+    //
+    // Effects and keyframes
     //   Layer and camera effects
     //   Shared effect controls and keyframes
-    //   Key animation preview and onion skin
-    //   Key animation drawing and selection
-    //   Key animation timeline view
+    //
+    // Animation preview and editing
+    //   Animation preview and onion skin
+    //   Animation drawing and selection
+    //   Animation timeline view
     //
     // Workspace and startup
     //   Shared utilities and refresh
@@ -38960,6 +38971,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
+    // ## SECTION: Project startup
     async function bootProjectStartup() {
       checkBrowserStoragePersistence(true);
       setProjectActive(false);
@@ -53347,7 +53359,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function localRecoveryAvailable() { return workspaceAutosaveUiAvailable() && Boolean(navigator.locks && navigator.locks.request); }
     function localRecoverySafe() {
       return storageSweepCanRun() && !gengaPlaybackWarm && !gengaScrubInFlight && !gengaStampDrag
-        && !(pointerDragSessions && pointerDragSessions.size) && !state.paintFillWorkerJob
+        && !(pointerDragSessions && pointerDragSessions.size) && !paintBucketInProgress()
         && !drawingRecordingWindowBusy && !loadingOverlayOwner && !document.querySelector('dialog[open]');
     }
     function localRecoveryAssert(owner, connection, explicitHeadRepair) {
@@ -73358,11 +73370,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 판본 링(rollback ring) 정책의 계산만 둔다. DB 부작용은 게시 트랜잭션이 한다(정책을 두 벌 만들지 않는다).
     // null = 이번엔 판본을 만들지 않는다(간격 throttle, 또는 마지막 판본과 같은 본문 — 같은 사본이 링의 옛 되돌리기
     // 지점을 밀어내지 않게). lastPayload 는 본문이 바뀌지 않은 게시에서만 읽어 온다(undefined = 비교 안 함).
-    function planProjectVersionPush(rawIndex, payload, savedAtIso, lastPayload) {
+    function planProjectVersionPush(rawIndex, payload, savedAtIso, lastPayload, bypassInterval) {
       const vi = normalizeProjectVersionIndex(rawIndex);
       const last = vi.versions[vi.versions.length - 1];
       if (last && lastPayload === payload) return null;
-      if (last && last.savedAt) {
+      if (!bypassInterval && last && last.savedAt) {
         const gap = Date.parse(savedAtIso) - Date.parse(last.savedAt);
         if (Number.isFinite(gap) && gap < INDEXED_DB_VERSION_MIN_INTERVAL_MS) return null; // too soon — keep the ring time-spread
       }
@@ -73379,9 +73391,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // tx.oncomplete 뿐이다.
     // ── Project save publishing: atomic transaction and serialized queue ──
     // One atomic publish attempt. Only oncomplete updates the in-memory published head.
+    // A file-open replacement archives the current body once, bypassing the version interval.
+    // The archive and replacement commit together. A retry of an already committed replacement leaves its ring intact.
     // Return workspaceDbOp directly; the queue owns retry and adds no new await boundary here.
-    function publishProjectSaveTransaction(db, id, payload, meta, seq, head) {
-      // 본문과 판본을 함께 쓰므로 시간 한도에 그 두 배 크기를 센다(putWorkspaceDbValue 와 같은 계산) — 큰 프로젝트가 기본 한도에 걸려 재시도하지 않게.
+    function publishProjectSaveTransaction(db, id, payload, meta, seq, head, preserveReplacedVersion) {
+      // The time limit counts every body this transaction writes (same rule as putWorkspaceDbValue), so large projects do not retry.
+      const writeBytes = workspaceDbValueBytes(payload) * 2 +(preserveReplacedVersion ? workspaceDbValueBytes(head.payload) : 0);
       return workspaceDbOp(db, 'publish ' + id, function(resolve, reject) {
         const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
         const store = tx.objectStore(WORKSPACE_STORE_NAME);
@@ -73394,7 +73409,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (current !== head.payload && current !== payload) { conflict = true; tx.abort(); return; }
           // 변경 없는 게시(탭 전환·같은 내용 재저장)는 본문을 다시 쓰지 않는다. 슬롯 목록(savedAt — 축출 순서·표시)은 갱신한다.
           const unchanged = current === payload;
-          if (!unchanged) store.put(payload, indexedDbProjectPayloadKey(id));
+          const preserveCurrent = preserveReplacedVersion && !unchanged && current !== null;
+          if (!unchanged && !preserveCurrent) store.put(payload, indexedDbProjectPayloadKey(id));
           // Pins and eviction share the publishing transaction: no stale preflight list.
           const pinsReq = store.get(PINNED_PROJECT_SLOTS_KEY);
           pinsReq.onsuccess = function() {
@@ -73413,23 +73429,41 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               evicted = plan.evicted;
             };
           };
+          if (preserveReplacedVersion && unchanged && current !== head.payload) return;
           const viReq = store.get(indexedDbVersionIndexKey(id));
           viReq.onsuccess = function() {
-            const push = function(lastPayload) {
-              const plan = planProjectVersionPush(viReq.result, payload, meta.savedAt, lastPayload);
+            const push = function(versionPayload, lastPayload, bypassInterval) {
+              const plan = planProjectVersionPush(viReq.result, versionPayload, meta.savedAt, lastPayload, bypassInterval);
               if (!plan) return;
               versionSeq = plan.seq;
-              store.put(payload, indexedDbVersionPayloadKey(id, plan.seq));
+              store.put(versionPayload, indexedDbVersionPayloadKey(id, plan.seq));
               store.put(plan.index, indexedDbVersionIndexKey(id));
               plan.drops.forEach(function(s) { store.delete(indexedDbVersionPayloadKey(id, s)); });
             };
             const versions = normalizeProjectVersionIndex(viReq.result).versions;
+            if (preserveCurrent) {
+              // Search newest first without loading all version bodies at once.
+              const findCurrent = function(i) {
+                if (i < 0) {
+                  push(current, undefined, true);
+                  store.put(payload, indexedDbProjectPayloadKey(id));
+                  return;
+                }
+                const req = store.get(indexedDbVersionPayloadKey(id, versions[i].seq));
+                req.onsuccess = function() {
+                  if (req.result === current) store.put(payload, indexedDbProjectPayloadKey(id));
+                  else findCurrent(i - 1);
+                };
+              };
+              findCurrent(versions.length - 1);
+              return;
+            }
             const last = versions[versions.length - 1];
-            if (!unchanged || !last) { push(undefined); return; }
+            if (!unchanged || !last) { push(payload); return; }
             // 본문이 그대로면 마지막 판본도 같은지 본다 — 같으면 판본을 만들지 않고, 다르면(간격 throttle 로 링에 못
             // 들어간 내용) 지금 남긴다. 같은 트랜잭션 안의 요청이라 자동 완료되지 않는다.
             const lastReq = store.get(indexedDbVersionPayloadKey(id, last.seq));
-            lastReq.onsuccess = function() { push(lastReq.result == null ? null : String(lastReq.result)); };
+            lastReq.onsuccess = function() { push(payload, lastReq.result == null ? null : String(lastReq.result)); };
           };
         };
         tx.oncomplete = function() {
@@ -73443,15 +73477,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           else reject(tx.error || new Error(t('msg.idb.txAbortedFor', indexedDbProjectPayloadKey(id))));
         };
         tx.onerror = function() { reject(tx.error || new Error(t('msg.idb.writeFailedFor', indexedDbProjectPayloadKey(id)))); };
-      }, workspaceDbValueBytes(payload) * 2);
+      }, writeBytes);
     }
-    async function publishProjectSaveTx(id, payload, meta, seq, head) {
+    async function publishProjectSaveTx(id, payload, meta, seq, head, preserveReplacedVersion) {
       const previous = projectSavePublishJobs.get(id) || Promise.resolve();
       const job = previous.catch(function() {}).then(async function() {
         if ((projectSavePublishedSeq.get(id) || 0) > seq || projectSaveHeads.get(id) !== head) return { ok: false, code: 'stale' };
         if (!indexedDbAvailable()) return { ok: false, code: 'refused' };
         storageRootsChanged();
-        return workspaceDbRetrying(function(db) { return publishProjectSaveTransaction(db, id, payload, meta, seq, head); });
+        return workspaceDbRetrying(function(db) { return publishProjectSaveTransaction(db, id, payload, meta, seq, head, preserveReplacedVersion); });
       });
       projectSavePublishJobs.set(id, job);
       const release = function() { if (projectSavePublishJobs.get(id) === job) projectSavePublishJobs.delete(id); };
@@ -73538,7 +73572,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (!drawingRecordingDurableRefs.has(frame.ref)) await drawingRecordingReadAsset(frame.ref, snapshot, recordingHandle, frame);
         }
         const published = await publishProjectSaveTx(id, payload,
-          { title: title, savedAt: savedAt, bytes: payload.length, kind: kind }, seq, head);
+          { title: title, savedAt: savedAt, bytes: payload.length, kind: kind }, seq, head, opts && opts.preserveReplacedVersion);
         if (!published.ok) {
           if (published.code !== 'stale') projectSaveMarkStatus(
             id,
@@ -73608,7 +73642,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function snapshotLoadedProject(owner) {
       assertProjectIoOwner(owner);
       if (!indexedDbAvailable()) return;
-      const result = await writeProjectToIndexedDbSlot({ owner: owner });
+      const result = await writeProjectToIndexedDbSlot({ owner: owner, preserveReplacedVersion: true });
       assertProjectIoOwner(owner);
       if (!result.ok) {
         const message = t('msg.workspace.saveFailed', result.error && result.error.message || result.code || 'save');
@@ -74792,7 +74826,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function memoryCacheCleanupReady() {
       return !userActivityBusy()
         && !gengaDrawSession && !state.paintRasterOp && !state.paintCurrentStroke
-        && !state.paintFillWorkerJob && !drawingRecordingWindowBusy
+        && !paintBucketInProgress() && !drawingRecordingWindowBusy
         && !(drawingRecordingRuntime && (drawingRecordingRuntime.running || drawingRecordingRuntime.pending.size));
     }
     // 다시 만들 수 있는 표시 캐시의 소유를 놓는다 — 그림 해독·어니언·콘티 미리보기·벡터 굽기·벡터 썸·동화 파생(채우기·환경·
@@ -99050,6 +99084,11 @@ async function drawingRecordingExportVideo(inspected, readAsset, options) {
       return project.kind === 'genga'
         ? { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit }
         : { valid: conteBucketRequestValid, prepare: conteBucketPrepare, commit: conteBucketCommit };
+    }
+    // The bucket queue stays busy from preparation through commit.
+    // localRecoverySafe and memoryCacheCleanupReady defer recovery and cache cleanup until it drains.
+    function paintBucketInProgress() {
+      return !!state.paintBucketQueue?.entries.length;
     }
     function paintBucketApply(request) {
       const adapter = paintBucketEngine(request.project);
@@ -144950,7 +144989,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return out;
     }
-    // ## SECTION: Key animation settings and layer creation
+    // ## SECTION: Animation settings and layer creation
 
     function gengaNormalizeLayerOrder(layers) {
       // 用紙 layer is pinned to the very top or very bottom (user rule); re-seat it every normalize so no cel/BG
@@ -147013,7 +147052,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
     }
 
-    // ## SECTION: Key animation timeline editing
+    // ## SECTION: Animation timeline editing
     // ---- レイヤー合体 (merge, the sheet tool's "Merge selected Layers" reference) ----
     // Shift/Ctrl/Cmd-click a layer head to multi-select (gengaSelectedLayerIdSet), then right-click any
     // selected layer → レイヤー合体. Rules (confirmed with the user):
@@ -151771,7 +151810,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (gengaStampDrag && gengaStampDrag.layerId !== String(centerLayerId)) return false;
       return true;
     }
-    // ## SECTION: Key animation preview and onion skin
+    // ## SECTION: Animation preview and onion skin
 
     // layerStates[i].base = the base index of a clipping layer that has one (drawn with its base, never on its own);
     // layerStates[base].clips = those clipping layers, top-first. The center's clipping group [liveTop, liveBottom] stays
@@ -155229,7 +155268,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
     }
-    // ## SECTION: Key animation drawing and selection
+    // ## SECTION: Animation drawing and selection
 
     // ── the commit-time ink scan's readback window (the "union scan") ────────────────────────
     // Every drawing commit has to find the ink bbox of a paper-res canvas, and that readback dominates a
@@ -162009,7 +162048,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         drawGengaLayerThumbs();
       }
     }
-    // ## SECTION: Key animation timeline view
+    // ## SECTION: Animation timeline view
     // The dopesheet row's geometry, read from the same --genga-row-h / --genga-fx-track-h the CSS uses, so the
     // JS row math (FX strip tops, gengaLayerRowBox) cannot drift from the layout. Read once and
     // cached: gengaLayerRenderRowHeight runs inside per-layer loops, where a getComputedStyle would violate the
