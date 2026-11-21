@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3528</title>
+  <title>MoArt ver3529</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -85102,9 +85102,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // 제 자리에 붙는다.
     const PAINT_PRESSURE_RISE_MAX = 0.25;   // 상승 지연 약 40ms@60Hz. lift-spike(1~2샘플)는 median±2 가 잡는다
     const PAINT_CATCHUP_TAIL_FLOOR_RATIO = 0.5;   // 수렴 꼬리 압의 바닥 = 마지막 인식 필압 × 이 값 — 뾰족 0 수렴(end taper 스타일)과 네이티브 뚝(마지막 값 유지) 사이의 안착점
-    // smoothWin === false 면 이동평균 창을 건너뛴다(rise-limit 은 그대로) — 필압('p')이 이 경로다. 레퍼런스
-    // 표준(CSP 補正은 전 항목 좌표 전용, Krita 의 Smooth Pressure 는 좌표와 분리된 옵트인)에 맞춰 손떨림 레벨은
-    // 좌표에만 건다. 기울기('t')는 창을 지난다.
+    // smoothWin === false 면 이동평균 창을 건너뛴다(rise-limit 은 그대로) — 필압('p')이 이 경로다. 레퍼런스에서
+    // 필압 평균은 좌표와 분리된 옵트인이라(Krita Weighted 의 Smooth Pressure · Stabilizer 의 Stabilize Sensors,
+    // Procreate StreamLine 의 Pressure) 손떨림 레벨은 필압에 걸지 않는다. 기울기('t')는 창을 지난다(Krita Stabilizer 의
+    // 센서 보정·OpenToonz Smooth 가 좌표와 같은 큐로 기울기를 평균한다). 조사: Relay 42a8d804728f(2026-11-21).
     function paintStabilizeAux(host, key, raw, riseMax, smoothWin) {
       if (raw == null || !host) return raw;
       let v = Math.max(0, Math.min(1, Number(raw) || 0));
@@ -85404,8 +85405,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         : paintStabilizeAux(host, 'p', raw == null ? 0.5 : raw, PAINT_PRESSURE_RISE_MAX, false);
       return value;
     }
-    function paintAttachPressure(pointObj, sampleEvent, stroke) {
-      if (stroke && stroke.pressure && sampleEvent) {
+    // 펜 표본 한 개의 필압·기울기·방위를 원화·콘티가 이 함수 하나로 읽는다(누름·이동 모두). 각 축은 쓰는 획에서만
+    // 안정화 사슬을 지난다 — 필압은 필압 획, 기울기는 기울기 획, 방위는 팁 追従=方位. keepPressure: 원화는 필압을 쓰지
+    // 않는 획도 필압을 읽는다(원화 벡터 점이 p 를 싣는 저장 형식 — 콘티 점은 필압 획에만 p 가 있다).
+    function paintAttachPressure(pointObj, sampleEvent, stroke, keepPressure) {
+      if (stroke && (stroke.pressure || keepPressure) && sampleEvent) {
         pointObj.p = paintReadStrokePressure(stroke, sampleEvent);
       }
       // 기울기도 원화와 같은 커널을 지난다(상태는 stroke 에 산다) — raw 를 그대로 실으면 같은 브러시가
@@ -155884,13 +155888,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const { layer, frame, p, pw, ph, cv, c, activeDr, seedRect, scanEligible } = target;
       const hardEdge = paintToolBinarizeOn(state.paintTool === 'eraser' ? 'eraser' : 'pen'); // 2値化 on → hard-edged pixel kernel (paintHardSegment) (the eraser has its own key; 透明色 펜은 펜의 설정을 읽는다)
       const penOpacity = paintBrushOpacityVal(); // brush settings (shared with conte)
-      const downPressure = paintSamplePressure(ev) ?? 0.5;
-      // 기울기·방위의 pointerdown 값. 방위는 실제로 쓸 때만 읽는다 — 팁이 등록돼 있고
-      // 追従이 '方位'일 때. (팁은 아래 붓 필드 담기(paintAttachBrushLook)에서 실리지만 그건 이 줄 다음이라,
-      // conte 빌더들과 마찬가지로 스토어를 직접 본다.)
-      const downTilt = paintSampleTiltNorm(ev);
-      const wantAzimuth = paintArmedTipActive() && paintTipRotateVal() === 'azimuth';
-      const downAzimuth = wantAzimuth ? paintSampleAzimuthDeg(ev) : null;
       // penOutlineMode collects a whole path for vector drawing or for raster brushes selected by
       // paintStrokeWantsWholePath. Binarized tip/grain paths use this mode and threshold the rendered buffer;
       // other binarized strokes use pixel stamps. Variable-width strokes buffer to avoid round-join pooling.
@@ -155939,38 +155936,32 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         strokeKey: 'g-' + Date.now().toString(36) + '-' + (gengaStrokeSeq += 1), // 잉크 세션의 스트로크 신원(conte의 stroke.id에 대응)
         stabScale: gengaPreviewXform ? 1 / Math.max(1e-6, gengaPreviewXform.scale) : 0, // paper px per screen px — the rope radius is a screen-space feel
         penOutline: penOutlineMode,
-        azOn: wantAzimuth, // 방위를 실제로 쓸 때만 샘플링한다(팁이 있고 追従=方位일 때)
-        // 첫 점도 t/a를 싣는다 — `{x,y,p}`뿐이면 arc 상태(t:0)와 어긋나고, paintVariableWidthRadii가 pts[0].t를
-        // undefined로 읽어 첫 점만 기울기가 빠진다. 벡터로 그릴 때 점을 모으는 판정은 위 penOutlineMode 에만
-        // 둔다 — 사본을 두면 「점을 모으는 경로」가 두 곳에서 정해져 갈린다.
-        pts: penOutlineMode ? [{ x: p.x, y: p.y, p: downPressure, t: downTilt, a: downAzimuth }] : null,
+        // 첫 점의 p/t/a 는 아래에서 누름 표본으로 싣는다(arc 도). 벡터로 그릴 때 점을 모으는 판정은 위 penOutlineMode
+        // 에만 둔다 — 사본을 두면 「점을 모으는 경로」가 두 곳에서 정해져 갈린다.
+        pts: penOutlineMode ? [{ x: p.x, y: p.y }] : null,
         vector: vectorDraw && !eraser,   // 지우개는 위에서 전용 세션으로 빠진다 — 여기 서면 지우개 획이 선으로 추가된다
         vectorColor: eraser ? null : activePaintColor(),
         arc: penOutlineMode
           ? {
           x: p.x,
           y: p.y,
-          p: downPressure,
-          t: downTilt,
-          a: downAzimuth,
           carry: 0,
           step: Math.max(1, Math.min(5, c.lineWidth * 0.35)),
           detail: (penTipOrGrain ? 0.25 : 0.1) / Math.max(1, gengaPreviewXform ? gengaPreviewXform.scale : 1)
         }
           : null, // Distance spacing stays sparse on straight lines; detail preserves turns and reversals within that interval.
-        smoothT: null, // 기울기 표본의 손떨림 상태(획마다 새로)
         scan: scanEligible ? gengaScanSeed(seedRect) : null,
         inkScan: scanEligible ? gengaScanSeed(null) : null   // 시드 없이 획만 모은다(칸 갱신용)
       };
-      // down 필압도 콘티(paintAttachPressure)와 같은 사슬을 지난다 — 어택 시드가 여기서 심긴다. 첫 샘플도 캡을
-      // 지나므로(원값은 pFirstRaw 로 보관) down 점·리샘플 시드에도 캡 값을 싣는다 — 원값을 남기면 시작에 원값
-      // dab 이 한 방 찍힌다(「시작 동그라미」).
-      const startPressure = paintReadStrokePressure(gengaDrawSession, ev);
-      // 기울기도 콘티(paintAttachPressure)처럼 down 표본부터 안정화 사슬에 넣는다 — 기울기를 쓰는 획만(쓰지 않으면 콘티도
-      // 표본을 싣지 않는다). 넣지 않으면 손떨림 보정 창이 첫 move 에서야 시작해 획 머리의 기울기가 콘티와 갈린다.
-      const startTilt = paintStrokeUsesTilt(gengaDrawSession) ? paintStabilizeAux(gengaDrawSession, 't', downTilt, 0) : downTilt;
-      if (gengaDrawSession.pts && gengaDrawSession.pts.length) { gengaDrawSession.pts[0].p = startPressure; gengaDrawSession.pts[0].t = startTilt; }
-      if (gengaDrawSession.arc) { gengaDrawSession.arc.p = startPressure; gengaDrawSession.arc.t = startTilt; }
+      // 누름 표본도 콘티와 같은 paintAttachPressure 를 지난다 — 필압 사슬에 어택 시드가 심기고(첫 샘플도 캡, 원값은
+      // pFirstRaw), 기울기 획이면 기울기 안정화·방위 추종이면 방위 안정화도 이 표본부터 시작한다. 첫 점·리샘플 시드가
+      // 그 값을 받는다(원값을 남기면 시작에 원값 dab 이 찍히고, 기울기·방위 창이 첫 move 에서야 시작해 콘티와 갈린다).
+      const head = paintAttachPressure({}, ev, gengaDrawSession, true);
+      const startPressure = head.p;
+      const startTilt = head.t != null ? head.t : null;
+      const headAxes = { p: startPressure, t: startTilt, a: head.a != null ? head.a : null };
+      if (gengaDrawSession.pts && gengaDrawSession.pts.length) Object.assign(gengaDrawSession.pts[0], headAxes);
+      if (gengaDrawSession.arc) Object.assign(gengaDrawSession.arc, headAxes);
       // 획 머리도 몸통과 같은 식으로 굵어진다 — 곡선을 곱해 반올림하고 그 정수에 틸트를 또 곱하면 두 번
       // 반올림이 되고, 제어점 곡선(pCurvePts)을 안 넘기면 그것이 머리에서만 빠진다. 세션이 정본 필드를 들었으므로
       // 그대로 커널에 넘긴다 — 세 경로 모두 paintPressureWidthFactor 로 굵기를 정한다. 첫 점도 캡을 지난 startPressure 로
@@ -156179,12 +156170,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           p = paintShiftLineConstrain(penSess, p, ev.shiftKey, { x: penSess.lastX, y: penSess.lastY }, 1, 1);
           if (!p) continue; // 각도가 아직 안 잠겼다
         }
-        const usePressure = paintReadStrokePressure(penSess, sample);
-        // Tilt, slewed like pressure so one orientation jitter can't kink the width envelope — the same shared
-        // kernel as coordinates and pressure, so the three axes share one latency window.
-        penSess.smoothT = paintStabilizeAux(penSess, 't', paintSampleTiltNorm(sample), 0);
-        const useTilt = penSess.smoothT;
-        const useAz = penSess.azOn ? paintStabilizeAzimuth(penSess, paintSampleAzimuthDeg(sample)) : null;
+        // 콘티와 같은 표본 읽기(누름과 같은 함수) — 기울기·방위는 그 축을 쓰는 획에서만 안정화 사슬을 지난다.
+        const axes = paintAttachPressure({}, sample, penSess, true);
+        const usePressure = axes.p;
+        const useTilt = axes.t != null ? axes.t : null;
+        const useAz = axes.a != null ? axes.a : null;
         if (penSess.penOutline) { // outline mode just accumulates; one whole redraw after the loop
           // accumulate resampled points (uniform arc-length + interpolated pressure), not raw
           const emitted = paintArcResampleEmit(penSess.arc, p.x, p.y, usePressure, useTilt, useAz);
