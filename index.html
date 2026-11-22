@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3555</title>
+  <title>MoArt ver3556</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -25488,15 +25488,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       playbackAudioContext: null,
       playbackAudioSources: [],
       audioPlaybackGeneration: 0,
-      audioBufferCache: {},
-      audioBufferPendingCache: {},
       cameraTimelineSlotsCache: null,     // { video, slots } -- keyed on the video timeline object
       cameraTimelineSlotMapsCache: null,  // { slots, maps }  -- keyed on that slot array
       audioSourcePeaks: {},           // sourceKey -> Uint8Array of 0..255 maxima, AUDIO_PEAK_BINS_PER_SECOND per second
       audioSourcePeaksPending: {},    // sourceKey -> in-flight build promise (one build per source, never per clip)
       audioSourcePeaksOrder: [],      // LRU order for audioSourcePeaks
       audioSourcePeaksFailed: {},     // sourceKey -> reason; kept so a failure is visible instead of an endless retry loop
-      audioBufferUrlToSource: {},
       audioSourceBlobCache: {},
       audioSourceBlobCacheOrder: [],
       audioSourceSliceInfoCache: {},
@@ -25547,7 +25544,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       timelineTimecodeLastText: '',
       timelineTimecodeLastFrame: -1,
       timelinePlayheadReadoutText: '', // Last `nn+nn` displayed while dragging. Skip duplicate writes.
-      audioWaveformCssCache: {},
       // Invalidate audio memoization when its cycle changes.
       audioCycleId: 0,
       audioDisplayClipsCache: null, // { cycle, clips }
@@ -28824,9 +28820,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
-    function settleAudioClipEdit(project, clip, before, options) {
+    function settleAudioClipEdit(project, clip, before) {
       if (!clip.audioTrimDurationFrames) clip.audioTrimDurationFrames = clip.durationFrames;
-      if (!(options && options.skipWaveform) && state.audioWaveformCssCache) delete state.audioWaveformCssCache[clip.id];
       bumpAudioCycle();
       sortAudioClips(project);
       if (before && (before.trackId !== clip.trackId || before.startFrame !== clip.startFrame || before.durationFrames !== clip.durationFrames
@@ -28851,7 +28846,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // Placement can add a single lane as part of a light clip edit. Keep its record with the command so
     // Undo can remove exactly that lane and Redo can restore it, including its persisted defaults.
-    function runMediaClipEditCommand(kind, name, clipId, mutator, options) {
+    function runMediaClipEditCommand(kind, name, clipId, mutator) {
       const spec = MEDIA_CLIP_EDIT_SPECS[kind], project = state.project, audio = kind === 'audio';
       spec.normalize(project);
       const clip = spec.find(project, clipId);
@@ -28860,7 +28855,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const trackIds = new Set(project.timeline.tracks.map(function(track) { return track.id; }));
       const beforeDialogue = audio ? captureDialogueState(project) : null;
       mutator(clip, project);
-      spec.settle(project, clip, before, options);
+      spec.settle(project, clip, before);
       const after = spec.capture(clip);
       const addedTrack = project.timeline.tracks.find(function(track) { return !trackIds.has(track.id) && track.id === after.trackId; });
       const command = { name: name, [spec.flag]: true, clipId: clipId, before: before, after: after };
@@ -28892,8 +28887,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       refreshMediaCommandViews([spec.lane]);
     }
 
-    function runAudioClipEditCommand(name, clipId, mutator, options) {
-      return runMediaClipEditCommand('audio', name, clipId, mutator, options);
+    function runAudioClipEditCommand(name, clipId, mutator) {
+      return runMediaClipEditCommand('audio', name, clipId, mutator);
     }
 
     // pushSelectionEditCommand records both engines; Undo and Redo restore through this registry.
@@ -43483,7 +43478,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Invalidate the cache at audio mutation entry points.
     function bumpAudioCycle() {
       state.audioCycleId = (state.audioCycleId | 0) + 1;
-      if (state.project) { dialoguePlaybackCache.delete(state.project); dialogueRelationsCache.delete(state.project); }
       state.audioDisplayClipsCache = null;
       state.audioNormalizedCycle = -1;
       state.audioTimelineTrackWrittenCycle = -1;
@@ -45363,7 +45357,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //     scoped to one drawing                    invalidateVideoPreviewForDrawingRef(ref)
     //   matching layer canvases' draw keys        invalidateLayerDrawingSurfaces    a layer drawing edited
     //                                             (ref); also stage keys when onion skin is enabled
-    //   audioWaveformCssCache[clipId]              delete on the clip                     audio clip trim / edit
     //   audio buffers by character                 invalidateAudioForCharacter(p, name)   voice / character change
     //   layer paste preview                        invalidateLayerDrawingPastePreview(ref) paste source changed
     // ============================================================================================
@@ -46801,7 +46794,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function defaultTtsProvider(project) {
-      return ttsSettings(project).defaultProvider || 'voicevox';
+      const settings = project.settings && project.settings.tts;
+      return settings && settings.defaultProvider || 'voicevox';
     }
 
     function voicevoxEndpoint(project) {
@@ -46931,31 +46925,28 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    function ensureCharacterVoiceProfile(project, name, characterInfo) {
-      const profiles = voiceProfiles(project);
+    function resolveCharacterVoiceProfile(project, name, characterInfo, persist) {
+      const profiles = persist ? voiceProfiles(project) : project.settings && project.settings.voiceProfiles;
       const key = scenarioMetaKey(name);
-      if (!Object.prototype.hasOwnProperty.call(profiles, key) || !profiles[key]) {
-        Object.defineProperty(profiles, key, {
-          value: createDefaultVoiceProfile(name, characterInfo || {}, new Set()),
-          writable: true,
-          enumerable: true,
-          configurable: true
-        });
+      const stored = profiles && Object.prototype.hasOwnProperty.call(profiles, key) && profiles[key];
+      const character = characterInfo || {};
+      const profile = stored ? (persist ? stored : Object.assign({}, stored))
+        : createDefaultVoiceProfile(project, name, character, new Set());
+      profile.name = name;
+      normalizeVoiceProfile(project, profile, character);
+      if (persist && !stored) {
+        Object.defineProperty(profiles, key, { value: profile, writable: true, enumerable: true, configurable: true });
       }
-      profiles[key].name = name;
-      normalizeVoiceProfile(project, profiles[key], characterInfo || {});
-      return profiles[key];
+      return profile;
     }
 
-    // Status, cache-label and staleness reads: the values ensureCharacterVoiceProfile would publish,
-    // without creating or normalizing a stored profile while rendering another owner's project.
+    function ensureCharacterVoiceProfile(project, name, characterInfo) {
+      return resolveCharacterVoiceProfile(project, name, characterInfo, true);
+    }
+
+    // Rendering and staleness reads resolve the same values without mutating stored profiles.
     function peekCharacterVoiceProfile(project, name, characterInfo) {
-      const profiles = project.settings && project.settings.voiceProfiles, key = scenarioMetaKey(name);
-      const stored = profiles && Object.prototype.hasOwnProperty.call(profiles, key) && profiles[key];
-      const profile = stored ? Object.assign({}, stored) : createDefaultVoiceProfile(name, characterInfo || {}, new Set());
-      profile.name = name;
-      normalizeVoiceProfile(project, profile, characterInfo || {});
-      return profile;
+      return resolveCharacterVoiceProfile(project, name, characterInfo, false);
     }
 
     function clipVoiceProfile(project, clip, lookup) {
@@ -46973,7 +46964,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const key = scenarioMetaKey(character.name);
         if (!Object.prototype.hasOwnProperty.call(profiles, key) || !profiles[key]) {
           Object.defineProperty(profiles, key, {
-            value: createDefaultVoiceProfile(character.name, character, usedVoices, usedVoicevox),
+            value: createDefaultVoiceProfile(project, character.name, character, usedVoices, usedVoicevox),
             writable: true,
             enumerable: true,
             configurable: true
@@ -46993,12 +46984,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    function createDefaultVoiceProfile(name, character, usedVoices, usedVoicevox) {
+    function createDefaultVoiceProfile(project, name, character, usedVoices, usedVoicevox) {
       const profile = {
         name: name,
         gender: normalizeGenderValue(character.gender),
         age: character.age || 'adult',
-        ttsProvider: defaultTtsProvider(state.project),
+        ttsProvider: defaultTtsProvider(project),
         voicevoxSpeakerId: chooseVoicevoxSpeakerId(name, normalizeGenderValue(character.gender), usedVoicevox || new Set(), character.age || 'adult'),
         voicevoxSpeakerAuto: true,
         voiceURI: chooseSpeechVoiceUri(name, normalizeGenderValue(character.gender), usedVoices || new Set()),
@@ -47430,7 +47421,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!clip || !clip.id) return;
       const url = state.workspaceObjectUrls.audio[clip.id];
       if (!url) return;
-      forgetAudioBufferCacheUrl(url);
+      invalidateAudioSource(audioClipSourceKey(clip));
       releaseWorkspaceMediaUrl('audio', url);
       delete state.workspaceObjectUrls.audio[clip.id];
     }
@@ -47441,8 +47432,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // directly; regenerated bytes get a new file and never overwrite the saved source.
       const sourceKey = audioClipSourceKey(clip);
       const hadSource = audioClipHasSource(state.project, clip);
-      clearAudioObjectUrl(clip);
-      if (sourceKey) forgetAudioBufferCacheUrl(sourceKey);
+      if (state.workspaceObjectUrls.audio[clip.id]) clearAudioObjectUrl(clip);
+      else invalidateAudioSource(sourceKey);
       clip.audioFileName = '';
       clip.audioMime = '';
       clip.audioStorage = null;
@@ -47906,8 +47897,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Legacy links remain readable, but never confer permission to delete a block.
     const DIALOGUE_EDGE_FRAMES = 4;
     const DIALOGUE_CLIP_RELATION_FIELDS = ['sourceCutId', 'characterName', 'dialogTags', 'dialogMode', 'dialogueGroupIds', 'linkedDialogBlockIds', 'syncedDialogBlockIds', 'syncedCutIds', 'syncedDialogTexts', 'dialogBlockId', 'dialogueLinksExplicit', 'dialogueVoiceId'];
-    const dialoguePlaybackCache = new WeakMap();
-    const dialogueRelationsCache = new WeakMap();
+    const dialogueDerivedByProject = new WeakMap();
+
+    function dialogueDerived(project) {
+      let derived = dialogueDerivedByProject.get(project);
+      if (!derived) {
+        derived = { relations: null, parsedText: new WeakMap() };
+        dialogueDerivedByProject.set(project, derived);
+      }
+      return derived;
+    }
+
+    function invalidateDialogueDerived(project) {
+      const derived = dialogueDerivedByProject.get(project);
+      if (derived) derived.relations = null;
+    }
 
     function dialogueSourceBlockIds(block, group) {
       return Array.from(new Set(
@@ -47932,7 +47936,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function dialogueRelationIndex(project) {
       const cycle = project === state.project ? state.audioCycleId : 0;
-      const previous = dialogueRelationsCache.get(project);
+      const derived = dialogueDerived(project);
+      const previous = derived.relations;
       if (previous && previous.cycle === cycle) return previous;
       const clips = (project.audio && project.audio.clips) || [];
       const byClip = new Map(), byGroup = new Map(), bySource = new Map(), legacy = new Map();
@@ -47947,11 +47952,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       const groups = new Map((project.dialogueGroups || []).map(function(g) { return [g.id, g]; }));
       const clipById = new Map(clips.map(function(c) { return [c.id, c]; }));
+      const clipsByCut = new Map();
+      clips.forEach(function(c) { if (!c.hidden && !c.dialogueLinksExplicit) push(clipsByCut, c.sourceCutId, c); });
+      const lookup = { clipById: clipById, clipsByCut: clipsByCut };
       const sources = [], seenGroups = new Set();
       (project.cuts || []).forEach(function(cut) {
         // Owned views already have explicit relations; do not repeat legacy text matching per clip edit.
         const views = Array.isArray(cut.dialogBlocks) && cut.dialogBlocks.every(function(b) { return groups.has(b.dialogueGroupId); })
-          ? cut.dialogBlocks : dialogBlocksForDisplay(project, cut);
+          ? cut.dialogBlocks : dialogBlocksForDisplay(project, cut, lookup);
         views.forEach(function(view) {
           const group = groups.get(view.dialogueGroupId);
           const block = group ? group.block : view;
@@ -47975,7 +47983,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         linked.forEach(function(clip) { push(byClip, clip.id, group.block); });
       });
       const result = { cycle: cycle, byClip: byClip, bySource: bySource, groups: groups, sources: sources };
-      dialogueRelationsCache.set(project, result);
+      derived.relations = result;
       return result;
     }
 
@@ -48191,7 +48199,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         clip.syncedDialogBlockIds = arrayWithoutId(clip.syncedDialogBlockIds || [], block.id);
         if (clip.dialogBlockId === block.id) clip.dialogBlockId = '';
       });
-      dialogueRelationsCache.delete(project);
+      invalidateDialogueDerived(project);
       return group;
     }
 
@@ -48394,7 +48402,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function applyAudioTimelineToCuts(project) {
-      dialogueRelationsCache.delete(project);
+      invalidateDialogueDerived(project);
       normalizeAudioClips(project);
       syncDialogueGroups(project);
     }
@@ -48409,8 +48417,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function updateSingleAudioClipToCuts(project, clipOrId) {
       if (!project || !project.audio) return;
-      dialogueRelationsCache.delete(project);
-      dialoguePlaybackCache.delete(project);
+      invalidateDialogueDerived(project);
       normalizeAudioClips(project);
       const clip = typeof clipOrId === 'string' ? audioClipById(project, clipOrId) : clipOrId;
       if (clip) updateDialogBlockClipToCuts(project, clip);
@@ -48427,14 +48434,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       clip.linkedDialogBlockIds = [];
       clip.syncedDialogBlockIds = [];
       clip.dialogueLinksExplicit = true;
-      dialogueRelationsCache.delete(project);
-      dialoguePlaybackCache.delete(project);
+      invalidateDialogueDerived(project);
     }
 
     function syncDialogueGroups(project, ids) {
       const groups = project.dialogueGroups || [];
-      dialogueRelationsCache.delete(project);
-      if (!groups.length) { dialoguePlaybackCache.delete(project); return; }
+      invalidateDialogueDerived(project);
+      if (!groups.length) return;
       const selected = ids ? new Set(ids) : null;
       const plans = groups.filter(function(g) { return !selected || selected.has(g.id); }).map(function(group) {
         group.block = normalizeDialogBlock(group.block);
@@ -48483,8 +48489,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // No linked audio: retain the source as one ordinary block, then release group ownership.
       const detached = new Set(plans.filter(function(p) { return !p.clips.length && p.views.length; }).map(function(p) { return p.group.id; }));
       project.dialogueGroups = groups.filter(function(g) { return !detached.has(g.id); });
-      dialoguePlaybackCache.delete(project);
-      dialogueRelationsCache.delete(project);
+      invalidateDialogueDerived(project);
     }
 
     function captureDialogueState(project) {
@@ -48540,21 +48545,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cut.dialogBlockIds = fastClone(saved.dialogBlockIds || []);
         cut.sourceBlockIds = fastClone(saved.sourceBlockIds || []);
       });
-      dialoguePlaybackCache.delete(project);
-      dialogueRelationsCache.delete(project);
+      invalidateDialogueDerived(project);
     }
 
     function dialoguePlaybackIndex(project) {
       const video = buildVideoTimelineCached(project);
-      const cycle = project === state.project ? state.audioCycleId : 0;
       const scope = (project.settings && project.settings.conteSilentDialogue) === 'cut' ? 'cut' : 'panel';
       const peaks = state.audioPeaksEpoch || 0;   // Newly loaded peaks can change the silent tail reported by `dialogueVoicedSpan`.
-      const previous = dialoguePlaybackCache.get(project);
-      if (previous && previous.video === video && previous.cycle === cycle && previous.scope === scope && previous.peaks === peaks) return previous;
+      const relations = dialogueRelationIndex(project);
+      const previous = relations.playback;
+      if (previous && previous.video === video && previous.scope === scope && previous.peaks === peaks) return previous;
       // A line without a voice lasts for the panel it is written on (its slot), or the whole cut when the project says so.
       const byCutGroup = new Map();
       const add = function(key, entry) { if (!byCutGroup.has(key)) byCutGroup.set(key, []); byCutGroup.get(key).push(entry); };
-      dialogueRelationIndex(project).sources.forEach(function(source) {
+      relations.sources.forEach(function(source) {
         const block = source.block, group = source.group, clips = source.clips;
         if (!String(block.body || '').trim() && !String(block.speaker || '').trim()) return;
         const entry = { block: block, group: group, key: group ? group.id : block.id, cut: source.cut, linked: clips.length > 0 };
@@ -48571,9 +48575,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           );
         }
       });
-      const result = { video: video, cycle: cycle, scope: scope, peaks: peaks, byCutGroup: byCutGroup };
-      dialoguePlaybackCache.set(project, result);
-      return result;
+      return relations.playback = { video: video, scope: scope, peaks: peaks, byCutGroup: byCutGroup };
     }
 
     function dialogueEntryText(project, entry, cut) {
@@ -48642,7 +48644,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
       });
       if (group) syncDialogueGroups(project, [group.id]);
-      dialoguePlaybackCache.delete(project); dialogueRelationsCache.delete(project);
+      invalidateDialogueDerived(project);
     }
 
     function dialogueSpeakerConflict(project, block, name) {
@@ -48874,7 +48876,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           hit.cut.dialogBlocks = blocks.filter(function(b) { return b.id !== blockId; });
           deriveDialogTextFromBlocks(hit.cut);
         }
-        dialogueRelationsCache.delete(p);
+        invalidateDialogueDerived(p);
         const owners = dialogueRelationIndex(p).bySource;
         assignDialogueSources(p, sourceIds.filter(function(id) { return !(owners.get(id) || []).length; }), null);
         cleanupProvisionalCharacters(p);
@@ -48910,22 +48912,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function parseDialogBlocksFromText(project, cut) {
+      const text = String(cut.dialogText || '');
+      const blockIds = Array.isArray(cut.dialogBlockIds) ? cut.dialogBlockIds : [];
+      // Imported sources can be edited in place. Read their current fields when parsing.
+      if (blockIds.length) return parseDialogueText(cut.id, text, blockIds.map(function(id) { return id ? findBlockById(project, id) : null; }));
+
+      const cache = dialogueDerived(project).parsedText;
+      let parsed = cache.get(cut);
+      if (!parsed || parsed.text !== text || parsed.id !== cut.id) {
+        parsed = { text: text, id: cut.id, blocks: parseDialogueText(cut.id, text, []) };
+        cache.set(cut, parsed);
+      }
+      // Display links and materialization mutate blocks. Keep the parsed templates private.
+      return parsed.blocks.map(function(block) {
+        return Object.assign({}, block, { tags: block.tags.slice() });
+      });
+    }
+
+    function parseDialogueText(cutId, text, sources) {
       const blocks = [];
-      const lines = String((cut && cut.dialogText) || '').split(/\n+/);
-      const blockIds = Array.isArray(cut && cut.dialogBlockIds) ? cut.dialogBlockIds.slice() : [];
-      const sources = blockIds.map(function(id) { return findBlockById(project, id); });
+      const lines = text.split(/\n+/);
       if (sources.length && sources.every(function(b) { return b && b.sourceFormat === 'scenario_to_conte_package'; })
           && [
             sources.map(function(b) { return b.text; }).join('\n'),
             sources.map(dialogDisplayTextForBlock).join('\n')
-          ].includes(String(cut.dialogText || ''))) {
-        return sources.map(function(b, index) { return dialogBlockFromScenarioSource(b, 'dlgblk-' + cut.id + '-' + (index + 1)); });
+          ].includes(text)) {
+        return sources.map(function(b, index) { return dialogBlockFromScenarioSource(b, 'dlgblk-' + cutId + '-' + (index + 1)); });
       }
       let idx = 0;
       lines.forEach(function(line) {
         const rawLine = String(line || '').trim();
         if (!rawLine) return;
-        const srcBlock = blockIds[idx] ? findBlockById(project, blockIds[idx]) : null;
+        const srcBlock = sources[idx];
         idx += 1;
         const speaker = inferDialogSpeakerFromLine(rawLine) || (srcBlock && (srcBlock.characterName || srcBlock.speaker) || '');
         const tags = normalizeDialogTags([dialogLineMarkerText(rawLine), srcBlock && srcBlock.modifier].filter(Boolean).join(' '));
@@ -48933,7 +48951,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         blocks.push(normalizeDialogBlock({
           // Deterministic id (cut + line index) so display and materialize produce the same ids;
           // otherwise the first edit's findBlock(id) misses (random ids) and only refreshes.
-          id: 'dlgblk-' + String(cut && cut.id || 'cut') + '-' + idx,
+          id: 'dlgblk-' + String(cutId || 'cut') + '-' + idx,
           kind: 'dialog',
           speaker: speaker,
           tags: tags,
@@ -48946,9 +48964,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // Match an existing audio clip to a dialog block (for linking migrated/existing data):
     // first by shared sourceBlockId (scenario block), then by cut + speaker + body text.
-    function findClipForDialogBlock(project, cutId, block, claimed) {
+    function findClipForDialogBlock(project, cutId, block, claimed, lookup) {
       if (!block || block.kind === 'free') return null;
-      const clips = (project.audio && project.audio.clips) || [];
+      const clips = lookup ? lookup.clipsByCut.get(cutId) || [] : (project.audio && project.audio.clips) || [];
       const norm = function(s) { return String(s || '').replace(/[「」『』\s]/g, '').replace(/[…・。、，,.]+$/, ''); };
       // Both lookups gate on the same cut. Without it a block with no audioClipId could claim a neighbouring cut's
       // clip whenever the two share a sourceBlockId (imported projects carry such collisions); the stolen clip's
@@ -48967,14 +48985,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return m2 || null;
     }
 
-    function fillDialogBlockClipLinks(project, cutId, blocks, persist) {
+    function fillDialogBlockClipLinks(project, cutId, blocks, persist, lookup) {
       const claimed = new Set(blocks.map(function(b) { return b.audioClipId; }).filter(Boolean));
       // drop stale links (clip no longer exists)
-      const clipIds = new Set(((project.audio && project.audio.clips) || []).map(function(c) { return c.id; }));
+      const clipIds = lookup ? lookup.clipById : new Set(((project.audio && project.audio.clips) || []).map(function(c) { return c.id; }));
       blocks.forEach(function(b) {
         if (b.audioClipId && !clipIds.has(b.audioClipId)) b.audioClipId = '';
         if (b.kind === 'free' || b.audioClipId || b.dialogueGroupId || b.audioLinkExplicit) return;
-        const clip = findClipForDialogBlock(project, cutId, b, claimed);
+        const clip = findClipForDialogBlock(project, cutId, b, claimed, lookup);
         if (clip) {
           b.audioClipId = clip.id;
           claimed.add(clip.id);
@@ -48984,7 +49002,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return blocks;
     }
 
-    function dialogBlocksForDisplay(project, cut) {
+    function dialogBlocksForDisplay(project, cut, lookup) {
       let blocks;
       if (cut && Array.isArray(cut.dialogBlocks)) {
         blocks = cut.dialogBlocks.map(function(b) {
@@ -48995,7 +49013,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } else {
         blocks = parseDialogBlocksFromText(project, cut);
       }
-      return fillDialogBlockClipLinks(project, cut.id, blocks, false);
+      return fillDialogBlockClipLinks(project, cut.id, blocks, false, lookup);
     }
 
     function dialogDisplayTextForBlock(block) {
@@ -49167,7 +49185,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           dialogBlockLinkedClips(p, original).forEach(function(c) { freezeDialogueClipLinks(p, c); });
           clip.linkedDialogBlockIds = Array.from(new Set((clip.linkedDialogBlockIds || []).concat(blockId)));
           original.audioClipId = clipId;
-          dialogueRelationsCache.delete(p);
+          invalidateDialogueDerived(p);
           ensureDialogueGroup(p, original, hit.cut);
         }
         syncDialogueGroups(p, clip.dialogueGroupIds);
@@ -53166,13 +53184,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Math.max(8, Math.min(AUDIO_WAVEFORM_MAX_COLUMNS, Math.round(frames * framePx)));
     }
 
-    // Preserve peak object identity without retaining peak bytes in CSS records.
-    const waveformPeakTokens = new WeakMap();
-    function waveformPeakToken(peaks) {
-      let token = waveformPeakTokens.get(peaks);
-      if (!token) { token = {}; waveformPeakTokens.set(peaks, token); }
-      return token;
-    }
+    // Source peaks own the pictures. Replacing or evicting peaks releases their picture set.
+    // Use the stable clip ID within a set so Undo can reuse pictures after restoring new clip objects.
+    let audioWaveformPictures = new WeakMap();
+
     // Take one peak per display column. Adjacent one-pixel strokes form a continuous envelope.
     function waveformSvgUrl(peaks, fromBin, toBin, columns) {
       const total = peaks && peaks.length ? peaks.length : 0;
@@ -53207,6 +53222,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return "url('data:image/svg+xml," + encodeURIComponent(svg) + "')";
     }
 
+    // Picture identity uses the actual sampling coordinates. Rounding can hide a crossed bin boundary.
+    function audioWaveformPicture(clip, peaks, from, to, columns) {
+      if (!clip.id) return waveformSvgUrl(peaks, from, to, columns);
+      let pictures = audioWaveformPictures.get(peaks);
+      if (!pictures) {
+        pictures = new Map();
+        audioWaveformPictures.set(peaks, pictures);
+      }
+      const previous = pictures.get(clip.id);
+      if (previous && previous.from === from && previous.to === to && previous.columns === columns) return previous.css;
+      const css = waveformSvgUrl(peaks, from, to, columns);
+      pictures.set(clip.id, { from: from, to: to, columns: columns, css: css });
+      return css;
+    }
+
     function audioWaveformCssValue(clip) {
       const sourceKey = audioClipSourceKey(clip);
       const peaks = audioSourcePeaksIfReady(sourceKey);
@@ -53215,13 +53245,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const fromBin = clipBoxOffsetToSourceSeconds(clip, fps, 0).offsetSec * AUDIO_PEAK_BINS_PER_SECOND;
       const toBin = clipBoxOffsetToSourceSeconds(clip, fps, Math.max(1, Number(clip.durationFrames) || 1) / fps).offsetSec * AUDIO_PEAK_BINS_PER_SECOND;
       const columns = audioClipDisplayColumns(clip);
-      const key = [sourceKey, peaks.length, fromBin.toFixed(1), toBin.toFixed(1), columns].join(':');
-      const peakToken = waveformPeakToken(peaks);
-      const cached = state.audioWaveformCssCache && state.audioWaveformCssCache[clip.id || key];
-      if (cached && cached.key === key && cached.peakToken === peakToken) return cached.css;
-      const css = waveformSvgUrl(peaks, fromBin, toBin, columns);
-      if (clip.id) state.audioWaveformCssCache[clip.id] = { key: key, peakToken: peakToken, css: css };
-      return css;
+      return audioWaveformPicture(clip, peaks, fromBin, toBin, columns);
     }
 
     // ---- automatic peak building (no re-analyse button) -----------------------------------------
@@ -53279,7 +53303,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // The waveform obeys the full-decode limit here too. A buffer already decoded (or being
         // decoded) for playback is reused; otherwise an over-limit compressed source is streamed or skipped.
         // Playback chooses PCM windows or the native whole-buffer path separately; this is cold-waveform policy.
-        resident: function() { return gengaAudioBuf.get(ref) || gengaAudioBufPending.get(ref) || null; }
+        resident: function() { return decodedAudioBuffers.get(sourceKey) || decodedAudioPending.get(sourceKey) || null; }
       });
     }
 
@@ -53292,7 +53316,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const byId = new Map(clips.map(function(c) { return [String(c.id), c]; }));
       const fps = gengaMediaFps(gt);   // peaks are source seconds
       const cellW = gengaCellW();
-      const cache = state.gengaAudioWaveformCss || (state.gengaAudioWaveformCss = {});
       nodes.forEach(function(node) {
         const id = String(node.getAttribute('data-genga-audio') || '');
         const clip = byId.get(id);
@@ -53308,11 +53331,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const window = gengaAudioWindow(clip, { duration: peaks.length / AUDIO_PEAK_BINS_PER_SECOND }, fps, 0);
         const from = window.sourceStart * AUDIO_PEAK_BINS_PER_SECOND,
           to = (window.sourceStart + Math.max(0, Number(clip.durationSec) || 0)) * AUDIO_PEAK_BINS_PER_SECOND;
-        const key = [clip.ref, peaks.length, columns, from, to].join(':');
-        const peakToken = waveformPeakToken(peaks);
-        const hit = cache[id];
-        const css = (hit && hit.key === key && hit.peakToken === peakToken) ? hit.css : waveformSvgUrl(peaks, from, to, columns);
-        if (!hit || hit.key !== key || hit.peakToken !== peakToken) cache[id] = { key: key, peakToken: peakToken, css: css };
+        const css = audioWaveformPicture(clip, peaks, from, to, columns);
         if (css) node.style.setProperty('--waveform', css);
       });
     }
@@ -54802,7 +54821,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function resetAudioClipVolume(clipId) {
       if (timelineMediaRefuseLocked(state.project, [{ kind: 'audio', clip: audioClipById(state.project, clipId) }])) return;
-      runAudioClipEditCommand('音量をリセット', clipId, function(targetClip) { targetClip.volume = 1; }, { skipWaveform: true });
+      runAudioClipEditCommand('音量をリセット', clipId, function(targetClip) { targetClip.volume = 1; });
     }
     // Razor pieces share one dialogue group and keep separate source-audio windows.
     function nextAudioClipSplitId(list, baseId) {
@@ -55191,7 +55210,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               if (action === 'spatkey-add') sk.push({ frame: frame, pan: cur.pan, distance: cur.distance });
               sk.sort(function(a, b) { return a.frame - b.frame; });
               clip.audioFx.spatialKeyframes = sk;
-            }, { skipWaveform: true });
+            });
             updateAudioFxWindow();
           }
         },
@@ -55237,7 +55256,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 c.audioFx.pan = 0;
                 c.audioFx.distance = 0;
                 c.audioFx.spatialKeyframes = [];
-              }, { skipWaveform: true });
+              });
               updateAudioFxWindow();
             } }
         ], { width: 130, height: 44 });
@@ -55259,7 +55278,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           c.durationFrames = nb;
         } // un-retime the box
         delete c.audioSpeedSpan;
-      }, { skipWaveform: true });
+      });
       updateAudioFxWindow();
     }
 
@@ -55387,7 +55406,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               fx.fadeOffsetFrames = fx.fadeLengthFrames = 0;
               fx[prop] = val;
               clip.audioFx = fx;
-            }, { skipWaveform: true });
+            });
             updateAudioFxWindow();
           };
           beginDragStrand(e, {
@@ -55410,8 +55429,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         runAudioClipEditCommand(
           'Audio pitch lock',
           fid,
-          function(clip) { clip.audioFx = normalizeAudioFx(clip.audioFx); clip.audioFx.preservePitch = on; },
-          { skipWaveform: true }
+          function(clip) { clip.audioFx = normalizeAudioFx(clip.audioFx); clip.audioFx.preservePitch = on; }
         );
         updateAudioFxWindow();
       });
@@ -55444,7 +55462,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               sk.sort(function(a, b) { return a.frame - b.frame; });
               clip.audioFx.spatialKeyframes = sk;
             } else { clip.audioFx.pan = p; clip.audioFx.distance = d; }
-          }, { skipWaveform: true });
+          });
           updateAudioFxWindow();
         };
         beginDragStrand(e, {
@@ -60591,13 +60609,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       clearTimelineLayerThumbnailTargets();
       updateTransportRuntimeDom(document);
       updateTimelineRuntimeDom(totalFrames, { lightweight: true, updateTimecode: true, skipAutoScroll: true });
-      const playbackAudibleClips = audioTimelineAudibleClips(state.project).slice().sort(function(left, right) {
-        return left.startFrame - right.startFrame;
-      });
-      state.playbackClipQueue = playbackAudibleClips.filter(function(clip) {
-        return clip.startFrame + clip.durationFrames >= startFrame;
-      });
-      state.playbackNextClipIndex = 0;
+      rebuildTimelineAudioQueue(startFrame);
       const needsBrowserSpeech = state.playbackClipQueue.some(function(clip) {
         if (state.workspaceObjectUrls.audio[clip.id]) return false;
         if (clip.audioFileName && state.workspaceHandle) return false;
@@ -60660,6 +60672,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           else stopTimelinePlayback(true);
         }
       }, 120);
+    }
+
+    function rebuildTimelineAudioQueue(frame) {
+      state.playbackClipQueue = audioTimelineAudibleClips(state.project)
+        .filter(function(clip) { return clip.startFrame + clip.durationFrames > frame; })
+        .sort(function(a, b) { return a.startFrame - b.startFrame; });
+      state.playbackNextClipIndex = 0;
     }
 
     function advancePlaybackAudioQueue(previousFrame, currentFrame, fps) {
@@ -60729,7 +60748,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       stopTimelineAudioSources();
       const fps = mediaFpsForProject(state.project);   // Same clock as startTimelinePlayback
       const frame = state.videoPlaybackStarting ? state.videoPlayheadFrames : state.videoPlaybackStartFrame + Math.max(0, (performance.now() - state.videoPlaybackStartClock) / 1000 * fps);
-      state.playbackClipQueue = audioTimelineAudibleClips(state.project).filter(function(c) { return c.startFrame + c.durationFrames > frame; }).sort(function(a, b) { return a.startFrame - b.startFrame; });
+      rebuildTimelineAudioQueue(frame);
       if (!state.videoPlaybackStarting) advancePlaybackAudioQueue(frame - 1, frame, fps);
     }
 
@@ -68510,7 +68529,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const clip = targets[index];
         const audioUrl = state.workspaceObjectUrls.audio[clip.id];
         if (!audioUrl) continue;
-        const buffer = pcmAudioReadyWindow(audioClipSourceKey(clip), audioClipPcmTime(clip, frame), ctx) || state.audioBufferCache[audioClipSourceKey(clip)] || audioClipCachedSliceBuffer(clip);
+        const buffer = pcmAudioReadyWindow(audioClipSourceKey(clip), audioClipPcmTime(clip, frame), ctx) || decodedAudioBuffers.get(audioClipSourceKey(clip)) || audioClipCachedSliceBuffer(clip);
         // Start decoding and skip this scrub tick, which cannot await the buffer.
         // Count the miss for the playback report.
         if (!buffer) {
@@ -68581,7 +68600,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const key = perClipSlices ? sourceKey + '#clip:' + clip.id : sourceKey;
         if (perClipSlices) {
           if (audioClipCachedSliceBuffer(clip)) continue;
-        } else if (state.audioBufferCache[sourceKey] || state.audioBufferPendingCache[sourceKey]) continue;
+        } else if (decodedAudioBuffers.get(sourceKey) || decodedAudioPending.get(sourceKey)) continue;
         const start = Math.round(Number(clip.startFrame) || 0);
         const end = start + Math.max(0, Math.round(Number(clip.durationFrames) || 0));
         const dist = scrubWarmDistance(center, start, end); // Shared with Animation.
@@ -68598,7 +68617,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function preloadAudioBufferForClip(clip, current, frame) {
       const audioUrl = clip && state.workspaceObjectUrls.audio[clip.id];
-      if (!audioUrl || state.audioBufferCache[audioClipSourceKey(clip)] || audioClipCachedSliceBuffer(clip)) return;
+      if (!audioUrl || decodedAudioBuffers.get(audioClipSourceKey(clip)) || audioClipCachedSliceBuffer(clip)) return;
       warmPlaybackAudioBuffer(clip, audioUrl, current, frame).catch(function(error) {
         if (!current || current()) noteAudioPlaybackMiss(clip, 'preload-failed');
       }); // Current playback failures remain visible; superseded warm-up cannot mark a new run.
@@ -68874,7 +68893,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const ctx = ensureAudioDecodeContext();
         if (!ctx) throw new Error('no audio context');
         return audioBufferForClip(ctx, clip, url);
-      }, { resident: function() { return state.audioBufferCache[sourceKey] || null; } });
+      }, { resident: function() { return decodedAudioBuffers.get(sourceKey) || null; } });
     }
 
     // Native audio decode can finish after a project switch. Track both engines' decodes in one list.
@@ -68890,48 +68909,70 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       audioNativeDecodePending.add(entry);
       try { return await entry.promise; } finally { audioNativeDecodePending.delete(entry); }
     }
-    async function audioBufferForClip(ctx, clip, audioUrl) {
+    function audioBufferForClip(ctx, clip, audioUrl) {
       const key = audioClipSourceKey(clip);
       const owner = projectIoOwner();
-      const pending = state.audioBufferPendingCache;
-      state.audioBufferUrlToSource[audioUrl] = key;
-      if (state.audioBufferCache[key]) {
-        touchAudioBufferCache(key);
-        return state.audioBufferCache[key];
-      }
-      if (state.audioBufferPendingCache[key]) return state.audioBufferPendingCache[key];
-      const current = function() { return projectIoOwnerCurrent(owner) && state.audioBufferPendingCache === pending && pending[key] === job; };
-      const job = fetch(audioUrl).then(async function(response) {
-        if (!current()) throw new DOMException('Audio source changed', 'AbortError');
-        if (!response.ok) throw new Error('Audio cache HTTP ' + response.status);
-        await awaitOtherProjectAudioDecodes(owner.project);   // before materializing compressed JS bytes
-        if (!current()) throw new DOMException('Audio source changed', 'AbortError');
-        return response.arrayBuffer();
-      }).then(function(buffer) {
-        if (!current()) throw new DOMException('Audio source changed', 'AbortError');
-        return decodeAudioRegistered(ctx, owner.project, buffer);
-      }).then(function(decoded) {
-        if (!current()) throw new DOMException('Audio source changed', 'AbortError');
-        state.audioBufferCache[key] = decoded;
-        touchAudioBufferCache(key);
-        trimDecodedAudioCaches();
-        delete state.audioBufferPendingCache[key];
-        return decoded;
-      }).catch(function(error) {
-        if (pending[key] === job) delete pending[key];
-        throw error;
-      });
-      pending[key] = job;
-      return job;
+      bindStoryboardAudioUrl(audioUrl, key);
+      return loadFullDecodedAudio(ctx, owner.project, key, audioUrl, function() { return projectIoOwnerCurrent(owner); });
     }
 
-    // Storyboard `state.audioBufferCache` and Animation `gengaAudioBuf` share one decoded byte budget and one LRU.
-    // Separate budgets would let an idle tab keep its buffers while the active tab filled another budget.
-    // Track recency by buffer in a WeakMap because the caches use separate key spaces.
+    function loadFullDecodedAudio(ctx, project, key, url, ownerCurrent) {
+      return loadDecodedAudio(key, async function(current) {
+        const response = await fetch(url);
+        current();
+        if (!response.ok) throw new Error('Audio cache HTTP ' + response.status);
+        await awaitOtherProjectAudioDecodes(project);
+        current();
+        const bytes = await response.arrayBuffer();
+        current();
+        return decodeAudioRegistered(ctx, project, bytes);
+      }, ownerCurrent);
+    }
+
+    // Full buffers and fallback slices share recency, byte budget and pending-job identity.
+    // Use the source key for full buffers and the source plus its exact range for slices.
+    const storyboardAudioSourceUrls = new Map();
+    const decodedAudioBuffers = new Map();
+    const decodedAudioPending = new Map();
     const decodedAudioUsedAt = new WeakMap();
     let decodedAudioClock = 0;
-    function markDecodedAudioUse(buffer) { if (buffer) decodedAudioUsedAt.set(buffer, ++decodedAudioClock); }
-    function touchAudioBufferCache(cacheKey) { markDecodedAudioUse(state.audioBufferCache[cacheKey]); }
+
+    function residentDecodedAudio(key) {
+      const buffer = decodedAudioBuffers.get(key);
+      if (buffer) decodedAudioUsedAt.set(buffer, ++decodedAudioClock);
+      return buffer;
+    }
+
+    function rememberDecodedAudio(key, buffer) {
+      decodedAudioBuffers.set(key, buffer);
+      decodedAudioUsedAt.set(buffer, ++decodedAudioClock);
+      trimDecodedAudioCaches();
+    }
+
+    async function loadDecodedAudio(key, decode, ownerCurrent) {
+      const ready = residentDecodedAudio(key);
+      if (ready) return ready;
+      const pending = decodedAudioPending.get(key);
+      if (pending) return pending;
+
+      const current = function() {
+        if (decodedAudioPending.get(key) !== job || !ownerCurrent()) {
+          throw new DOMException('Audio source changed', 'AbortError');
+        }
+      };
+      const job = Promise.resolve().then(function() {
+        current();
+        return decode(current);
+      }).then(function(buffer) {
+        current();
+        rememberDecodedAudio(key, buffer);
+        return buffer;
+      }).finally(function() {
+        if (decodedAudioPending.get(key) === job) decodedAudioPending.delete(key);
+      });
+      decodedAudioPending.set(key, job);
+      return job;
+    }
 
     // Decoded PCM is enormous relative to the compressed sources (float32 x channels: a 16-minute stereo
     // 48kHz recording is ~370MB decoded from a 20MB mp3), so an item-count cap alone is meaningless --
@@ -68945,55 +68986,82 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return buffer.length * buffer.numberOfChannels * 4;
     }
 
-    // The url->sourceKey bridge only has to survive as long as the buffer it points at. Dropping its entries
-    // alongside the buffer keeps the map from growing one dead entry per decoded object URL (URLs are re-minted
-    // on every blob replacement), and stops a later forgetAudioBufferCacheUrl(staleUrl) from resolving to a key that now belongs
-    // to different audio.
-    function forgetAudioBufferUrlMappingsForKey(cacheKey) {
-      const map = state.audioBufferUrlToSource;
-      if (!cacheKey || !map || typeof map !== 'object') return;
-      Object.keys(map).forEach(function(url) { if (map[url] === cacheKey) delete map[url]; });
+    // A live URL can have peaks, headers, or slices after its full buffer is evicted.
+    function bindStoryboardAudioUrl(url, key) {
+      let binding = storyboardAudioSourceUrls.get(url);
+      if (!binding || binding.key !== key) {
+        binding = { key: key };
+        storyboardAudioSourceUrls.set(url, binding);
+      }
+      return binding;
     }
 
     // Call after marking the just-cached buffer: it is then the newest and survives the at-least-one rule.
     function trimDecodedAudioCaches() {
-      const conte = state.audioBufferCache || {}, entries = [];
-      Object.keys(conte).forEach(function(key) {
-        entries.push({ buffer: conte[key], drop: function() { delete conte[key]; forgetAudioBufferUrlMappingsForKey(key); } });
-      });
-      gengaAudioBuf.forEach(function(buffer, ref) { entries.push({ buffer: buffer, drop: function() { gengaAudioBuf.delete(ref); } }); });
+      const entries = Array.from(decodedAudioBuffers);
       const budget = audioBufferCacheBudgetBytes();
       let total = 0, count = entries.length;
-      entries.forEach(function(entry) { total += audioBufferByteSize(entry.buffer); });
-      entries.sort(function(a, b) { return (decodedAudioUsedAt.get(a.buffer) || 0) - (decodedAudioUsedAt.get(b.buffer) || 0); });
+      entries.forEach(function(entry) { total += audioBufferByteSize(entry[1]); });
+      entries.sort(function(a, b) { return decodedAudioUsedAt.get(a[1]) - decodedAudioUsedAt.get(b[1]); });
       for (let index = 0; count > 1 && (count > DECODED_AUDIO_MAX_ITEMS || total > budget); index += 1) {
-        total -= audioBufferByteSize(entries[index].buffer);
-        entries[index].drop();
+        const [key, buffer] = entries[index];
+        total -= audioBufferByteSize(buffer);
+        decodedAudioBuffers.delete(key);
         count -= 1;
       }
     }
 
-    function forgetAudioBufferCacheUrl(audioUrl) {
+    function forgetDecodedAudioSource(key) {
+      const prefix = audioSliceKeyPrefix(key);
+      for (const cache of [decodedAudioBuffers, decodedAudioPending]) {
+        cache.delete(key);
+        for (const candidate of cache.keys()) {
+          if (candidate.startsWith(prefix)) cache.delete(candidate);
+        }
+      }
+    }
+
+    function invalidateStoryboardAudioUrl(audioUrl) {
       if (!audioUrl) return;
-      const map = state.audioBufferUrlToSource && typeof state.audioBufferUrlToSource === 'object' ? state.audioBufferUrlToSource : null;
-      const key = (map && map[audioUrl]) || audioUrl;
-      delete state.audioBufferCache[key];
-      delete state.audioBufferPendingCache[key];
+      const binding = storyboardAudioSourceUrls.get(audioUrl);
+      if (binding) invalidateAudioSource(binding.key);
+    }
+
+    function invalidateAudioSource(key) {
+      if (!key) return;
+      forgetDecodedAudioSource(key);
       const pcm = pcmAudioSources.get(key);
       if (pcm && pcm.source) { pcm.source.retired = true; pcm.source.windows.clear(); }
       pcmAudioSources.delete(key);
+      if (state.audioSourcePeaks[key]) state.audioPeaksEpoch = (state.audioPeaksEpoch || 0) + 1;
       delete state.audioSourcePeaks[key];
       delete state.audioSourcePeaksPending[key];
       delete state.audioSourcePeaksFailed[key];
-      forgetAudioBufferUrlMappingsForKey(key); // sibling clips' URLs pointed at this same (now-dropped) buffer
-      if (map) delete map[audioUrl];
-      // Clip-range slices of this source (key + '#s...') die with it -- their audio content changed too.
-      const slicePrefix = key + '#s';
-      Object.keys(state.audioBufferCache).forEach(function(k) { if (k.indexOf(slicePrefix) === 0) delete state.audioBufferCache[k]; });
-      Object.keys(state.audioBufferPendingCache).forEach(function(k) { if (k.indexOf(slicePrefix) === 0) delete state.audioBufferPendingCache[k]; });
+      storyboardAudioSourceUrls.forEach(function(binding, url) {
+        if (binding.key === key) storyboardAudioSourceUrls.delete(url);
+      });
       if (state.audioSourceBlobCache) delete state.audioSourceBlobCache[key];
       if (Array.isArray(state.audioSourceBlobCacheOrder)) state.audioSourceBlobCacheOrder = state.audioSourceBlobCacheOrder.filter(function(item) { return item !== key; });
       if (state.audioSourceSliceInfoCache) delete state.audioSourceSliceInfoCache[key];
+    }
+
+    function resetStoryboardAudioCaches() {
+      retirePcmAudioSources();
+      for (const cache of [decodedAudioBuffers, decodedAudioPending]) {
+        for (const key of cache.keys()) if (!key.startsWith('ga:')) cache.delete(key);
+      }
+      storyboardAudioSourceUrls.clear();
+      state.audioPeaksEpoch = (state.audioPeaksEpoch || 0) + 1;
+      state.audioSourcePeaks = {};
+      state.audioSourcePeaksPending = {};
+      state.audioSourcePeaksFailed = {};
+      state.audioSourcePeaksOrder = [];
+      audioWaveformPictures = new WeakMap();
+      state.audioPeakQueue = [];
+      state.audioSourceBlobCache = {};
+      state.audioSourceBlobCacheOrder = [];
+      state.audioSourceSliceInfoCache = {};
+      if (state.audioStretchCache) state.audioStretchCache.clear();
     }
 
     // ---- Source working sets: bounded PCM windows, then the existing mobile codec/pitch fallback ----
@@ -69366,13 +69434,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function audioSourceCompressedBlobForClip(clip, audioUrl) {
       const owner = projectIoOwner();
       const key = audioClipSourceKey(clip);
+      const binding = bindStoryboardAudioUrl(audioUrl, key);
       if (!state.audioSourceBlobCache || typeof state.audioSourceBlobCache !== 'object') state.audioSourceBlobCache = {};
       if (!Array.isArray(state.audioSourceBlobCacheOrder)) state.audioSourceBlobCacheOrder = [];
       if (state.audioSourceBlobCache[key]) return state.audioSourceBlobCache[key];
       const response = await fetch(audioUrl);
       if (!response.ok) throw new Error('audio source HTTP ' + response.status);
       const blob = await response.blob();
-      if (!projectIoOwnerCurrent(owner) || state.workspaceObjectUrls.audio[clip.id] !== audioUrl) throw new DOMException('Audio source changed', 'AbortError');
+      if (!projectIoOwnerCurrent(owner) || storyboardAudioSourceUrls.get(audioUrl) !== binding ||
+          state.workspaceObjectUrls.audio[clip.id] !== audioUrl) {
+        throw new DOMException('Audio source changed', 'AbortError');
+      }
       if (state.audioSourceBlobCache[key]) return state.audioSourceBlobCache[key];
       state.audioSourceBlobCache[key] = blob;
       state.audioSourceBlobCacheOrder.push(key);
@@ -69469,19 +69541,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     async function audioSourceSliceInfoForClip(clip, audioUrl) {
       const owner = projectIoOwner();
       const key = audioClipSourceKey(clip);
-      if (!state.audioSourceSliceInfoCache || typeof state.audioSourceSliceInfoCache !== 'object') state.audioSourceSliceInfoCache = {};
-      if (Object.prototype.hasOwnProperty.call(state.audioSourceSliceInfoCache, key)) return state.audioSourceSliceInfoCache[key];
-      let info = null;
-      try {
-        const blob = await audioSourceCompressedBlobForClip(clip, audioUrl);
-        const headBuffer = await blob.slice(0, 262144).arrayBuffer();
-        info = parseWavSliceInfo(headBuffer, blob.size) || parseMp3SliceInfo(new Uint8Array(headBuffer), blob.size);
-      } catch (error) {
-        info = null;
-      }
-      if (!projectIoOwnerCurrent(owner) || state.workspaceObjectUrls.audio[clip.id] !== audioUrl) throw new DOMException('Audio source changed', 'AbortError');
-      state.audioSourceSliceInfoCache[key] = info;
-      return info;
+      const cache = state.audioSourceSliceInfoCache;
+      bindStoryboardAudioUrl(audioUrl, key);
+      if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
+      const job = (async function() {
+        try {
+          const blob = await audioSourceCompressedBlobForClip(clip, audioUrl);
+          const head = await blob.slice(0, 262144).arrayBuffer();
+          const info = parseWavSliceInfo(head, blob.size) || parseMp3SliceInfo(new Uint8Array(head), blob.size);
+          if (!projectIoOwnerCurrent(owner) || state.audioSourceSliceInfoCache !== cache || cache[key] !== job) {
+            throw new DOMException('Audio source changed', 'AbortError');
+          }
+          cache[key] = info;
+          return info;
+        } finally {
+          if (cache[key] === job) delete cache[key];
+        }
+      })();
+      cache[key] = job;
+      return job;
     }
 
     // The source-second window this clip can play: trim-in .. trim-in + box*speed, padded on both sides
@@ -69496,9 +69574,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { startSec: startSec, endSec: Math.max(startSec + 0.05, endSec) };
     }
 
+    function audioSliceKeyPrefix(sourceKey) {
+      return 'slice:' + sourceKey.length + ':' + sourceKey + ':';
+    }
+
     function audioClipSliceCacheKey(clip, range) {
-      const key = audioClipSourceKey(clip);
-      return key + '#s' + Math.round(range.startSec * 1000) + '-' + Math.round(range.endSec * 1000);
+      return audioSliceKeyPrefix(audioClipSourceKey(clip)) + range.startSec + ':' + range.endSec;
     }
 
     // Synchronous cache lookup for the scrub path (scrub never awaits): the slice buffer for this clip's
@@ -69507,19 +69588,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!clip || !state.audioSourceSliceInfoCache) return null;
       const key = audioClipSourceKey(clip);
       const info = key ? state.audioSourceSliceInfoCache[key] : null;
-      if (!info) return null;
+      if (!info || !info.kind) return null;
       const range = clipSourceSliceRange(clip, mediaFpsForProject(state.project), info);
       const sliceKey = audioClipSliceCacheKey(clip, range);
-      const hit = state.audioBufferCache[sliceKey];
-      if (hit) touchAudioBufferCache(sliceKey);
-      return hit || null;
+      return residentDecodedAudio(sliceKey) || null;
     }
 
     // 'full' (decode whole file -- desktop always, small sources on mobile), 'slice' (oversized +
     // sliceable), or 'html' (oversized but unsliceable -- plain <audio> playback, never full-decode).
     async function audioClipDecodePlan(clip, audioUrl) {
       const key = audioClipSourceKey(clip);
-      if (state.audioBufferCache[key]) return 'full'; // already decoded & resident -- use it
+      if (decodedAudioBuffers.get(key)) return 'full'; // already decoded & resident -- use it
       const limit = audioFullDecodeByteLimit();
       if (!Number.isFinite(limit)) return 'full';
       let info = null;
@@ -69535,75 +69614,60 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     async function audioBufferSliceForClip(ctx, clip, audioUrl) {
-      const owner = projectIoOwner(), pending = state.audioBufferPendingCache;
-      const fps = mediaFpsForProject(state.project);   // Slice window is source seconds
+      const owner = projectIoOwner();
+      const fps = mediaFpsForProject(owner.project);
       const info = await audioSourceSliceInfoForClip(clip, audioUrl);
       assertProjectIoOwner(owner);
       if (!info) throw new Error('audio source is not sliceable');
       const range = clipSourceSliceRange(clip, fps, info);
       const sliceKey = audioClipSliceCacheKey(clip, range);
-      if (state.audioBufferCache[sliceKey]) {
-        touchAudioBufferCache(sliceKey);
-        return state.audioBufferCache[sliceKey];
-      }
-      if (state.audioBufferPendingCache[sliceKey]) return state.audioBufferPendingCache[sliceKey];
-      const job = (async function() {
-        try {
-          const blob = await audioSourceCompressedBlobForClip(clip, audioUrl);
-          let sliceArrayBuffer = null;
-          let sliceStartSec = 0;
-          if (info.kind === 'wav') {
-            const format = info.format;
-            const startFrames = Math.floor(range.startSec * format.sampleRate);
-            const endFrames = Math.ceil(range.endSec * format.sampleRate);
-            const byteStart = info.dataOffset + startFrames * format.blockAlign;
-            const byteEnd = Math.min(info.dataOffset + info.dataSize, info.dataOffset + endFrames * format.blockAlign);
-            const dataBytes = Math.max(format.blockAlign, byteEnd - byteStart);
-            sliceStartSec = startFrames / format.sampleRate;
-            sliceArrayBuffer = await pcmWavRange(blob, info, startFrames, startFrames + dataBytes / format.blockAlign);
-          } else {
-            const byteStart = info.audioStart + Math.floor(range.startSec * info.bitrate / 8);
-            const byteEnd = Math.min(blob.size, info.audioStart + Math.ceil(range.endSec * info.bitrate / 8));
-            sliceArrayBuffer = await blob.slice(byteStart, byteEnd).arrayBuffer();
-            // Align the slice to a real frame-sync boundary: Chrome's decoder skips leading garbage but
-            // Safari (CoreAudio) can refuse a stream that doesn't open on a clean frame header. Scan for
-            // the first 0xFF-sync whose implied next frame also syncs (rejects false positives inside
-            // audio data), trim the prefix, and account for it in the slice's time origin.
-            const bytes = new Uint8Array(sliceArrayBuffer);
-            const frameBytes = Math.floor(144 * info.bitrate / info.sampleRate);
-            let align = 0;
-            const syncAt = function(pos) { return pos + 1 < bytes.length && bytes[pos] === 0xFF && (bytes[pos + 1] & 0xE0) === 0xE0; };
-            while (align < Math.min(bytes.length - 4, frameBytes * 3)) {
-              if (syncAt(align) && (syncAt(align + frameBytes) || syncAt(align + frameBytes + 1) || align + frameBytes >= bytes.length)) break;
-              align += 1;
-            }
-            if (align > 0 && align < bytes.length - 4) sliceArrayBuffer = sliceArrayBuffer.slice(align);
-            sliceStartSec = (byteStart + align - info.audioStart) * 8 / info.bitrate;
+      return loadDecodedAudio(sliceKey, async function(current) {
+        const blob = await audioSourceCompressedBlobForClip(clip, audioUrl);
+        let sliceArrayBuffer = null;
+        let sliceStartSec = 0;
+        if (info.kind === 'wav') {
+          const format = info.format;
+          const startFrames = Math.floor(range.startSec * format.sampleRate);
+          const endFrames = Math.ceil(range.endSec * format.sampleRate);
+          const byteStart = info.dataOffset + startFrames * format.blockAlign;
+          const byteEnd = Math.min(info.dataOffset + info.dataSize, info.dataOffset + endFrames * format.blockAlign);
+          const dataBytes = Math.max(format.blockAlign, byteEnd - byteStart);
+          sliceStartSec = startFrames / format.sampleRate;
+          sliceArrayBuffer = await pcmWavRange(blob, info, startFrames, startFrames + dataBytes / format.blockAlign);
+        } else {
+          const byteStart = info.audioStart + Math.floor(range.startSec * info.bitrate / 8);
+          const byteEnd = Math.min(blob.size, info.audioStart + Math.ceil(range.endSec * info.bitrate / 8));
+          sliceArrayBuffer = await blob.slice(byteStart, byteEnd).arrayBuffer();
+          // Align the slice to a real frame-sync boundary: Chrome's decoder skips leading garbage but
+          // Safari (CoreAudio) can refuse a stream that doesn't open on a clean frame header. Scan for
+          // the first 0xFF-sync whose implied next frame also syncs (rejects false positives inside
+          // audio data), trim the prefix, and account for it in the slice's time origin.
+          const bytes = new Uint8Array(sliceArrayBuffer);
+          const frameBytes = Math.floor(144 * info.bitrate / info.sampleRate);
+          let align = 0;
+          const syncAt = function(pos) { return pos + 1 < bytes.length && bytes[pos] === 0xFF && (bytes[pos + 1] & 0xE0) === 0xE0; };
+          while (align < Math.min(bytes.length - 4, frameBytes * 3)) {
+            if (syncAt(align) && (syncAt(align + frameBytes) || syncAt(align + frameBytes + 1) || align + frameBytes >= bytes.length)) break;
+            align += 1;
           }
-          let decoded = null;
-          try {
-            decoded = await ctx.decodeAudioData(sliceArrayBuffer);
-          } catch (decodeError) {
-            // This decoder rejects mid-stream slices of this source -- permanently downgrade the source to
-            // the streaming (html) plan instead of retrying a decode that will keep failing per clip.
-            const sourceKey = audioClipSourceKey(clip);
-            if (projectIoOwnerCurrent(owner) && pending[sliceKey] === job && sourceKey && state.audioSourceSliceInfoCache) state.audioSourceSliceInfoCache[sourceKey] = null;
-            throw decodeError;
-          }
-          if (!projectIoOwnerCurrent(owner) || state.audioBufferPendingCache !== pending || pending[sliceKey] !== job) throw new DOMException('Audio source changed', 'AbortError');
-          decoded.conteSliceStartSec = sliceStartSec;
-          state.audioBufferCache[sliceKey] = decoded;
-          touchAudioBufferCache(sliceKey);
-          trimDecodedAudioCaches();
-          delete state.audioBufferPendingCache[sliceKey];
-          return decoded;
-        } catch (error) {
-          if (pending[sliceKey] === job) delete pending[sliceKey];
-          throw error;
+          if (align > 0 && align < bytes.length - 4) sliceArrayBuffer = sliceArrayBuffer.slice(align);
+          sliceStartSec = (byteStart + align - info.audioStart) * 8 / info.bitrate;
         }
-      })();
-      pending[sliceKey] = job;
-      return job;
+        let decoded = null;
+        try {
+          current();
+          decoded = await decodeAudioRegistered(ctx, owner.project, sliceArrayBuffer);
+        } catch (decodeError) {
+          // This decoder rejects mid-stream slices of this source -- permanently downgrade the source to
+          // the streaming (html) plan instead of retrying a decode that will keep failing per clip.
+          const sourceKey = audioClipSourceKey(clip);
+          current();
+          state.audioSourceSliceInfoCache[sourceKey] = null;
+          throw decodeError;
+        }
+        decoded.conteSliceStartSec = sliceStartSec;
+        return decoded;
+      }, function() { return projectIoOwnerCurrent(owner) && state.workspaceObjectUrls.audio[clip.id] === audioUrl; });
     }
 
     // ---- Audio source registry + library window (ソースライブラリ) ----
@@ -69642,9 +69706,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const list = Array.from(map.values());
       list.forEach(function(entry) {
         // Clip-range slices of the source (key + '#s<range>', mobile slice plan) ride the same budget cache.
-        const ofSource = function(key) { return key === entry.key || key.indexOf(entry.key + '#s') === 0; };
-        entry.decodedBytes = Object.keys(state.audioBufferCache).filter(ofSource).reduce(function(sum, key) { return sum + audioBufferByteSize(state.audioBufferCache[key]); }, 0);
-        entry.decodePending = Object.keys(state.audioBufferPendingCache).some(ofSource);
+        const slicePrefix = audioSliceKeyPrefix(entry.key);
+        const ofSource = function(key) { return key === entry.key || key.startsWith(slicePrefix); };
+        entry.decodedBytes = Array.from(decodedAudioBuffers.keys()).filter(ofSource).reduce(function(sum, key) { return sum + audioBufferByteSize(decodedAudioBuffers.get(key)); }, 0);
+        entry.decodePending = Array.from(decodedAudioPending.keys()).some(ofSource);
       });
       list.sort(function(left, right) { return right.clipCount - left.clipCount || left.label.localeCompare(right.label); });
       return {
@@ -69740,7 +69805,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Whole-window WSOLA retains its established phase/quality. Do not replace it with per-chunk stretching.
       if (fx.preservePitch !== false && Math.abs(fx.speed - 1) > 0.01) return null;
       const key = audioClipSourceKey(clip);
-      if (state.audioBufferCache[key]) return null;
+      if (decodedAudioBuffers.get(key)) return null;
       const source = await pcmAudioSource(key, function() { return audioSourceCompressedBlobForClip(clip, url); });
       return source && source.info.kind === 'aac-mp4' && audioSourceHasMultipleClips(key) ? null : source;
     }
@@ -70099,7 +70164,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       // The trim window just moved, so the cached picture for this clip is stale; the peaks themselves are
       // per-source and stay valid.
-      if (state.audioWaveformCssCache) delete state.audioWaveformCssCache[clip.id];
     }
 
     // ## SECTION: Storyboard inspector and paper display
@@ -72001,7 +72065,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             for (const [ref, blob] of gengaAssets.blobs) gengaDrawStorePut(ref, blob);
             delete gengaAssets.blobs;
             for (const [ref, blob] of gengaAssets.audioBlobs) {
-              gengaAudioStore.set(ref, blob);
+              gengaPublishAudioSource(ref, blob);
               persistAudioRecord('ga:' + ref, blob);
             }
             gengaAssets.audioBlobs.clear();
@@ -74598,7 +74662,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (prepared.deltas.has(ref)) gengaScheduleTileEncode(ref, value);
           else if (!gengaIsTileSet(value)) gengaScheduleWholeRasterConvert(ref);
         });
-        prepared.audio.forEach(function(url, ref) { gengaAudioStore.set(ref, url); });
+        prepared.audio.forEach(function(source, ref) { gengaPublishAudioSource(ref, source); });
         prepared.persisted.forEach(function(ref) { gengaPersistedRefs.add(ref); });
         prepared.thumbs.forEach(function(url, ref) { gengaThumbCache.set(ref, url); });
         gengaTrimThumbnailCaches();
@@ -75498,7 +75562,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (bytes === null) complete = false; // A partial ownership walk cannot prove later deduplication.
         result.push({ key: key, bytes: bytes, budget: budget });
       };
-      add('settings.memory.audioDecoded', [gengaAudioBuf, state.audioBufferCache], audioBufferCacheBudgetBytes());
+      add('settings.memory.audioDecoded', [decodedAudioBuffers], audioBufferCacheBudgetBytes());
       // Read only PCM windows. Source entries also retain the project and compressed Blob.
       const pcmWindows = [];
       pcmAudioSources.forEach(function(entry) {
@@ -76522,21 +76586,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           try { releaseWorkspaceMediaUrl('audio', state.workspaceObjectUrls.audio[id]); } catch (error) {}
         });
         state.workspaceObjectUrls.audio = {};
-        retirePcmAudioSources();
-        state.audioBufferCache = {};
-        state.audioBufferPendingCache = {};
-        state.audioBufferUrlToSource = {};
-        state.audioSourcePeaks = {};
-        state.audioSourcePeaksPending = {};
-        state.audioSourcePeaksFailed = {};
-        state.audioSourcePeaksOrder = [];
-        state.audioWaveformCssCache = {};
-        state.gengaAudioWaveformCss = {};
-        state.audioPeakQueue = [];
-        state.audioSourceBlobCache = {};
-        state.audioSourceBlobCacheOrder = [];
-        state.audioSourceSliceInfoCache = {};
-        if (state.audioStretchCache) state.audioStretchCache.clear();
+        resetStoryboardAudioCaches();
       }
       if (options.layers && state.workspaceObjectUrls && state.workspaceObjectUrls.layers) {
         Object.values(state.workspaceObjectUrls.layers).forEach(registerLayerBlobUrl);
@@ -76577,7 +76627,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (kind === 'layers') {
           registerLayerBlobUrl(store[key]);
         } else {
-          forgetAudioBufferCacheUrl(store[key]);
+          invalidateStoryboardAudioUrl(store[key]);
           releaseWorkspaceMediaUrl(kind, store[key]);
         }
       }
@@ -123927,7 +123977,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaReleaseBlobUrl(key) {
       const previous = gengaBlobUrls.get(key);
       if (!previous) return;
-      if (key.indexOf('audio:') === 0) forgetAudioBufferCacheUrl(previous.url);
       URL.revokeObjectURL(previous.url);
       gengaBlobUrls.delete(key);
     }
@@ -127685,10 +127734,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
 
     // ## SECTION: Animation asset storage and retention
     // ---- Genga audio: clip holds {ref,...}; original Blob or legacy dataURL lives in gengaAudioStore +
-    // the workspace IndexedDB (WORKSPACE_DB_NAME) 'ga:<ref>'; decoded AudioBuffers cached in gengaAudioBuf for WebAudio playback. ----
+    // the workspace IndexedDB (WORKSPACE_DB_NAME) 'ga:<ref>'; decoded AudioBuffers cached in the shared decoded audio cache for WebAudio playback. ----
     let gengaAudioStore = new Map();   // immutable ref → original Blob or legacy dataURL
-    let gengaAudioBuf = new Map();     // ref → AudioBuffer (decoded, lazy)
-    let gengaAudioBufPending = new Map(); // Ref → in-flight decode promise (mirrors conte's audioBufferPendingCache)
     let gengaAudioRefSeq = 0;
     let gengaAudioCtx = null;
     function newGengaAudioClipId() { return 'ac_' + Date.now().toString(36) + '_' + (gengaAudioRefSeq++).toString(36); }
@@ -127696,10 +127743,22 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const value = ref && gengaAudioStore.get(ref);
       return value instanceof Blob ? gengaBlobUrl('audio:' + ref, value) : embeddedMediaUrl(value) || null;
     }
+    // Workspace adoption can supply new bytes under an existing ref. Retire derived data before readers see them.
+    function gengaPublishAudioSource(ref, source) {
+      if (gengaAudioStore.get(ref) === source) return;
+      if (gengaAudioStore.has(ref)) invalidateGengaAudioSource(ref);
+      gengaAudioStore.set(ref, source);
+    }
+
+    function invalidateGengaAudioSource(ref) {
+      invalidateAudioSource(gengaAudioSourceKey(ref));
+      gengaReleaseBlobUrl('audio:' + ref);
+    }
+
     function gengaPutAudioData(source, write) {
       const ref = newPrefixedId('ga'); // Audio imported simultaneously in another tab also receives a distinct immutable key.
       const value = gengaDataUrlToBlob(source) || String(source || '');
-      gengaAudioStore.set(ref, value);
+      gengaPublishAudioSource(ref, value);
       persistAudioRecord('ga:' + ref, value, write); // Keep failed writes in memory so the save barrier can retry.
       return ref;
     }
@@ -127916,9 +127975,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaThumbCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbCache.delete(ref); });   // Prune panel thumbnail cache entries at the same boundary to bound session growth.
       gengaThumbImageCache.forEach(function(_v, ref) { if (!drawRefs.has(ref)) gengaThumbImageCache.delete(ref); });   // Also reclaim layer-header thumbnail images.
       gengaThumbBakeFailed.forEach(function(ref) { if (!drawRefs.has(ref)) gengaThumbBakeFailed.delete(ref); });
-      gengaAudioStore.forEach(function(_v, ref) { if (!audioRefs.has(ref)) { gengaAudioStore.delete(ref); gengaReleaseBlobUrl('audio:' + ref); } });
-      gengaAudioBuf.forEach(function(_v, ref) { if (!audioRefs.has(ref)) gengaAudioBuf.delete(ref); });
-      gengaAudioBufPending.forEach(function(_v, ref) { if (!audioRefs.has(ref)) gengaAudioBufPending.delete(ref); });
+      gengaAudioStore.forEach(function(_v, ref) {
+        if (audioRefs.has(ref)) return;
+        gengaAudioStore.delete(ref);
+        invalidateGengaAudioSource(ref);
+      });
       return { drawings: freedDrawings, bytes: freedBytes };
     }
     // Debounce pruning after history trim because each stroke can drop history after the budget is reached.
@@ -127955,55 +128016,23 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Full-buffer fallback (compressed audio, export, small WAV). Long PCM preview/scrub uses the
     // shared window cache instead. Bounded with conte's buffers by trimDecodedAudioCaches; that is not a
     // guarantee on the decoder's peak allocation.
-    function gengaCacheAudioBuf(ref, buf) {
-      gengaAudioBuf.set(ref, buf);
-      markDecodedAudioUse(buf);
-      trimDecodedAudioCaches();
-    }
-
     // ## SECTION: Animation audio decode and playback
     async function gengaDecodeAudio(ref) {
       if (!ref) return null;
-      if (gengaAudioBuf.has(ref)) {
-        const cached = gengaAudioBuf.get(ref);
-        markDecodedAudioUse(cached);
-        return cached;
-      }
-      // Share an in-flight decode between scrub warm-up and playback requests for the same ref.
-      // Scrub ticks only consume ready buffers; warmGengaScrubAudioBuffers prepares them at drag start.
-      const inflight = gengaAudioBufPending.get(ref);
-      if (inflight) return inflight;
+      const key = gengaAudioSourceKey(ref);
+      const ready = residentDecodedAudio(key);
+      if (ready) return ready;
       const url = gengaAudioUrl(ref);
       if (!url) return null;
       const ctx = gengaEnsureAudioCtx(false);
       if (!ctx) return null;
-      // Audio refs are immutable and may survive Undo/tutorials. Retire work when its source or pending entry is gone.
-      const current = function() { return gengaAudioBufPending.get(ref) === job && gengaAudioUrl(ref) === url; };
       const project = state.project;
-      const job = (async function() {
-        try {
-          const resp = await fetch(url);
-          if (!current()) return null;
-          if (!resp.ok) throw new Error('Audio cache HTTP ' + resp.status);
-          await awaitOtherProjectAudioDecodes(project);   // Use the same replacement barrier as storyboard, audioNativeDecodePending.
-          if (!current()) return null;
-          const ab = await resp.arrayBuffer();
-          if (!current()) return null;
-          const buf = await decodeAudioRegistered(ctx, project, ab);
-          if (!current()) return null;
-          gengaCacheAudioBuf(ref, buf);
-          return buf;
-        } catch (e) {
-          if (!current()) return null;
-          // Preserve the failure reason so codec, memory, and AudioContext problems can be distinguished.
-          // Playback records omissions through noteAudioPlaybackMiss and reports them when it stops.
-          console.warn('[genga audio] decode failed', ref, (e && e.message ? e.message : String(e)));
-          return null;
-        }
-        finally { if (gengaAudioBufPending.get(ref) === job) gengaAudioBufPending.delete(ref); }
-      })();
-      gengaAudioBufPending.set(ref, job);
-      return job;
+      try {
+        return await loadFullDecodedAudio(ctx, project, key, url, function() { return gengaAudioUrl(ref) === url; });
+      } catch (error) {
+        if (error.name !== 'AbortError') console.warn('[genga audio] decode failed', ref, error.message || error);
+        return null;
+      }
     }
     let gengaAudioSources = [];
     // Monotonic generation for playback starts, mirroring conte's state.videoPlaybackStartToken. A boolean "are
@@ -128019,7 +128048,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       schedulePlaybackAudioIdle(gengaAudioCtx, AUDIO_PLAYBACK_IDLE_GRACE_MS);
     }
     // ---- Scrub audio, genga side -- mirrors playScrubAudioAtFrame/stopScrubAudio (conte side) but reads
-    // genga's own separate audio subsystem (gt.audioClips / gengaAudioBuf / gengaAudioCtx) instead.
+    // genga's own separate audio subsystem (gt.audioClips / gengaAudioCtx) instead.
     // Use makeScrubAudioState. Genga schedules one blip, but shares the array-based stop logic.
     const gengaScrubAudioState = makeScrubAudioState();
     function stopGengaScrubAudioSource() {
@@ -128039,7 +128068,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const nearest = new Map();
       (gt.audioClips || []).forEach(function(c) {
         if (!c || !c.ref) return;
-        if (gengaAudioBuf.has(c.ref)) return;   // already decoded
+        if (decodedAudioBuffers.has(gengaAudioSourceKey(c.ref))) return;   // already decoded
         if (!gengaAudioUrl(c.ref)) return;      // no bytes in the store — nothing to decode
         const start = Math.max(1, Math.round(Number(c.startFrame) || 1));
         const end = start + Math.max(1, Math.round(Math.max(0.05, Number(c.durationSec) || 0.05) * fps)) - 1;
@@ -128081,7 +128110,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaAudioBufferAt(clip, playheadSec, fps) {
       const sourceTime = Math.max(0, Number(clip.sourceOffsetSec) || 0) + Math.max(0, playheadSec - (clip.startFrame - 1) / fps);
-      return pcmAudioReadyWindow(gengaAudioSourceKey(clip.ref), sourceTime, gengaAudioCtx) || gengaAudioBuf.get(clip.ref);
+      return pcmAudioReadyWindow(gengaAudioSourceKey(clip.ref), sourceTime, gengaAudioCtx) || decodedAudioBuffers.get(gengaAudioSourceKey(clip.ref));
     }
     function playGengaScrubAudioAtFrame(frame) {
       frame = Math.round(Number(frame) || 1);
@@ -128123,7 +128152,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // schedule every clip via WebAudio relative to the playhead start frame (frame-accurate, survives rAF jitter)
     async function gengaPcmAudioSource(ref) {
-      if (gengaAudioBuf.has(ref)) return null;
+      if (decodedAudioBuffers.has(gengaAudioSourceKey(ref))) return null;
       const key = gengaAudioSourceKey(ref);
       const source = await pcmAudioSource(key, function() {
         const url = gengaAudioUrl(ref);
@@ -128403,7 +128432,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         (Math.max(1, cut.durationFrames || 0, cut.totalFrames || 0) - Math.max(0, Math.round(atFrame) - 1)) / fps) : duration;
       if (nativeRef && !(length > 0)) { showToast(t('project.genga.tvppAudio.outsideCut')); return false; }
       const ref = gengaPutAudioData(source);
-      if (buf) gengaCacheAudioBuf(ref, buf);
+      if (buf) rememberDecodedAudio(gengaAudioSourceKey(ref), buf);
       else pcmAudioSource(gengaAudioSourceKey(ref), function() { return f; }, pcmPrepared);
       const clipId = newGengaAudioClipId();
       runCommand('音声追加', function(proj) {
@@ -129217,7 +129246,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const start = (startFrame - 1) / fps, end = endFrame / fps;
       return (gt.audioClips || []).filter(function(clip) {
         const at = (Math.max(1, Number(clip.startFrame) || 1) - 1) / fps;
-        const cached = gengaAudioBuf.get(clip.ref);
+        const cached = decodedAudioBuffers.get(gengaAudioSourceKey(clip.ref));
         const duration = clip.sourceOffsetSec == null ? (cached ? cached.duration : Infinity) : Math.max(0, Number(clip.durationSec) || 0);
         return at < end && at + duration > start;
       });
@@ -167554,7 +167583,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           runAudioClipEditCommand(a === 'af-volume' ? 'Audio volume' : 'Audio echo', fid, function(c) {
             if (a === 'af-volume') c.volume = clampAudioClipVolume(val);
             else { c.audioFx = normalizeAudioFx(c.audioFx); c.audioFx.echo = val; }
-          }, { skipWaveform: true });
+          });
           updateAudioFxWindow();
         }
       } else if (a === 'af-speed') { // same le-slider commit model; body = the retime
@@ -167569,7 +167598,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const fid = clip.id, newSpeed = Math.max(0.1, Math.min(4, v / 100));
           runAudioClipEditCommand('Audio speed', fid, function(clip) {
             retimeAudioClip(clip, newSpeed);
-          }, { skipWaveform: true });
+          });
           updateAudioFxWindow();
         }
       }
