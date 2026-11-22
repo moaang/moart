@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3549</title>
+  <title>MoArt ver3550</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -99716,6 +99716,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const clips = genga ? (gt.audioClips || []).filter(c => (Number(c.startFrame) || 1) <= end && (Number(c.startFrame) || 1) + Math.ceil((Number(c.durationSec) || 0) * fps) > start)
         : audioTimelineAudibleClips(project).filter(c => c.startFrame <= end && c.startFrame + c.durationFrames > start);
       let cache = null;
+      const preparation = genga ? gengaExportPreparation(gt) : null;
       return {
         fps,
         frames: end - start + 1,
@@ -99736,7 +99737,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         },
         render: async function drawingRecordingRenderAnimation(canvas, index, check) {
           check();
-          if (genga) await gengaRenderExportFrame(canvas, start + index, width, height, {check, strict: true});
+          if (genga) await gengaRenderExportFrame(canvas, start + index, width, height, preparation, check);
           else await renderConteVideoFrameToCanvas(canvas, start + index, {
             outWidth: width,
             outHeight: height,
@@ -99962,7 +99963,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           || state.videoPlaybackStarting
           || state.gengaPlaying
           || gengaScrubInFlight
-          || gengaSoloBypass
+          || gengaMotionExports > 0
           || state.gengaSoloView) return false;
       if (gengaDrawSession || gengaSelLifted(gengaSel) || gengaStampDrag || gengaFxLive || gengaFxGizmoDrag || state.gengaCamFxLive || gengaHydrateInFlight) return false;
       if (state.paintRasterOp || state.paintCurrentStroke || state.paintTransformPreview || state.paintStampPreview) return false;
@@ -126730,7 +126731,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // (gengaInlineDrawings), the autosave slot write (writeProjectToIndexedDbSlot), the project-swap boundary
     // (gengaPruneRuntimeStores), and every URL-keyed consumer entry: the export family
     // (gengaPreloadExportImages / gengaBatchExportItems / gengaRenderCelInstanceBlob /
-    // gengaResolvePaperForExport / gengaCelArtCanvas), the FX bake pair
+    // gengaCelExportPaper / gengaCelArtCanvas), the FX bake pair
     // (gengaBakeExposureFx / gengaRasterizeFx), the paper-resize rebake (openGengaSettings apply), and the 診断
     // fix click. Pixel readers that stay on gengaDrawDrawingInto/thumbs take the canvas branch, and the
     // presence guards ask `dr.dataUrl || dr.canvas` (composite, stroke seed, nearest-drawing, clear,
@@ -129064,62 +129065,75 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // ## SECTION: Animation export rendering and audio mix
-    // solo view: preview shows only the current (selected) layer; export always renders every layer.
-    let gengaSoloBypass = false;
-    // 動画自動フィル is a view aid: the ・ frames drawn as an interpolated silhouette so timing can be judged
-    // before the in-betweens exist. An export must not inherit the toolbar toggle (the same project would export
-    // two different films depending on a forgotten button), so the export states its own answer here: null =
-    // follow the toolbar (every on-screen path), true/false = the export's own decision. gengaWithExportRenderState
-    // sets and clears it together with gengaSoloBypass and gengaLipsyncExport.
-    let gengaDougaFillForce = null;
-    let gengaLipsyncExport = false;   // Enable only while export draws 口パク mouths (gengaWithExportRenderState).
-    // Keep export render state (ignore solo, fill 動画, draw 口パク mouths) active only until run completes. Scope setup and teardown here for every export.
-    // o contains dougaFill and lipsync. run returns a Promise.
-    async function gengaWithExportRenderState(o, run) {
-      gengaSoloBypass = true;
-      gengaDougaFillForce = !!o.dougaFill;
-      gengaLipsyncExport = !!o.lipsync;
-      onionClearGhostCache();
+    let gengaMotionExports = 0;
+    // Drawing recording waits for motion output rather than borrowing its transient render settings.
+    async function gengaRunMotionExport(run) {
+      gengaMotionExports++;
       try { return await run(); }
-      finally {
-        gengaSoloBypass = false;
-        gengaDougaFillForce = null;
-        gengaLipsyncExport = false;
-        onionClearGhostCache();
-      }
+      finally { gengaMotionExports--; }
     }
-    function gengaDougaFillActive() {
-      return gengaDougaFillForce == null ? !!state.gengaDougaFill : !!gengaDougaFillForce;
+
+    // One run owns its raster preparation, failed-decode count and mouth analysis.
+    // With no motion settings, drawing recording retains the ordinary compositor behavior.
+    function gengaExportPreparation(gt, opts) {
+      const output = opts ? {dougaFill: Boolean(opts.dougaFill)} : null;
+      const playback = Boolean(output);
+      let misses = 0, lipsync = null;
+      return {
+        gt: gt,
+        output: output,
+        playback: playback,
+        warm: function(onStatus, frames) {
+          return gengaPreloadExportImages(gt, onStatus, frames, playback, output);
+        },
+        prepareFrame: async function(frame) {
+          const missing = await gengaEnsureFrameImagesDecoded(gt, frame, playback, output);
+          misses += missing;
+          return missing;
+        },
+        drawMouth: opts && opts.lipsync ? async function(ctx, width, height, frame) {
+          if (!lipsync) lipsync = gengaLipsyncPrepare(gt);
+          await lipsync;
+          gengaLipsyncDrawCanvas(ctx, width, height, gengaLipsyncAt(gt, frame));
+        } : null,
+        finish: function(onStatus) {
+          if (misses) {
+            console.error('[gengaExport] ' + misses + ' image decode failure(s) during frame rendering - those drawings are missing from the output');
+            if (onStatus) onStatus(t('msg.export.renderMissingImages', misses));
+          }
+          return misses;
+        }
+      };
     }
 
     // Share the list of raster sources needed by each frame across warmup and pre-render decode.
     // Include exposure art, mouth artwork used by this frame, and the next drawing for the silhouette pair.
-    function gengaForEachFrameRasterSource(gt, frame, playback, visit) {
+    function gengaForEachFrameRasterSource(gt, frame, playback, output, visit) {
+      const dougaFill = output ? output.dougaFill : gengaDougaFillActive();
       (gt.layers || []).forEach(function(l) {
-        if (!gengaLayerDrawsInComposite(l)) return;
+        if (!gengaLayerDrawsInComposite(l, gt, output)) return;
         const rs = gengaResolveExposureSample(l, frame, playback);
         const e = rs.exp;
         if (!e) return;
         visit(gengaExposureDrawing(l, e), l, e);
         const sDr = e.serifuId ? gengaSerifuResolveDrawing(l, e, rs.localFrame, gt) : undefined;   // Mouth artwork used by this frame.
         if (sDr) visit(sDr, l, e);
-        if (gengaDougaFillActive() && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) visit(gengaDougaNextDrawing(l, e).dr, l, e);
+        if (dougaFill && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) visit(gengaDougaNextDrawing(l, e).dr, l, e);
       });
     }
     // Warm only drawings used by the exported frames, in ascending frame order.
     // Stop when warming starts evicting earlier images under the item or byte cap.
     // gengaEnsureFrameImagesDecoded decodes remaining images immediately before use.
     // Skip hidden layers and drawings outside the output range.
-    async function gengaPreloadExportImages(onStatus, frames, playback) {
+    async function gengaPreloadExportImages(gt, onStatus, frames, playback, output) {
       await gengaFlushPendingDrawingEncodesAsync(); // Export decodes by URL — settle stragglers first (no-op when idle)
-      const gt = state.project && state.project.gengaTimeline;
-      if (!gt) return;
+      const dougaFill = output ? output.dougaFill : gengaDougaFillActive();
       const byKey = new Map(), silhouettes = new Map();   // Deduplicate by decode cache key. Map silhouette exposures to layers.
-      (frames || []).forEach(function(f) {
-        gengaForEachFrameRasterSource(gt, f, !!playback, function(d, l, e) {
+      frames.forEach(function(f) {
+        gengaForEachFrameRasterSource(gt, f, playback, output, function(d, l, e) {
           const k = d && d.dataUrl ? gengaRasterCacheKey(d) : null;   // Tiles, vectors, and pending encodes already have their own pixel sources.
           if (k && !byKey.has(k)) byKey.set(k, d);
-          if (gengaDougaFillActive() && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) silhouettes.set(e, l);
+          if (dougaFill && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length) silhouettes.set(e, l);
         });
       });
       // Count decode failures from gengaDecodeIntoCache, as storyboard preload does.
@@ -129173,10 +129187,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
 
     // Ensure this frame's raster sources just before drawing. Warmup is limited by cache capacity,
     // and export only draws a frame once, so a miss would leave a blank layer.
-    let gengaExportDecodeMisses = 0; // Reset the failed-decode count for each export.
-    async function gengaEnsureFrameImagesDecoded(frame, playback) {
-      const gt = state.project && state.project.gengaTimeline;
-      if (!gt) return 0;
+    async function gengaEnsureFrameImagesDecoded(gt, frame, playback, output) {
       const jobs = [];
       const need = function(d) {
         if (!d || !d.dataUrl) return; // Skip raster decode for tiles, vectors, and pending encodes that supply their own sources.
@@ -129186,30 +129197,21 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (img && img.complete && img.naturalWidth) return;
         jobs.push(gengaDecodeIntoCache(d));
       };
-      gengaForEachFrameRasterSource(gt, frame, playback, need);
+      gengaForEachFrameRasterSource(gt, frame, playback, output, need);
       if (!jobs.length) return 0;
       const done = await Promise.all(jobs);
-      const failed = done.filter(function(ok) { return !ok; }).length;
-      gengaExportDecodeMisses += failed;
-      return failed;
+      return done.filter(function(ok) { return !ok; }).length;
     }
-    // Report broken images that failed pre-render preparation after export.
-    // Cache evictions do not count because the preparation path reloads them.
-    function gengaReportExportDecodeMisses(onStatus) {
-      if (!gengaExportDecodeMisses) return;
-      console.error('[gengaExport] ' + gengaExportDecodeMisses + ' image decode failure(s) during frame rendering - those drawings are missing from the output');
-      if (onStatus) onStatus(t('msg.export.renderMissingImages', gengaExportDecodeMisses));
+    function gengaExportResultText(text, misses) {
+      return misses ? text + ' — ' + t('msg.export.renderMissingImages', misses) : text;
     }
-    // Include missing-image warnings in the final status so it cannot replace them with an unconditional success.
-    function gengaExportResultText(text) {
-      return gengaExportDecodeMisses ? text + ' — ' + t('msg.export.renderMissingImages', gengaExportDecodeMisses) : text;
-    }
-    async function gengaRenderExportFrame(canvas, frame, outW, outH, options) {
-      const playback = !!(options && options.playback);
-      const missing = await gengaEnsureFrameImagesDecoded(frame, playback);
-      if (options && options.check) options.check();
-      if (options && options.strict && missing) throw new Error(t('msg.export.requiredImageUnavailable')); // Accumulate failures for the final report.
-      const gt = state.project.gengaTimeline;
+    async function gengaRenderExportFrame(canvas, frame, outW, outH, preparation, check) {
+      const missing = await preparation.prepareFrame(frame);
+      if (check) {
+        check();
+        if (missing) throw new Error(t('msg.export.requiredImageUnavailable'));
+      }
+      const gt = preparation.gt;
       // Set canvas dimensions on the first renderFrame call, as the realtime storyboard spec does.
       // Without this, recording uses the default 300×150 canvas.
       if (canvas.width !== outW) canvas.width = outW;
@@ -129219,9 +129221,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, outW, outH);
       const cam = gengaCameraWorkAt(gt, frame);
-      const comp = gengaCompositeFrame(frame, 0, false, false, playback);
+      const comp = gengaCompositeFrame(frame, 0, false, false, preparation.playback, preparation);
       try {
-        if (options && options.strict && (!comp || comp._complete === false)) throw new Error(t('msg.export.requiredImageUnavailable'));
+        if (check && (!comp || comp._complete === false)) throw new Error(t('msg.export.requiredImageUnavailable'));
         if (comp) {
           ctx.save();
           try {
@@ -129237,11 +129239,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (comp && comp !== gengaPreviewRender.composite
             && (!gengaPreviewRender.clip || gengaPreviewRender.clip.cv !== comp)) paintReleaseCanvas(comp);
       }
-      if (gengaLipsyncExport) {
-        // Analyze each gt object once so frames do not rescan clip keys and pending work.
-        if (!gengaLipsyncPreparedGts.has(gt)) { await gengaLipsyncPrepare(gt); gengaLipsyncPreparedGts.add(gt); }
-        gengaLipsyncDrawCanvas(ctx, outW, outH, gengaLipsyncAt(gt, frame));
-      }
+      if (preparation.drawMouth) await preparation.drawMouth(ctx, outW, outH, frame);
     }
     function gengaExportAudioClips(gt, startFrame, endFrame, fps) {
       const start = (startFrame - 1) / fps, end = endFrame / fps;
@@ -129348,15 +129346,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const { fps, startFrame, endFrame } = gengaExportRange(gt);
       const camW = gt.camera.w || gt.output.w || 1920, camH = gt.camera.h || gt.output.h || 1080;
       const { w: outW, h: outH } = gengaVideoOutputDims(camW, camH, opts.outWidth);
-      gengaExportDecodeMisses = 0;
-      await gengaPreloadExportImages(onStatus, Array.from({ length: endFrame - startFrame + 1 }, function(_, i) { return startFrame + i; }), true);
+      const preparation = gengaExportPreparation(gt, opts);
+      await preparation.warm(onStatus, Array.from({ length: endFrame - startFrame + 1 }, function(_, i) { return startFrame + i; }));
       const clips = opts.audio === false ? [] : gengaExportAudioClips(gt, startFrame, endFrame, fps);
       const res = await runRealtimeRecordExport({
         fps: Number(opts.outFps) || fps,
         sourceFps: fps,
         startFrame: startFrame,
         endFrame: endFrame + 1, // This kernel takes an exclusive end. Add one to the fast path's inclusive end.
-        renderFrame: function(canvas, frame) { return gengaRenderExportFrame(canvas, frame, outW, outH, { playback: true }); },
+        renderFrame: function(canvas, frame) { return gengaRenderExportFrame(canvas, frame, outW, outH, preparation); },
         audio: (clips.length ? {
           prepare: async function(audioCtx, status, control) {
             const prepared = [];
@@ -129379,12 +129377,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           }
         } : null)
       }, onStatus);
-      gengaReportExportDecodeMisses(onStatus);
-      return { blob: res.blob, canceled: res.canceled, frames: res.frames, blobSize: res.blobSize, format: res.format, outW: outW, outH: outH };
+      const decodeMisses = preparation.finish(onStatus);
+      return { blob: res.blob, canceled: res.canceled, frames: res.frames, blobSize: res.blobSize, format: res.format, outW: outW, outH: outH, decodeMisses: decodeMisses };
     }
     async function runGengaExportVideo(opts, onStatus) {
-      return runVideoExportWithFallback(opts, onStatus, {
-        fast: exportGengaVideoFast, realtime: recordGengaVideoRealtime, logTag: '[genga video export]'
+      return gengaRunMotionExport(function() {
+        return runVideoExportWithFallback(opts, onStatus, {
+          fast: exportGengaVideoFast, realtime: recordGengaVideoRealtime, logTag: '[genga video export]'
+        });
       });
     }
     // Verb-led export functions place the engine after the verb, while engine-specific values use the engine prefix.
@@ -129401,7 +129401,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const clips = opts.audio === false ? [] : gengaExportAudioClips(gt, startFrame, endFrame, fps);
       const hasAudio = clips.length > 0;
       // The encode spine lives in runWebCodecsExport — only genga-specific pieces remain here.
-      gengaExportDecodeMisses = 0;
+      const preparation = gengaExportPreparation(gt, opts);
       const res = await runWebCodecsExport({
         outW: outW,
         outH: outH,
@@ -129422,18 +129422,18 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             const f = startFrame + timing.sourceFrame(i);
             if (frames[frames.length - 1] !== f) frames.push(f);
           }
-          return gengaPreloadExportImages(onStatus, frames, true);
+          return preparation.warm(onStatus, frames);
         },
         recFrames: recFrames,
         shouldCancel: function() { return Boolean(state.videoExportCancel); },
-        renderFrame: function(canvas, i) { return gengaRenderExportFrame(canvas, startFrame + timing.sourceFrame(i), outW, outH, { playback: true }); }, // Return the render promise so the recorder waits before capturing the canvas.
+        renderFrame: function(canvas, i) { return gengaRenderExportFrame(canvas, startFrame + timing.sourceFrame(i), outW, outH, preparation); }, // Return the render promise so the recorder waits before capturing the canvas.
         keyFrameAt: function(i) { return (i % Math.max(1, Math.round(timing.fps * 2))) === 0; }, // approximately 2s GOP (no cut structure here)
         statusMask: 15,
         statusText: function(i) { return t('msg.export.encoding', Math.round((i + 1) / recFrames * 100)); }
       }, onStatus);
       const blob = res.blob;
-      gengaReportExportDecodeMisses(onStatus);
-      return { blob: blob, streamed: res.streamed, frames: recFrames, blobSize: blob.size, format: res.wantMp4 ? 'mp4' : 'webm', outW: outW, outH: outH };
+      const decodeMisses = preparation.finish(onStatus);
+      return { blob: blob, streamed: res.streamed, frames: recFrames, blobSize: blob.size, format: res.wantMp4 ? 'mp4' : 'webm', outW: outW, outH: outH, decodeMisses: decodeMisses };
     }
 
     // ## SECTION: GIF encoding
@@ -129675,8 +129675,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return { frame: Math.floor(i * frameCount / count), delayCs: Math.round((i + 1) * totalCs / count) - Math.round(i * totalCs / count) };
       });
     }
-    async function gengaExportGif(opts, onStatus) {
-      opts = opts || {};
+    function gengaExportGif(opts, onStatus) {
+      return gengaRunMotionExport(function() { return gengaEncodeGifExport(opts || {}, onStatus); });
+    }
+    async function gengaEncodeGifExport(opts, onStatus) {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt) throw new Error(t('msg.genga.noProject'));
       const { fps, startFrame, endFrame } = gengaExportRange(gt);
@@ -129685,22 +129687,22 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const { w: outW, h: outH } = gengaGifOutputDims(camW, camH, opts.outWidth);
       const timing = gifFrameTiming(recFrames, fps);
       if (onStatus) onStatus(t('msg.export.preparing'));
-      gengaExportDecodeMisses = 0;
-      await gengaPreloadExportImages(onStatus, timing.map(function(x) { return startFrame + x.frame; }), true);
+      const preparation = gengaExportPreparation(gt, opts);
+      await preparation.warm(onStatus, timing.map(function(x) { return startFrame + x.frame; }));
       const canvas = document.createElement('canvas');
       canvas.width = outW;
       canvas.height = outH;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
       const frames = [];
       for (let i = 0; i < timing.length; i++) {
-        await gengaRenderExportFrame(canvas, startFrame + timing[i].frame, outW, outH, { playback: true }); // Wait for rendering to finish before reading frame pixels.
+        await gengaRenderExportFrame(canvas, startFrame + timing[i].frame, outW, outH, preparation); // Wait for rendering to finish before reading frame pixels.
         frames.push(ctx.getImageData(0, 0, outW, outH).data);
         if (i % 6 === 0) { // yield every few frames (setTimeout clamps to ~4ms, so per-frame would be 4ms×frames of dead time)
           if (onStatus) onStatus(t('msg.export.encoding', Math.round((i + 1) / timing.length * 85)));
           await new Promise(function (res) { setTimeout(res, 0); });
         }
       }
-      gengaReportExportDecodeMisses(onStatus);
+      const decodeMisses = preparation.finish(onStatus);
       if (onStatus) onStatus(t('msg.export.encoding', 95));
       const bytes = gengaEncodeGif(frames, {
         width: outW,
@@ -129710,7 +129712,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         colors: Math.max(2, Math.min(256, opts.colors || 256))
       });
       const blob = new Blob([bytes], { type: 'image/gif' });
-      return { blob: blob, frames: timing.length, blobSize: blob.size, outW: outW, outH: outH };
+      return { blob: blob, frames: timing.length, blobSize: blob.size, outW: outW, outH: outH, decodeMisses: decodeMisses };
     }
 
     // ## SECTION: Animation export dialog and instruction options
@@ -129952,7 +129954,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       };
       // A loaded paper image is the whole precondition for compositing one, so the row appears with the paper
       // and defaults to on when a 用紙 layer exists. Check gengaPaperLayer (role='paper'),
-      // the same source as gengaResolvePaperForExport.
+      // the same source as gengaCelExportPaper.
       // 「作画用紙を読み込む」 sets this layer, independently of storyboard's activePaperFrameSettings.
       const paperRow = document.getElementById('gengaBatchPaperRow');
       const paperLayerForExport = gengaPaperLayer(state.project && state.project.gengaTimeline);
@@ -130039,12 +130041,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const dimsG = gengaExportOutputDims();
           if (dimsG) rememberGengaExportOutput(dimsG.w, dimsG.h);
           const loopChk = document.getElementById('gengaExportGifLoop');
-          await gengaWithExportRenderState({ dougaFill: dougaFillG }, function() {
-            return gengaExportGif({ outWidth: dimsG ? dimsG.w : undefined, loop: !(loopChk && !loopChk.checked) }, onStatusG);
-          }).then(async function(r) {
+          await gengaExportGif({
+            outWidth: dimsG ? dimsG.w : undefined,
+            loop: !(loopChk && !loopChk.checked),
+            dougaFill: dougaFillG
+          }, onStatusG).then(async function(r) {
             assertProjectIoOwner(owner);
             const delivery = await deliverBlobFile(r.blob, fileBase + '.gif', 'image');
-            if (status) status.textContent = gengaExportResultText(fileDeliveryStatus(delivery, fileBase + '.gif'));
+            if (status) status.textContent = gengaExportResultText(fileDeliveryStatus(delivery, fileBase + '.gif'), r.decodeMisses);
             runBtn.disabled = false;
             runBtn.textContent = origG;
           }).catch(function(e) {
@@ -130076,9 +130080,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         await runVideoExportToDirectory(owner, fileBase, function(openSink) {
           opts.openSink = openSink;
           if (dims) rememberGengaExportOutput(dims.w, dims.h);
-          return gengaWithExportRenderState({ dougaFill: dougaFill, lipsync: lipsync }, function() { return runGengaExportVideo(opts, onStatus); });
+          return runGengaExportVideo(Object.assign(opts, {dougaFill: dougaFill, lipsync: lipsync}), onStatus);
         }).then(function(output) {
-          onStatus(output ? gengaExportResultText(fileDeliveryStatus(output.delivery, output.fileName)) : t('export.video.status.canceled'));
+          onStatus(output ? gengaExportResultText(fileDeliveryStatus(output.delivery, output.fileName), output.result.decodeMisses) : t('export.video.status.canceled'));
         }).catch(function(e) {
           // Encoding fallback belongs to runGengaExportVideo; delivery failures never re-encode.
           const detail = (e && e.message ? e.message : String(e));
@@ -130120,9 +130124,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const items = [];
       const warnings = [];
       const memberHasDraw = function(m, startFrame) {
-        const e = gengaExposureAt(m, startFrame); // synced ids across a group → same span covers startFrame
-        const dr = e ? gengaExposureDrawing(m, e) : null;
-        return gengaDrawingHasArt(dr);   // Vector strokes count as artwork.
+        return gengaDrawingHasArt(gengaExposureArtworkAt(m, startFrame));
       };
       // --- cel cells: group by cellGroupId (standalone cel = a group of one), preserve top-first appearance ---
       const celGroups = [];
@@ -130297,18 +130299,21 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Raw artwork compositing is shared by image output and grouped-art instruction previews.
     // strict: a member that fails to decode throws instead of leaving that layer out — a cel file must not be
     // written (and counted) with a layer silently missing; the batch files it as a failure that can be retried.
-    async function gengaCompositeExportMembers(ctx, members, frame, pw, ph, strict) {
+    async function gengaCompositeExportMembers(ctx, gt, members, frame, pw, ph, strict) {
       const draws = [];
       members.forEach(function(m) {
-        const e = gengaExposureAt(m, frame), dr = e ? gengaExposureDrawing(m, e) : null;
+        const dr = gengaExposureArtworkAt(m, frame);
         if (gengaDrawingHasArt(dr)) draws.push({ m: m, dr: dr });
       });
       // Stored drawings (tile sets, deltas, evicted refs) are made ready the way the single-image export does
       // (gengaExportEnsureRef): a tile set that is not decoded yet paints nothing and only starts its decode.
       for (const d of draws) {
         if (!d.dr.ref || d.dr.strokes) continue;
-        try { await gengaExportEnsureRef(d.dr.ref, new Set()); } catch (error) { if (strict) throw error; }
-        d.dr = gengaResolveDrawing(d.dr) || d.dr;
+        try { d.dr = await gengaResolveCelExportDrawing(d.dr); }
+        catch (error) {
+          if (strict) throw error;
+          d.dr = gengaResolveDrawing(d.dr) || d.dr;
+        }
       }
       const decoded = await Promise.all(draws.map(function(d) { return d.dr.dataUrl ? gengaDecodeIntoCache(d.dr) : Promise.resolve(true); }));
       const missing = decoded.filter(function(ok) { return !ok; }).length;
@@ -130316,7 +130321,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const byLayer = new Map(draws.map(function(d) { return [d.m, d]; }));
       // A decoded drawing can still fail to paint (gengaDrawDrawingInto returns false, e.g. tiles not ready); strict
       // makes that and any draw exception a failure instead of a missing layer.
-      compositeDrawItems(ctx, gengaClipDrawItems(state.project && state.project.gengaTimeline, members.slice().reverse(), function(m) {
+      compositeDrawItems(ctx, gengaClipDrawItems(gt, members.slice().reverse(), function(m) {
         const d = byLayer.get(m);
         return d ? {
           blend: m.blend,
@@ -130337,7 +130342,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // (bottom→top) drawn raw (no FX) with each member's base blend/opacity. Members are decoded first so the draws
     // are synchronous. opts: {whiteBg, format:'png'|'jpeg', quality, pw, ph, paper}. paper (optional) = the 用紙
     // frame composited at its stack side (bottom = under the cell, top = over the cell).
-    async function gengaRenderCelInstanceBlob(item, opts) {
+    async function gengaRenderCelInstanceBlob(project, item, opts) {
       await gengaFlushPendingDrawingEncodesAsync(); // Export decodes by URL
       const canvas = document.createElement('canvas');
       canvas.width = opts.pw;
@@ -130345,35 +130350,55 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const ctx = canvas.getContext('2d');
       // Use the revision stage's paper color instead of white when that option is enabled.
       // gengaRevisionPaperColor also supplies tag and selected-panel colors.
-      const revisionBg = item.revisionKey && opts.revisionPaperBg !== false ? gengaRevisionPaperColor(state.project, item.revisionKey) : null;
+      const revisionBg = item.revisionKey && opts.revisionPaperBg !== false ? gengaRevisionPaperColor(project, item.revisionKey) : null;
       if (revisionBg) { ctx.fillStyle = revisionBg.hex; ctx.fillRect(0, 0, opts.pw, opts.ph); }
       else if (opts.whiteBg) { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, opts.pw, opts.ph); }
       // Use gengaDrawingHasArt for 用紙 as well
       // so vector paper is not filtered out.
       const paper = opts.paper && gengaDrawingHasArt(opts.paper.dr) ? opts.paper : null;
       if (paper && paper.side === 'bottom') gengaDrawExportPaper(ctx, paper, opts.pw, opts.ph); // frame under the cell
-      await gengaCompositeExportMembers(ctx, item.members, item.startFrame, opts.pw, opts.ph, true);
+      await gengaCompositeExportMembers(ctx, project.gengaTimeline, item.members, item.startFrame, opts.pw, opts.ph, true);
       if (paper && paper.side !== 'bottom') gengaDrawExportPaper(ctx, paper, opts.pw, opts.ph); // frame over the cell (最前面, default)
       const mime = opts.format === 'jpeg' ? 'image/jpeg' : 'image/png';
       return await canvasToBlob(canvas, mime, opts.format === 'jpeg' ? opts.quality : undefined);
     }
-    // Resolve the visible 用紙 layer into a decoded {dr,blend,opacity,side} for batch compositing, or null.
-    async function gengaResolvePaperForExport(gt) {
-      await gengaFlushPendingDrawingEncodesAsync(); // Export decodes by URL
+    async function gengaResolveCelExportDrawing(dr) {
+      if (dr.ref && !dr.strokes) await gengaExportEnsureRef(dr.ref, new Set());
+      return gengaResolveDrawing(dr) || dr;
+    }
+    // Resolve the visible 用紙 source for batch warmup and compositing, including vector artwork.
+    function gengaCelExportPaper(gt) {
       const p = gengaPaperLayer(gt);
       if (!p || p.visible === false) return null;
-      const exp = (p.exposures || [])[0];
-      const dr = exp ? gengaExposureDrawing(p, exp) : null;
-      // Return vector 用紙 as artwork. Decode only raster sources,
-      // and let the drawing kernel bake vectors when needed.
+      const dr = gengaExposureDrawing(p, (p.exposures || [])[0]);
       if (!gengaDrawingHasArt(dr)) return null;
-      if (dr.dataUrl) await gengaDecodeIntoCache(dr);
       return {
         dr: dr,
         blend: p.blend || 'source-over',
         opacity: (p.opacity != null ? p.opacity : 1),
         side: (p.paperSide === 'bottom' ? 'bottom' : 'top')
       };
+    }
+    // Prepare only batch inputs: each item's members, artwork at its start frame, and 用紙.
+    // Count broken inputs so image batches can ask whether to proceed. Video warmup reports failures for its frame range.
+    async function gengaBatchPreloadPlan(plan, gt, includePaper) {
+      await gengaFlushPendingDrawingEncodesAsync();
+      const drawings = new Map();
+      const add = function(dr) {
+        if (gengaDrawingHasArt(dr)) drawings.set(dr.ref || gengaRasterCacheKey(dr) || dr, dr);
+      };
+      const paper = includePaper && gengaCelExportPaper(gt);
+      if (paper) add(paper.dr);
+      plan.forEach(function(it) {
+        it.members.forEach(function(m) { add(gengaExposureArtworkAt(m, it.startFrame)); });
+      });
+      const ok = await Promise.all(Array.from(drawings.values()).map(async function(dr) {
+        try {
+          const r = await gengaResolveCelExportDrawing(dr);
+          return r.dataUrl ? await gengaDecodeIntoCache(r) : true;
+        } catch (error) { return false; }
+      }));
+      return { failed: ok.filter(function(v) { return !v; }).length, total: drawings.size };
     }
     // ## SECTION: TVPaint blend modes and pixel compositing
     // TVPaint 11 layer modes (blendModel 'tvpaint11', set on TVPP import or by choosing it). Unlike the Canvas modes, the result
@@ -131453,17 +131478,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // The drawn box of whatever this layer shows at a frame — the box the 目盛り origin falls back to the centre of,
     // so the editor and the exported image agree on that point (the FX gizmo box itself is the whole 用紙).
     function gengaLayerDrawnBounds(layer, frame, pw, ph) {
-      const e = layer ? gengaExposureAt(layer, frame) : null;
-      const dr = e ? gengaExposureDrawing(layer, e) : null;
-      return gengaDrawnBounds(dr, pw, ph);
+      return gengaDrawnBounds(gengaExposureArtworkAt(layer, frame), pw, ph);
     }
     // Preserve the original RGB and alpha: filled artwork also carries interior detail.
-    async function gengaCelArtCanvas(layer, frame, pw, ph, members) {
+    async function gengaCelArtCanvas(gt, layer, frame, pw, ph, members) {
       await gengaFlushPendingDrawingEncodesAsync();
-      const exp = gengaExposureAt(layer, frame), dr = exp ? gengaExposureDrawing(layer, exp) : null;
+      const dr = gengaExposureArtworkAt(layer, frame);
       const hasArt = members ? members.some(function(m) {
-        const e = gengaExposureAt(m, frame);
-        return e && gengaDrawingHasArt(gengaExposureDrawing(m, e));
+        return gengaDrawingHasArt(gengaExposureArtworkAt(m, frame));
       }) : gengaDrawingHasArt(dr);
       if (!hasArt) return null;
       const cv = document.createElement('canvas');
@@ -131471,7 +131493,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       cv.height = ph;
       const cx = cv.getContext('2d');
       if (members) {
-        if (!await gengaCompositeExportMembers(cx, members, frame, pw, ph)) return null;
+        if (!await gengaCompositeExportMembers(cx, gt, members, frame, pw, ph)) return null;
       } else {
         if (dr.dataUrl) await gengaDecodeIntoCache(dr);
         try { gengaDrawDrawingInto(cx, dr, pw, ph); } catch (err) { return null; }
@@ -131510,7 +131532,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           states[i].art = hit.art;
           continue;
         }
-        states[i].canvas = opts.artAt ? await opts.artAt(f) : await gengaCelArtCanvas(layer, f, pw, ph, members);
+        states[i].canvas = opts.artAt ? await opts.artAt(f) : await gengaCelArtCanvas(opts.gt, layer, f, pw, ph, members);
         states[i].art = states[i].canvas ? gengaAlphaBounds(states[i].canvas) : null;
         if (key !== null) made.set(key, { canvas: states[i].canvas, art: states[i].art });
       }
@@ -132014,7 +132036,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!planned) {
         const group = gengaInstrGroupOf(gt, layer);
         const members = group ? group.members : gengaInstructionArtMembers(gt, layer);
-        for (let i = 0; i < states.length && !art; i += 1) art = await gengaCelArtCanvas(layer, states[i].frame, pw, ph, members);
+        for (let i = 0; i < states.length && !art; i += 1) art = await gengaCelArtCanvas(gt, layer, states[i].frame, pw, ph, members);
         artBox = art ? gengaAlphaBounds(art) : null;
       }
       if (!artBox) return null;                               // No rendered artwork means no instruction.
@@ -132218,30 +132240,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // owners lists member layer IDs. A recreated cel can have the same tag and number but a different owner.
     function gengaBatchRetryItem(it) { return { name: it.name, identity: it.identity, owners: (it.members || []).map(function(m) { return String(m.id); }).join(',') }; }
     function gengaBatchRetryKey(it) { return it.name + '\u0000' + it.identity + '\u0000' + it.owners; }
-    // Prepare only batch inputs: each item's members, artwork at its start frame, and 用紙.
-    // Count broken inputs so image batches can ask whether to proceed. Video warmup reports failures for its frame range.
-    async function gengaBatchPreloadPlan(plan, paperLayer) {
-      await gengaFlushPendingDrawingEncodesAsync();
-      const drawings = new Map();
-      if (paperLayer && paperLayer.visible !== false) {   // Use the same per-cel 用紙 drawing as gengaResolvePaperForExport.
-        const pe = (paperLayer.exposures || [])[0], pdr = pe ? gengaExposureDrawing(paperLayer, pe) : null;
-        if (gengaDrawingHasArt(pdr)) drawings.set(pdr.ref || gengaRasterCacheKey(pdr) || pdr, pdr);
-      }
-      plan.forEach(function(it) {
-        it.members.forEach(function(m) {
-          const e = gengaExposureAt(m, it.startFrame), dr = e ? gengaExposureDrawing(m, e) : null;
-          if (gengaDrawingHasArt(dr)) drawings.set(dr.ref || gengaRasterCacheKey(dr) || dr, dr);
-        });
-      });
-      const ok = await Promise.all(Array.from(drawings.values()).map(async function(dr) {
-        try {
-          if (dr.ref && !dr.strokes) await gengaExportEnsureRef(dr.ref, new Set());
-          const r = gengaResolveDrawing(dr) || dr;
-          return r.dataUrl ? await gengaDecodeIntoCache(r) : true;
-        } catch (error) { return false; }
-      }));
-      return { failed: ok.filter(function(v) { return !v; }).length, total: drawings.size };
-    }
     // List top-level PNG and JPG names to report stale files in a reused output folder.
     async function gengaBatchFolderImages(dirHandle) {
       const names = [];
@@ -132277,7 +132275,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Predecode batch images as for video or GIF. Missing art in an image batch can leave blank files
       // among valid production assets.
       // Ask before continuing with missing art and default to stopping.
-      const pre = await gengaBatchPreloadPlan(plan, opts.includePaper ? gengaPaperLayer(gt) : null);
+      const pre = await gengaBatchPreloadPlan(plan, gt, opts.includePaper);
       const before = await gengaBatchFolderImages(dirHandle);   // List existing folder images before writing so stale filenames can be reported afterward.
       assertProjectIoOwner(owner);
       if (pre && pre.failed > 0) {
@@ -132298,7 +132296,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           };
         }
       }
-      const paper = opts.includePaper ? await gengaResolvePaperForExport(gt) : null; // decoded once, composited into every cell
+      let paper = null;
+      if (opts.includePaper) {
+        await gengaFlushPendingDrawingEncodesAsync();
+        paper = gengaCelExportPaper(gt);
+        if (paper && paper.dr.dataUrl) await gengaDecodeIntoCache(paper.dr);
+      }
       const ext = opts.format === 'jpeg' ? 'jpg' : 'png';
       // Record files actually written to _camera and include their count in completion status.
       // Otherwise successful instruction images can look absent when status lists only cels and sheets.
@@ -132325,7 +132328,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const fileName = it.name + '.' + ext;
         if (onStatus) onStatus(t('msg.batchExport.layerImage', i + 1, plan.length, fileName), i + 1, plan.length, fileName); // Numbers ride along for the motion overlay
         try {
-          const blob = await gengaRenderCelInstanceBlob(it, {
+          const blob = await gengaRenderCelInstanceBlob(project, it, {
             whiteBg: opts.whiteBg,
             format: opts.format,
             quality: opts.quality,
@@ -135499,9 +135502,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function captureGengaDialogueState(project) {
       const gt = project && project.gengaTimeline;
       return { dialogue: fastClone(gt && gt.dialogue || { lanes: 1, entries: [] }) };
-    }
-    function gengaDialogueRenderPlan(gt, beforeShape) {
-      return beforeShape === gengaDialogueRowsShape(gt) ? { scope: 'partial', layerIds: [], audio: false, dialogue: true } : { scope: 'all', reason: 'dialogue-rows' };
     }
     function runGengaDialogueCommand(name, mutator) {
       paintInputFlushSync();
@@ -139018,7 +139018,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       } catch (error) { return Promise.resolve(fallback(error)); }
     }
     // Await the analysis needed for export. Preview can show an empty mouth before analysis finishes.
-    const gengaLipsyncPreparedGts = new WeakSet();   // Keep one analyzed gt object for the export run.
     async function gengaLipsyncPrepare(gt) {
       const settings = gengaLipsyncSettings(gt);
       if (!settings.estimate || !settings.audio) return;
@@ -144900,6 +144899,57 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     const GENGA_MAX_SANE_HOLD = 500000;
     // Store the イメージマーク color on the exposure (instance) as `mark`. Omit the field when unset to preserve existing project bytes.
     const GENGA_IMAGE_MARKS = ['red', 'blue', 'green', 'yellow'];
+    function gengaLayerInTimeline(gt, id) {
+      return gt ? (gt.layers || []).find(function(layer) { return String(layer.id) === String(id); }) : null;
+    }
+    function gengaLayerById(id) {
+      return gengaLayerInTimeline(state.project && state.project.gengaTimeline, id);
+    }
+    function gengaExposureById(layer, id) {
+      return layer ? (layer.exposures || []).find(function(e) { return String(e.id) === String(id); }) : null;
+    }
+    function gengaFindExposure(project, layerId, expId) {
+      return gengaExposureById(gengaLayerInTimeline(project && project.gengaTimeline, layerId), expId);
+    }
+    // Return the last frame of one exposure. Apply Math.max(1, …) so gengaOnionInstanceFrames agrees
+    // on both exposure membership and loop end when hold is nonpositive.
+    // gengaExposureEndFrame(layers, seed) instead computes the maximum end across layers.
+    // Keep that aggregate extent separate from the end of a single exposure.
+    function gengaExposureLastFrame(exposure) {
+      return exposure.startFrame + Math.max(1, exposure.holdFrames) - 1;
+    }
+
+    function gengaExposureAt(layer, frame) {
+      if (!layer || !Array.isArray(layer.exposures)) return null;
+      for (let i = 0; i < layer.exposures.length; i++) {
+        const e = layer.exposures[i];
+        if (frame >= e.startFrame && frame <= e.startFrame + e.holdFrames - 1) return e;
+      }
+      return null;
+    }
+    function gengaSortedExposures(layer) {
+      return (layer && Array.isArray(layer.exposures)) ? layer.exposures.slice().sort(function(a, b) { return a.startFrame - b.startFrame; }) : [];
+    }
+    // Sheet notation uses the last sorted cel's end, even when an earlier cel overlaps it.
+    // Walking covered intervals also handles a long hold without visiting every held frame.
+    function gengaExposureStrip(sorted) {
+      const first = sorted[0].startFrame;
+      const last = gengaExposureLastFrame(sorted[sorted.length - 1]);
+      const gaps = [];
+      let next = first;
+      for (const exposure of sorted) {
+        if (exposure.startFrame > next) gaps.push({start: next, end: exposure.startFrame - 1});
+        next = Math.max(next, gengaExposureLastFrame(exposure) + 1);
+      }
+      return {first: first, last: last, gaps: gaps};
+    }
+    // Display instanceValue when assigned and otherwise use the exposure's position rank.
+    // Share the numbering rule between cels, pre/post behavior, and 中間リピート.
+    function gengaExposureNumberText(exposure, ranks) {
+      const v = exposure ? exposure.instanceValue : null;
+      if (v !== null && v !== undefined && v !== '') return String(v);
+      return String((ranks || {})[exposure ? exposure.id : '']);
+    }
     function gengaExposureDrawing(layer, exp) {
       if (!exp) return null;
       const key = gengaValueKey(exp.instanceValue);
@@ -144907,6 +144957,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const dr = gengaResolveDrawing(stored);
       if (dr && Array.isArray(exp.silFix) && exp.silFix.length) dr.silFix = exp.silFix; // carry 診断 fixes onto the resolved drawing
       return dr;
+    }
+    function gengaExposureArtworkAt(layer, frame) {
+      return gengaExposureDrawing(layer, gengaExposureAt(layer, frame));
     }
     function gengaSetExposureDrawing(layer, exp, drawing) {
       if (!exp) return;
@@ -144928,11 +144981,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // assign / relink / unlink an instance value. choice ('mine'|'theirs') resolves a same-value drawing
     // conflict (both the exposure and the target value already hold art); null choice = no conflict path.
     function gengaApplyInstanceValue(proj, layerId, expId, newValueRaw, choice) {
-      const gt = proj && proj.gengaTimeline;
-      if (!gt) return;
-      const layer = (gt.layers || []).find(function(l) { return String(l.id) === String(layerId); });
-      if (!layer) return;
-      const exp = (layer.exposures || []).find(function(e) { return String(e.id) === String(expId); });
+      const layer = gengaLayerInTimeline(proj && proj.gengaTimeline, layerId);
+      const exp = gengaExposureById(layer, expId);
       if (!exp) return;
       if (!layer.sharedDrawings) layer.sharedDrawings = {};
       const oldKey = gengaValueKey(exp.instanceValue);
@@ -144956,9 +145006,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Display the sequential number for a cel without a value. renderGengaView and 原画 sheet export use
     // the same sorted index plus one, so assigning that number leaves the sheet output unchanged.
-    function gengaPositionalRanks(layer) {
+    function gengaPositionalRanks(layer, sorted) {
       const ranks = {};
-      gengaSortedExposures(layer).forEach(function(e, i) { ranks[e.id] = i + 1; });
+      (sorted || gengaSortedExposures(layer)).forEach(function(e, i) { ranks[e.id] = i + 1; });
       return ranks;
     }
     // Skip separate numbering when a セリフ range owns the cel. A 動画マーク ends the range, and cels after it
@@ -145147,7 +145197,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const l = gengaLayerById(id);
       if (!gengaCanBeManualInstr(l) || !!l.instrManual === !!on) return;
       runCommand(on ? '指示レイヤーにする' : '指示レイヤーを解除', function(p) {
-        const L = (p.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(id); });
+        const L = gengaLayerInTimeline(p.gengaTimeline, id);
         if (!L) return;
         if (on) L.instrManual = true; else { delete L.instrManual; delete L.instrStage; }
       });
@@ -145157,7 +145207,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const l = gengaLayerById(id);
       if (!gengaLayerIsAnyInstr(l) || (l.instrStage || '') === code) return;
       runCommand('指示レイヤーの修正工程', function(p) {
-        const L = (p.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(id); });
+        const L = gengaLayerInTimeline(p.gengaTimeline, id);
         if (L) { if (code) L.instrStage = code; else delete L.instrStage; }
       });
     }
@@ -145857,7 +145907,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!layer || gengaLayerEffLocked(layer)) return false;
       if (!gengaSerifuSectionById(layer, sectionId)) return false;
       runCommand('セリフ手動配置を破棄', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
         const S = (L.serifuSections || []).find(function(x) { return x.id === sectionId; });
         if (!S) return;
@@ -145985,7 +146035,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const nextExp = gengaExposureAt(layer, e + 1);
       const rolled = gengaSerifuRollArray(span, alphabet, nextExp ? parseInt(nextExp.instanceValue, 10) : NaN, opts.step || 3);
       runCommand('セリフ区間', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
         // Move each at-risk direct drawing into shared storage under its new slot number, including each peer's own pool.
         // After this command, group sync assigns peers the new slots, and the numbers resolve their pool drawings.
@@ -146045,7 +146095,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!layer || gengaLayerEffLocked(layer)) return false;
       if (!gengaSerifuSectionById(layer, sectionId)) return false;
       runCommand('セリフ区間解除', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
         (L.exposures || []).forEach(function(x) { if (x.serifuId === sectionId) x.serifuId = ''; });
         L.serifuSections = (L.serifuSections || []).filter(function(x) { return x.id !== sectionId; });
@@ -146668,9 +146718,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaAdoptLayer(newId);
       gengaDropUnfitSelections();
       if (gengaPreviewDrawSeq === drawSeq) drawGengaPreview();
-    }
-    function gengaLayerStructurePlan(previewByCaller) {
-      return { scope: 'all', reuseCelContent: true, previewByCaller: previewByCaller };
     }
     function gengaRefreshLayerInsertion(previewByCaller) {
       invalidateVideoTimelineCache();
@@ -147332,7 +147379,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     //   - the composite uses each layer's raw (pre-FX) drawing — FX keyframes are never baked in. If any
     //     selected layer has FX keys, warn that both the FX and the pre-merge layers are gone once you accept.
     function gengaValidateMergeSelection(gt, ids) {
-      const layers = ids.map(function(id) { return (gt.layers || []).find(function(l) { return String(l.id) === String(id); }); }).filter(Boolean);
+      const layers = ids.map(function(id) { return gengaLayerInTimeline(gt, id); }).filter(Boolean);
       if (layers.length < 2) return { ok: false, reason: t('msg.genga.merge.needTwoLayers') };
       // Exclude project-wide 用紙 and folder rows from merge candidates to avoid deleting them as cel layers.
       if (layers.some(function(l) { return gengaLayerIsFixedRow(l) || gengaLayerIsFolder(l); })) return { ok: false, reason: t('msg.genga.merge.specialRows') };
@@ -147343,7 +147390,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Reject merges across isolated folder boundaries because the result cannot preserve their appearance. Within one isolated folder,
       // disable folder effects during compositing and let the folder keep applying them. Any isolation field defines a boundary even when the current result matches pass-through.
       const isoKeys = new Set(layers.map(function(l) {
-        const f = l.folderId ? (gt.layers || []).find(function(x) { return String(x.id) === String(l.folderId); }) : null;
+        const f = l.folderId ? gengaLayerInTimeline(gt, l.folderId) : null;
         return f && f.folderBlend ? String(f.id) : '';
       }));
       if (isoKeys.size > 1) return { ok: false, reason: t('msg.genga.merge.folderIsolation') };
@@ -147672,7 +147719,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const v = cancel ? orig : span.textContent.trim();
         if (!v || v === orig || state.project !== project || gengaLayerById(id) !== layer) { span.textContent = orig; return; }
         runCommand('原画レイヤー名変更', function(p) {
-          const l = (p.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(id); });
+          const l = gengaLayerInTimeline(p.gengaTimeline, id);
           if (l) l.name = v;
         });
       };
@@ -147924,10 +147971,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaShowIoMenu(ev.clientX, ev.clientY);
     }
     // ---- layer opacity / blend (popover on the layer head's % button) -----------------------------------------
-    function gengaLayerById(id) {
-      const gt = state.project && state.project.gengaTimeline;
-      return gt ? (gt.layers || []).find(function(x) { return String(x.id) === String(id); }) : null;
-    }
     // Both commands use folderBlend for folders because legacy rows can contain unused blend and opacity fields.
     // Choosing 「通過」 (GENGA_FOLDER_PASS) deletes folderBlend. Absence means pass-through (folder_composite_design a1).
     const GENGA_FOLDER_PASS = 'pass';
@@ -147936,7 +147979,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function setGengaLayerBlend(id, blend) {
       if (!state.project || state.project.kind !== 'genga') return;
       runCommand('レイヤーブレンド', function(p) {
-        const l = (p.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(id); });
+        const l = gengaLayerInTimeline(p.gengaTimeline, id);
         if (!l) return;
         const tvp = GENGA_TVPAINT_BLEND_MODES.find(function(m) { return m.v === blend; });
         const v = GENGA_BLEND_MODES.some(function(m) { return m.v === blend; }) ? blend : 'source-over';
@@ -147958,7 +148001,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!state.project || state.project.kind !== 'genga') return;
       const o = Math.max(0, Math.min(1, Number(opacity) || 0));
       runCommand('レイヤー不透明度', function(p) {
-        const l = (p.gengaTimeline.layers || []).find(function(x) { return String(x.id) === String(id); });
+        const l = gengaLayerInTimeline(p.gengaTimeline, id);
         if (l) gengaSetLayerOpacityField(l, o);
       });
     }
@@ -147966,7 +148009,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // and a locked folder prevents drawing on unlocked children. Folders are top-level, so check just one parent.
     function gengaLayerFolderOf(l, gt) {
       if (!l || !l.folderId) return null;
-      const f = gt ? (gt.layers || []).find(function(x) { return String(x.id) === String(l.folderId); }) : gengaLayerById(l.folderId);
+      const f = gt ? gengaLayerInTimeline(gt, l.folderId) : gengaLayerById(l.folderId);
       return gengaLayerIsFolder(f) ? f : null;
     }
     function gengaLayerEffVisible(l, gt) {
@@ -147981,8 +148024,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return !!(f && f.locked);
     }
     // Share one compositing visibility check for visible, solo, and folder state.
-    function gengaLayerDrawsInComposite(l) {
-      return !!l && !gengaLayerIsFolder(l) && gengaLayerEffVisible(l) && !gengaSoloHides(l);
+    function gengaLayerDrawsInComposite(l, gt, output) {
+      return !!l && !gengaLayerIsFolder(l) && gengaLayerEffVisible(l, gt) && (Boolean(output) || !gengaSoloHides(l));
     }
     // 下のレイヤーでクリッピング (CSP · Photoshop): the base is the nearest non-clipping layer below in the same folder. A
     // folder row, 用紙 or another folder's layer ends the search, so a clipping layer at the bottom of its folder (or of the
@@ -148015,7 +148058,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Solo preview includes the current layer, selected rows, and the children of selected folders.
     function gengaSoloHides(l) {
-      if (!state.gengaSoloView || gengaSoloBypass) return false;
+      if (!state.gengaSoloView) return false;
       return !gengaSoloSelects(l);
     }
     // Share this predicate between gengaSoloHides and gengaUpdateLayerSelectionDom (.solo-shown), independent of whether solo is active.
@@ -148795,7 +148838,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function toggleGengaPaperSide(id) {
       if (!state.project || state.project.kind !== 'genga') return;
       runCommand('用紙 前後切替', function(p) {
-        const l = ((p.gengaTimeline && p.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(id); });
+        const l = gengaLayerInTimeline(p.gengaTimeline, id);
         if (l && l.role === 'paper') l.paperSide = (l.paperSide === 'bottom') ? 'top' : 'bottom';
       });
     }
@@ -148908,48 +148951,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     let gengaPreviewXform = null;
     let gengaDrawSession = null;
     let gengaStrokeSeq = 0;   // Stroke identity counter for each ink session's strokeKey.
-    // Return the last frame of one exposure. Apply Math.max(1, …) so gengaOnionInstanceFrames agrees
-    // on both exposure membership and loop end when hold is nonpositive.
-    // gengaExposureEndFrame(layers, seed) instead computes the maximum end across layers.
-    // Keep that aggregate extent separate from the end of a single exposure.
-    function gengaExposureLastFrame(exposure) {
-      return exposure.startFrame + Math.max(1, exposure.holdFrames) - 1;
-    }
-
-    function gengaExposureAt(layer, frame) {
-      if (!layer || !Array.isArray(layer.exposures)) return null;
-      for (let i = 0; i < layer.exposures.length; i++) {
-        const e = layer.exposures[i];
-        if (frame >= e.startFrame && frame <= e.startFrame + e.holdFrames - 1) return e;
-      }
-      return null;
-    }
-    // ---- instance (koma) navigation: onion/parapara step by drawing instance, not literal frame ----
-    function gengaSortedExposures(layer) {
-      return (layer && Array.isArray(layer.exposures)) ? layer.exposures.slice().sort(function(a, b) { return a.startFrame - b.startFrame; }) : [];
-    }
-    // Return covered cells and the end frame for the sheet's pre/post behavior and 中間リピート. Clamp hold to at least one.
-    // `last` is the final exposure's end, which can precede an earlier exposure's end.
-    function gengaExposureSpanMap(sorted) {
-      const covered = {};
-      (sorted || []).forEach(function(e) {
-        const end = e.startFrame + Math.max(1, e.holdFrames) - 1;
-        for (let f = e.startFrame; f <= end; f++) covered[f] = 1;
-      });
-      const tail = (sorted && sorted.length) ? sorted[sorted.length - 1] : null;
-      return {
-        covered: covered,
-        first: (sorted && sorted.length) ? sorted[0].startFrame : 0,
-        last: tail ? (tail.startFrame + Math.max(1, tail.holdFrames) - 1) : 0
-      };
-    }
-    // Display instanceValue when assigned and otherwise use the exposure's position rank.
-    // Share the numbering rule between cels, pre/post behavior, and 中間リピート.
-    function gengaExposureNumberText(exposure, ranks) {
-      const v = exposure ? exposure.instanceValue : null;
-      if (v !== null && v !== undefined && v !== '') return String(v);
-      return String((ranks || {})[exposure ? exposure.id : '']);
-    }
+    // Onion and flipbook navigation step by drawing instance.
     function gengaInstanceIndexAtOrBefore(layer, frame) {
       const s = gengaSortedExposures(layer);
       let idx = -1;
@@ -149119,7 +149121,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const f = Math.max(1, Math.round(frame));
       if (on && !gengaRepeatCycle(layer, f)) { alert(t('msg.genga.repeat.noSourceDrawing')); return false; }
       runCommand(on ? 'リピート' : 'リピート解除', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
         L.repeats = (L.repeats || []).filter(function(r) { return r.startFrame !== f; });
         if (on) L.repeats.push({ id: newPrefixedId('genga-rep'), startFrame: f });
@@ -151238,7 +151240,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaFrameStackInvalidate(); scheduleGengaPreviewRedraw();
     }
     // Skip stack caching when transient state changes the composite.
-    // This covers playback (repeat and セリフ), export (gengaSoloBypass), solo (omitted layers),
+    // This covers playback (repeat and セリフ), solo (omitted layers),
     // flipbook playback, 動画フィル (pending silhouettes can resolve), silhouette diagnostics,
     // and live FX drags (gengaFxAt reads gengaFxLive). A lifted selection belongs to its layer.
     // Allow it on the center layer outside the stack, and block caching when it is on another layer.
@@ -151247,7 +151249,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Export in particular would miss each frame and rebuild page-sized canvases without reuse.
       if (!reuse || noFx) return false;
       if (gengaHydrateInFlight) return false; // Fall back to full composition when multiple drawings are still unavailable.
-      if (state.gengaPlaying || gengaSoloBypass || state.gengaSoloView) return false;
+      if (state.gengaPlaying || state.gengaSoloView) return false;
       if (gengaParaparaSoloLayerId || gengaParaparaFrame != null || gengaDougaFillActive() || state.gengaSilDebug) return false;
       if (gengaFxLive || fxQualityInteractive) return false;
       if (gengaSelLifted(gengaSel) && String(gengaSel.layerId) !== String(centerLayerId)) return false;
@@ -151299,10 +151301,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // ## SECTION: Animation preview compositing
+    function gengaDougaFillActive() { return !!state.gengaDougaFill; }
     // layerStates[i].base = the base index of a clipping layer that has one (drawn with its base, never on its own);
     // layerStates[base].clips = those clipping layers, top-first. The center's clipping group [liveTop, liveBottom] stays
     // live between the below/above caches: a clipping layer needs its base alone, and a base's clipping layers follow it.
-    function gengaCompositeScene(layers, frame, sess, noFx, reuse, layerStates) {
+    function gengaCompositeScene(layers, frame, sess, noFx, reuse, layerStates, gt, output) {
       const centerId = sess ? sess.layerId : state.gengaSelectedLayerId;
       const centerIdx = layers.findIndex(function(l) { return String(l.id) === String(centerId); });
       for (let i = 0; i < layers.length; i++) layerStates[i] = { draws: false, fx: undefined, base: gengaClipBaseIndex(layers, i), clips: null, iso: null };
@@ -151333,7 +151336,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         belowEmpty = true,
         aboveFoldable = centerIdx >= 0 && !gengaDougaFillActive();
       for (let i = 0; i < layers.length; i++) {
-        const visible = gengaLayerDrawsInComposite(layers[i]);
+        const visible = gengaLayerDrawsInComposite(layers[i], gt, output);
         const layerState = layerStates[i];
         layerState.draws = visible;
         if (!visible && i !== centerIdx) continue;
@@ -151392,7 +151395,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // The blur result lives in the layer-2 kernel's fxFinalBlurSlot (single-slot final-look contract; the key
     // carries |g / |bk). gengaFxBlurPreviewKey below is the contentKey source for the kernel caches.
-    function gengaFxBlurPreviewKey(l, frame) { // cache identity of the layer's current content; null = uncacheable (pixels can change per tick)
+    function gengaFxBlurPreviewKey(l, frame, dougaFill, output) { // cache identity of the layer's current content; null = uncacheable (pixels can change per tick)
       if (gengaStampDrag && frame === gengaStampDrag.frame && String(l.id) === gengaStampDrag.layerId) return null;
       if (gengaDrawSession && String(l.id) === String(gengaDrawSession.layerId)) return null; // live stroke
       if (gengaSelLifted(gengaSel) && String(l.id) === String(gengaSel.layerId)) return null; // lifted selection replaces the art
@@ -151403,11 +151406,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // override would hand it the cache built under the other setting.
       // 動画フィル also applies at rest and during export. A marked cel draws its own artwork before its first 動画 mark
       // and the kth intermediate silhouette after it. Content can differ on each local frame, as in playback.
-      const perFrame = state.gengaPlaying || (gengaDougaFillActive() && rs.exp && Array.isArray(rs.exp.dougaOffsets) && rs.exp.dougaOffsets.length > 0);
+      const perFrame = state.gengaPlaying || (dougaFill && rs.exp && Array.isArray(rs.exp.dougaOffsets) && rs.exp.dougaOffsets.length > 0);
       // The drawing's own content identity: a ref-less vector drawing gets a new strokes array per edit while the
       // layer and exposure ids stay, so 'inline' alone would hand the final blur slot the pre-edit pixels.
       return String(l.id) + '|' + (rs.exp ? rs.exp.id : '') + '|' + (dr ? (gengaDrawingCacheKey(dr) || 'inline') : '') +
-        '|' + (perFrame ? 'p' + rs.localFrame : '') + '|df' + (gengaDougaFillActive() ? 1 : 0) + '|sd' + (state.gengaSilDebug ? 1 : 0); // serifu (playback) / douga-fill variants resolve per localFrame
+        '|' + (perFrame ? 'p' + rs.localFrame : '') + '|df' + (dougaFill ? 1 : 0) + '|sd' + (state.gengaSilDebug ? 1 : 0) + (output ? '|export' : ''); // serifu (playback) / douga-fill variants resolve per localFrame
     }
     // Two paper-sized scratches for one clipping group at a time (groups do not nest; the compositor draws them in turn).
     // `folder` holds one isolated folder. Keep it separate from group and clip because clipping groups can be inside folders, which never nest.
@@ -151491,18 +151494,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // Resolve artwork for this cel. During playback and export, the 口パク range track can replace its slot drawing. Null means a blank cel.
-    function gengaCompositeSampleDrawing(l, rs, layerById, gt) {
+    function gengaCompositeSampleDrawing(l, rs, layerById, gt, output) {
       l = layerById.get(String(l.id)) || l;
-      if (state.gengaPlaying || gengaSoloBypass) {
+      if (state.gengaPlaying || output) {
         const sDr = gengaSerifuResolveDrawing(l, rs.exp, rs.localFrame, gt);
         if (sDr !== undefined) return sDr;
       }
       return gengaExposureDrawing(l, rs.exp);
     }
 
-    function gengaCompositeFrame(frame, pad, noFx, reuse, playback) {
-      const gt = state.project && state.project.gengaTimeline;
+    function gengaCompositeFrame(frame, pad, noFx, reuse, playback, preparation) {
+      const gt = preparation ? preparation.gt : state.project && state.project.gengaTimeline;
       if (!gt) return null;
+      const output = preparation && preparation.output;
+      const dougaFill = output ? output.dougaFill : gengaDougaFillActive();
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       // The preview draws 用紙 itself (gengaDrawPreviewPaper) so onion ghosts can sit between the paper and
       // the layers; exports keep it in the composite.
@@ -151514,7 +151519,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // One synchronous composite owns these evaluations. Only the small eligibility scene persists.
       // Hidden center FX still affects stackability; hidden parapara content is evaluated when drawn.
       const layerStates = new Array(layers.length);
-      const scene = gengaCompositeScene(layers, frame, sess, noFx, reuse, layerStates);
+      const scene = gengaCompositeScene(layers, frame, sess, noFx, reuse, layerStates, gt, output);
       if (reuse) gengaPreviewRender.scene = scene;
       // FX transforms can push content outside the paper (zoom/move); the preview passes a pad so those pixels
       // aren't clipped, also during a stroke (else the live line drawn in the margin under an FX offset is
@@ -151535,7 +151540,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // FX and clipping draw layer copies with adjusted blend and opacity. Resolve the drawing against the original layer.
       // Dialog-derived 口パク placement requires object identity in gt.layers and would otherwise fall back to the saved random sequence.
       const layerById = new Map((gt.layers || []).map(function(x) { return [String(x.id), x]; }));
-      const sampleOf = function(l) { return gengaResolveExposureSample(layerById.get(String(l.id)) || l, frame, playback || (state.gengaPlaying && !gengaSoloBypass)); };
+      const sampleOf = function(l) { return gengaResolveExposureSample(layerById.get(String(l.id)) || l, frame, playback || (state.gengaPlaying && !output)); };
       const drawLayerContent = function(target, l) {
         let src = null;
         if (sess && String(l.id) === String(sess.layerId)) {
@@ -151550,12 +151555,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const e = rs.exp;
           // 動画フィル: on a ・-marked span show the interpolated silhouette instead of the held drawing. rel comes
           // from rs.localFrame, not the raw `frame`: repeat post/pre-behavior wraps the playhead past the loop point,
-          // and `frame` there picks the wrong in-between index. The gate is the switch itself, not gengaSoloBypass:
-          // that flag means "an export is rendering" (so the compositor ignores solo-view), and borrowing it to mean
-          // "skip the in-betweens" would make 自動動画 unexportable. The still-image export forces the switch off at
-          // its own call site. The 診断 silhouette below uses gengaSoloBypass on purpose — it is a diagnosis
-          // overlay, never output.
-          if (gengaDougaFillActive() && e && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length && rs.localFrame >= e.startFrame) {
+          // and `frame` there picks the wrong in-between index. Motion output supplies its own fill setting.
+          if (dougaFill && e && Array.isArray(e.dougaOffsets) && e.dougaOffsets.length && rs.localFrame >= e.startFrame) {
             const rel = rs.localFrame - e.startFrame;
             let k = -1;
             for (let di = 0; di < e.dougaOffsets.length; di++) { if (e.dougaOffsets[di] <= rel) k = di; }
@@ -151578,11 +151579,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           // the slot's own drawing. Paused/scrubbing keeps showing the slot — the drawing a stroke would edit at this
           // playhead — so WYSIWYG for drawing wins over preview accuracy while stopped. undefined = no track to
           // apply; null = an empty cell (cover ×) → draw nothing.
-          // Video and GIF exports (gengaSoloBypass) draw range mouths just like playback.
+          // Video and GIF exports draw range mouths just like playback.
           // Otherwise the exported speech bubble would change while the mouth drawing stayed fixed.
-          const dr = gengaCompositeSampleDrawing(l, rs, layerById, gt);
+          const dr = gengaCompositeSampleDrawing(l, rs, layerById, gt, output);
           if (gengaDrawingHasArt(dr)) { // pending-encode art and vector strokes count as drawable art (gengaDrawingHasArt)
-            if (state.gengaSilDebug && !gengaSoloBypass) { // 診断: paint the computed silhouette under this instance's lines
+            if (state.gengaSilDebug && !output) { // 診断: paint the computed silhouette under this instance's lines
               const env = gengaDougaEnvDebugFor(l, e, pw, ph, drawGengaPreview);
               if (env === 'pending') { missingArt++; cv._complete = false; }
               if (env && env !== 'pending') {
@@ -151617,7 +151618,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Use drawLayerContent's drawing resolution for FX source bounds. In-progress canvas content, stamps, and selection fit the paper and can be omitted.
       const fxDrawingOf = function(l) {
         const rs = sampleOf(l);
-        return rs.exp ? gengaCompositeSampleDrawing(l, rs, layerById, gt) : null;
+        return rs.exp ? gengaCompositeSampleDrawing(l, rs, layerById, gt, output) : null;
       };
       // Draw a copy without blend mode or opacity into scratch, then apply those values when compositing.
       const neutral = function(l) { return Object.assign({}, l, { blend: 'source-over', opacity: 1 }); };
@@ -151666,7 +151667,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (s) drawLayerContent(s.ctx, neutral(l));
         const blurType = gengaFxStatics(l).blurType;
         // Only bitmap blur consumes a content key; native filter and transform-only draws do not.
-        const ck = fx.blur > 0 && (blurType === 'bokeh' || !CANVAS_FILTER_SUPPORTED) ? gengaFxBlurPreviewKey(l, frame) : null;
+        const ck = fx.blur > 0 && (blurType === 'bokeh' || !CANVAS_FILTER_SUPPORTED) ? gengaFxBlurPreviewKey(l, frame, dougaFill, output) : null;
         const fxOptions = {
           paint: fxVectorPaint,   // When supplied, the kernel calls this under the transform in place of the bitmap.
           pivot: { x: pw / 2, y: ph / 2 },
@@ -160288,11 +160289,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const gt = project && project.gengaTimeline;
       return { cameraWork: fastClone((gt && gt.cameraWork) || { keyframes: [] }) };
     }
-    function gengaCameraRenderPlan(gt, structural) {
-      if (structural) return gengaLayerStructurePlan(false);
-      const instr = gengaCameraInstrLayer(gt);
-      return { scope: 'partial', layerIds: instr ? [String(instr.id)] : [], camera: true };
-    }
     function applyGengaCameraHistoryState(snapshot) {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt || !snapshot) return;
@@ -160586,18 +160582,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         refresh({ skipChrome: true, gengaPreviewCachesSettled: true, gengaRenderPlan: gengaLayerEditRenderPlan(layerIds, dependenciesChanged) });
       }
       gengaFxPanelUpdate();                     // FX window numbers follow an undone/redone key
-    }
-    // Rerender all rows when other row labels or folder visibility change. Otherwise patch affected rows.
-    function gengaLayerEditRenderPlan(layerIds, dependenciesChanged) {
-      return dependenciesChanged ? { scope: 'all', reason: 'layer-dependencies' } : { scope: 'partial', layerIds: layerIds, audio: false };
-    }
-    // cells: [{ layerId, frame }] — the koma whose art changed. The commit and its history know it (gengaDrawingContext).
-    function gengaDrawingRenderPlan(cells, layerIds) {
-      return { scope: 'drawing', cells: cells, layerIds: layerIds.map(String) };
-    }
-    // A caller's plan wins over the computed one, except that a drawing-only plan cannot hide a cross-row change.
-    function gengaPresetRenderPlan(preset, computed) {
-      return preset && !(preset.scope === 'drawing' && computed && computed.scope === 'all') ? preset : computed;
     }
     // Lean edits and full commands share label and folder dependencies. Folder visibility/color/collapse
     // also changes child rows; testing only the edited row would leave those children stale.
@@ -162324,12 +162308,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (k === 'v' && gengaLayerClipboard && gengaClipIsNewest('layer')) { event.stopImmediatePropagation(); return armKeydownPaste(event, gengaPasteLayer); }
       return false;
     }
-    function gengaFindExposure(proj, layerId, expId) {
-      const gt = proj && proj.gengaTimeline;
-      if (!gt) return null;
-      const layer = (gt.layers || []).find(function(l) { return String(l.id) === String(layerId); });
-      return layer ? (layer.exposures || []).find(function(e) { return String(e.id) === String(expId); }) : null;
-    }
     // would [s,e] overlap any other koma in the layer? (drag-move is rejected on overlap; jump-over to a free gap is fine)
     function gengaRangeOverlapsOther(layer, expId, s, e) {
       return (layer.exposures || []).some(function(x) {
@@ -163462,7 +163440,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     const gengaTimelineWindowCache = new WeakMap();
     function gengaWindowRowsChanged(node) {
       const cache = gengaTimelineWindowCache.get(node.closest('.genga-tl-content'));
-      if (cache) cache.rowsChanged = true;
+      if (!cache) return;
+      cache.rows.delete(node);
+      cache.rowsChanged = true;
     }
     function updateGengaTimelineWindow(root, left, width, reveal) {
       const stage = root || document.getElementById('gengaStage');
@@ -164031,7 +164011,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!gengaStripScalePlan(target, side, n, extend)) { gengaShowStatus(t('status.genga.strip.scaleNoRoom'), { warn: true }); return; }
       }
       runCommand(label, function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
         const s = gengaSortedExposures(L);
         if (!s.length) return; // Shared sorting kernel.
@@ -164721,9 +164701,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const settled = function(ok) { if (typeof onSettled === 'function') onSettled(ok); };
       const project = state.project;
       const layer = gengaLayerById(layerId);
-      const expNow = gengaFindExposure(project, layerId, expId);
+      const expNow = gengaExposureById(layer, expId);
       // Cel edits keep their ordinary-koma role and target across the conflict choice.
-      const current = function() { return layer && expNow && state.project === project && gengaLayerById(layerId) === layer && gengaFindExposure(project, layerId, expId) === expNow && !gengaLayerEffLocked(layer)
+      const current = function() { return layer && expNow && state.project === project && gengaLayerById(layerId) === layer && gengaExposureById(layer, expId) === expNow && !gengaLayerEffLocked(layer)
         && !gengaSerifuSectionOf(layer, expNow); };
       if (!current()) { settled(false); return; }
       const commit = function(choice, adoptedValue) {
@@ -164771,7 +164751,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!layer || gengaLayerEffLocked(layer) || gengaLayerIsFolder(layer) || gengaLayerIsFixedRow(layer) || gengaFrameHasExposure(layer, frame)) return;
       const key = gengaValueKey(value);
       runCommand('原画インスタンス値', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(l) { return String(l.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L || gengaLayerIsFolder(L) || gengaLayerIsFixedRow(L)) return;
         L.exposures = L.exposures || [];
         // the drawing is whatever that value already holds in this layer — a blank value legitimately has none,
@@ -164901,13 +164881,17 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
     }
     function gengaStartEditInstanceValue(numEl) {
-      if (!numEl || numEl.getAttribute('contenteditable') === 'true') return;
+      const stage = numEl && numEl.closest('#gengaStage');
+      if (!stage || !numEl.isConnected || numEl.isContentEditable) return;
+      const tracker = gengaViewRowTracker(stage);
+      if (tracker.numberEditor) tracker.numberEditor.finish(false);
+      if (!numEl.isConnected) return;
       const layerId = numEl.getAttribute('data-genga-layer');
       const expId = numEl.getAttribute('data-genga-exposure');
       const project = state.project;
       const layer = gengaLayerById(layerId);
       if (!layer || gengaLayerEffLocked(layer)) return;
-      const e = gengaFindExposure(project, layerId, expId);
+      const e = gengaExposureById(layer, expId);
       if (!e) return;
       // Section members edit their shared range, including entry by sequential numbering.
       const sec = gengaSerifuSectionOf(layer, e);
@@ -164925,6 +164909,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return;
       }
       const orig = (e.instanceValue != null ? String(e.instanceValue) : '');
+      // The editor borrows the number band; preserve its generated rank and 動画 marks as live nodes.
+      const children = Array.from(numEl.childNodes);
+      tracker.flush();
+      tracker.numberEditor = {element: numEl, finish: finish};
       numEl.setAttribute('contenteditable', 'true');
       numEl.classList.add('editing');
       numEl.textContent = orig;
@@ -164937,23 +164925,24 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         s.addRange(r);
       } catch (err) {}
       // After committing, step to the adjacent cel's number editor so sheet numbers can be entered in sequence.
-      const finish = function(cancel, step) {
+      function finish(cancel, step) {
         numEl.removeEventListener('blur', onBlur);
         numEl.removeEventListener('keydown', onKey);
+        const v = cancel ? orig : numEl.textContent.trim();
         numEl.removeAttribute('contenteditable');
         numEl.classList.remove('editing');
-        if (state.project !== project || gengaLayerById(layerId) !== layer || gengaFindExposure(project, layerId, expId) !== e) { numEl.textContent = orig; return; }
-        const v = cancel ? orig : numEl.textContent.trim();
+        numEl.replaceChildren(...children);
+        tracker.flush();
+        tracker.numberEditor = null;
+        if (state.project !== project || gengaLayerById(layerId) !== layer || gengaExposureById(layer, expId) !== e) return;
         const next = step ? gengaNeighbourExposure(layerId, expId, step) : null;
         const goNext = function() { if (next) gengaEditExposureValueAt(layerId, next); };
         if (v === orig) {
-          numEl.textContent = orig;
           goNext();
           return;
         }
-        // Shared with the cell picker. On a declined conflict prompt the strip goes back to what it showed.
-        gengaCommitInstanceValue(layerId, expId, v, numEl, function(ok) { if (!ok) numEl.textContent = orig; else goNext(); });
-      };
+        gengaCommitInstanceValue(layerId, expId, v, numEl, function(ok) { if (ok) goNext(); });
+      }
       const onBlur = function() { finish(false); };
       const onKey = function(ev) {
         if (isImeEnter(ev)) return;
@@ -165375,12 +165364,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaToggleDougaMark(layerId, expId, rel, on) {
       const layer = gengaLayerById(layerId);
-      const exp = layer && (layer.exposures || []).find(function(x) { return String(x.id) === String(expId); });
+      const exp = layer && gengaExposureById(layer, expId);
       if (on && !gengaDougaMarkCanPlace(layer, exp, rel)) return;
       runCommand(on ? '動画マーク' : '動画マーク解除', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
-        const e = (L.exposures || []).find(function(x) { return String(x.id) === String(expId); });
+        const e = gengaExposureById(L, expId);
         if (!e) return;
         if (on && !gengaDougaMarkCanPlace(L, e, rel)) return;
         const set = new Set(Array.isArray(e.dougaOffsets) ? e.dougaOffsets : []);
@@ -165396,7 +165385,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const want = new Set(expIds.map(String));
       const off = (layer.exposures || []).filter(function(e) { return want.has(String(e.id)); }).every(function(e) { return e.mark === color; });
       runCommand(off ? 'イメージマーク解除' : 'イメージマーク', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
         (L.exposures || []).forEach(function(e) { if (!want.has(String(e.id))) return; if (off) delete e.mark; else e.mark = color; });
       });
@@ -165415,9 +165404,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const layer = gengaLayerById(layerId);
       if (!layer || gengaLayerEffLocked(layer)) return;
       runCommand('中セリフ', function(proj) {
-        const L = ((proj.gengaTimeline && proj.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
+        const L = gengaLayerInTimeline(proj.gengaTimeline, layerId);
         if (!L) return;
-        const e = (L.exposures || []).find(function(x) { return String(x.id) === String(expId); });
+        const e = gengaExposureById(L, expId);
         if (!e || (e.dougaOffsets || []).indexOf(rel) < 0) return;
         const m = Object.assign({}, e.nakaSerifu);
         if (shape == null) delete m[rel]; else m[rel] = String(shape);
@@ -165450,7 +165439,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const expId = nmEl.getAttribute('data-genga-exposure');
       const layer = gengaLayerById(layerId);
       if (!layer || gengaLayerEffLocked(layer)) return;
-      const exp = (layer.exposures || []).find(function(x) { return String(x.id) === String(expId); });
+      const exp = gengaExposureById(layer, expId);
       if (!exp) return;
       const project = state.project, startFrame = exp.startFrame;
       const resolvedDotEl = dotEl || ev.target;
@@ -165600,7 +165589,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       runCommand('原画インスタンス削除', function(proj) {
         const gt = proj.gengaTimeline;
         if (!gt) return;
-        const layer = (gt.layers || []).find(function(l) { return String(l.id) === String(layerId); });
+        const layer = gengaLayerInTimeline(gt, layerId);
         if (!layer || !Array.isArray(layer.exposures)) return;
         const exposure = gengaFindExposure(proj, layerId, expId);
         const cells = state.gengaCellSel;
@@ -165866,6 +165855,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const invalidate = function(records) {
         records.forEach(function(record) {
           const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+          // An inline editor restores the borrowed band's nodes before settling a command.
+          if (tracker.numberEditor && target && tracker.numberEditor.element.contains(target)) return;
           const row = target && target.closest('.genga-lane');
           if (row) gengaViewRowCache.delete(row);
           else {
@@ -165896,20 +165887,39 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return {
         markup: new Map(),
         reused: [],
+        cardPatches: new Map(),
         tracker: tracker,
         heads: new Map(heads ? Array.from(heads.children, function(el) { return [el.dataset.gengaLayer, el]; }) : []),
         current: new Map(container ? Array.from(container.children).map(function(el) { return [el.dataset.gengaLayer, el]; }) : [])
       };
     }
-    function gengaViewRowMarkup(rows, id, markup) {
+    function gengaViewRowMarkup(rows, id, markup, partial) {
       const node = rows.current.get(id), cached = node && gengaViewRowCache.get(node);
-      if (!cached || cached.body !== markup.body || cached.cells !== markup.cells) return markup.body + markup.cells + markup.fx + '</div>';
+      if (!cached || cached.body !== markup.body) return markup.body + markup.cells + markup.fx + '</div>';
+      if (cached.cells !== markup.cells) {
+        const changes = partial && !pointerDragSessions.size && cached.fx === markup.fx
+          ? gengaChangedExposureCards(cached.content, markup.content) : null;
+        if (!changes) return markup.body + markup.cells + markup.fx + '</div>';
+        rows.cardPatches.set(node, changes);
+      }
       const index = rows.reused.push(node) - 1;
       // Cross-layer FX letters can change on reorder without changing any cel. Parse/bind only
       // the replacement FX strips; retain the expensive exposure subtree and its listeners.
       const fxChanged = cached.fx !== markup.fx;
       return '<div class="genga-lane" data-genga-layer="' + escapeAttr(id) + '" data-genga-reuse="' + index + '"' +
         (fxChanged ? ' data-genga-reuse-fx="1">' + markup.fx : '>') + '</div>';
+    }
+    // Match generated segments. Any change to gap notation, row shape, or cell order takes the normal row patch.
+    function gengaChangedExposureCards(before, after) {
+      if (!before || !after || before.beforeCards !== after.beforeCards ||
+          before.afterCards !== after.afterCards || before.cards.length !== after.cards.length) return null;
+      const changes = [];
+      for (let i = 0; i < after.cards.length; i++) {
+        const old = before.cards[i], next = after.cards[i];
+        if (old.id !== next.id) return null;
+        if (old.html !== next.html) changes.push({index: i, html: next.html});
+      }
+      return changes;
     }
     function gengaRememberViewRows(stageEl, rows) {
       rows.tracker.flush(); // invalidate other rows touched by binding before recording the settled rows
@@ -165926,7 +165936,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
     }
 
-    // These three partial-render regions replace whole node pairs. Preflight, replacement, and binding roots share this table and its order.
+    // These partial-render regions replace whole node pairs. The patch passes inserted roots to binding.
     // Replace dialog headers and lanes together to keep heights aligned. Callers request it only when row shape is unchanged.
     // Layer rows keep nodes and patch keys. Audio keeps the scroll container and replaces its children.
     // When adding a region, update partial HTML generation in gengaBuildViewHtml too.
@@ -166014,6 +166024,20 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const resolveRow = function(node) {
         const retained = reused.get(node);
         if (!retained) return bindNewElement(node);
+        const changes = rows.cardPatches.get(retained);
+        if (changes && changes.length) {
+          const cards = Array.from(retained.children).filter(function(child) {
+            return child.hasAttribute('data-genga-exposure');
+          });
+          const pairs = changes.map(function(card) {
+            const current = cards[card.index];
+            if (!current) failInvariant('retained exposure');
+            const next = document.createRange().createContextualFragment(card.html).firstElementChild;
+            return { current: current, next: next };
+          });
+          gengaWindowRowsChanged(retained);
+          pairs.forEach(replacePair);
+        }
         if (node.dataset.gengaReuseFx === '1') {
           Array.from(retained.children).forEach(function(child) {
             if (child.classList.contains('genga-fx-strip')) child.remove();
@@ -166089,6 +166113,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           seenRows.add(pair.currentHead);
           seenRows.add(pair.currentLane);
         });
+        rows.bindingRoots = [];
         rowPairs.forEach(function(pair) {
           updateHead(pair.currentHead, pair.nextHead);
           const lane = resolveRow(pair.nextLane);
@@ -166102,6 +166127,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           audioNodes.currentAHeads.replaceChildren(...audioNodes.nextAHeads.childNodes);
           audioNodes.currentAScroll.style.cssText = audioNodes.nextAScroll.style.cssText;
           audioNodes.currentAudioLanes.replaceChildren(...audioNodes.nextAudioLanes.childNodes);
+          rows.bindingRoots.push(audioNodes.currentAHeads, audioNodes.currentAScroll);
         }
         swapPairs.forEach(replacePair);
         return 'patched';
@@ -166236,6 +166262,30 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
     }
 
+    function gengaLayerStructurePlan(previewByCaller) {
+      return { scope: 'all', reuseCelContent: true, previewByCaller: previewByCaller };
+    }
+    // Rerender all rows when other row labels or folder visibility change. Otherwise patch affected rows.
+    function gengaLayerEditRenderPlan(layerIds, dependenciesChanged) {
+      return dependenciesChanged ? { scope: 'all', reason: 'layer-dependencies' } : { scope: 'partial', layerIds: layerIds, audio: false };
+    }
+    // cells: [{ layerId, frame }] — the koma whose art changed. The commit and its history know it (gengaDrawingContext).
+    function gengaDrawingRenderPlan(cells, layerIds) {
+      return { scope: 'drawing', cells: cells, layerIds: layerIds.map(String) };
+    }
+    // A caller's plan wins over the computed one, except that a drawing-only plan cannot hide a cross-row change.
+    function gengaPresetRenderPlan(preset, computed) {
+      return preset && !(preset.scope === 'drawing' && computed && computed.scope === 'all') ? preset : computed;
+    }
+    function gengaCameraRenderPlan(gt, structural) {
+      if (structural) return gengaLayerStructurePlan(false);
+      const instr = gengaCameraInstrLayer(gt);
+      return { scope: 'partial', layerIds: instr ? [String(instr.id)] : [], camera: true };
+    }
+    function gengaDialogueRenderPlan(gt, beforeShape) {
+      return beforeShape === gengaDialogueRowsShape(gt) ? { scope: 'partial', layerIds: [], audio: false, dialogue: true } : { scope: 'all', reason: 'dialogue-rows' };
+    }
+
     // Ignore `totalFrames` here. `gengaRenderPlanForProjects` handles what to redraw when the content extent changes.
     function gengaTimelineGlobalRenderSignature(gt) {
       if (!gt) return '';
@@ -166318,10 +166368,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Playback can trigger full rendering at the strip boundary via setGengaFrame.
       // Commit before reading the project into local variables below.
       gengaDialogueReopenEdit();   // Preserve dialog text as a draft and reopen it after render.
+      const numberEditor = gengaViewRowTrackers.get(stageEl)?.numberEditor;
       const editingEl = stageEl.querySelector('[contenteditable="true"]');
-      if (editingEl && typeof editingEl.blur === 'function') {
+      if (numberEditor || editingEl) {
         gengaCommitDeferConflict = true;
-        try { editingEl.blur(); } finally { gengaCommitDeferConflict = false; }
+        try {
+          if (numberEditor) numberEditor.finish(false);
+          else editingEl.blur();
+        } finally { gengaCommitDeferConflict = false; }
       }
       const project = state.project;
       const gt = project && project.gengaTimeline;
@@ -166406,14 +166460,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // row is clutter and wasted work on each renderGengaView rebuild. The interactive shapes (koma buttons,
       // drag handles, postbehavior cycle buttons) stay — only the text inside them is blanked below.
       const isCelSubLayer = !!(l.cellGroupId && l.tagOff);
-      let blocks = '';
+      const cards = [];
+      let beforeCards = '', afterCards = '';
       // Number unassigned cels by left-to-right timeline position. This table assigns every sorted entry a one-based number,
       // so readers need no fallback.
       const numberTitle = escapeAttr(t('project.genga.exposure.numTitle'));
       const headTitle = escapeAttr(t('project.genga.exposure.headHandleTitle'));
       const tailTitle = escapeAttr(t('project.genga.exposure.exposureHandleTitle'));
       const layerAttr = escapeHtml(l.id);
-      const expoRank = gengaPositionalRanks(l); // Same numbering as positional commit.
+      const sortedExposures = gengaSortedExposures(l);
+      const expoRank = gengaPositionalRanks(l, sortedExposures); // Same numbering as positional commit.
       const serifuSpans = new Map(); // One read of this row; discarded before any edit can run.
       // Share sheetCell and sheetDash for frame cells and continuation lines in pre/post behavior, 中間リピート, and inline セリフ.
       const sheetCell = function(txt, cls) { return '<span class="pb-cell' + (cls || '') + '" style="width:' + gengaTimelinePx(1) + '">' + txt + '</span>'; };
@@ -166436,7 +166492,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         // Revision layers compute dimming independently per cel, so only drawn instances appear active.
         const revExpEmpty = (l.revisionKey || l.revisionCustom) && !eDr ? ' genga-revision-exposure-empty' : '';
-        blocks += '<div class="genga-exposure' + revExpEmpty + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '"' + gengaTimelineWindowAttrs(e.startFrame - 1, e.startFrame - 1 + e.holdFrames) + ' style="left:' + gengaTimelinePx(e.startFrame - 1, 1) + ';width:' + gengaTimelinePx(e.holdFrames, -1) + '">' +
+        const html = '<div class="genga-exposure' + revExpEmpty + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '"' + gengaTimelineWindowAttrs(e.startFrame - 1, e.startFrame - 1 + e.holdFrames) + ' style="left:' + gengaTimelinePx(e.startFrame - 1, 1) + ';width:' + gengaTimelinePx(e.holdFrames, -1) + '">' +
           '<span class="genga-exposure-thumb">' + thumb + '</span>' +
           (e.mark ? '<span class="genga-exposure-mark" data-mark="' + escapeAttr(e.mark) + '"></span>' : '') +
           '<span class="genga-exposure-num' + (valued ? ' valued' : '') + '" data-genga-layer="' + layerAttr + '" data-genga-exposure="' + escapeHtml(e.id) + '" title="' + numberTitle + '">' +
@@ -166447,6 +166503,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           '</span>' +
           '<span class="genga-exposure-h genga-exposure-h-tl" title="' + headTitle + '"></span>' +
           '<span class="genga-exposure-h genga-exposure-h-br" title="' + tailTitle + '"></span></div>';
+        cards.push({id: String(e.id), html: html});
       });
       // pre/post-behavior toggles flanking the koma-content span: none / hold / repeat, drawn as Japanese
       // timesheet notation on the instance-number strip — none = ×, hold = a continuation line ───, repeat = the
@@ -166455,20 +166512,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // A single number would create a third representation distinct from both sheet and playback.
       // PRE and POST intentionally differ.
       // Both pre/post notation and middle gaps read the same immutable coverage for this row.
-      const sortedExposures = gengaSortedExposures(l);
-      const exposureSpan = sortedExposures.length ? gengaExposureSpanMap(sortedExposures) : null;
-      // Uncovered runs inside the existence region. Empty-cell cards and the mid-gap notation read the
-      // same runs instead of rediscovering them with two identical frame scans.
-      const gapRuns = [];
-      if (exposureSpan) {
-        for (let f = exposureSpan.first; f <= exposureSpan.last; f++) {
-          if (exposureSpan.covered[f]) continue;
-          let runEnd = f;
-          while (runEnd + 1 <= exposureSpan.last && !exposureSpan.covered[runEnd + 1]) runEnd++;
-          gapRuns.push({ start: f, end: runEnd });
-          f = runEnd;
-        }
-      }
+      const exposureSpan = sortedExposures.length ? gengaExposureStrip(sortedExposures) : null;
+      const gapRuns = exposureSpan ? exposureSpan.gaps : [];
       if (sortedExposures.length) {
         const pbFirst = sortedExposures[0];
         const pbSpan = exposureSpan;
@@ -166506,22 +166551,22 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             phHtml += '</div>';
           }
         });
-        blocks = '<div class="genga-content-box" style="left:' + gengaTimelinePx(firstStart - 1) + ';width:' + gengaTimelinePx(lastEnd - firstStart + 1) + '">' +
+        beforeCards = '<div class="genga-content-box" style="left:' + gengaTimelinePx(firstStart - 1) + ';width:' + gengaTimelinePx(lastEnd - firstStart + 1) + '">' +
           '<span class="genga-strip-h genga-strip-h-head" title="' + escapeAttr(t('project.genga.strip.headHandleTitle')) + '"></span>' +
-          '<span class="genga-strip-h genga-strip-h-tail" title="' + escapeAttr(t('project.genga.strip.tailHandleTitle')) + '"></span></div>' + phHtml + blocks;
+          '<span class="genga-strip-h genga-strip-h-tail" title="' + escapeAttr(t('project.genga.strip.tailHandleTitle')) + '"></span></div>' + phHtml;
         // POST notation: five cells after the last exposure; repeat replays the preceding contiguous cycle.
         //   none = ×———— (× + 4-cell line) · hold = ————— (5-cell line) · repeat = n + リピート(4 cells)
         const pb = l.postBehavior || 'none';
         const postInner = isCelSubLayer ? '' : (pb === 'hold' ? sheetDash(5)
           : (pb === 'repeat' ? (sheetCell(escapeHtml(gengaExposureNumberText(pbFirst, expoRank))) + pbRep()) : (sheetCell('×') + sheetDash(4))));
-        blocks += '<button class="genga-postbehavior pb-' + pb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="post" style="left:' + gengaTimelinePx(lastEnd) + ';width:' + gengaTimelinePx(5) + '" title="' + escapeAttr(t('project.genga.behavior.postPrefix') + bhTitle(pb)) + '">' + postInner + '</button>';
+        afterCards += '<button class="genga-postbehavior pb-' + pb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="post" style="left:' + gengaTimelinePx(lastEnd) + ';width:' + gengaTimelinePx(5) + '" title="' + escapeAttr(t('project.genga.behavior.postPrefix') + bhTitle(pb)) + '">' + postInner + '</button>';
         // PRE notation sits before the first exposure; repeat wraps through the first contiguous cycle.
         //   none = × (1 cell) · hold = ─ line (1 cell, matches the post line) · repeat = リピート (4 cells)
         if (firstStart >= 2) {
           const preb = l.preBehavior || 'none';
           const preInner = isCelSubLayer ? '' : (preb === 'repeat' ? pbRep() : (preb === 'hold' ? sheetDash(1) : sheetCell('×')));
           const preCells = preb === 'repeat' ? 4 : 1;
-          blocks += '<button class="genga-postbehavior pb-' + preb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="pre" style="left:' + gengaTimelinePx(firstStart - 1 - preCells) + ';width:' + gengaTimelinePx(preCells) + '" title="' + escapeAttr(t('project.genga.behavior.prePrefix') + bhTitle(preb)) + '">' + preInner + '</button>';
+          afterCards += '<button class="genga-postbehavior pb-' + preb + '" type="button" data-genga-layer="' + escapeHtml(l.id) + '" data-genga-behavior="pre" style="left:' + gengaTimelinePx(firstStart - 1 - preCells) + ';width:' + gengaTimelinePx(preCells) + '" title="' + escapeAttr(t('project.genga.behavior.prePrefix') + bhTitle(preb)) + '">' + preInner + '</button>';
         }
       }
       // セリフ（口パク）区間: one grouped notation per section, over the member komas (whose own value
@@ -166600,7 +166645,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           ' title="' + escapeAttr(t('project.genga.serifu.sectionPrefix', gengaSerifuLabel(sec)) + (sec.cover ? t('project.genga.serifu.coverSuffix') : '') +
           ((sec.placement && sec.placement.length) ? t('project.genga.serifu.manualPlacementSuffix') : t('project.genga.serifu.rollSuffix')) + t('project.genga.serifu.editHint')) + '">' + inner + '</div>';
       });
-      return { html: blocks + midHtml + serifuHtml, context: stable ? context : null, thumbs: thumbs };
+      afterCards += midHtml + serifuHtml;
+      return {
+        cards: cards, beforeCards: beforeCards, afterCards: afterCards,
+        html: beforeCards + cards.map(function(card) { return card.html; }).join('') + afterCards,
+        context: stable ? context : null, thumbs: thumbs
+      };
     }
 
     function gengaReusableCelContent(cached, context) {
@@ -166813,7 +166863,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const controls = reusable && cached.bottom === bottom ? '<div data-genga-keep-bottom="' + escapeAttr(id) + '"></div>' : bottom;
           rowsHead += head.replace(bottomSlot, function() { return controls; });
         } else rowsHead += head;
-        rowsLane += rows ? gengaViewRowMarkup(rows, id, markup) : body + markup.cells + markup.fx + '</div>';
+        rowsLane += rows ? gengaViewRowMarkup(rows, id, markup, partialRender) : body + markup.cells + markup.fx + '</div>';
       };
       // Keep each A–Z tab inside its row. A separate overlay updated from scroll events can lag
       // behind inertial scrolling on iOS. A row child scrolls with its header.
@@ -167138,21 +167188,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Mark after every binding pass: the same fresh node can receive several distinct listeners.
     // Binding state follows node identity, without thousands of DOM attribute writes.
     const gengaBoundViewNodes = new WeakSet();
-    function gengaBindView(stageEl, renderPlan, partialRender, changedRoots) {
+    function gengaBindView(stageEl, renderPlan, partialRender, bindingRoots) {
       const newlyBoundNodes = new Set();
-      // Keyed patches only create controls inside their requested heads/lanes. Retained rows already
-      // own their listeners; scanning their entire exposure trees for each selector is unnecessary.
-      const bindingRoots = changedRoots || (partialRender ? [] : null);
-      if (partialRender) {
-        const ids = new Set((renderPlan.layerIds || []).map(String));
-        if (ids.size) stageEl.querySelectorAll('.genga-layer-head[data-genga-layer], .genga-lane[data-genga-layer]').forEach(function(el) {
-          if (ids.has(el.dataset.gengaLayer)) bindingRoots.push(el);
-        });
-        GENGA_VIEW_SWAP_AREAS.forEach(function(area) {
-          if (renderPlan[area.key]) area.selectors.forEach(function(selector) { bindingRoots.push(stageEl.querySelector(selector)); });
-        });
-        if (renderPlan.audio) bindingRoots.push(stageEl.querySelector('.genga-audio-scroll-heads'), stageEl.querySelector('.genga-audio-scroll'));
-      }
+      // Patch and binding share the actual inserted roots; retained lanes already own their delegated listeners.
       const gengaUnboundNode = function(el) {
         if (!el || gengaBoundViewNodes.has(el)) return null;
         newlyBoundNodes.add(el);
@@ -168243,9 +168281,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Those legitimately skip the timesheet because its content did not change.
     //
     // Choosing gengaRenderPlan.scope:
-    // 'all'     — the camera lane, or any cross-layer label sequence, may have changed. The camera lane and the
-    // a/b/c.. FX label sequence are only rebuilt on a non-partial render.
-    // 'partial' — keyed layer/audio/dialogue rows or the topbar changed without changing geometry.
+    // 'all'     — geometry or cross-layer dependencies such as FX letter sequences require the full patch.
+    // 'partial' — named layer, camera, audio, or dialogue rows or the topbar changed with the same geometry.
     // 'none'    — nothing visible changed; the stage render is skipped (the timesheet still refreshes).
     // 'drawing' — only the art of the given koma cells changed (a stroke commit and its undo/redo): those cells,
     //             the layer heads' thumbnails and the preview. gengaDrawingRenderPlan makes it; a computed 'all'
