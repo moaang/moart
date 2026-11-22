@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3550</title>
+  <title>MoArt ver3551</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -125951,7 +125951,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Defer the background pump and thumbnail timers while a stroke is active.
     // Synchronous save and project-swap flushes bypass this gate.
     // Use strokeInProgress for the background pump so both engines are covered.
-    // gengaFrameStackOnArtReady instead checks the genga session so pending curves also defer cache refresh.
     // Checking only genga would miss storyboard drawing. Counting a phase-one curve with no pointer
     // as an active stroke would delay persistence indefinitely.
     const GENGA_BG_STROKE_DEFER_MS = 250;
@@ -151143,8 +151142,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // Paper-resolution composite. The selected/session layer stays live between cached below/above stacks.
-    // Exposure signatures reuse unchanged holds across frames; commands and content arrival invalidate them.
-    const gengaPreviewRender = { composite: null, stack: null, clip: null, camera: null, viewState: null, presentedView: null, scene: null, stageFill: null }; // reused output canvas for the per-frame preview composite
+    // Exposure signatures reuse unchanged holds across frames; commands invalidate stacks after artwork edits.
+    const gengaPreviewRender = { composite: null, stack: null, clip: null, camera: null, viewState: null, scene: null, stageFill: null }; // reused output canvas for the per-frame preview composite
     // Reuse frame stacks above and below the active layer to avoid rebuilding on stroke start
     // and compositing all layers again on commit. The session or selected layer divides a single cache into two stacks.
     // A drawing commit changes only that center layer, so both stacks remain valid. Invalidate at command boundaries
@@ -151223,21 +151222,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaFrameStackStrokeKeepOk(layerIds) {
       return Boolean(gengaPreviewRender.stack && !gengaPreviewRender.stack.session && layerIds && layerIds.length
         && layerIds.every(function(id) { return String(id) === gengaPreviewRender.stack.layerId; }));
-    }
-    // If building a stack encounters an unresolved tile or image decode, onReady invalidates the partial cache so it can rebuild.
-    // Notify on success and failure. Retain failed sources in error state so rerenders do not repeat the I/O.
-    // If a drawing session is active, including a pending curve, defer refreshing a complete cache until it ends and recheck every 250 ms.
-    // The first stroke after reload or scrub can coincide with decodes. Rebuilding the full stack on every arrival
-    // would interrupt the stroke. Update incomplete caches on arrival so new strokes can be displayed.
-    // Coalesce arrivals into one timer and one invalidation and redraw at session end.
-    let gengaFrameStackArtDefer = 0;
-    function gengaFrameStackOnArtReady() {
-      const partial = function(store) { return store && ((store.belowCache && store.belowCache._complete === false) || (store.aboveCache && store.aboveCache._complete === false)); };
-      if (gengaDrawSession && !partial(gengaPreviewRender.stack)) {
-        if (!gengaFrameStackArtDefer) gengaFrameStackArtDefer = setTimeout(function() { gengaFrameStackArtDefer = 0; gengaFrameStackOnArtReady(); }, GENGA_BG_STROKE_DEFER_MS);
-        return;
-      }
-      gengaFrameStackInvalidate(); scheduleGengaPreviewRedraw();
     }
     // Skip stack caching when transient state changes the composite.
     // This covers playback (repeat and セリフ), solo (omitted layers),
@@ -151446,6 +151430,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       cv._pad = pad;
       cv._complete = !gengaHydrateInFlight;
+      cv._pending = gengaHydrateInFlight; // A settled missing asset is incomplete but cannot hold the preview.
       return cv;
     }
 
@@ -151515,7 +151500,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const layers = (gt.layers || []).filter(function(l) { return !(reuse && gengaLayerIsPaper(l)) && gengaLayerInPictures(l); });
       const sess = (gengaDrawSession && frame === gengaDrawSession.frame) ? gengaDrawSession : null;
       let missingArt = 0;
-      let stackBuilding = false; // gengaPreviewRender.stack owns both stack caches.
       // One synchronous composite owns these evaluations. Only the small eligibility scene persists.
       // Hidden center FX still affects stackability; hidden parapara content is evaluated when drawn.
       const layerStates = new Array(layers.length);
@@ -151561,10 +151545,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             let k = -1;
             for (let di = 0; di < e.dougaOffsets.length; di++) { if (e.dougaOffsets[di] <= rel) k = di; }
             if (k >= 0) {
-              const sil = gengaDougaSilhouetteFor(l, e, k, pw, ph, drawGengaPreview);
+              const sil = gengaDougaSilhouetteFor(l, e, k, pw, ph, scheduleGengaPreviewRedraw);
               if (sil === 'pending') {
                 missingArt++;
                 cv._complete = false;
+                cv._pending = true;
                 return;
               }
               if (sil) {
@@ -151584,25 +151569,30 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const dr = gengaCompositeSampleDrawing(l, rs, layerById, gt, output);
           if (gengaDrawingHasArt(dr)) { // pending-encode art and vector strokes count as drawable art (gengaDrawingHasArt)
             if (state.gengaSilDebug && !output) { // 診断: paint the computed silhouette under this instance's lines
-              const env = gengaDougaEnvDebugFor(l, e, pw, ph, drawGengaPreview);
-              if (env === 'pending') { missingArt++; cv._complete = false; }
+              const env = gengaDougaEnvDebugFor(l, e, pw, ph, scheduleGengaPreviewRedraw);
+              if (env === 'pending') { missingArt++; cv._complete = false; cv._pending = true; }
               if (env && env !== 'pending') {
                 target.globalAlpha = (l.opacity != null ? l.opacity : 1);
                 target.drawImage(env, 0, 0, pw, ph);
                 target.globalAlpha = 1;
               }
             }
-            const onReady = stackBuilding ? gengaFrameStackOnArtReady : scheduleGengaPreviewRedraw, tvp = tvpaintBlendOf(l);
-            let drawn;
-            if (tvp) drawn = tvpaintBlendDraw(target, tvp, l.opacity, function(c) { return gengaDrawDrawingInto(c, dr, pw, ph, onReady); });
+            const pixels = gengaPrepareDrawing(dr, scheduleGengaPreviewRedraw);
+            if (pixels.status !== 'ready') {
+              missingArt++;
+              cv._complete = false;
+              if (pixels.status === 'pending') cv._pending = true;
+              return;
+            }
+            const tvp = tvpaintBlendOf(l);
+            if (tvp) tvpaintBlendDraw(target, tvp, l.opacity, function(c) { return gengaDrawPreparedInto(c, pixels, pw, ph); });
             else {
               target.globalCompositeOperation = l.blend || 'source-over';
               target.globalAlpha = (l.opacity != null ? l.opacity : 1);
-              drawn = gengaDrawDrawingInto(target, dr, pw, ph, onReady);
+              gengaDrawPreparedInto(target, pixels, pw, ph);
               target.globalAlpha = 1;
               target.globalCompositeOperation = 'source-over';
             }
-            if (!drawn) { missingArt++; cv._complete = false; }
             return;
           }
         }
@@ -151803,63 +151793,34 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           }
           store = gengaPreviewRender.stack;
         }
-        // below-stack cache (layers array is top-first → indices after centerIdx are below)
-        if (scene.belowEmpty) {
-          paintReleaseCanvas(store.belowCache);
-          store.belowCache = null;
-        } else if (!store.belowCache || store.belowCache.width !== cw || store.belowCache.height !== ch) {
-          paintReleaseCanvas(store.belowCache);
-          const bc = document.createElement('canvas');
-          bc.width = cw;
-          bc.height = ch;
-          const bctx = bc.getContext('2d');
-          if (pad) bctx.setTransform(1, 0, 0, 1, pad, pad);
-          const missingBefore = missingArt;
-          stackBuilding = true;
-          drawLayerRange(bctx, layers.length - 1, liveBottom + 1);
-          stackBuilding = false;
-          bc._complete = missingArt === missingBefore;
-          store.belowCache = bc;
-        }
-        if (store.belowCache) {
-          if (store.belowCache._complete === false) cv._complete = false;
-          cx2.drawImage(store.belowCache, -pad, -pad);
-        }
-        drawLayerRange(cx2, liveBottom, liveTop);
-        // Cache the upper stack as one image to reuse on every move while a stroke leaves upper layers unchanged.
-        // Fall back to full composition if an upper layer has a blend mode that reads its destination.
-        // Its destination includes the live layer and everything below, which an isolated upper stack would omit.
-        // Also exclude 動画フィル because a pending silhouette decode can resolve and change the pixels.
-        // Pending silhouettes request another render when ready.
-        // Both stack caches include padding to preserve FX beyond the paper.
-        store.aboveFoldable = scene.aboveFoldable;
-        // No visible upper layer is an empty contribution, not a paper-sized transparent cache.
-        if (scene.aboveEmpty) {
-          paintReleaseCanvas(store.aboveCache);
-          store.aboveCache = null;
-        } else if (store.aboveFoldable) {
-          if (!store.aboveCache || store.aboveCache.width !== cw || store.aboveCache.height !== ch) {
-            paintReleaseCanvas(store.aboveCache);
-            const ac = document.createElement('canvas');
-            ac.width = cw;
-            ac.height = ch;
-            const actx = ac.getContext('2d');
-            if (pad) actx.setTransform(1, 0, 0, 1, pad, pad); // Draw in the same coordinate space as cx2.
-            const missingBefore = missingArt;
-            stackBuilding = true;
-            drawLayerRange(actx, liveTop - 1, 0);
-            stackBuilding = false;
-            ac._complete = missingArt === missingBefore;
-            store.aboveCache = ac;
+        // Cache only finished stacks. A decode completion just requests another preview;
+        // there is no partial stack to invalidate or refresh after the stroke.
+        const drawStack = function(key, from, to, used) {
+          let cached = store[key];
+          if (cached && (!used || cached.width !== cw || cached.height !== ch)) {
+            paintReleaseCanvas(cached);
+            cached = store[key] = null;
           }
-          cx2.save();
-          cx2.setTransform(1, 0, 0, 1, 0, 0); // The cache already includes padding.
-          if (store.aboveCache._complete === false) cv._complete = false;
-          cx2.drawImage(store.aboveCache, 0, 0);
-          cx2.restore();
-        } else {
-          drawLayerRange(cx2, liveTop - 1, 0); // layers above (blend vs live content stays correct)
-        }
+          if (!used) return;
+          if (!cached) {
+            cached = document.createElement('canvas');
+            cached.width = cw;
+            cached.height = ch;
+            const ctx = cached.getContext('2d');
+            if (pad) ctx.setTransform(1, 0, 0, 1, pad, pad);
+            const missingBefore = missingArt;
+            drawLayerRange(ctx, from, to);
+            if (missingArt === missingBefore) store[key] = cached;
+          }
+          cx2.drawImage(cached, -pad, -pad);
+          if (!store[key]) paintReleaseCanvas(cached);
+        };
+        drawStack('belowCache', layers.length - 1, liveBottom + 1, !scene.belowEmpty);
+        drawLayerRange(cx2, liveBottom, liveTop);
+        // Destination-dependent blends above the live layer must read the assembled pixels.
+        store.aboveFoldable = scene.aboveFoldable;
+        drawStack('aboveCache', liveTop - 1, 0, scene.aboveFoldable && !scene.aboveEmpty);
+        if (!scene.aboveFoldable) drawLayerRange(cx2, liveTop - 1, 0);
         // Raster pens change only the accumulated inkScan area, with or without buffering.
         // For noncentral content, each upper and lower stack must have a complete cache or be explicitly empty.
         // Keep full composition for shapes, vector erasing, FX, 動画フィル, diagnostics, and floating selections.
@@ -153390,7 +153351,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         // History keeps the whole stroke. Only a published, complete view consumes its pending brush damage.
         const sess = gengaPreviewRender.viewState?.session;
-        if (sess && result.surface._artComplete) sess.previewScan = gengaScanSeed(null);
+        if (sess && result.artComplete) sess.previewScan = gengaScanSeed(null);
       }
       updateSelectionUi(); // This preview owns 原画 selection rendering.
       gengaLipsyncUpdateHud(); // Update mouth bubble DOM only when the mouth changes.
@@ -153505,9 +153466,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       state.gengaPanX = panX;
       state.gengaPanY = panY;
       const ox = Math.round(cenX + panX), oy = Math.round(cenY + panY);
-      const prevScale = gengaPreviewXform ? gengaPreviewXform.scale : 0;
-      gengaPreviewXform = { ox: ox, oy: oy, scale: scale, zoom: zoom, pw: pw, ph: ph, W: W, H: H };
-      if (scale !== prevScale) updateGengaZoomLabel(); // A viewport resize changes fit scale and therefore the effective pixel ratio.
       // pad only as far as the viewport can show around the paper — keeps the composite canvas small even
       // mid-stroke (the pad stays on during drawing so the live line is visible in the margin too)
       const visPad = Math.ceil(Math.max(0, ox, oy, W - (ox + dw), H - (oy + dh)) / Math.max(1e-4, scale));
@@ -153516,7 +153474,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // the preview blit compensates through composite._pad.
       const padRaw = state.gengaPlaying || visPad <= 0 ? 0 : Math.min(gengaPreviewPad(frame), visPad);
       const pad = padRaw > 0 ? Math.ceil(padRaw / 128) * 128 : 0;
-      return { canvas, gt, W, H, pw, ph, frame, onionShow, scale, dw, dh, ox, oy, vrot, vfl, pad };
+      return { canvas, gt, W, H, pw, ph, frame, onionShow, zoom, scale, dw, dh, ox, oy, vrot, vfl, pad };
     }
     function gengaPreparePreviewComposite(view) {
       const { frame, pad } = view;
@@ -153538,11 +153496,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           viewMipMark(snap, null);
           snap._pad = src._pad;
           snap._complete = true;
+          snap._pending = false;
           gengaPreviewRender.camera = { canvas: snap, token: viewTok, frame: frame, pad: pad };
           composite = snap;
         }
       }
-      return { status: composite && composite._complete ? 'ready' : 'pending', canvas: composite };
+      return composite;
     }
     // For a camera or FX instruction row, draw the active session canvas when editing that row. Otherwise use the current exposure drawing.
     function gengaDrawInstrSheetView(ctx, row, frame, pw, ph) {
@@ -154173,25 +154132,25 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
 
       const view = gengaReadPreviewView(boxHint);
       if (!view) return { status: 'empty' };
-      const { canvas, gt, W, H, pw, ph, frame, onionShow, scale, dw, dh, ox, oy, vrot, vfl } = view;
-      const prepared = gengaPreparePreviewComposite(view);
-      const composite = prepared.canvas;
-      const oldSurface = canvas.paintScratch && canvas.paintScratch.preview;
+      const { canvas, gt, W, H, pw, ph, frame, onionShow, zoom, scale, dw, dh, ox, oy, vrot, vfl } = view;
+      const composite = gengaPreparePreviewComposite(view);
       const topPaper = gengaPreviewPaper(gt, frame, 'top'), bottomPaper = gengaPreviewPaper(gt, frame, 'bottom');
-      const paperPending = topPaper?.pixels.status === 'pending' || bottomPaper?.pixels.status === 'pending';
-      const papersReady = (!topPaper || topPaper.pixels.status === 'ready') && (!bottomPaper || bottomPaper.pixels.status === 'ready');
-      const complete = prepared.status === 'ready' && papersReady;
-      const viewKey = [state.gengaPlaying, frame, W, H, pw, ph, ox, oy, scale, vrot, vfl].join('|');
-      // Keep atomic artwork presentation while stationary, but never make the first
-      // paper, frame navigation or view gestures wait for unavailable drawing pixels.
-      if ((prepared.status !== 'ready' || paperPending) && oldSurface && oldSurface._artComplete && gengaPreviewRender.presentedView === viewKey) {
-        gengaPreviewRender.viewState = null; // Include all edits accumulated while the complete view was held.
+      // A decode finishing requests the current view again. Only a settled view may
+      // replace the front buffer, including during seeks, playback, and view gestures.
+      // An unavailable asset has no outstanding decode and follows the normal missing-art rendering.
+      if (composite?._pending || topPaper?.pixels.status === 'pending' || bottomPaper?.pixels.status === 'pending') {
+        gengaPreviewRender.viewState = null;
         return { status: 'pending' };
       }
+      const prevScale = gengaPreviewXform?.scale;
+      gengaPreviewXform = { ox, oy, scale, zoom, pw, ph, W, H };
+      if (scale !== prevScale) updateGengaZoomLabel();
+      const oldSurface = canvas.paintScratch && canvas.paintScratch.preview;
+      const complete = Boolean(composite?._complete)
+        && (!topPaper || topPaper.pixels.status === 'ready') && (!bottomPaper || bottomPaper.pixels.status === 'ready');
       const region = complete ? gengaPreviewStrokeRegion(oldSurface, frame, W, H, ox, oy, scale, vrot, vfl) : null;
       if (region && region.unchanged) { gengaPreviewRender.viewState = region.state; return { status: 'unchanged' }; }
       const surface = region && region.rect ? oldSurface : paintScratchCanvas(canvas, 'preview', W, H);
-      surface._complete = false;
       gengaPreviewRender.viewState = null;
       const ctx = surface.getContext('2d');
       if (!ctx) return { status: 'error' };
@@ -154264,9 +154223,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           ctx.strokeStyle = CAMERA_PLAYBACK.edge;
           ctx.lineWidth = CAMERA_PLAYBACK.edgeW;
           ctx.strokeRect(fx, fy, fw, fh);
-          surface._artComplete = false;
-          surface._complete = !!comp && comp._complete;
-          return { status: 'ready', surface: surface, rect: region && region.rect };
+          return { status: 'ready', surface: surface, rect: region && region.rect, artComplete: false };
         }
         // Per-layer onion skin: no global on/off — each layer with its bulb (layer.onion) on ghosts its own
         // previous/next koma. The top-bar window only holds shared settings (opacity + which neighbors 前/後).
@@ -154300,11 +154257,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // If prediction is reintroduced, anchor it to the last painted point (sess.lastX/lastY),
         // limit the prediction distance, and enable it only for pen input.
         gengaDrawPreviewOverlays(ctx, view);
-        surface._complete = true;
         gengaPreviewRender.viewState = region ? region.state : null;
-        surface._artComplete = complete;
-        gengaPreviewRender.presentedView = viewKey;
-        return { status: 'ready', surface: surface, rect: region && region.rect };
+        return { status: 'ready', surface: surface, rect: region && region.rect, artComplete: complete };
       } finally { ctx.restore(); }
     }
     // how far FX pushes any visible layer's content past the paper edge at `frame` → preview canvas padding
@@ -156907,7 +156861,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaDrawStoreFaults.clear();
       paintReleaseCanvas(gengaPreviewRender.composite);
       gengaPreviewRender.composite = null;
-      gengaPreviewRender.presentedView = null;
+      gengaPreviewXform = null;
       gengaPreviewRender.scene = null;
       gengaEndDrawSession();                   // Clear the active stroke for the previous layer.
       paintClearStrokeBufferPool();
