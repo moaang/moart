@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3554</title>
+  <title>MoArt ver3555</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -19936,7 +19936,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   Animation effect preview and controls
     //   Animation effect gizmos and keyframe menus
     //   Shared effect field editing
-    //   Shared effect scrubbing and keyframes
+    //   Shared effect scrubbing
+    //   Shared effect evaluation and keyframes
     //   Camera effect controls
     //   Transform quad controls
     //
@@ -45311,7 +45312,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Flag a shorter replacement source without stretching it or moving the cut.
         clip.sourceShort = videoMediaClipSourceShort(clip, mediaFps);
         // Store position, scale, rotation, opacity, blur, and keys in the same shape as Storyboard layer FX.
-        // This lets `conteFxChannels` and `layerEffectAtFrame` evaluate both.
+        // Both use the same storyboard FX evaluator.
         clip.effect = normalizeStoredLayerEffect(clip.effect);
         clips[index] = clip;
       });
@@ -55504,7 +55505,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // Returns the effect object to write transform props onto: the keyframe at the playhead (created if
-    // needed) when keyframed, else the static effect. Used by the on-preview move gizmo.
+    // needed) when keyframed, else the static effect. Both the field editor and gizmo use this target.
     function ensureLayerEffectWriteTarget(layer) {
       if (!layer) return null;
       if (!layer.effect) layer.effect = normalizeLayerEffect(null);
@@ -55615,7 +55616,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const paperWidth = contePaperGeom(state.project).paper.w;
         const ctWidth = paperEl ? (paperEl.offsetWidth || paperWidth) : paperWidth;
         const moveFactor = paperWidth / Math.max(1, ctWidth);
-        const preDrag = fastClone(layer.effect || {}); // Pre-drag snapshot for cancel=discard — ensureLayerEffectWriteTarget below may itself create the effect object / auto-create the playhead key this drag then edits, so capture before it runs
+        const preDrag = layer.effect === undefined ? undefined : fastClone(layer.effect); // Pre-drag snapshot for cancel=discard — ensureLayerEffectWriteTarget below may itself create the effect object / auto-create the playhead key this drag then edits, so capture before it runs
         let target = null;
         const cur = normalizeLayerEffect(layerEffectAtFrame(layer, layerEffectCurrentLocalFrame()));
         const pivotRect = localRect(box.querySelector('.le-gizmo-center'));
@@ -55652,11 +55653,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (!ue || ue.type !== 'pointercancel') move.flush();
           else move.cancel();
           if (!target) return;
-          if (ue && ue.type === 'pointercancel') { // cancel=discard, not commit — a palm touch / OS gesture steal must not land a half-made transform. Self-overwrite type (as the volume drag): the drag wrote straight into layer.effect (and may have auto-created a key), so restore the pre-drag snapshot; replacing the object also orphans `target`, which makes any still-pending rAF move tick harmless (it writes into a dead object, then repaints from the restored state).
-            layer.effect = fastClone(preDrag);
-            updateLayerEffectWindowControls();
-            forceVideoPreviewRebuild();
-            updateCameraLane();
+          if (ue && ue.type === 'pointercancel') {
+            restoreConteLayerFx(layer, preDrag);
             return;
           }
           commitLayerEffectEdit();
@@ -55726,7 +55724,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // All Conte consumers share this read-time normalization and interpolation. Round only the
       // cut-local query; key frames and duplicate ordering retain the adapter's existing semantics.
       const f = Math.max(0, Math.round(Number(localFrame) || 0));
-      return resolveLayerFx(conteFxChannels(layer), f);
+      return conteFxValues(layer, f);
     }
 
     function layerEffectWindowEl() {
@@ -55802,17 +55800,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const d = leFxFieldDef(prop); const layer = fxEditTargetObject();
         if (!d || !layer) return null;
         const start = leFxCurrentDisplay(d);
-        return { d: d, prop: prop, startValue: start, value: start, preEdit: fastClone(layer.effect || {}) };
+        return { d: d, prop: prop, startValue: start, value: start, preEdit: layer.effect === undefined ? undefined : fastClone(layer.effect) };
       },
       clamp: function(s, v) { return fxClampField(s.d, v); },
       applyLive: function(s) { onLayerEffectInput(s.prop, s.value / s.d.writeDiv); }, // live edit + preview + sync (writes the display span too)
       cancel: function(s) { // Discard the live tweak (auto-created key included), no commit, no numeric entry
         const layer = s.moved ? fxEditTargetObject() : null;
         if (!layer) return;
-        layer.effect = fastClone(s.preEdit);
-        updateLayerEffectWindowControls();
-        forceVideoPreviewRebuild();
-        updateCameraLane();
+        restoreConteLayerFx(layer, s.preEdit);
       },
       commit: function() { commitLayerEffectEdit(); },
       openEditor: function(s) {
@@ -55973,23 +55968,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       else if (prop === 'tx') obj.tx = v;
       else if (prop === 'ty') obj.ty = v;
     }
+    function restoreConteLayerFx(layer, effect) {
+      layer.effect = effect;
+      updateLayerEffectWindowControls();
+      forceVideoPreviewRebuild();
+      updateCameraLane();
+    }
     function onLayerEffectInput(prop, rawValue) {
       const layer = fxEditTargetObject();
       if (!layer) return;
       const v = Number(rawValue);
       if (!Number.isFinite(v)) return;
-      if (!layer.effect) layer.effect = normalizeLayerEffect(null);
-      const kfs = Array.isArray(layer.effect.keyframes) ? layer.effect.keyframes : null;
-      if (kfs && kfs.length) {
-        // keyframed: edit (creating if needed) the keyframe at the current playhead local frame.
-        const lf = layerEffectCurrentLocalFrame();
-        const patch = {};
-        setEffectProp(patch, prop, v); // the setEffectProp clamp stays in this adapter; the kernel assigns the clamped patch
-        const r = fxKfWrite(kfs, lf, patch, function() { return layerEffectAtFrame(layer, lf); }); // auto-key = write verb (ensure∘assign), seed = full-channel resolve
-        if (r.created) updateCameraLane();
-      } else {
-        setEffectProp(layer.effect, prop, v);
-      }
+      setEffectProp(ensureLayerEffectWriteTarget(layer), prop, v);
       updateLayerEffectWindowControls();
       forceVideoPreviewRebuild();
     }
@@ -56072,6 +56062,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function finishLayerEffectWindowInput() {
+      pointerDragSessions.get('conte-fx-gizmo')?.cancel();
       const win = document.getElementById('layerEffectWindow');
       const input = win && win.querySelector('.gfx-edit');
       if (input) input.blur();
@@ -64008,7 +63999,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const e = layerEffectAtFrame(layer, localFrame);
           const drawing = ensureLayerDrawingData(project, layer.drawingRef);
           const dr = layerDrawingBitmapRect(drawing), o = layerDrawingFxOrigin(drawing);
-          const blur = conteFxStatics(layer).blurType === 'bokeh' ? 0 : e.blur;
+          const blur = fxBlurType(layer.effect) === 'bokeh' ? 0 : e.blur;
           item.fx = { e: e, px: dr.x + o.x, py: dr.y + o.y, blur: blur };
           item.alpha *= e.opacity;
           const th = e.rot * Math.PI / 180, cs = Math.cos(th) * e.scale, sn = Math.sin(th) * e.scale;
@@ -64312,18 +64303,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // at a -pad offset (bit-preserving vs every site); scale>1 ⇒ cv is a low-res interactive approximation
     // covering the same padded user rect and the one composite drawImage doubles as the remaining upscale (≤2
     // draws per interactive tick).
-    let fxQualityInteractive = false; // interlock fallback (the fxScrub kernel carries no phase
-    // hook): the genga scrub/gizmo adapters set true while a drag is live and false on every exit — commit,
-    // openEditor, pointercancel (preRelease / the gizmo up-path) and FX-window close. mode-branch-must-exit: a
-    // stranded true = permanently degraded blur, so the reset rides paths that always run.
     let fxMipChainSlot = null;    // single slot { key, levels[] } — content-keyed halving chain (radius-free:
     // the radius only picks the stop depth, so one chain serves every radius of a value drag)
     let fxFinalBlurSlot = null;   // single slot { key, out } — final-look result cache (the key carries
-    // |g / |bk so gaussian and bokeh results cannot collide)
+    // the blur type, exact radius and dimensions)
     let fxInteractiveSlot = null; // single slot { key, out } — quantized-radius interactive result (same-radius
     // ticks and 2px-quantized bokeh steps hit here; only a quantization-step change recomputes)
     let fxMipPrebuildPending = false; // one-shot prebuild request: the scrub-down redraw builds the
-    // chain before the first value tick (set by the genga blur-field begin hook, consumed by fx*Source)
+    // chain before the first value tick (consumed by fxBitmapBlurSource).
     function fxMipChainRequestPrebuild() { fxMipPrebuildPending = true; }
     // levels[i] = the source rasterized at drawW×drawH then halved (i+1) times — the approxGaussianBlurCanvas chain's
     // own bilinear half-step idiom, split out so the downscale 20% of the pipeline survives a radius change.
@@ -64358,63 +64345,55 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Gaussian source for the kernel: final = approxGaussianBlurCanvas verbatim (the calibrated look) behind
     // the single final slot; interactive = mip stop-level + one exact-stop hop, the composite draw does the
     // upscale (slightly blocky approximation, allowed only mid-drag).
-    function fxGaussianSource(src, blurPx, drawW, drawH, cache, quality) {
-      fxMipChainConsumePrebuild(cache, src, drawW, drawH);
-      const finalKey = cache ? (cache.contentKey + '|' + Math.round(blurPx * 10) + '|' + Math.round(drawW) + 'x' + Math.round(drawH) + '|g') : null;
-      if (finalKey && fxFinalBlurSlot && fxFinalBlurSlot.key === finalKey) return fxFinalBlurSlot.out;
-      if (quality === 'interactive' && cache) {
-        const R = Math.max(1, Math.round(blurPx)); // integer quantize — scrub step=1 satisfies this naturally
-        const iKey = cache.contentKey + '|i' + R + '|' + Math.round(drawW) + 'x' + Math.round(drawH) + '|g';
-        if (fxInteractiveSlot && fxInteractiveSlot.key === iKey) return fxInteractiveSlot.out;
-        const D = Math.max(1, R * 1.5);
-        const lvl = Math.max(0, Math.floor(Math.log(D) / Math.LN2)); // stop depth ℓ = floor(log2(1.5R))
-        const mip = fxMipChainFor(cache.contentKey, src, drawW, drawH, lvl);
-        const padStop = 2, cwF = drawW / D, chF = drawH / D;
-        const cv = document.createElement('canvas');
-        cv.width = Math.max(1, Math.ceil(cwF)) + padStop * 2;
-        cv.height = Math.max(1, Math.ceil(chF)) + padStop * 2;
-        const cx = cv.getContext('2d');
-        cx.imageSmoothingEnabled = true;
-        cx.drawImage(mip, padStop, padStop, cwF, chF); // the one hop to the exact stop size (fractional dest keeps the up-mapping exact)
-        const out = { cv: cv, pad: padStop * D, scale: D };
-        fxInteractiveSlot = { key: iKey, out: out };
-        return out;
-      }
-      const g = approxGaussianBlurCanvas(src, blurPx, drawW, drawH);
-      const out = { cv: g.cv, pad: g.pad, scale: 1 };
-      if (finalKey) fxFinalBlurSlot = { key: finalKey, out: out };
-      return out;
+    function fxInteractiveGaussian(src, R, drawW, drawH, contentKey) {
+      const D = Math.max(1, R * 1.5);
+      const lvl = Math.max(0, Math.floor(Math.log(D) / Math.LN2)); // stop depth ℓ = floor(log2(1.5R))
+      const mip = fxMipChainFor(contentKey, src, drawW, drawH, lvl);
+      const padStop = 2, cwF = drawW / D, chF = drawH / D;
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.ceil(cwF)) + padStop * 2;
+      cv.height = Math.max(1, Math.ceil(chF)) + padStop * 2;
+      const cx = cv.getContext('2d');
+      cx.imageSmoothingEnabled = true;
+      cx.drawImage(mip, padStop, padStop, cwF, chF); // the one hop to the exact stop size (fractional dest keeps the up-mapping exact)
+      return { cv: cv, pad: padStop * D, scale: D };
     }
     // 玉ボケ source for the kernel: final = discBokehCanvas n=48 verbatim (the shared disc primitive).
     // interactive = n=12 at 1/8 resolution off mip L3, radius quantized to 2px.
-    function fxBokehSource(src, blurPx, drawW, drawH, cache, quality) {
-      fxMipChainConsumePrebuild(cache, src, drawW, drawH);
-      const R = Math.max(0, blurPx);
-      const finalKey = cache ? (cache.contentKey + '|' + Math.round(blurPx * 10) + '|' + Math.round(drawW) + 'x' + Math.round(drawH) + '|bk') : null;
+    function fxInteractiveBokeh(src, Rq, drawW, drawH, contentKey) {
+      const k = 8, mip = fxMipChainFor(contentKey, src, drawW, drawH, 3);
+      const Rs = Rq / k, padStop = Math.ceil(Rs) + 1, cwF = drawW / k, chF = drawH / k;
+      const cv = document.createElement('canvas');
+      cv.width = Math.max(1, Math.ceil(cwF)) + padStop * 2;
+      cv.height = Math.max(1, Math.ceil(chF)) + padStop * 2;
+      const cx = cv.getContext('2d');
+      cx.imageSmoothingEnabled = true;
+      const offs = discBokehOffsets(Rs, 12); // n=12 ≈ 0.19WH accumulated
+      for (let i = 0; i < offs.length; i += 1) {
+        cx.globalAlpha = 1 / (i + 1); // progressive alpha = true disc convolution (discBokehCanvas contract)
+        cx.drawImage(mip, padStop + offs[i][0], padStop + offs[i][1], cwF, chF);
+      }
+      cx.globalAlpha = 1;
+      return { cv: cv, pad: padStop * k, scale: k };
+    }
+    function fxBitmapBlurSource(src, radius, w, h, type, cache, interactive) {
+      const contentKey = cache && cache.contentKey;
+      if (interactive) fxMipChainConsumePrebuild(cache, src, w, h);
+      const suffix = '|' + w + 'x' + h + '|' + type;
+      const finalKey = cache ? contentKey + '|' + radius + suffix : null;
       if (finalKey && fxFinalBlurSlot && fxFinalBlurSlot.key === finalKey) return fxFinalBlurSlot.out;
-      if (quality === 'interactive' && cache) {
-        const Rq = Math.max(2, Math.round(R / 2) * 2); // 2px quantize — only a step change recomputes
-        const iKey = cache.contentKey + '|i' + Rq + '|' + Math.round(drawW) + 'x' + Math.round(drawH) + '|bk';
-        if (fxInteractiveSlot && fxInteractiveSlot.key === iKey) return fxInteractiveSlot.out;
-        const k = 8, mip = fxMipChainFor(cache.contentKey, src, drawW, drawH, 3); // ℓ=3 = 1/8 resolution
-        const Rs = Rq / k, padStop = Math.ceil(Rs) + 1, cwF = drawW / k, chF = drawH / k;
-        const cv = document.createElement('canvas');
-        cv.width = Math.max(1, Math.ceil(cwF)) + padStop * 2;
-        cv.height = Math.max(1, Math.ceil(chF)) + padStop * 2;
-        const cx = cv.getContext('2d');
-        cx.imageSmoothingEnabled = true;
-        const offs = discBokehOffsets(Rs, 12); // n=12 ≈ 0.19WH accumulated
-        for (let i = 0; i < offs.length; i += 1) {
-          cx.globalAlpha = 1 / (i + 1); // progressive alpha = true disc convolution (discBokehCanvas contract)
-          cx.drawImage(mip, padStop + offs[i][0], padStop + offs[i][1], cwF, chF);
-        }
-        cx.globalAlpha = 1;
-        const out = { cv: cv, pad: padStop * k, scale: k };
-        fxInteractiveSlot = { key: iKey, out: out };
+      const bokeh = type === 'bokeh';
+      if (interactive && cache) {
+        const r = bokeh ? Math.max(2, Math.round(radius / 2) * 2) : Math.max(1, Math.round(radius));
+        const key = contentKey + '|i' + r + suffix;
+        if (fxInteractiveSlot && fxInteractiveSlot.key === key) return fxInteractiveSlot.out;
+        const out = bokeh ? fxInteractiveBokeh(src, r, w, h, contentKey) : fxInteractiveGaussian(src, r, w, h, contentKey);
+        fxInteractiveSlot = { key: key, out: out };
         return out;
       }
-      const cv = discBokehCanvas(src, drawW, drawH, R, 48);
-      const out = { cv: cv, pad: Math.ceil(R), scale: 1 };
+      const out = bokeh
+        ? { cv: discBokehCanvas(src, w, h, radius, 48), pad: Math.ceil(radius), scale: 1 }
+        : Object.assign(approxGaussianBlurCanvas(src, radius, w, h), { scale: 1 });
       if (finalKey) fxFinalBlurSlot = { key: finalKey, out: out };
       return out;
     }
@@ -64434,18 +64413,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         target.globalCompositeOperation = opts.compositeOp || 'source-over';
         target.globalAlpha = Math.max(0, Math.min(1, opts.alpha != null ? opts.alpha : 1));
         let drawSrc = src, pad = 0, up = 1;
-        const q = (opts.quality === 'interactive') ? 'interactive' : 'final';
         if (opts.blurPx > 0) {
-          if (opts.blurType === 'bokeh') {
-            const b = fxBokehSource(src, opts.blurPx, opts.drawRect.w, opts.drawRect.h, opts.cache || null, q);
-            drawSrc = b.cv;
-            pad = b.pad;
-            up = b.scale;
-          } else if (!CANVAS_FILTER_SUPPORTED) {
-            const g = fxGaussianSource(src, opts.blurPx, opts.drawRect.w, opts.drawRect.h, opts.cache || null, q);
-            drawSrc = g.cv;
-            pad = g.pad;
-            up = g.scale;
+          if (opts.blurType === 'bokeh' || !CANVAS_FILTER_SUPPORTED) {
+            const blur = fxBitmapBlurSource(src, opts.blurPx, opts.drawRect.w, opts.drawRect.h,
+              opts.blurType, opts.cache, opts.quality === 'interactive');
+            drawSrc = blur.cv;
+            pad = blur.pad;
+            up = blur.scale;
           } else {
             target.filter = 'blur(' + opts.blurPx + 'px)';
           }
@@ -119447,11 +119421,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     // Export FX poses for fx.transform keys or a static value. Return null for disabled or identity FX.
     // Sample endpoints, keys, each eased frame, and the last frame before a hold ends. Write CSP curves as Linear.
-    // Read resolveLayerFx independently of open windows or drags. Export base layer opacity without opacity keys.
+    // Sample committed transform keys. Export base layer opacity without opacity keys.
     function exportClipFxPlan(plan, layer) {
       if (!layer || layer.fxEnabled === false) return null;
-      const ch = gengaFxChannels(layer),
-        keys = ((layer.fx && layer.fx.transform) || []).slice().sort(function(a, b) { return a.frame - b.frame; });
+      const transform = layer.fx && layer.fx.transform;
+      const defaults = gengaFxStaticFor(layer, 'transform');
+      const keys = (transform || []).slice().sort(function(a, b) { return a.frame - b.frame; });
       const n = plan.frameCount, frames = new Set([1, n]), inside = function(f) { if (f > 1 && f < n) frames.add(f); };
       keys.forEach(function(key, i) {
         inside(key.frame);
@@ -119461,7 +119436,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (key.interp === 'hold') inside(next.frame - 1);
       });
       const poseAt = function(frame) {
-        const r = resolveLayerFx(ch, frame);
+        const r = sampleFxTrack(transform, frame, defaults);
         return {
           tick: (frame - 1) * CLIP_EXPORT_TICKS / plan.fps,
           x: Number(r.x) || 0,
@@ -120601,12 +120576,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // For keyed FX, use the layerEffectAtFrame values in the cache key instead of the frame number.
       // This reuses constant spans before, after, and between keys. Unkeyed cuts use cut, camera, and width.
       let kfTag = '';
+      let keyedFx = null;
       if (slot && slot.cut) {
         const kfEntries = layerDrawingEntriesForCut(project, slot.cut.id).filter(function(en) { return en.layer && en.layer.effect && Array.isArray(en.layer.effect.keyframes) && en.layer.effect.keyframes.length; });
         if (kfEntries.length) {
           const kfLocal = conteLayerEffectLocalFrame(project, slot.cut.id, f);
+          keyedFx = new Map();
           kfTag = '|kf' + kfEntries.map(function(en) {
             const e = layerEffectAtFrame(en.layer, kfLocal);
+            keyedFx.set(en.layer, e);
             return en.layer.id + ':' + [e.opacity, e.tx, e.ty, e.scale, e.rot, e.blur].join(',');
           }).join(';');
         }
@@ -120677,7 +120655,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             }
             const rect = layerDrawingBitmapRect(drawing);
             if (img && layerEffectIsAnimatedOrActive(layer)) {
-              const e = layerEffectAtFrame(layer, leLocal);
+              const e = keyedFx?.get(layer) || layerEffectAtFrame(layer, leLocal);
               const k = outW / BASE_W; // layer-effect pan/blur are frame px
               const lcx = ((opts.paperArea ? rect.x : contePlaneToFrameX(rect.x, geometry.frame)) + layerDrawingFxOrigin(drawing).x) * sx,
                 lcy = ((opts.paperArea ? rect.y : contePlaneToFrameY(rect.y, geometry.frame)) + layerDrawingFxOrigin(drawing).y) * sx; // compositor canvas 0 = frame origin
@@ -120693,7 +120671,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                   h: rect.h * sx
                 },
                 blurPx: e.blur * k,
-                blurType: conteFxStatics(layer).blurType, // the named source (conteFxStatics), not an inline copy of its ternary
+                blurType: fxBlurType(layer.effect),
                 alpha: conteLayerOpacityValue(layer.opacity) * e.opacity,
                 compositeOp: 'source-over',
                 cache: null,
@@ -120776,7 +120754,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           scale: e.scale,
           drawRect: { x: fit.x, y: fit.y, w: fit.w, h: fit.h },
           blurPx: e.blur * k,
-          blurType: conteFxStatics(clip).blurType,
+          blurType: fxBlurType(clip.effect),
           alpha: e.opacity,
           compositeOp: 'source-over',
           cache: null,
@@ -131532,7 +131510,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       const refArt = (states.find(function(s) { return s.art; }) || {}).art;
       if (!refArt) return null;                               // nothing drawn on this cel → nothing to instruct
-      const fxAt = function(f) { return gengaFxTrackAt(layer.fx.transform, f, GENGA_FX_DEFAULTS.transform); };
+      const fxAt = function(f) { return sampleFxTrack(layer.fx.transform, f, GENGA_FX_DEFAULTS.transform); };
       const firstFrame = states[0].frame, lastFrame = states[states.length - 1].frame;
       let l = 0, t = 0, r = pw, b = ph;                       // same directional-growth rule as the camera image
       const grow = function(pts) {
@@ -132034,7 +132012,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         artBox = art ? gengaAlphaBounds(art) : null;
       }
       if (!artBox) return null;                               // No rendered artwork means no instruction.
-      const fxAt = function(f) { return gengaFxTrackAt(layer.fx.transform, f, GENGA_FX_DEFAULTS.transform); };
+      const fxAt = function(f) { return sampleFxTrack(layer.fx.transform, f, GENGA_FX_DEFAULTS.transform); };
       // Read camera rectangles through gengaCameraWorkAt, as for camera instructions.
       // Without keys it supplies a stationary paper-space frame.
       const cornersAt = function(f) {
@@ -134197,7 +134175,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!(duration >= 1) || !keys.length) return keys;
       const out = keys.filter(function(k) { return k.frame <= duration; });
       if (out.length && out[out.length - 1].frame < duration && keys[keys.length - 1].frame > duration) {
-        out.push(Object.assign({}, out[out.length - 1], gengaFxTrackAt(keys, duration, GENGA_FX_DEFAULTS.transform), { frame: duration }));
+        out.push(Object.assign({}, out[out.length - 1], sampleFxTrack(keys, duration, GENGA_FX_DEFAULTS.transform), { frame: duration }));
       }
       return out;
     }
@@ -142809,7 +142787,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!base || !base.length) return own || null;
       if (!own || !own.length) return base;
       const id = { x: 0, y: 0, scale: 1, rot: 0 };
-      const at = function(keys, f) { return gengaFxTrackAt(keys.slice().sort(function(a, b) { return a.frame - b.frame; }), f, id); };
+      const at = function(keys, f) { return sampleFxTrack(keys.slice().sort(function(a, b) { return a.frame - b.frame; }), f, id); };
       const frames = Array.from(new Set(base.concat(own).map(function(k) { return k.frame; }))).sort(function(a, b) { return a - b; });
       // Keep interpolation only with matching key frames and curves and constant ancestor scale and rotation.
       const keyAt = function(keys, f) { return keys.find(function(k) { return k.frame === f; }); };
@@ -142929,14 +142907,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       delete defaults.frame;
       delete defaults.interp;
       if (sorted[0].frame < from && !inside.some(function(k) { return k.frame === from; })) {
-        inside.unshift(Object.assign({ frame: from }, gengaFxTrackAt(sorted, from, defaults)));
+        inside.unshift(Object.assign({ frame: from }, sampleFxTrack(sorted, from, defaults)));
       }
       if (sorted[sorted.length - 1].frame > to && !inside.some(function(k) { return k.frame === to; })) {
         if (inside.length) {
           inside[inside.length - 1] = Object.assign({}, inside[inside.length - 1]);
           delete inside[inside.length - 1].interp;
         }
-        inside.push(Object.assign({ frame: to }, gengaFxTrackAt(sorted, to, defaults)));
+        inside.push(Object.assign({ frame: to }, sampleFxTrack(sorted, to, defaults)));
       }
       return inside.map(function(k) { return Object.assign({}, k, { frame: k.frame - cd.timelineStartFrame }); });
     }
@@ -149245,7 +149223,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       { key: 'blur', labelKey: 'fx.blur', color: '#2f9d64' }
     ];
     const GENGA_FX_DEFAULTS = { transform: { x: 0, y: 0, scale: 1, rot: 0 }, opacity: { v: 1 }, blur: { v: 0 } };
-    let gengaFxLive = null; // { layerId, track, patch } while a panel gauge drags — preview-only override (project state untouched)
+    let gengaFxLive = null; // {layerId, track, patch} for the current scrub or gizmo gesture.
+    let gengaFxPreviewInteractive = false;
+    function gengaFxPreviewEnd() {
+      const live = gengaFxLive;
+      gengaFxLive = null;
+      gengaFxPreviewInteractive = false;
+      fxMipPrebuildPending = false;
+      return live;
+    }
     function toggleGengaLayerFxEnabled(layerId) { // fx button = master on/off (does not touch the drawing)
       runCommand('FX有効切替', function(p) {
         const L = ((p.gengaTimeline && p.gengaTimeline.layers) || []).find(function(x) { return String(x.id) === String(layerId); });
@@ -149265,16 +149251,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return gengaFxLive.groupIds.indexOf(id) >= 0;
     }
-    function gengaFxTrackAt(arr, frame, defaults) { // linear interpolation between keys; flat hold at both ends
-      // Read channel fields directly from the shared sorted track. The evaluator preserves flat
-      // endpoint holds and shortest-arc rotation; only requested value fields enter the result.
-      const out = {};
-      Object.keys(defaults).forEach(function(k) {
-        out[k] = resolveFxChannel({ kfs: arr, prop: k, def: defaults[k] }, frame);
-      });
-      return out;
-    }
-
     // ── the two directions of a layer's FX, as one inverse pair ────────────────────────────────
     // Forward (drawing coords → where they appear on the paper) and inverse (a point on the paper → the drawing
     // coords under it). Same pivot, same order, opposite signs, so they compose to the identity, which makes
@@ -149302,25 +149278,21 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { x: cx + dx * c - dy * s, y: cy + dx * s + dy * c };
     }
 
-    function gengaFxAt(layer, frame, ignoreEnabled) { // → {x,y,scale,rot,opacity,blur} | null when the layer has no active FX
-      const fx = layer && layer.fx;
-      const isOpen = String(state.gengaFxOpenId || '') === String(layer && layer.id);
-      // master switch off → FX ignored (but still previews while its edit window is open, or when rasterizing)
-      if (layer && layer.fxEnabled === false && !isOpen && !ignoreEnabled) return null;
-      const live = gengaFxLiveAppliesTo(layer) ? gengaFxLive : null;
-      // …or a static value on any track. The identity→null shortcut at the bottom still short-circuits the case
-      // where the statics happen to be identity, so the plain path stays fast.
+    // The preview can audition a disabled layer and overlay its live patch.
+    // Export and rasterize sample the supplied layer's committed FX.
+    function gengaFxAt(layer, frame, ignoreEnabled, committed) {
+      if (!layer) return null;
+      const audition = !committed && String(state.gengaFxOpenId || '') === String(layer.id);
+      if (layer.fxEnabled === false && !audition && !ignoreEnabled) return null;
+      const fx = layer.fx;
+      const live = !committed && gengaFxLiveAppliesTo(layer) ? gengaFxLive : null;
       if (!live && (!fx || (!fx.transform.length && !fx.opacity.length && !fx.blur.length && !gengaFxHasStatic(layer)))) return null;
-      // Adapter facade over the layer-FX kernel — the gates, the gengaFxLive overlay, and the identity→null
-      // shortcut live here; the kernel stays a pure evaluator. Only the 3-track evaluation is delegated
-      // (resolveLayerFx ∘ gengaFxChannels).
-      const out = resolveLayerFx(gengaFxChannels(layer), frame);
+      const out = gengaFxValues(layer, frame);
       if (live) {
         if (live.track === 'transform') Object.assign(out, live.patch);
-        else if (live.track === 'opacity' && live.patch.v != null) out.opacity = live.patch.v;
-        else if (live.track === 'blur' && live.patch.v != null) out.blur = live.patch.v;
+        else if (live.patch.v != null) out[live.track] = live.patch.v;
       }
-      if (out.x === 0 && out.y === 0 && out.scale === 1 && out.rot === 0 && out.opacity === 1 && out.blur === 0) return null; // identity → plain path
+      if (out.x === 0 && out.y === 0 && out.scale === 1 && out.rot === 0 && out.opacity === 1 && out.blur === 0) return null;
       return out;
     }
     // The FX-track editors below only rewrite L.fx on one layer — no new refs, no koma add/remove — so they
@@ -149380,7 +149352,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const arr = gengaLayerFxEnsure(L)[track];
         if (!arr) return;
         if (arr.length) { // animated → the edit is a key at the playhead (auto-key seeded from the curve)
-          fxKfWrite(arr, frame, patch, function() { return gengaFxTrackAt(arr, frame, gengaFxStaticFor(L, track)); });
+          fxKfWrite(arr, frame, patch, function() { return sampleFxTrack(arr, frame, gengaFxStaticFor(L, track)); });
           return;
         }
         if (!L.fx.static) L.fx.static = {};
@@ -149393,7 +149365,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!arr) return;
         // Seed from gengaFxStaticFor, not the raw defaults — the first key on a track must inherit the
         // static the track has been showing, or pressing ◆ would silently snap the effect back to identity.
-        fxKfWrite(arr, frame, patch, function() { return gengaFxTrackAt(arr, frame, gengaFxStaticFor(L, track)); }); // auto-key = write verb — seed from the interpolated value (the kernel re-sets k.frame, keeping the frame-leak defense)
+        fxKfWrite(arr, frame, patch, function() { return sampleFxTrack(arr, frame, gengaFxStaticFor(L, track)); }); // auto-key = write verb — seed from the interpolated value (the kernel re-sets k.frame, keeping the frame-leak defense)
       });
     }
     // Move or delete one key via the batch operation so command names, locking, and mutation stay shared.
@@ -149489,10 +149461,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // `tracks` (optional array of 'transform' | 'opacity' | 'blur') bakes only those channels — the rest
     // render at identity and keep their keys, so 焼き込み can be run one effect at a time. Omitted = all three (only('x') is true for every channel).
     // Result: drawing = baked pixels, null = successfully empty, undefined = not ready / failed.
-    function gengaBakeExposureFx(layer, exposure, fxFrame, tracks) {
+    function gengaBakeExposureFx(gt, layer, exposure, fxFrame, tracks, out) {
       gengaFlushPendingDrawingEncodes(); // The bake reads dr.dataUrl through the image cache
-      const gt = state.project && state.project.gengaTimeline;
-      if (!gt) return undefined;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       const dr = gengaExposureDrawing(layer, exposure);
       if (!dr) return undefined;
@@ -149501,42 +149471,25 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // coordinates; raster readiness/placement is owned by gengaDrawDrawingInto.
       const bakeStrokes = gengaDrawingStrokes(dr);
       const srcRect = gengaFxSourceRect([dr], pw, ph);
-      const src = document.createElement('canvas');
-      src.width = srcRect.w;
-      src.height = srcRect.h;
-      const sctx = src.getContext('2d');
-      if (srcRect.x || srcRect.y) sctx.setTransform(1, 0, 0, 1, -srcRect.x, -srcRect.y);
+      const src = gengaFxScratch(srcRect);
       if (bakeStrokes) {
-        sctx.drawImage(gengaVectorBakedCanvas(bakeStrokes, pw, ph), 0, 0);   // Stroke coordinates are in paper space.
-      } else {
-        // Use the shared readiness and placement path. Failure is not a successfully empty bake.
-        if (!gengaDrawDrawingInto(sctx, dr, pw, ph, null)) {
-          src.width = src.height = 0;
-          return undefined;
-        }
+        src.ctx.drawImage(gengaVectorBakedCanvas(bakeStrokes, pw, ph), 0, 0);
+      } else if (!gengaDrawDrawingInto(src.ctx, dr, pw, ph, null)) {
+        return undefined;
       }
-      const out = document.createElement('canvas');
-      out.width = pw;
-      out.height = ph;
+      if (out.width !== pw) out.width = pw;
+      if (out.height !== ph) out.height = ph;
       const octx = out.getContext('2d');
-      const fx = gengaFxAt(layer, fxFrame, true); // ignore the master switch — rasterize always bakes the FX
-      const only = function(tk) { return !Array.isArray(tracks) || tracks.indexOf(tk) >= 0; };
+      octx.clearRect(0, 0, pw, ph);
+      const fx = gengaFxAt(layer, fxFrame, true, true);
       if (fx) {
-        applyLayerFx(octx, src, { // layer-2 kernel (the same T(t)∘T(pv)∘R∘S∘T(−pv) sequence).
-          // cache:null + 'final' = the one-shot uncached bake; the WebKit ctx.filter no-op guard lives in the kernel
-          pivot: { x: pw / 2, y: ph / 2 },
-          translate: only('transform') ? { x: fx.x, y: fx.y } : { x: 0, y: 0 },
-          rotDeg: only('transform') ? fx.rot : 0,
-          scale: only('transform') ? fx.scale : 1,
-          drawRect: srcRect,
-          blurPx: only('blur') ? fx.blur : 0,
-          blurType: gengaFxStatics(layer).blurType, // Bake 玉ボケ into pixels before clearing the blur type. Resetting the flag first would rasterize Gaussian blur instead.
-          alpha: only('opacity') ? Math.max(0, Math.min(1, fx.opacity)) : 1,
-          compositeOp: 'source-over',
-          cache: null,
-          quality: 'final'
-        });
-      } else octx.drawImage(src, srcRect.x, srcRect.y);
+        const only = function(track) { return !tracks || tracks.includes(track); };
+        const pose = only('transform') ? fx : GENGA_FX_DEFAULTS.transform;
+        applyLayerFx(octx, src.cv, gengaFxPaintOptions(
+          pose, srcRect, pw, ph, only('blur') ? fx.blur : 0, fxBlurType(layer.fx),
+          only('opacity') ? Math.max(0, Math.min(1, fx.opacity)) : 1
+        ));
+      } else octx.drawImage(src.cv, srcRect.x, srcRect.y);
       return gengaTrimCanvasToDrawing(out); // {dataUrl,w,h,x,y} | null (empty)
     }
     // rasterize: timeMode 'frame' = current-playhead FX value for every exposure; 'instance' = each exposure's
@@ -149595,6 +149548,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const bakes = {};          // layerId → expId → baked
       const bakedIds = {};       // expId baked on any member — the group shares exposure ids/values, so all members change together
       const keepValueIds = {};   // Keep the セリフ区間 slot number and write the baked drawing to its pool.
+      const gt = state.project.gengaTimeline;
+      const out = document.createElement('canvas');
       let coldMisses = 0, any = false;
       targetIds.forEach(function(id) {
         const T = gengaLayerById(id);
@@ -149605,13 +149560,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const dr = gengaExposureDrawing(T, e);
           if (!dr) return; // empty exposure — FX bakes to nothing; leave it keyless (untouched below)
           if (!gengaDrawingHasArt(dr)) return;
-          const baked = gengaBakeExposureFx(T, e, timeMode === 'frame' ? curFrame : e.startFrame, bakeTracks);
+          const baked = gengaBakeExposureFx(gt, T, e, timeMode === 'frame' ? curFrame : e.startFrame, bakeTracks, out);
           if (baked === undefined) { coldMisses += 1; return; }
           mine[e.id] = baked;
           bakedIds[e.id] = true;
           any = true;
         });
       });
+      paintReleaseCanvas(out);
       // Atomicity: a cold image cache must not silently skip the bake while the FX track below is cleared —
       // irreversible FX loss. Any miss aborts the run.
       if (coldMisses) { alert(t('msg.genga.fx.rasterizeColdMiss', coldMisses)); return; }
@@ -149783,6 +149739,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     let gengaFxPanelEl = null;
     function gengaRemoveFxPanel() {
+      pointerDragSessions.get('genga-fx-gizmo')?.cancel();
       if (!gengaFxPanelEl) return;
       cancelPointerDragsIn(gengaFxPanelEl);
       gengaFxPanelEl.remove();
@@ -149790,8 +149747,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaCloseFxPanel() {
       gengaRemoveFxPanel();
-      fxQualityInteractive = false;
-      fxMipPrebuildPending = false; // window close = the last-resort reset of the quality round trip (mode-branch-must-exit — a stranded true would mean permanently degraded blur)
       if (state.gengaFxOpenId) {
         const closingId = String(state.gengaFxOpenId);
         state.gengaFxOpenId = null;
@@ -149944,7 +149899,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const layer = gengaLayerById(state.gengaFxOpenId);
         if (!d || !layer || gengaLayerEffLocked(layer)) return null; // Skip live preview and numeric input for locked layers, including folder locks, because commit is rejected.
         const cur = gengaFxCurrent(layer, gengaCurrentFrame());
-        fxQualityInteractive = true; // interactive quality while this scrub is live (preRelease resets on every exit incl. pointercancel)
+        gengaFxPreviewInteractive = true;
         if (track === 'blur') { fxMipChainRequestPrebuild(); drawGengaPreview(); } // build the mip chain on the down redraw — the ~20-35ms chain cost lands before the first value tick
         return { d: d, track: track, layerId: layer.id, startValue: d.get(cur), value: d.get(cur) };
       },
@@ -149955,11 +149910,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         drawGengaPreview();
         gengaScheduleTimesheetLiveDraw();
       },
-      preRelease: function() {
-        gengaFxLive = null;
-        fxQualityInteractive = false;
-        fxMipPrebuildPending = false;
-      }, // always drop the overlay on release — a stranded live buffer would keep the preview frozen off-data. The quality flag returns to final on every exit (fxScrubUp calls preRelease before commit, openEditor and pointercancel — the mode-branch-must-exit round trip)
+      preRelease: gengaFxPreviewEnd,
       cancel: function(s) {
         gengaFxSetFieldDisplay(s.el, s.d, s.startValue);
         drawGengaPreview();
@@ -150057,7 +150008,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         for (let f = f0; f <= f1; f += 1) {
           // The path and gizmo box share the preview, so use the same forward transform (gengaFxGizmoScreen → gengaFxForwardXY).
           // Separate implementations can diverge at scale floors such as 0.01 and 1e-4.
-          const pt = gengaFxForwardXY(op.x, op.y, gengaFxTrackAt(keys, f, GENGA_FX_DEFAULTS.transform), pw, ph);
+          const pt = gengaFxForwardXY(op.x, op.y, sampleFxTrack(keys, f, GENGA_FX_DEFAULTS.transform), pw, ph);
           paperPath.push({ frame: f, x: pt.x, y: pt.y, key: keyFrames.has(f) });
         }
         cache = gengaFxOriginPathCache = { sig: sig, paperPath: paperPath, xfSig: null, projected: null };
@@ -150131,7 +150082,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // a rejected press must not arm the quality flag: gengaFxGizmoUp is what clears it, and with no strand
       // there is no up — a stranded true means permanently degraded blur (mode-branch-must-exit).
       if (!started) { gengaFxGizmoDrag = null; return false; }
-      fxQualityInteractive = true; // gizmo apply ticks composite at interactive quality (gengaFxGizmoUp resets after the flush — incl. pointercancel)
+      gengaFxPreviewInteractive = true;
       return true;
     }
     let gengaFxGizmoRaf = 0, gengaFxGizmoLatest = null;
@@ -150200,12 +150151,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (gengaFxGizmoRaf) { cancelAnimationFrame(gengaFxGizmoRaf); gengaFxGizmoRaf = 0; }
       if (gengaFxGizmoLatest && gengaFxGizmoDrag && !(ev && ev.type === 'pointercancel')) gengaFxGizmoApply(gengaFxGizmoLatest); // land the pending tick (final = un-coalesced); a cancel discards it
       gengaFxGizmoLatest = null;
-      fxQualityInteractive = false; // back to final on every gizmo exit (up and pointercancel) — the commit/cancel redraw below repaints the final look
       const d = gengaFxGizmoDrag;
       gengaFxGizmoDrag = null;
+      const live = gengaFxPreviewEnd();
       if (!d) return;
-      const live = gengaFxLive;
-      gengaFxLive = null;
       gengaScheduleTimesheetLiveDraw(); // A commit redraw cancels this request; cancellation restores committed data.
       if (ev && ev.type === 'pointercancel') {
         drawGengaPreview();
@@ -150468,7 +150417,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Hosts retain their units, live writes, Undo boundary and cancellation policy.
     const FX_SCRUB_MOVE_THRESH = 3;
 
-    // ## SECTION: Shared effect scrubbing and keyframes
+    // ## SECTION: Shared effect scrubbing
     function fxScrubDown(ev, host, el) {
       if (ev.button != null && ev.button !== 0) return;
       if (ev.target && ev.target.closest('input, textarea, select')) return;
@@ -150549,79 +150498,58 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       else if (clean && fxScrubSecondClick(s, ev)) host.openEditor(s); // double-click → editor
       else host.cancel(s); // a single clean click changes nothing
     }
-    // ==== layer-FX evaluation kernel. Pure functions evaluate already-normalized inputs without state/DOM
-    // access. Normalization belongs to each engine's contract site: conte clamps at read via its adapter below,
-    // genga at save via normalizeGengaFx. The interpolation is the conte layerEffectAtFrame expression verbatim;
-    // the genga while-advance bracket is the same bracket on strictly-increasing frames, so the harness gates on
-    // bit-exact equality (Object.is), not ε.
-    // ch: { kfs: [{frame:Number, ...}],  // sorted by the adapter (stable sort — duplicate frames keep order)
-    //       prop: String,                // value field in the shared key records
-    //       def: Number,                 // returned when there are no keys (conte: static effect / genga: track default)
-    //     }                              // rotation is an absolute angle like every other channel
-    // frame: Number — origin/rounding is the adapter's job (conte rounds cut-local ≥0, genga passes 1-based through).
-    // Duplicate-frame keys resolve first-match + t=0 (conte rule; unreachable in the deduped genga domain).
-    function resolveFxChannel(ch, frame) {
-      const kfs = ch.kfs;
-      if (!kfs || !kfs.length) return ch.def;
-      const prop = ch.prop;
-      if (frame <= kfs[0].frame) return kfs[0][prop];
-      const last = kfs[kfs.length - 1];
-      if (frame >= last.frame) return last[prop];
-      // Lower bound chooses the same first interval at duplicate frames as a linear scan.
-      let lo = Math.min(1, kfs.length - 1), hi = kfs.length - 1;
+
+    // ## SECTION: Shared effect evaluation and keyframes
+    // Read one bracket per sorted track. The adapter owns frame origin and normalization.
+    // Layer tracks keep the first interior match at duplicate frames and the last endpoint.
+    function fxKeyRightIndex(keys, frame) {
+      let lo = Math.min(1, keys.length - 1), hi = keys.length - 1;
       while (lo < hi) {
         const mid = (lo + hi) >>> 1;
-        if (kfs[mid].frame < frame) lo = mid + 1; else hi = mid;
+        if (keys[mid].frame < frame) lo = mid + 1;
+        else hi = mid;
       }
-      let a = kfs[Math.max(0, lo - 1)], b = kfs[lo];
-      if (!(a.frame <= frame && frame <= b.frame)) { a = kfs[0]; b = last; }
-      const t = keyInterpT(a.interp, b.frame > a.frame ? (frame - a.frame) / (b.frame - a.frame) : 0);
-      return a[prop] + (b[prop] - a[prop]) * t;   // Rotation is also an absolute angle.
+      return lo;
     }
-    // channels: { [key]: ch } → { [key]: Number } — no `frame` in the result (consumers are verified
-    // name-field-only, so the kernel does not carry it).
-    function resolveLayerFx(channels, frame) {
+    function fxKeyProgress(a, b, frame) {
+      return keyInterpT(a.interp, b.frame > a.frame ? (frame - a.frame) / (b.frame - a.frame) : 0);
+    }
+    function sampleFxTrack(keys, frame, defaults) {
+      if (!keys || !keys.length) return Object.assign({}, defaults);
+      let a = keys[0], b = keys[keys.length - 1], progress = null;
+      if (frame <= a.frame) b = a;
+      else if (frame >= b.frame) a = b;
+      else {
+        const right = fxKeyRightIndex(keys, frame);
+        const left = Math.max(0, right - 1);
+        if (keys[left].frame <= frame && frame <= keys[right].frame) {
+          a = keys[left];
+          b = keys[right];
+        }
+        progress = fxKeyProgress(a, b, frame);
+      }
       const out = {};
-      for (const k in channels) out[k] = resolveFxChannel(channels[k], frame);
+      for (const prop in defaults) {
+        out[prop] = progress === null ? a[prop] : a[prop] + (b[prop] - a[prop]) * progress;
+      }
       return out;
     }
-    // conte adapter: read-time clamp contract — every key is normalized per evaluation, kf frames are taken as
-    // Number()||0 without rounding (the bracket compares raw frames); only the query frame is rounded, by the
-    // caller (layerEffectAtFrame). def = the static layer.effect fallback.
-    function conteFxChannels(layer) {
-      const stat = normalizeLayerEffect(layer && layer.effect);
-      const kfs = layerEffectKeyframes(layer);
-      const rows = kfs.map(function(k) {
-        const frame = Number(k.frame) || 0, values = copyKeyInterp(k, normalizeLayerEffect(k));
-        values.frame = frame;
-        return values;
+    function conteFxValues(layer, frame) {
+      const defaults = normalizeLayerEffect(layer && layer.effect);
+      const keys = layerEffectKeyframes(layer).map(function(k) {
+        return copyKeyInterp(k, Object.assign(normalizeLayerEffect(k), { frame: Number(k.frame) || 0 }));
       });
-      const mk = function(prop) {
-        return { def: stat[prop], prop: prop, kfs: rows };
-      };
-      return { opacity: mk('opacity'), tx: mk('tx'), ty: mk('ty'),
-               scale: mk('scale'), rot: mk('rot'), blur: mk('blur') };
+      return sampleFxTrack(keys, frame, defaults);
     }
-    // conte static (non-interpolated) props are not channels — layer-2 opts.
-    function conteFxStatics(layer) { return { blurType: layer.effect && layer.effect.blurType === 'bokeh' ? 'bokeh' : 'gaussian' }; }
-    // genga sibling of conteFxStatics; gengaBakeExposureFx and drawLayer's genga branch call it instead of
-    // copying the ternary.
-    function gengaFxStatics(layer) { return { blurType: layer.fx && layer.fx.blurType === 'bokeh' ? 'bokeh' : 'gaussian' }; }
-    // Defaults come from track static values, falling back to GENGA_FX_DEFAULTS-equivalent values.
-    function gengaFxChannels(layer) {
-      const fx = layer && layer.fx;
-      const st = (fx && fx.static) || null;
-      // Def is the track's static value when it has one: resolveFxChannel returns ch.def when the key list is
-      // empty, so an unkeyed track reads its static everywhere and a keyed one ignores it (flat hold at both
-      // ends), like gengaCamRectAtFromKeys' `if (!kfs.length) return base`.
-      const dec = function(track, prop, def) {
-        const arr = (fx && fx[track]) || [];
-        const sv = (st && st[track]) ? Number(st[track][prop]) : NaN;
-        return { def: Number.isFinite(sv) ? sv : def, prop: prop, kfs: arr };
-      };
-      return { x: dec('transform', 'x', 0), y: dec('transform', 'y', 0),
-               scale: dec('transform', 'scale', 1), rot: dec('transform', 'rot', 0),
-               opacity: dec('opacity', 'v', 1), blur: dec('blur', 'v', 0) };
+    function fxBlurType(effect) {
+      return effect && effect.blurType === 'bokeh' ? 'bokeh' : 'gaussian';
+    }
+    function gengaFxValues(layer, frame) {
+      const fx = layer.fx;
+      const out = sampleFxTrack(fx && fx.transform, frame, gengaFxStaticFor(layer, 'transform'));
+      out.opacity = sampleFxTrack(fx && fx.opacity, frame, gengaFxStaticFor(layer, 'opacity')).v;
+      out.blur = sampleFxTrack(fx && fx.blur, frame, gengaFxStaticFor(layer, 'blur')).v;
+      return out;
     }
     // ==== Layer 3 mutation kernel — Layer FX keyframe verbs. Pure data operations on {frame, ...} records: no
     // state/DOM/undo access (undo lives in each engine's command wrapper — genga: runGengaLayerEdit mutators,
@@ -151235,7 +151163,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (gengaHydrateInFlight) return false; // Fall back to full composition when multiple drawings are still unavailable.
       if (state.gengaPlaying || state.gengaSoloView) return false;
       if (gengaParaparaSoloLayerId || gengaParaparaFrame != null || gengaDougaFillActive() || state.gengaSilDebug) return false;
-      if (gengaFxLive || fxQualityInteractive) return false;
+      if (gengaFxLive || gengaFxPreviewInteractive) return false;
       if (gengaSelLifted(gengaSel) && String(gengaSel.layerId) !== String(centerLayerId)) return false;
       if (gengaStampDrag && gengaStampDrag.layerId !== String(centerLayerId)) return false;
       return true;
@@ -151324,7 +151252,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const layerState = layerStates[i];
         layerState.draws = visible;
         if (!visible && i !== centerIdx) continue;
-        const fx = layerState.fx = noFx ? null : gengaFxAt(layers[i], frame);
+        const fx = layerState.fx = noFx ? null : gengaFxAt(layers[i], frame, false, Boolean(output));
         if (fx && i >= liveTop) stackable = false;
         if (!visible) continue;
         if (fx) fxFree = false;
@@ -151347,13 +151275,31 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       };   // Exclude isolated folder contents from dirty-region drawing and composite the whole folder.
     }
     let gengaFxScratchCv = null;
-    function gengaFxScratch(pw, ph) { // reused offscreen canvas for the FX composite step (one at a time — drawLayer is not reentrant)
+    function gengaFxPaintOptions(fx, src, pw, ph, blur, blurType, alpha, blend, cache, quality, paint) {
+      return {
+        pivot: { x: pw / 2, y: ph / 2 },
+        translate: { x: fx.x, y: fx.y },
+        rotDeg: fx.rot,
+        scale: fx.scale,
+        drawRect: src,
+        blurPx: blur,
+        blurType: blurType,
+        alpha: alpha,
+        compositeOp: blend,
+        cache: cache,
+        quality: quality,
+        paint: paint
+      };
+    }
+    function gengaFxScratch(rect) { // reused offscreen canvas for the FX composite step (one at a time — drawLayer is not reentrant)
       if (!gengaFxScratchCv) gengaFxScratchCv = document.createElement('canvas');
+      const { x, y, w: pw, h: ph } = rect;
       const cv = gengaFxScratchCv;
       if (cv.width !== pw || cv.height !== ph) { cv.width = pw; cv.height = ph; }
       const ctx = cv.getContext('2d');
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, pw, ph);
+      if (x || y) ctx.setTransform(1, 0, 0, 1, -x, -y);
       return { cv: cv, ctx: ctx };
     }
     // Use the union of paper and all drawing placement rectangles before applying FX. Motion can bring off-paper artwork into view,
@@ -151378,8 +151324,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     }
     // The blur result lives in the layer-2 kernel's fxFinalBlurSlot (single-slot final-look contract; the key
-    // carries |g / |bk). gengaFxBlurPreviewKey below is the contentKey source for the kernel caches.
-    function gengaFxBlurPreviewKey(l, frame, dougaFill, output) { // cache identity of the layer's current content; null = uncacheable (pixels can change per tick)
+    // carries the blur type). The compositor supplies the source identity below.
+    function gengaFxBlurContentKey(l, frame, dougaFill, output) { // cache identity of the layer's current content; null = uncacheable (pixels can change per tick)
       if (gengaStampDrag && frame === gengaStampDrag.frame && String(l.id) === gengaStampDrag.layerId) return null;
       if (gengaDrawSession && String(l.id) === String(gengaDrawSession.layerId)) return null; // live stroke
       if (gengaSelLifted(gengaSel) && String(l.id) === String(gengaSel.layerId)) return null; // lifted selection replaces the art
@@ -151498,7 +151444,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // the layers; exports keep it in the composite.
       // Exclude instruction rows from the art composite. gengaDrawCameraInstrView draws them after paper on screen. Art export omits them, and instruction output uses `_camera`.
       const layers = (gt.layers || []).filter(function(l) { return !(reuse && gengaLayerIsPaper(l)) && gengaLayerInPictures(l); });
-      const sess = (gengaDrawSession && frame === gengaDrawSession.frame) ? gengaDrawSession : null;
+      const sess = (!output && gengaDrawSession && frame === gengaDrawSession.frame) ? gengaDrawSession : null;
       let missingArt = 0;
       // One synchronous composite owns these evaluations. Only the small eligibility scene persists.
       // Hidden center FX still affects stackability; hidden parapara content is evaluated when drawn.
@@ -151531,7 +151477,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           src = sess.canvas;
         } else if (reuse && gengaStampDrag && gengaStamp && gengaStamp.work && frame === gengaStampDrag.frame && String(l.id) === gengaStampDrag.layerId) {
           src = gengaStamp.work;
-        } else if (gengaSelLifted(gengaSel) && String(l.id) === String(gengaSel.layerId) && frame === gengaSel.frame) {
+        } else if (!output && gengaSelLifted(gengaSel) && String(l.id) === String(gengaSel.layerId) && frame === gengaSel.frame) {
           src = gengaSelCompositeFrom(gengaSel); // Only a lifted selection replaces the art (a marquee alone renders the drawing untouched)
         } else {
           // Explicit playback exports and live playback share source-frame resolution; stopped gaps stay empty.
@@ -151616,27 +151562,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!fx) { drawLayerContent(target, l); return; }
         if (batch && batch.length > 1) {
           const src = gengaFxSourceRect(batch.map(fxDrawingOf), pw, ph);
-          const s = gengaFxScratch(src.w, src.h);
-          if (src.x || src.y) s.ctx.setTransform(1, 0, 0, 1, -src.x, -src.y);
+          const s = gengaFxScratch(src);
           batch.forEach(function(b) { drawLayerContent(s.ctx, neutral(b)); });
-          applyLayerFx(target, s.cv, {
-            pivot: { x: pw / 2, y: ph / 2 },
-            translate: { x: fx.x, y: fx.y },
-            rotDeg: fx.rot,
-            scale: fx.scale,
-            drawRect: src,
-            blurPx: 0,
-            blurType: gengaFxStatics(l).blurType,
-            alpha: Math.max(0, Math.min(1, fx.opacity)),
-            compositeOp: 'source-over',
-            cache: null,
-            quality: fxQualityInteractive ? 'interactive' : 'final'
-          });
+          applyLayerFx(target, s.cv, gengaFxPaintOptions(fx, src, pw, ph, 0, null, 1));
           return;
         }
         // FX path: render this layer's content neutral (no blend/opacity) into a scratch canvas, then composite
         // through the layer-2 kernel in one pass; export shares this code path. Scratch ownership stays here (the
-        // kernel receives, never owns). blurType comes from gengaFxStatics. quality rides the interactive fallback
+        // kernel receives, never owns). The track's blur type determines the kernel. quality rides the interactive fallback
         // flag: interactive only while a scrub/gizmo drag is live; capture, export and playback stay 'final'.
         // When scaling up a vector layer, draw directly under the transform. Enlarging a paper-sized scratch canvas
         // would pixelate the drawing. Direct drawing preserves detail, as with view zoom.
@@ -151652,26 +151585,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           : null;
         const missingBeforeFx = missingArt;
         const src = fxVectorPaint ? { x: 0, y: 0, w: pw, h: ph } : gengaFxSourceRect([fxDrawingOf(l)], pw, ph);
-        const s = fxVectorPaint ? null : gengaFxScratch(src.w, src.h);
-        if (s && (src.x || src.y)) s.ctx.setTransform(1, 0, 0, 1, -src.x, -src.y);
+        const s = fxVectorPaint ? null : gengaFxScratch(src);
         if (s) drawLayerContent(s.ctx, neutral(l));
-        const blurType = gengaFxStatics(l).blurType;
+        const blurType = fxBlurType(l.fx);
         // Only bitmap blur consumes a content key; native filter and transform-only draws do not.
-        const ck = fx.blur > 0 && (blurType === 'bokeh' || !CANVAS_FILTER_SUPPORTED) ? gengaFxBlurPreviewKey(l, frame, dougaFill, output) : null;
-        const fxOptions = {
-          paint: fxVectorPaint,   // When supplied, the kernel calls this under the transform in place of the bitmap.
-          pivot: { x: pw / 2, y: ph / 2 },
-          translate: { x: fx.x, y: fx.y }, // pivot = paper center
-          rotDeg: fx.rot,
-          scale: fx.scale,
-          drawRect: src,
-          blurPx: fx.blur,
-          blurType: blurType, // Use track-level 玉ボケ like storyboard. The shared canvas renderer shows the disc blur in preview and MP4. The kernel reads blurType only when fx.blur > 0.
-          alpha: (l.opacity != null ? l.opacity : 1) * Math.max(0, Math.min(1, fx.opacity)),
-          compositeOp: l.blend || 'source-over',
-          cache: ck == null || missingArt !== missingBeforeFx ? null : { contentKey: ck },
-          quality: fxQualityInteractive ? 'interactive' : 'final'
-        };
+        const ck = fx.blur > 0 && (blurType === 'bokeh' || !CANVAS_FILTER_SUPPORTED) ? gengaFxBlurContentKey(l, frame, dougaFill, output) : null;
+        const fxOptions = gengaFxPaintOptions(fx, src, pw, ph, fx.blur, blurType,
+          (l.opacity != null ? l.opacity : 1) * Math.max(0, Math.min(1, fx.opacity)),
+          l.blend, ck == null || missingArt !== missingBeforeFx ? null : { contentKey: ck },
+          !output && gengaFxPreviewInteractive ? 'interactive' : 'final', fxVectorPaint);
         if (!tvpaintBlendOf(l)) { applyLayerFx(target, s ? s.cv : null, fxOptions); return; }
         tvpaintBlendDraw(
           target,
@@ -151849,7 +151771,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         return cv;
       }
-      if (gengaParaparaSoloLayerId) {
+      if (!output && gengaParaparaSoloLayerId) {
         gengaDrawParaparaCompositeLayer(cx2, layers, layerStates, drawLayer, frame, noFx);
         return cv;
       }
@@ -156857,7 +156779,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaPreviewRender.scene = null;
       gengaEndDrawSession();                   // Clear the active stroke for the previous layer.
       paintClearStrokeBufferPool();
-      gengaFxLive = null;                        // Clear live FX preview for the previous layer.
+      gengaFxPreviewEnd();
       gengaFxGizmoDrag = null;
       gengaFxOriginPathCache = null;            // Clear caches tied to the previous layer and camera.
       gengaPreviewRender.camera = null;
@@ -160216,11 +160138,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!(frame > kfs[0].frame)) return gengaCamKfRect(kfs[0]);
       if (frame >= kfs[kfs.length - 1].frame) return gengaCamKfRect(kfs[kfs.length - 1]);
       // Lower bound keeps an exact key on the earlier segment, including hold/ease boundaries.
-      let lo = 1, hi = kfs.length - 1;
-      while (lo < hi) { const mid = (lo + hi) >> 1; if (kfs[mid].frame < frame) lo = mid + 1; else hi = mid; }
-      const a = kfs[lo - 1], b = kfs[lo];
-      const t = keyInterpT(a.interp, b.frame > a.frame ? (frame - a.frame) / (b.frame - a.frame) : 0);
-      return lerpCameraRect(gengaCamKfRect(a), gengaCamKfRect(b), t);
+      const right = fxKeyRightIndex(kfs, frame);
+      const a = kfs[right - 1], b = kfs[right];
+      return lerpCameraRect(gengaCamKfRect(a), gengaCamKfRect(b), fxKeyProgress(a, b, frame));
     }
     function gengaCameraWorkAt(gt, frame, sortedKeys) {
       const cw = gt.cameraWork || gt.camera;
@@ -160733,7 +160653,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           const patch = Object.assign({}, k), frame = Math.max(1, at + k.dFrame);
           delete patch.dFrame;
           patch.interp = keyInterpOf(k);   // Linear interpolation (undefined) overwrites the destination key's interpolation too.
-          fxKfWrite(arr, frame, patch, function() { return gengaFxTrackAt(arr, frame, gengaFxStaticFor(L, track)); });
+          fxKfWrite(arr, frame, patch, function() { return sampleFxTrack(arr, frame, gengaFxStaticFor(L, track)); });
         });
       })) return true;   // Reject layer and folder locks before starting a command.
       gengaFxPanelUpdate();
