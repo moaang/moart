@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3544</title>
+  <title>MoArt ver3545</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -19835,7 +19835,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   Project JSON and ZIP writing
     //   Lossless audio storage and temporary cache
     //   Storyboard project bundles
-    //   Project archive and workspace saves
+    //   Project archive and explicit saves
+    //   Workspace project saves and retention
     //   ZIP reading and project opening
     //   Dropbox authentication and project files
     //   Project open and drop entry points
@@ -71591,19 +71592,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const parts = name.split('/'), leaf = parts.pop();
       const dir = parts.length ? await getWorkspaceDirectory(parts.join('/'), true, connection.handle) : connection.handle;
       const handle = await dir.getFileHandle(leaf, { create: true });
-      let writable = await handle.createWritable();
-      try {
-        await writable.write(blob);
-        localRecoveryAssert(owner, connection, explicitHeadRepair && name === 'head.json');
-        await writable.close();
-        writable = null;
-      }
-      finally { if (writable) await writable.abort(); }
-      // HEAD close publishes the generation; finish verifying its original connection even after a tab change.
-      // Dropping bookkeeping here would make our own next save look like a foreign writer.
-      if (name !== 'head.json') localRecoveryAssert(owner, connection);
-      const file = await localRecoveryRead(connection, name);
-      if (file.size !== blob.size || await localRecoveryHash(file) !== (expectedDigest || await localRecoveryHash(blob))) throw new Error('Recovery verification failed: ' + name);
+      const head = name === 'head.json';
+      const digest = expectedDigest || await localRecoveryHash(blob);
+      return writeBlobToFileHandle(handle, blob, {
+        path: name,
+        beforeClose: function() { localRecoveryAssert(owner, connection, explicitHeadRepair && head); },
+        verify: async function() {
+          // HEAD publishes the generation. Recheck a failed read on this connection even if the editor moved on.
+          if (!head) localRecoveryAssert(owner, connection);
+          const file = head
+            ? await handle.getFile().catch(function() { return handle.getFile(); })
+            : await handle.getFile();
+          if (file.size !== blob.size || await localRecoveryHash(file) !== digest) throw new Error('Recovery verification failed: ' + name);
+          return file;
+        }
+      });
     }
     async function localRecoveryAsset(connection, owner, key, source, read, output) {
       localRecoveryAssert(owner, connection);
@@ -71616,14 +71619,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           : key.indexOf('ref:') === 0 ? REFS_ASSET_DIR + '/'
           : '';
         const digest = await localRecoveryHash(blob), fileName = dir + 'asset-' + digest + '.bin';
-        let valid = false;
+        let valid = null;
         try {
           const file = await localRecoveryRead(connection, fileName);
-          valid = file.size === blob.size && await localRecoveryHash(file) === digest;
+          if (file.size === blob.size && await localRecoveryHash(file) === digest) valid = file;
         }
         catch (error) { if (error.name !== 'NotFoundError') throw error; }
-        if (!valid) await localRecoveryWrite(connection, fileName, blob, owner, digest);
-        const verified = await localRecoveryRead(connection, fileName);
+        const verified = valid || await localRecoveryWrite(connection, fileName, blob, owner, digest);
         item = {
           source: source,
           fileName: fileName,
@@ -72486,7 +72488,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!await ensureWorkspacePermission(root, true)) throw new Error('Working folder write permission was not granted.');
       const dir = await getWorkspaceDirectory(project.settings.localWorkspace.audioDir, true, root);
       const blob = new Blob(['conte audio write test ' + new Date().toISOString()], { type: 'text/plain' });
-      let fileName = '', fileHandle = null, writable = null;
+      let fileName = '', fileHandle = null;
       try {
         for (let attempt = 0; attempt < 16; attempt += 1) {
           const candidate = '__conte_audio_write_test_' + crypto.randomUUID() + '.txt';
@@ -72497,12 +72499,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           fileName = candidate; fileHandle = created; break;
         }
         if (!fileHandle) throw new Error('Could not reserve a new audio write test file.');
-        writable = await fileHandle.createWritable();
-        await writable.write(blob); await writable.close(); writable = null;
-        const checked = await fileHandle.getFile();
-        if (!checked || await checked.text() !== await blob.text()) throw new Error('Audio folder write test failed.');
+        await writeBlobToFileHandle(fileHandle, blob, {
+          verify: async function(handle) {
+            const checked = await handle.getFile();
+            if (await checked.text() !== await blob.text()) throw new Error('Audio folder write test failed.');
+          }
+        });
       } finally {
-        if (writable) { try { await writable.abort(); } catch (error) { console.warn('[workspace] Write test abort failed', error); } }
         if (fileHandle) {
           await removeWorkspaceFileIfSameEntry(dir, fileName, fileHandle);
         }
@@ -72765,20 +72768,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       await rememberPickerHandle(id, handle);
       return handle;
     }
-    async function writeBlobToFileHandle(handle, contents) {
-      let writable = null, phase = 'createWritable';
-      try {
-        writable = await handle.createWritable();
-        phase = 'write'; await writable.write(contents);
-        phase = 'close'; await writable.close(); writable = null;
-      } catch (error) { throw projectFileOperationError(error, phase, handle.name || ''); }
-      finally {
-        if (writable) {
-          try { await writable.abort(); }
-          catch (error) { console.warn('[file-write] Failed to abort incomplete write', handle.name, error); }
-        }
-      }
-    }
     // Native write, share handoff, and download request are distinct outcomes; '' means cancellation.
     // Sharing and downloading do not confirm that the recipient persisted a file.
     function fileDeliveryShareFile(blob, fileName) {
@@ -72820,6 +72809,75 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return delivery;
       } catch (error) { showToast(t('file.failed') + ': ' + (error.message || error), { warn: true }); return ''; }
     }
+
+    function projectFileOperationError(error, phase, fileName) {
+      const detail = (error && error.name ? error.name + ': ' : '') + (error && error.message ? error.message : String(error));
+      const wrapped = new Error('[' + phase + '] ' + fileName + '\n' + detail);
+      wrapped.name = error && error.name || 'Error';
+      wrapped.cause = error;
+      console.error('[project-file]', phase, fileName, error);
+      return wrapped;
+    }
+    // Closing publishes the bytes. Commit bookkeeping must run before any fallible re-read.
+    // The caller owns permission and its format-specific checks. ZIP supplies a streaming producer.
+    async function writeFileHandle(handle, write, { path = handle.name || '', beforeClose, onCommit, verify } = {}) {
+      let writable = null, phase = 'createWritable';
+      try {
+        writable = await handle.createWritable();
+        phase = 'write';
+        await write(function(bytes) { return writable.write(bytes); });
+        phase = 'verify-source';
+        if (beforeClose) await beforeClose();
+        phase = 'close';
+        await writable.close();
+        writable = null;
+        phase = 'commit';
+        if (onCommit) onCommit();
+        phase = 'verify';
+        if (verify) return await verify(handle);
+      } catch (error) {
+        throw projectFileOperationError(error, phase, path);
+      } finally {
+        if (writable) {
+          try { await writable.abort(); }
+          catch (error) { console.warn('[file-write] Failed to abort incomplete write', path, error); }
+        }
+      }
+    }
+
+    function writeBlobToFileHandle(handle, blob, options) {
+      return writeFileHandle(handle, function(write) { return write(blob); }, options);
+    }
+
+    // Compare in slices so verifying or comparing a large saved file needs bounded scratch memory.
+    async function fileBlobBytesEqual(left, right, owner) {
+      if (left.size !== right.size) return false;
+      if (left === right) return true;
+      for (let offset = 0; offset < left.size; offset += 262144) {
+        const a = await readZipBlobRange(left, offset, offset + 262144, owner);
+        const b = await readZipBlobRange(right, offset, offset + 262144, owner);
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      }
+      return true;
+    }
+
+    async function readWrittenFile(handle, expectedSize) {
+      const file = await handle.getFile();
+      if (file.size !== expectedSize) throw new Error('Expected ' + expectedSize + ' bytes, got ' + file.size);
+      return file;
+    }
+
+    function projectFileVersionOf(file) { return { size: file.size, lastModified: file.lastModified }; }
+    function projectFileVersionMatches(file, expected) {
+      return !!expected && file.size === expected.size && file.lastModified === expected.lastModified;
+    }
+    async function assertProjectFileVersion(handle, expected, owner) {
+      assertProjectIoOwner(owner);
+      const current = await handle.getFile();
+      assertProjectIoOwner(owner);
+      if (!projectFileVersionMatches(current, expected)) throw new Error(t('project.source.changed'));
+    }
+
 
     function readTextFile(file) {
       if (file && typeof file.text === 'function') return file.text();
@@ -73684,6 +73742,44 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Project sessions and source identity
+    // Dirty-state snapshots omit base64 with `portable: false`.
+    // A drawing edit changes its reference, so pixel strings are unnecessary for comparison.
+    // Store eviction must not affect that snapshot.
+    // Including base64 only while a drawing is resident would make a saved project appear dirty after eviction.
+    // Omitting it also avoids serializing all pixels on every comparison.
+    // If stroke commits switch from new references to incrementing `version`,
+    // include that version in the dirty-state snapshot.
+    function projectUnsavedSnapshot() { return serializedProjectJson({ portable: false }); }
+    function markProjectSavedBaseline() {
+      try {
+        state.projectSavedSnapshot = projectUnsavedSnapshot();
+      } catch (error) {
+        state.projectSavedSnapshot = '';
+      }
+    }
+
+    let projectFileLoadSerial = 0;
+    function projectIoOwner(request) {
+      return { request: request || null, active: state.projectActive, project: state.project, handle: state.workspaceHandle, name: state.workspaceName,
+        source: projectFileSources.get(state.project) || null,
+        settings: Object.assign({}, state.project && state.project.settings && state.project.settings.localWorkspace) };
+    }
+    function projectIoOwnerCurrent(owner) {
+      if (!owner || owner.project !== state.project || owner.handle !== state.workspaceHandle || owner.active !== state.projectActive
+          || owner.source !== (projectFileSources.get(state.project) || null)) return false;
+      if (owner.request && owner.request.id !== projectFileLoadSerial) return false;
+      const settings = state.project && state.project.settings && state.project.settings.localWorkspace || {};
+      return ['audioDir', 'videoDir', 'layerDir', 'backupDir', 'projectFileName'].every(function(key) { return owner.settings[key] === settings[key]; });
+    }
+    function assertProjectIoOwner(owner) {
+      if (!projectIoOwnerCurrent(owner)) throw new DOMException(t('msg.workspace.writeTargetChanged'), 'AbortError');
+    }
+    function beginProjectFileLoad() {
+      const request = { id: ++projectFileLoadSerial };
+      request.owner = projectIoOwner(request);
+      return request;
+    }
+
     function generateProjectId() {
       return 'conte_' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
     }
@@ -73848,65 +73944,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } else if (generated) project.projectId = generateProjectId();
       if (generated && (!handle || identityBytes) && !fingerprint) fingerprint = await projectSourceFingerprint(file, owner, identityBytes);
       return { generatedId: generated, fingerprint: fingerprint };
-    }
-    async function rememberProjectSource(owner, source) {
-      assertProjectIoOwner(owner);
-      source = normalizeProjectSource(source);
-      if (!source) return false;
-      const id = ensureCurrentProjectId(), title = String(owner.project.title || ''), kind = owner.project.kind;
-      const failureKey = 'moart-project-source-unremembered:' + id;
-      // A failed new reference must never leave an older folder looking current.
-      // This small independent marker also covers interruption during publication.
-      try { localStorage.setItem(failureKey, source.fileName); } catch (error) { console.warn('[project-load] Source failure marker unavailable', error); }
-      try {
-        if (!indexedDbAvailable()) throw new Error('Browser storage unavailable');
-        await workspaceDbRetrying(function(db, own) {
-          assertProjectIoOwner(owner);
-          return workspaceDbOp(db, 'remember project source', function(resolve, reject) {
-            const tx = own(db.transaction(WORKSPACE_STORE_NAME, 'readwrite')), store = tx.objectStore(WORKSPACE_STORE_NAME);
-            const read = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
-            read.onsuccess = function() {
-              if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
-              const index = normalizeIndexedDbProjectIndex(read.result);
-              let slot = index.slots.find(function(item) { return item.id === id; });
-              if (!slot) slot = { id: id, savedAt: '', bytes: 0 };
-              index.slots = index.slots.filter(function(item) { return item.id !== id; });
-              Object.assign(slot, { title: title, kind: kind === 'genga' ? 'genga' : 'conte', source: source });
-              index.slots.push(slot);
-              index.lastActiveId = id;
-              const pinRead = store.get(PINNED_PROJECT_SLOTS_KEY);
-              pinRead.onsuccess = function() {
-                if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
-                const pins = normalizePinnedProjectSlots(pinRead.result);
-                if (pinnedProjectSlotsEnabled() && !pins.includes(id) && pins.length < PINNED_PROJECT_MAX && id.indexOf('tltut-') !== 0) {
-                  pins.push(id);
-                  store.put(pins, PINNED_PROJECT_SLOTS_KEY);
-                }
-                // Keep at most three unpinned name-only references. This is separate
-                // from backup retention: never retire a body, version or fixed slot here.
-                const references = index.slots.filter(function(item) { return item.source && !item.bytes && !pins.includes(item.id); });
-                const dropped = new Set(references.slice(0, Math.max(0, references.length - INDEXED_DB_BACKUP_ONLY_MAX_SLOTS)).map(function(item) { return item.id; }));
-                index.slots = index.slots.filter(function(item) { return !dropped.has(item.id); });
-                try { store.put(index, INDEXED_DB_PROJECT_INDEX_KEY); }
-                catch (error) { tx.abort(); reject(error); }
-              };
-            };
-            tx.oncomplete = resolve;
-            tx.onabort = function() { reject(tx.error || new Error('Project source publication aborted')); };
-            tx.onerror = function() { reject(tx.error || new Error('Project source publication failed')); };
-          });
-        }, true);   // beforeTxOnly
-        assertProjectIoOwner(owner);
-        try { localStorage.removeItem(failureKey); } catch (error) { console.warn('[project-load] Source failure marker could not be cleared', error); }
-        return true;
-      } catch (error) {
-        assertProjectIoOwner(owner);
-        // The file operation already succeeded; failing to remember it is a
-        // distinct warning and must not skip its saved baseline or retention.
-        console.warn('[project-load] Project source was not remembered', error);
-        showToast(t('project.source.rememberFailed'), { warn: true });
-        return false;
-      }
     }
     function offerProjectSourceReconnect(slot, request, automatic) {
       if (automatic || !projectIoOwnerCurrent(request.owner)) return false;
@@ -74109,6 +74146,145 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.indexedDbAutosaveStatus = t('settings.autosave.checkFailed');
       }
       updatePrefsUI();
+    }
+
+    async function rememberProjectSource(owner, source) {
+      assertProjectIoOwner(owner);
+      source = normalizeProjectSource(source);
+      if (!source) return false;
+      const id = ensureCurrentProjectId(), title = String(owner.project.title || ''), kind = owner.project.kind;
+      const failureKey = 'moart-project-source-unremembered:' + id;
+      // A failed new reference must never leave an older folder looking current.
+      // This small independent marker also covers interruption during publication.
+      try { localStorage.setItem(failureKey, source.fileName); } catch (error) { console.warn('[project-load] Source failure marker unavailable', error); }
+      try {
+        if (!indexedDbAvailable()) throw new Error('Browser storage unavailable');
+        await workspaceDbRetrying(function(db, own) {
+          assertProjectIoOwner(owner);
+          return workspaceDbOp(db, 'remember project source', function(resolve, reject) {
+            const tx = own(db.transaction(WORKSPACE_STORE_NAME, 'readwrite')), store = tx.objectStore(WORKSPACE_STORE_NAME);
+            const read = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
+            read.onsuccess = function() {
+              if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
+              const index = normalizeIndexedDbProjectIndex(read.result);
+              let slot = index.slots.find(function(item) { return item.id === id; });
+              if (!slot) slot = { id: id, savedAt: '', bytes: 0 };
+              index.slots = index.slots.filter(function(item) { return item.id !== id; });
+              Object.assign(slot, { title: title, kind: kind === 'genga' ? 'genga' : 'conte', source: source });
+              index.slots.push(slot);
+              index.lastActiveId = id;
+              const pinRead = store.get(PINNED_PROJECT_SLOTS_KEY);
+              pinRead.onsuccess = function() {
+                if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
+                const pins = normalizePinnedProjectSlots(pinRead.result);
+                if (pinnedProjectSlotsEnabled() && !pins.includes(id) && pins.length < PINNED_PROJECT_MAX && id.indexOf('tltut-') !== 0) {
+                  pins.push(id);
+                  store.put(pins, PINNED_PROJECT_SLOTS_KEY);
+                }
+                // Keep at most three unpinned name-only references. This is separate
+                // from backup retention: never retire a body, version or fixed slot here.
+                const references = index.slots.filter(function(item) { return item.source && !item.bytes && !pins.includes(item.id); });
+                const dropped = new Set(references.slice(0, Math.max(0, references.length - INDEXED_DB_BACKUP_ONLY_MAX_SLOTS)).map(function(item) { return item.id; }));
+                index.slots = index.slots.filter(function(item) { return !dropped.has(item.id); });
+                try { store.put(index, INDEXED_DB_PROJECT_INDEX_KEY); }
+                catch (error) { tx.abort(); reject(error); }
+              };
+            };
+            tx.oncomplete = resolve;
+            tx.onabort = function() { reject(tx.error || new Error('Project source publication aborted')); };
+            tx.onerror = function() { reject(tx.error || new Error('Project source publication failed')); };
+          });
+        }, true);   // beforeTxOnly
+        assertProjectIoOwner(owner);
+        try { localStorage.removeItem(failureKey); } catch (error) { console.warn('[project-load] Source failure marker could not be cleared', error); }
+        return true;
+      } catch (error) {
+        assertProjectIoOwner(owner);
+        // The file operation already succeeded; failing to remember it is a
+        // distinct warning and must not skip its saved baseline or retention.
+        console.warn('[project-load] Project source was not remembered', error);
+        showToast(t('project.source.rememberFailed'), { warn: true });
+        return false;
+      }
+    }
+
+    // Project bodies and their rollback ring have one lifetime. Asset rows remain
+    // for the common reference/lease-aware sweep; never delete assets by project ID.
+    function deleteProjectStorageRecords(store, id) {
+      store.delete(indexedDbProjectPayloadKey(id));
+      store.delete(indexedDbVersionIndexKey(id));
+      const prefix = INDEXED_DB_PROJECT_VERSION_PREFIX + String(id) + ':';
+      const request = store.openKeyCursor(IDBKeyRange.bound(prefix, prefix + '\uffff'));
+      request.onsuccess = function() {
+        const cursor = request.result;
+        if (cursor) { store.delete(cursor.key); cursor.continue(); }
+      };
+    }
+
+    async function deleteProjectSlot(id) {
+      storageRootsChanged();
+      const db = await openWorkspaceDb();
+      await workspaceDbOp(db, 'delete project ' + id, function(resolve, reject) {
+        const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+        const store = tx.objectStore(WORKSPACE_STORE_NAME);
+        deleteProjectStorageRecords(store, id);
+        const indexRequest = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
+        indexRequest.onsuccess = function() {
+          const index = normalizeIndexedDbProjectIndex(indexRequest.result);
+          index.slots = index.slots.filter(function(slot) { return slot.id !== id; });
+          if (index.lastActiveId === id) index.lastActiveId = '';
+          store.put(index, INDEXED_DB_PROJECT_INDEX_KEY);
+        };
+        const pinsRequest = store.get(PINNED_PROJECT_SLOTS_KEY);
+        pinsRequest.onsuccess = function() {
+          if (Array.isArray(pinsRequest.result)) store.put(pinsRequest.result.filter(function(pid) { return pid !== id; }), PINNED_PROJECT_SLOTS_KEY);
+        };
+        tx.oncomplete = function() { resolve(); };
+        tx.onabort = function() { reject(tx.error || new Error('Project deletion aborted')); };
+        tx.onerror = function() { reject(tx.error || new Error('Project deletion failed')); };
+      });
+      if (String(state.project && state.project.projectId) === String(id)) projectSaveBeginEdit(id, null);
+      else forgetProjectSession(id);
+    }
+
+    function indexedDbVersionPayloadKey(id, seq) { return INDEXED_DB_PROJECT_VERSION_PREFIX + String(id || '') + ':' + String(seq); }
+    function indexedDbVersionIndexKey(id) { return INDEXED_DB_PROJECT_VERSION_INDEX_PREFIX + String(id || ''); }
+    function normalizeProjectVersionIndex(raw) {
+      const src = raw && typeof raw === 'object' ? raw : {};
+      const versions = Array.isArray(src.versions) ? src.versions.filter(function(v) { return v && typeof v === 'object' && Number.isFinite(Number(v.seq)); }).map(function(v) {
+        return { seq: Math.round(Number(v.seq)), savedAt: String(v.savedAt || ''), bytes: Math.max(0, Math.round(Number(v.bytes) || 0)) };
+      }) : [];
+      let nextSeq = Math.max(1, Math.round(Number(src.nextSeq) || 0));
+      versions.forEach(function(v) { if (v.seq >= nextSeq) nextSeq = v.seq + 1; });
+      return { versions: versions, nextSeq: nextSeq };
+    }
+    async function loadProjectVersionIndex(id) {
+      return normalizeProjectVersionIndex(await getWorkspaceDbValue(indexedDbVersionIndexKey(id)));
+    }
+
+    // A restore prepares media outside IndexedDB. Activate only the exact body that was prepared.
+    async function activateProjectSlot(id, payload, owner) {
+      const db = await openWorkspaceDb();
+      assertProjectIoOwner(owner);
+      await workspaceDbOp(db, 'activate project', function(resolve, reject) {
+        const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
+        const store = tx.objectStore(WORKSPACE_STORE_NAME);
+        let changed = false;
+        const readBody = store.get(indexedDbProjectPayloadKey(id));
+        readBody.onsuccess = function() {
+          if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
+          if (readBody.result !== payload) { changed = true; tx.abort(); return; }
+          const readIndex = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
+          readIndex.onsuccess = function() {
+            if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
+            const index = normalizeIndexedDbProjectIndex(readIndex.result);
+            index.lastActiveId = String(id);
+            store.put(index, INDEXED_DB_PROJECT_INDEX_KEY);
+          };
+        };
+        tx.oncomplete = resolve;
+        tx.onabort = function() { reject(tx.error || new Error(changed ? t('msg.project.saveConflict') : 'Project activation aborted')); };
+      });
     }
 
     // The write itself, unconditional — split out of saveProjectToIndexedDbAutosave (right below, gated on the
@@ -74807,24 +74983,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         await prepareIndexedDbProjectRestore(project, owner, prepared);
         assertProjectIoOwner(owner);
         // Finish fallible activation before replacing the live project or releasing its Undo/media.
-        if (!versionRestore) {
-          const db = await openWorkspaceDb();
-          assertProjectIoOwner(owner);
-          await workspaceDbOp(db, 'activate project', function(resolve, reject) {
-            const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
-            const store = tx.objectStore(WORKSPACE_STORE_NAME);
-            const read = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
-            read.onsuccess = function() {
-              if (!projectIoOwnerCurrent(owner)) { tx.abort(); return; }
-              const index = normalizeIndexedDbProjectIndex(read.result);
-              index.lastActiveId = String(id);
-              store.put(index, INDEXED_DB_PROJECT_INDEX_KEY);
-            };
-            tx.oncomplete = resolve;
-            tx.onabort = function() { reject(tx.error || new Error('Project activation aborted')); };
-          });
-          assertProjectIoOwner(owner);
-        }
+        if (!versionRestore) await activateProjectSlot(id, payload, owner);
+        assertProjectIoOwner(owner);
         if (options.canContinue && !options.canContinue()) throw new DOMException('Recovery surface changed', 'AbortError');
         if (outcome) outcome.adoptionStarted = true;
         applyRestoredIndexedDbProject(project, payload, versionRestore);
@@ -75881,7 +76041,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       storageCleanRunning = false;
       localRecoveryAction = null;
       projectVersionRestoreToken = null;
-      projectVersionRestoreRunning = false;
     }
     function updateStorageCleanButton() {
       const button = document.getElementById('storageCleanBtn');
@@ -76092,45 +76251,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    // Project bodies and their rollback ring have one lifetime. Asset rows remain
-    // for the common reference/lease-aware sweep; never delete assets by project ID.
-    function deleteProjectStorageRecords(store, id) {
-      store.delete(indexedDbProjectPayloadKey(id));
-      store.delete(indexedDbVersionIndexKey(id));
-      const prefix = INDEXED_DB_PROJECT_VERSION_PREFIX + String(id) + ':';
-      const request = store.openKeyCursor(IDBKeyRange.bound(prefix, prefix + '\uffff'));
-      request.onsuccess = function() {
-        const cursor = request.result;
-        if (cursor) { store.delete(cursor.key); cursor.continue(); }
-      };
-    }
     async function deleteIndexedDbProjectSlot(id, title) {
       if (!await askConfirm(t('msg.project.confirmDeleteBackup', title),
                             { okLabel: t('menu.delete'), danger: true })) return;
       try {
-        storageRootsChanged();
-        const db = await openWorkspaceDb();
-        await workspaceDbOp(db, 'delete project ' + id, function(resolve, reject) {
-          const tx = db.transaction(WORKSPACE_STORE_NAME, 'readwrite');
-          const store = tx.objectStore(WORKSPACE_STORE_NAME);
-          deleteProjectStorageRecords(store, id);
-          const indexRequest = store.get(INDEXED_DB_PROJECT_INDEX_KEY);
-          indexRequest.onsuccess = function() {
-            const index = normalizeIndexedDbProjectIndex(indexRequest.result);
-            index.slots = index.slots.filter(function(slot) { return slot.id !== id; });
-            if (index.lastActiveId === id) index.lastActiveId = '';
-            store.put(index, INDEXED_DB_PROJECT_INDEX_KEY);
-          };
-          const pinsRequest = store.get(PINNED_PROJECT_SLOTS_KEY);
-          pinsRequest.onsuccess = function() {
-            if (Array.isArray(pinsRequest.result)) store.put(pinsRequest.result.filter(function(pid) { return pid !== id; }), PINNED_PROJECT_SLOTS_KEY);
-          };
-          tx.oncomplete = function() { resolve(); };
-          tx.onabort = function() { reject(tx.error || new Error('Project deletion aborted')); };
-          tx.onerror = function() { reject(tx.error || new Error('Project deletion failed')); };
-        });
-        if (String(state.project && state.project.projectId) === String(id)) projectSaveBeginEdit(id, null);
-        else forgetProjectSession(id);
+        await deleteProjectSlot(id);
         scheduleStorageSweep('delete-project');
         await renderIndexedDbProjectSlots();
         await renderProjectStartRecent();
@@ -76140,35 +76265,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function indexedDbVersionPayloadKey(id, seq) { return INDEXED_DB_PROJECT_VERSION_PREFIX + String(id || '') + ':' + String(seq); }
-    function indexedDbVersionIndexKey(id) { return INDEXED_DB_PROJECT_VERSION_INDEX_PREFIX + String(id || ''); }
-    function normalizeProjectVersionIndex(raw) {
-      const src = raw && typeof raw === 'object' ? raw : {};
-      const versions = Array.isArray(src.versions) ? src.versions.filter(function(v) { return v && typeof v === 'object' && Number.isFinite(Number(v.seq)); }).map(function(v) {
-        return { seq: Math.round(Number(v.seq)), savedAt: String(v.savedAt || ''), bytes: Math.max(0, Math.round(Number(v.bytes) || 0)) };
-      }) : [];
-      let nextSeq = Math.max(1, Math.round(Number(src.nextSeq) || 0));
-      versions.forEach(function(v) { if (v.seq >= nextSeq) nextSeq = v.seq + 1; });
-      return { versions: versions, nextSeq: nextSeq };
-    }
-    async function loadProjectVersionIndex(id) {
-      return normalizeProjectVersionIndex(await getWorkspaceDbValue(indexedDbVersionIndexKey(id)));
-    }
     // Publish the rollback ring in the same transaction as the project payload to prevent mismatched versions.
     // `planProjectVersionPush` computes policy and `publishProjectSaveTransaction` applies it.
-    let projectVersionRestoreRunning = false, projectVersionRestoreToken = null, projectVersionsRenderSeq = 0;
+    let projectVersionRestoreToken = null, projectVersionsRenderSeq = 0;
     async function restoreProjectVersion(seq, canContinue) {
       const owner = projectIoOwner(), id = String(owner.project && owner.project.projectId || '');
-      if (projectVersionRestoreRunning || !id || canContinue && !canContinue()) return false;
+      if (projectVersionRestoreToken || !id || canContinue && !canContinue()) return false;
       const token = projectVersionRestoreToken = {};
-      projectVersionRestoreRunning = true;
       const before = projectUnsavedSnapshot();
       try {
         if (!await askConfirm(t('msg.project.confirmRestoreVersion')) || !projectIoOwnerCurrent(owner) || canContinue && !canContinue()) return false;
         assertProjectReplacement(owner, before);
         return await restoreIndexedDbProjectById(id, { versionSeq: seq, canContinue: canContinue });
       } finally {
-        if (projectVersionRestoreToken === token) { projectVersionRestoreToken = null; projectVersionRestoreRunning = false; }
+        if (projectVersionRestoreToken === token) projectVersionRestoreToken = null;
       }
     }
     async function renderProjectVersions() {
@@ -76199,8 +76309,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         container.replaceChildren();
         if (!versions.length) container.appendChild(recoveryPointCard(t('settings.versions.none'), '', false));
         versions.forEach(function(v) {
-          container.appendChild(recoveryPointCard(recoveryPointDate(v.savedAt), '', !projectVersionRestoreRunning, async function(button) {
-            if (!current() || projectVersionRestoreRunning) return;
+          container.appendChild(recoveryPointCard(recoveryPointDate(v.savedAt), '', !projectVersionRestoreToken, async function(button) {
+            if (!current() || projectVersionRestoreToken) return;
             container.querySelectorAll('button').forEach(function(b) { b.disabled = true; });
             try { await restoreProjectVersion(v.seq, function() { return prefsStorageRequestCurrent(request); }); }
             catch (error) { if (prefsStorageRequestCurrent(request) && noneEl) { noneEl.hidden = false; noneEl.textContent = error.message; } }
@@ -76209,8 +76319,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
       } catch (error) {
         if (current()) {
-          container.replaceChildren(recoveryPointCard(t('settings.versions.readFailed'), '', !projectVersionRestoreRunning, function(button) {
-            if (!current() || projectVersionRestoreRunning) return;
+          container.replaceChildren(recoveryPointCard(t('settings.versions.readFailed'), '', !projectVersionRestoreToken, function(button) {
+            if (!current() || projectVersionRestoreToken) return;
             button.disabled = true;
             renderProjectVersions();
           }, t('settings.versions.retry')));
@@ -76653,27 +76763,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return dir;
     }
 
-    let projectFileLoadSerial = 0;
-    function projectIoOwner(request) {
-      return { request: request || null, active: state.projectActive, project: state.project, handle: state.workspaceHandle, name: state.workspaceName,
-        source: projectFileSources.get(state.project) || null,
-        settings: Object.assign({}, state.project && state.project.settings && state.project.settings.localWorkspace) };
-    }
-    function projectIoOwnerCurrent(owner) {
-      if (!owner || owner.project !== state.project || owner.handle !== state.workspaceHandle || owner.active !== state.projectActive
-          || owner.source !== (projectFileSources.get(state.project) || null)) return false;
-      if (owner.request && owner.request.id !== projectFileLoadSerial) return false;
-      const settings = state.project && state.project.settings && state.project.settings.localWorkspace || {};
-      return ['audioDir', 'videoDir', 'layerDir', 'backupDir', 'projectFileName'].every(function(key) { return owner.settings[key] === settings[key]; });
-    }
-    function assertProjectIoOwner(owner) {
-      if (!projectIoOwnerCurrent(owner)) throw new DOMException(t('msg.workspace.writeTargetChanged'), 'AbortError');
-    }
-    function beginProjectFileLoad() {
-      const request = { id: ++projectFileLoadSerial };
-      request.owner = projectIoOwner(request);
-      return request;
-    }
     // Keep the first-folder safety net through failed writes and retries without retaining closed projects.
     const workspaceFirstSaves = new WeakMap();
     let workspaceWriteQueue = Promise.resolve();
@@ -76690,38 +76779,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       workspaceWriteQueue = job.then(function() {}, function() {});
       return job;
     }
-    function projectFileOperationError(error, phase, fileName) {
-      const detail = (error && error.name ? error.name + ': ' : '') + (error && error.message ? error.message : String(error));
-      const wrapped = new Error('[' + phase + '] ' + fileName + '\n' + detail);
-      wrapped.name = error && error.name || 'Error';
-      wrapped.cause = error;
-      console.error('[project-file]', phase, fileName, error);
-      return wrapped;
-    }
-    async function writeWorkspaceFileHandle(fileHandle, path, blob, onCommit) {
-      let phase = 'createWritable', writable = null;
-      try {
-        writable = await fileHandle.createWritable();
-        phase = 'write';
-        await writable.write(blob);
-        phase = 'close';
-        await writable.close();
-        writable = null;
-        if (onCommit) onCommit();
-        phase = 'verify';
-        const written = await fileHandle.getFile();
-        const expectedSize = Math.max(0, Math.round(Number(blob && blob.size) || 0));
-        if (expectedSize && (!written || Math.round(Number(written.size) || 0) !== expectedSize)) {
-          throw new Error('Expected ' + expectedSize + ' bytes, got ' + (written ? written.size : 0));
-        }
-        return written;
-      } catch (error) {
-        if (writable) { try { await writable.abort(); } catch (abortError) { console.warn('[workspace] Failed to abort file write', path, abortError); } }
-        throw projectFileOperationError(error, phase, path);
-      }
+    function writeWorkspaceFileHandle(handle, path, blob) {
+      return writeBlobToFileHandle(handle, blob, {
+        path: path,
+        verify: function() { return readWrittenFile(handle, blob.size); }
+      });
     }
 
-    async function writeBlobToWorkspace(relativeDir, fileName, blob, workspaceHandle, onCommit) {
+    async function writeBlobToWorkspace(relativeDir, fileName, blob, workspaceHandle) {
       const root = workspaceHandle || state.workspaceHandle;
       const path = String(relativeDir || '') + '/' + fileName;
       let phase = 'permission', fileHandle;
@@ -76732,7 +76797,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         phase = 'getFileHandle';
         fileHandle = await dir.getFileHandle(fileName, { create: true });
       } catch (error) { throw projectFileOperationError(error, phase, path); }
-      await writeWorkspaceFileHandle(fileHandle, path, blob, onCommit);
+      await writeWorkspaceFileHandle(fileHandle, path, blob);
       return fileName;
     }
 
@@ -78420,25 +78485,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       assertProjectIoOwner(owner);
       return { projectJson: JSON.stringify(copy), media: media, baseline: baseline, recordingSource: recordingSource };
     }
-    // ## SECTION: Project archive and workspace saves
-    function projectFileVersionOf(file) { return { size: file.size, lastModified: file.lastModified }; }
-    function projectFileVersionMatches(file, expected) {
-      return !!expected && file.size === expected.size && file.lastModified === expected.lastModified;
-    }
-    async function assertProjectFileVersion(handle, expected, owner) {
-      assertProjectIoOwner(owner);
-      const current = await handle.getFile();
-      assertProjectIoOwner(owner);
-      if (!projectFileVersionMatches(current, expected)) throw new Error(t('project.source.changed'));
-    }
-
+    // ## SECTION: Project archive and explicit saves
     async function exportConteFolderZip(options) {
       if (warnIfUnfinishedEdit()) return false;
       options = options || {};
       const owner = options.owner || projectIoOwner();
       const base = String(projectJsonFileNameForTitle(owner.project.title || owner.project.projectId || 'project')).replace(/\.conte\.json$/i, '').replace(/\.json$/i, '');
       let zipName = base + '.moart';
-      let writable = null, phase = 'picker', currentFile = zipName;
+      let phase = 'picker', currentFile = zipName;
       const saveLeases = { recording: [], layerUrls: [] };
       try {
         assertProjectIoOwner(owner);
@@ -78462,32 +78516,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const selectedVersion = selectedFile && projectFileVersionOf(selectedFile);
         const recoveryPreparation = handle && !reuse ? await prepareLocalProjectRecovery(owner, handle) : null;
         const result = await runWorkspaceWrite(owner, async function() {
-          try {
-            const chunks = [], savedAudio = [], tempAudio = [];
-            let zipBytes = 0;
-            let expectedVersion = selectedVersion;
-            if (reuse) {
-              const initialFile = await handle.getFile();
+          const chunks = [], savedAudio = [], tempAudio = [];
+          let zipBytes = 0;
+          let expectedVersion = selectedVersion;
+          if (reuse) {
+            const initialFile = await handle.getFile();
+            assertProjectIoOwner(owner);
+            expectedVersion = source.fileVersion;
+            // Ask about genuine outside changes against a coherent queued observation.
+            if (!projectFileVersionMatches(initialFile, expectedVersion)) {
+              const choice = await askActionChoice(t('project.source.changedChoice'), [
+                { value: 'saveAs', label: t('project.source.saveAs'), primary: true },
+                { value: 'overwrite', label: t('project.source.overwrite'), danger: true },
+                { value: 'cancel', label: t('ui.cancel') }]);
               assertProjectIoOwner(owner);
-              expectedVersion = source.fileVersion;
-              // Ask about genuine outside changes against a coherent queued observation.
-              if (!projectFileVersionMatches(initialFile, expectedVersion)) {
-                const choice = await askActionChoice(t('project.source.changedChoice'), [
-                  { value: 'saveAs', label: t('project.source.saveAs'), primary: true },
-                  { value: 'overwrite', label: t('project.source.overwrite'), danger: true },
-                  { value: 'cancel', label: t('ui.cancel') }]);
-                assertProjectIoOwner(owner);
-                if (choice === 'saveAs') return 'saveAs';
-                if (choice !== 'overwrite') return false;
-                expectedVersion = projectFileVersionOf(initialFile);
-              }
+              if (choice === 'saveAs') return 'saveAs';
+              if (choice !== 'overwrite') return false;
+              expectedVersion = projectFileVersionOf(initialFile);
             }
-            if (handle) {
-              await assertProjectFileVersion(handle, expectedVersion, owner);
-              phase = 'createWritable';
-              writable = await handle.createWritable();
-              assertProjectIoOwner(owner);
-            }
+          }
+          const produceArchive = async function(write) {
+            assertProjectIoOwner(owner);
             phase = 'prepare';
             showLoadingOverlay(t('msg.loading.creatingShareZip'), null, owner);
             const bundle = await buildConteFolderBundle(owner, saveLeases);
@@ -78496,7 +78545,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               assertProjectIoOwner(owner);
               phase = 'write';
               zipBytes += bytes instanceof Blob ? bytes.size : bytes.byteLength;
-              if (writable) await writable.write(bytes); else chunks.push(bytes instanceof Blob ? bytes : new Blob([bytes]));
+              await write(bytes);
               assertProjectIoOwner(owner);
             });
             const projectBytes = new TextEncoder().encode(bundle.projectJson);
@@ -78525,99 +78574,98 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             phase = 'finish';
             await zip.finish();
             assertProjectIoOwner(owner);
-            let delivered;
-            let savedSource = null;
-            if (writable) {
-              phase = 'verify-source';
-              await assertProjectFileVersion(handle, expectedVersion, owner);
-              phase = 'close';
-              await writable.close();
-              writable = null;
-              delivered = 'saved';
-              assertProjectIoOwner(owner);
-              phase = 'verify-save';
-              const savedFile = await handle.getFile();
-              assertProjectIoOwner(owner);
-              if (savedFile.size !== zipBytes) throw new Error(t('project.source.changed'));
-              rememberSavedAudioOptimizations(owner.project, handle, savedFile, savedAudio);
-              savedSource = {
-                kind: 'zip',
-                fileName: handle.name || zipName,
-                fileHandle: handle,
-                fileVersion: { size: savedFile.size, lastModified: savedFile.lastModified }
-              };
-            }
-            else if (remote) {
-              // 412 = changed elsewhere: never overwrite. A conflict or a network failure keeps the open work and
-              // its IndexedDB autosave; the user may deliver the same bytes as a separate .moart.
-              phase = 'upload';
-              const blob = new Blob(chunks, { type: 'application/zip' });
-              let upload = null, failure = null;
-              try { upload = await putRemoteProjectFile(remote, blob); } catch (error) { failure = error; }
-              assertProjectIoOwner(owner);
-              if (!upload || upload.conflict) {
-                remote.status = failure ? 'failed' : 'conflict';
-                updateWorkspaceUI();
-                if (failure) console.warn('[remote] Save failed', failure);
-                const message = failure ? t(remoteTextKey(remote, 'saveFailed'), failure.message || String(failure)) : t(remoteTextKey(remote, 'conflict'));
-                const choice = await askActionChoice(message, [
-                  { value: 'cancel', label: t('ui.cancel') },
-                  { value: 'copy', label: t('project.remote.saveCopy'), primary: true }]);
-                assertProjectIoOwner(owner);
-                if (choice === 'copy') {
-                  phase = 'deliver';
-                  const copied = await deliverBlobFile(blob, zipName, 'project');
-                  if (copied) notifyWorkspaceStatus(fileDeliveryStatus(copied, zipName));
-                }
-                return false;
-              }
-              remote.etag = upload.etag;
-              remote.status = 'saved';
-              remote.at = Date.now();
-              savedSource = source;
-              delivered = isDropboxRemoteUrl(remote.url) ? 'uploaded-dropbox' : 'uploaded';
-            }
-            else {
-              phase = 'deliver';
-              delivered = await deliverBlobFile(new Blob(chunks, { type: 'application/zip' }), zipName, 'project');
-              // No persistent handle backed this ZIP: the slice-reuse cache above has nothing to slice from,
-              // so a repeated handle-less save instead reuses this OPFS-backed temporary cache.
-              if (delivered === 'downloaded') {
-                phase = 'cache-temp-audio';
-                // Best-effort only: a cache failure (including the project closing mid-write) must never
-                // turn an already-delivered download into a reported failure.
-                try { await rememberTempAudioCache(owner, tempAudio); }
-                catch (error) { console.warn('[audio temp cache] population failed', error); }
-              }
-            }
-            if (!delivered) return false;
-            if (projectIoOwnerCurrent(owner)) {
-              // A folder's explicit ZIP export remains a copy; a ZIP Save As adopts
-              // the selected file only after its writable close is confirmed.
-              if (savedSource && (!owner.handle || source)) {
-                // Keep queued owners for this same linked original. Version observations
-                // are local to the write queue; a different destination replaces the source.
-                if (reuse) source.fileVersion = savedSource.fileVersion;
-                else if (!remote) setProjectFileSource(owner.project, savedSource);
-                Object.assign(owner, projectIoOwner(owner.request));
-                if (owner.request) owner.request.owner = owner;
-                await rememberProjectSource(owner, savedSource);
-                assertProjectIoOwner(owner);
-              }
-              if (!owner.handle || source) state.projectSavedSnapshot = bundle.baseline;
-              notifyWorkspaceStatus(fileDeliveryStatus(delivered, zipName));
+            return bundle;
+          };
+          let bundle, delivered, savedSource = null;
+          if (handle) {
+            await assertProjectFileVersion(handle, expectedVersion, owner);
+            phase = 'createWritable';
+            const savedFile = await writeFileHandle(handle, async function(write) {
+              bundle = await produceArchive(write);
+            }, {
+              path: zipName,
+              beforeClose: function() { return assertProjectFileVersion(handle, expectedVersion, owner); },
+              verify: function() { return readWrittenFile(handle, zipBytes); }
+            });
+            // The same linked source may be used by an already queued owner or a parked tab.
+            const fileVersion = projectFileVersionOf(savedFile);
+            if (reuse) source.fileVersion = fileVersion;
+            assertProjectIoOwner(owner);
+            delivered = 'saved';
+            rememberSavedAudioOptimizations(owner.project, handle, savedFile, savedAudio);
+            savedSource = {
+              kind: 'zip',
+              fileName: handle.name || zipName,
+              fileHandle: handle,
+              fileVersion: fileVersion
+            };
+          } else {
+            bundle = await produceArchive(function(bytes) { chunks.push(bytes instanceof Blob ? bytes : new Blob([bytes])); });
+          }
+          if (remote) {
+            // 412 = changed elsewhere: never overwrite. A conflict or a network failure keeps the open work and
+            // its IndexedDB autosave; the user may deliver the same bytes as a separate .moart.
+            phase = 'upload';
+            const blob = new Blob(chunks, { type: 'application/zip' });
+            let upload = null, failure = null;
+            try { upload = await putRemoteProjectFile(remote, blob); } catch (error) { failure = error; }
+            assertProjectIoOwner(owner);
+            if (!upload || upload.conflict) {
+              remote.status = failure ? 'failed' : 'conflict';
               updateWorkspaceUI();
-              if (savedSource && handle && (!owner.handle || source) && projectIoOwnerCurrent(owner)) {
-                offerLocalProjectRecovery(owner, handle, false, false, recoveryPreparation).catch(function(error) { console.warn('[recovery] Connection offer unavailable', error); });
+              if (failure) console.warn('[remote] Save failed', failure);
+              const message = failure ? t(remoteTextKey(remote, 'saveFailed'), failure.message || String(failure)) : t(remoteTextKey(remote, 'conflict'));
+              const choice = await askActionChoice(message, [
+                { value: 'cancel', label: t('ui.cancel') },
+                { value: 'copy', label: t('project.remote.saveCopy'), primary: true }]);
+              assertProjectIoOwner(owner);
+              if (choice === 'copy') {
+                phase = 'deliver';
+                const copied = await deliverBlobFile(blob, zipName, 'project');
+                if (copied) notifyWorkspaceStatus(fileDeliveryStatus(copied, zipName));
               }
+              return false;
             }
-            return true;
-          } finally {
-            if (writable) {
-              try { await writable.abort(); } catch (abortError) { console.warn('[zip-export] Failed to abort file write', zipName, abortError); }
-              writable = null;
+            remote.etag = upload.etag;
+            remote.status = 'saved';
+            remote.at = Date.now();
+            savedSource = source;
+            delivered = isDropboxRemoteUrl(remote.url) ? 'uploaded-dropbox' : 'uploaded';
+          }
+          else if (!handle) {
+            phase = 'deliver';
+            delivered = await deliverBlobFile(new Blob(chunks, { type: 'application/zip' }), zipName, 'project');
+            // No persistent handle backed this ZIP: the slice-reuse cache above has nothing to slice from,
+            // so a repeated handle-less save instead reuses this OPFS-backed temporary cache.
+            if (delivered === 'downloaded') {
+              phase = 'cache-temp-audio';
+              // Best-effort only: a cache failure (including the project closing mid-write) must never
+              // turn an already-delivered download into a reported failure.
+              try { await rememberTempAudioCache(owner, tempAudio); }
+              catch (error) { console.warn('[audio temp cache] population failed', error); }
             }
           }
+          if (!delivered) return false;
+          if (projectIoOwnerCurrent(owner)) {
+            // A folder's explicit ZIP export remains a copy; a ZIP Save As adopts
+            // the selected file only after its writable close is confirmed.
+            if (savedSource && (!owner.handle || source)) {
+              // Keep queued owners for this same linked original. Version observations
+              // are local to the write queue; a different destination replaces the source.
+              if (!reuse && !remote) setProjectFileSource(owner.project, savedSource);
+              Object.assign(owner, projectIoOwner(owner.request));
+              if (owner.request) owner.request.owner = owner;
+              await rememberProjectSource(owner, savedSource);
+              assertProjectIoOwner(owner);
+            }
+            if (!owner.handle || source) state.projectSavedSnapshot = bundle.baseline;
+            notifyWorkspaceStatus(fileDeliveryStatus(delivered, zipName));
+            updateWorkspaceUI();
+            if (savedSource && handle && (!owner.handle || source) && projectIoOwnerCurrent(owner)) {
+              offerLocalProjectRecovery(owner, handle, false, false, recoveryPreparation).catch(function(error) { console.warn('[recovery] Connection offer unavailable', error); });
+            }
+          }
+          return true;
         });
         // Release the queue/Web Lock before recursively selecting another destination.
         if (result === 'saveAs') return await exportConteFolderZip(Object.assign({}, options, { owner: owner, reuseSource: false }));
@@ -78633,23 +78681,124 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    // Dirty-state snapshots omit base64 with `portable: false`.
-    // A drawing edit changes its reference, so pixel strings are unnecessary for comparison.
-    // Store eviction must not affect that snapshot.
-    // Including base64 only while a drawing is resident would make a saved project appear dirty after eviction.
-    // Omitting it also avoids serializing all pixels on every comparison.
-    // If stroke commits switch from new references to incrementing `version`,
-    // include that version in the dirty-state snapshot.
-    function projectUnsavedSnapshot() { return serializedProjectJson({ portable: false }); }
-    function markProjectSavedBaseline() {
+    // The single-file JSON must carry conte layer pixels itself — a folder file name or an IndexedDB
+    // key resolves only on this device. A loaded source that fails to read fails the save; an ordinary empty
+    // drawing (no external reference) stays empty, and a reference with no bytes in this session is kept.
+    async function inlineLayerDrawingsForJson(copy, owner) {
+      const out = copy && copy.layerDrawings, live = owner.project.layerDrawings || {};
+      if (!out) return;
+      const refs = Object.keys(out);
+      for (let i = 0; i < refs.length; i += 1) {
+        const ref = refs[i], saved = out[ref];
+        if (!saved || saved.bitmapDataUrl || !live[ref]) continue;
+        const drawing = normalizeLayerDrawingData(Object.assign({}, live[ref]));
+        const src = String(drawing.bitmapDataUrl || ''), storage = drawing.bitmapStorage;
+        const storedKey = layerDrawingIndexedDbKeyStored(drawing);
+        let blob = null;
+        if (/^blob:/i.test(src)) blob = await fetch(src).then(function(response) { return response.blob(); });
+        else if (storedKey) blob = await readLayerDrawingBlobFromIndexedDb(ref, drawing);
+        else if (storage && storage.fileName && owner.handle) blob = await readBlobFromWorkspace(storage.dir || owner.settings.layerDir, storage.fileName, owner.handle);
+        else {
+          if (storage && storage.fileName) console.warn('[json-save] layer drawing has no bytes in this session: ' + storage.fileName);
+          continue;
+        }
+        assertProjectIoOwner(owner);
+        if (!blob || !blob.size) throw new Error('Layer drawing source unavailable: ' + ref);
+        saved.bitmapDataUrl = await blobToDataUrl(blob);
+        saved.bitmapStorage = null;
+        assertProjectIoOwner(owner);
+      }
+    }
+    // Single-file .conte.json fallback for saveProjectToWorkspace callers without a working folder.
+    // Capture metadata first, then prepare portable bytes privately; edits made while awaiting are not marked saved.
+    async function saveJsonDownload(owner) {
+      owner = owner || projectIoOwner();
+      await drawingFlushPending();
+      assertProjectIoOwner(owner);
+      flushLayerLiveBitmapsForSave();
+      const baseline = projectUnsavedSnapshot(), copy = projectForJsonStorage({ portable: false });
+      await inlineLayerDrawingsForJson(copy, owner);
+      assertProjectIoOwner(owner);
+      const drawingUrls = await gengaPreparePortableDrawings(copy, owner);
+      assertProjectIoOwner(owner);
+      if (copy.gengaTimeline) {
+        gengaInlineDrawings(copy.gengaTimeline, drawingUrls);
+        gengaInlineAudio(copy.gengaTimeline, await gengaPreparePortableAudio(copy, owner));
+      }
+      await drawingRecordingPrepareFile(copy, owner, 'inline');
+      assertProjectIoOwner(owner);
+      await refsPrepareFile(copy, owner, 'inline');
+      assertProjectIoOwner(owner);
+      const payload = serializedProjectJson(null, copy);
+      const blob = new Blob([payload], { type: 'application/json' });
+      const delivery = await deliverBlobFile(blob, (owner.project.projectId || 'conte_project') + '.conte.json', 'project');
+      if (!delivery) return false;
+      if (projectIoOwnerCurrent(owner)) state.projectSavedSnapshot = baseline;
+      return true;
+    }
+
+    // Mobile, genga, and projects opened from a linked original save a self-contained ZIP.
+    // The save menu and command share this choice so they do not offer duplicate actions.
+    function saveIsShareZipExport() {
+      return !fileSystemAccessAvailable() || Boolean(state.project && state.project.kind === 'genga')
+        || Boolean(projectFileSources.get(state.project));
+    }
+    // An explicit save during a stroke or an uncommitted stamp drag would write the drawing without
+    // the in-flight pixels and report success. Both save entries (saveJson and the ZIP menu) stop here.
+    function warnIfUnfinishedEdit() {
+      paintBucketFlush();
+      if (!strokeInProgress() && !(typeof gengaStampDrag !== 'undefined' && gengaStampDrag)) return false;
+      showToast(t('status.save.finishStroke'), {});
+      return true;
+    }
+    async function saveJson(owner) {
+      // Ctrl+S does not blur the focused field. Commit it before acquiring the save owner or freezing any snapshot:
+      // Dialogue blocks keep focus and run their change command. Blur other text fields, such as inspector action, cut number, 尺,
+      // and inline 用紙 editors, so their change or blur handler commits.
+      const input = document.activeElement;
+      if (input && input.matches('.dialog-blocks .dlgblk-body, .dialog-blocks .dlgblk-speaker') && !input.readOnly) {
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      } else if (input && input !== document.body && input.matches('input, textarea, [contenteditable="true"]') && !input.readOnly) {
+        input.blur();
+      }
+      if (warnIfUnfinishedEdit()) return false;
+      owner = owner || projectIoOwner();
       try {
-        state.projectSavedSnapshot = projectUnsavedSnapshot();
+        assertProjectIoOwner(owner);
+        // Mobile (no File System Access): export a self-contained ZIP (separate media entries) — sidesteps the inline
+        // single-JSON ~512MB string limit. exportConteFolderZip delivers it via the OS share sheet / download.
+        // Genga also uses a ZIP with separate drawing/audio entries. The exported file is the durable copy;
+        // IndexedDB autosave is an evictable local safety net.
+        if (saveIsShareZipExport()) {
+          const saved = await exportConteFolderZip({ owner: owner, reuseSource: true });
+          if (saved) { scheduleStorageSweep('save-zip'); window.moartUsage.note('manual-save'); }
+          return saved;
+        }
+        const firstFolder = !owner.handle;
+        if (firstFolder) {
+          // Folder setup is part of the pending save/replacement, not a competing load request.
+          const request = owner.request || beginProjectFileLoad();
+          owner.request = request;
+          request.owner = owner;
+          if (!await askConfirm(t('msg.workspace.firstSavePrompt'))) return false;
+          assertProjectIoOwner(owner);
+          const selected = await selectWorkspaceFolder({ silent: true, loadExisting: false, saveCurrent: false, request: request });
+          if (!selected) return false;
+          assertProjectIoOwner(request.owner);
+          // Adopt only the connection committed by this request; later edits still need saving.
+          Object.assign(owner, request.owner);
+          workspaceFirstSaves.set(owner.project, owner.handle);
+        }
+        const saved = await saveProjectToWorkspace(owner, { retireIndexedDbAutosave: workspaceFirstSaves.get(owner.project) === owner.handle });
+        if (saved) { scheduleStorageSweep('save'); window.moartUsage.note('manual-save'); }
+        return saved;
       } catch (error) {
-        state.projectSavedSnapshot = '';
+        alert(t('msg.err.jsonSave', (error && error.message ? error.message : error)));
+        return false;
       }
     }
 
-
+    // ## SECTION: Workspace project saves and retention
     // Called only after the project JSON has committed, while runWorkspaceWrite still owns this save.
     // This ledger owns only files explicitly supplied by this feature. Existing backups/assets are never adopted.
     // A durable ledger write gates deletion; a final compaction failure leaves harmless stale ownership records.
@@ -79134,7 +79283,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const previous = clip.ref && imported.get(clip.ref);
         let shared = false;
         if (previous) {
-          if (blob && previous.blob) shared = await gengaAudioBlobsEqual(blob, previous.blob, owner);
+          if (blob && previous.blob) shared = blob.type === previous.blob.type && await fileBlobBytesEqual(blob, previous.blob, owner);
           else {
             const left = blob ? await gengaBlobToDataUrl(blob) : url;
             const right = previous.blob ? await gengaBlobToDataUrl(previous.blob) : previous.url;
@@ -79149,17 +79298,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         delete clip.dataUrl;
       }
       return prepared;
-    }
-    // Canonical FileReader data URLs compare MIME plus bytes. Bound comparison scratch memory.
-    async function gengaAudioBlobsEqual(left, right, owner) {
-      if (left.type !== right.type || left.size !== right.size) return false;
-      if (left === right) return true;
-      for (let offset = 0; offset < left.size; offset += 262144) {
-        const a = await readZipBlobRange(left, offset, offset + 262144, owner);
-        const b = await readZipBlobRange(right, offset, offset + 262144, owner);
-        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-      }
-      return true;
     }
     async function gengaPrepareWorkspaceSave(copy, owner, prepared, optimizeAudio) {
       const gt = copy.gengaTimeline;
@@ -79228,23 +79366,35 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function rememberWorkspaceJsonVersion(handle, fileName, file) {
       if (handle && file) workspaceJsonVersions.set(handle, Object.assign({ fileName: fileName }, projectFileVersionOf(file)));
     }
-    // Detect external changes to `project.conte.json` as `projectFileVersionMatches` does for ZIP saves.
-    // Abort passive saves on conflict and let persistence clean up staged files. Explicit save asks before overwriting.
-    // Overwriting preserves the changed file under `backups/`. Skip the prompt when the file or baseline is absent.
-    async function confirmWorkspaceJsonUnchanged(owner, fileName, passive) {
+    // Use the same observation for overwrite consent, the backup, and the final pre-close check.
+    async function workspaceJsonWriteTarget(owner, fileName, passive) {
       const known = workspaceJsonVersions.get(owner.handle);
-      if (!known || known.fileName !== fileName) return true;
-      let current = null;
-      try { current = await (await owner.handle.getFileHandle(fileName, { create: false })).getFile(); }
-      catch (error) { if (!error || error.name !== 'NotFoundError') throw error; }
+      let handle = null, file = null;
+      try {
+        handle = await owner.handle.getFileHandle(fileName, { create: false });
+        file = await handle.getFile();
+      } catch (error) {
+        if (error.name !== 'NotFoundError') throw error;
+        handle = null;
+      }
       assertProjectIoOwner(owner);
-      if (!current || projectFileVersionMatches(current, known)) return true;
-      if (passive) throw new Error(t('msg.workspace.externalChangePaused', fileName));
-      const choice = await askActionChoice(t('msg.workspace.externalChangeChoice', fileName), [
-        { value: 'overwrite', label: t('project.source.overwrite'), danger: true },
-        { value: 'cancel', label: t('ui.cancel'), primary: true }]);
+      if (file && known && known.fileName === fileName && !projectFileVersionMatches(file, known)) {
+        if (passive) throw new Error(t('msg.workspace.externalChangePaused', fileName));
+        const choice = await askActionChoice(t('msg.workspace.externalChangeChoice', fileName), [
+          { value: 'overwrite', label: t('project.source.overwrite'), danger: true },
+          { value: 'cancel', label: t('ui.cancel'), primary: true }]);
+        assertProjectIoOwner(owner);
+        if (choice !== 'overwrite') return null;
+      }
+      return { handle: handle, file: file };
+    }
+
+    async function assertWorkspaceJsonWriteTarget(owner, fileName, handle, original) {
+      const currentHandle = await owner.handle.getFileHandle(fileName, { create: false });
+      if (!await currentHandle.isSameEntry(handle)) throw new Error(t('project.source.changed'));
+      const current = await currentHandle.getFile();
+      if (original ? !projectFileVersionMatches(current, original) : current.size !== 0) throw new Error(t('project.source.changed'));
       assertProjectIoOwner(owner);
-      return choice === 'overwrite';
     }
 
     // Workspace compression keeps original assets for backups and publishes references only after JSON save.
@@ -79435,7 +79585,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Compression saves stop on external JSON edits without prompting for overwrite.
     async function persistWorkspaceProjectInWriteQueue(owner, compressedAssetChanges, options) {
       const prepared = [], gengaPrepared = [];
-      let published = false, jsonStarted = false, backup = null, attemptedPayload = null;
+      let backup = null, jsonWrite = null;
       try {
         assertProjectIoOwner(owner);
         await drawingFlushPending();
@@ -79483,15 +79633,27 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const fileName = owner.settings.projectFileName || 'project.conte.json';
         // External changes block background or compression saves. Only explicit saves offer overwrite.
         const passive = !!compressedAssetChanges || !!(options && options.cleanup === false);
-        if (!await confirmWorkspaceJsonUnchanged(owner, fileName, passive)) return false;
-        backup = await backupExistingWorkspaceProject(fileName, owner);
+        const target = await workspaceJsonWriteTarget(owner, fileName, passive);
+        if (!target) return false;
+        backup = await backupExistingWorkspaceProject(fileName, owner, target.file);
         assertProjectIoOwner(owner);
-        attemptedPayload = payload;
-        jsonStarted = true;
-        await writeBlobToWorkspace('', fileName, blob, owner.handle, function() { published = true; });
-        // A successful close owns the files even if verification or the following owner check fails.
+        const handle = target.handle || await owner.handle.getFileHandle(fileName, { create: true });
         assertProjectIoOwner(owner);
-        rememberWorkspaceJsonVersion(owner.handle, fileName, await (await owner.handle.getFileHandle(fileName, { create: false })).getFile());
+        jsonWrite = { fileName: fileName, blob: blob, closeAttempted: false, closed: false, verified: false };
+        const written = await writeBlobToFileHandle(handle, blob, {
+          beforeClose: async function() {
+            await assertWorkspaceJsonWriteTarget(owner, fileName, handle, target.file);
+            jsonWrite.closeAttempted = true;
+          },
+          onCommit: function() { jsonWrite.closed = true; },
+          verify: async function() {
+            const file = await readWrittenFile(handle, blob.size);
+            if (!await fileBlobBytesEqual(file, blob)) throw new Error(t('project.source.changed'));
+            return file;
+          }
+        });
+        jsonWrite.verified = true;
+        rememberWorkspaceJsonVersion(owner.handle, fileName, written);
         assertProjectIoOwner(owner);
         const unchanged = projectUnsavedSnapshot() === beforeWrite;
         if (gengaAssets) gengaWorkspaceAssets.set(owner.project, gengaAssets);
@@ -79537,37 +79699,47 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return true;
       } finally {
         const owned = prepared.concat(compressedAssetChanges || [], gengaPrepared);
-        if (!published && jsonStarted) {
+        let keepPrepared = Boolean(jsonWrite && jsonWrite.closed), keepBackup = keepPrepared;
+        if (jsonWrite && jsonWrite.closeAttempted && !jsonWrite.verified) {
           try {
-            const current = await readBlobFromWorkspace('', owner.settings.projectFileName || 'project.conte.json', owner.handle);
-            const text = await current.text();
-            published = text === attemptedPayload || owned.some(function(change) { return change.createdFile && text.includes(change.createdFile.fileName); });
+            const current = await readBlobFromWorkspace('', jsonWrite.fileName, owner.handle);
+            if (await fileBlobBytesEqual(current, jsonWrite.blob)) {
+              // Our write reached disk even if close or verification reported failure. Retry from this baseline.
+              keepPrepared = keepBackup = true;
+              rememberWorkspaceJsonVersion(owner.handle, jsonWrite.fileName, current);
+            } else {
+              // A partial overwrite may have destroyed the last good root JSON.
+              if (backup) keepBackup = !await fileBlobBytesEqual(current, backup.blob);
+              if (!keepPrepared && owned.length) {
+                const text = await current.text();
+                keepPrepared = owned.some(function(change) { return change.createdFile && text.includes(change.createdFile.fileName); });
+              }
+            }
           } catch (error) {
-            if (error.name !== 'NotFoundError') { published = true; console.warn('[workspace] Uncertain JSON state; prepared files retained', error); }
+            keepBackup = true;
+            if (error.name !== 'NotFoundError') {
+              keepPrepared = true;
+              console.warn('[workspace] Uncertain JSON state; prepared files retained', error);
+            }
           }
         }
-        if (!published) {
-          const abandoned = backup ? owned.concat([{ createdFile: backup }]) : owned;
+        if (!keepPrepared || backup && !keepBackup) {
+          const abandoned = keepPrepared ? [] : owned;
+          if (backup && !keepBackup) abandoned.push({ createdFile: backup });
           await discardWorkspacePreparedFiles(owner, abandoned);
         }
       }
     }
 
-    async function backupExistingWorkspaceProject(fileName, owner) {
+    async function backupExistingWorkspaceProject(fileName, owner, existingFile) {
       owner = owner || projectIoOwner();
       assertProjectIoOwner(owner);
-      if (!owner.handle) return false;
-      let phase = 'open-original', created = null;
+      if (!existingFile || !existingFile.size) return false;
+      let created = null;
       try {
-        const existingHandle = await owner.handle.getFileHandle(fileName, { create: false });
-        phase = 'read-original';
-        const existingFile = await existingHandle.getFile();
-        assertProjectIoOwner(owner);
-        if (!existingFile || !existingFile.size) return false;
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         const backupName = safeFileName(fileName.replace(/\.json$/i, '')) + '_' + stamp + '_' + crypto.randomUUID() + '.json';
         const backupDir = owner.settings.backupDir || 'backups';
-        phase = 'backup';
         const dir = await getWorkspaceDirectory(backupDir, true, owner.handle);
         const handle = await dir.getFileHandle(backupName, { create: true });
         created = { dir: backupDir, fileName: backupName, handle: handle };
@@ -79578,126 +79750,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Retention runs after the root JSON write, so keep the backup entry's own snapshot.
         return Object.assign({ blob: verified }, created);
       } catch (error) {
-        if (phase === 'open-original' && error && error.name === 'NotFoundError') return false;
         if (created) await discardWorkspacePreparedFiles(owner, [{ createdFile: created }]);
-        throw projectFileOperationError(error, phase, fileName);
-      }
-    }
-
-    // The single-file JSON must carry conte layer pixels itself — a folder file name or an IndexedDB
-    // key resolves only on this device. A loaded source that fails to read fails the save; an ordinary empty
-    // drawing (no external reference) stays empty, and a reference with no bytes in this session is kept.
-    async function inlineLayerDrawingsForJson(copy, owner) {
-      const out = copy && copy.layerDrawings, live = owner.project.layerDrawings || {};
-      if (!out) return;
-      const refs = Object.keys(out);
-      for (let i = 0; i < refs.length; i += 1) {
-        const ref = refs[i], saved = out[ref];
-        if (!saved || saved.bitmapDataUrl || !live[ref]) continue;
-        const drawing = normalizeLayerDrawingData(Object.assign({}, live[ref]));
-        const src = String(drawing.bitmapDataUrl || ''), storage = drawing.bitmapStorage;
-        const storedKey = layerDrawingIndexedDbKeyStored(drawing);
-        let blob = null;
-        if (/^blob:/i.test(src)) blob = await fetch(src).then(function(response) { return response.blob(); });
-        else if (storedKey) blob = await readLayerDrawingBlobFromIndexedDb(ref, drawing);
-        else if (storage && storage.fileName && owner.handle) blob = await readBlobFromWorkspace(storage.dir || owner.settings.layerDir, storage.fileName, owner.handle);
-        else {
-          if (storage && storage.fileName) console.warn('[json-save] layer drawing has no bytes in this session: ' + storage.fileName);
-          continue;
-        }
-        assertProjectIoOwner(owner);
-        if (!blob || !blob.size) throw new Error('Layer drawing source unavailable: ' + ref);
-        saved.bitmapDataUrl = await blobToDataUrl(blob);
-        saved.bitmapStorage = null;
-        assertProjectIoOwner(owner);
-      }
-    }
-    // Single-file .conte.json fallback for saveProjectToWorkspace callers without a working folder.
-    // Capture metadata first, then prepare portable bytes privately; edits made while awaiting are not marked saved.
-    async function saveJsonDownload(owner) {
-      owner = owner || projectIoOwner();
-      await drawingFlushPending();
-      assertProjectIoOwner(owner);
-      flushLayerLiveBitmapsForSave();
-      const baseline = projectUnsavedSnapshot(), copy = projectForJsonStorage({ portable: false });
-      await inlineLayerDrawingsForJson(copy, owner);
-      assertProjectIoOwner(owner);
-      const drawingUrls = await gengaPreparePortableDrawings(copy, owner);
-      assertProjectIoOwner(owner);
-      if (copy.gengaTimeline) {
-        gengaInlineDrawings(copy.gengaTimeline, drawingUrls);
-        gengaInlineAudio(copy.gengaTimeline, await gengaPreparePortableAudio(copy, owner));
-      }
-      await drawingRecordingPrepareFile(copy, owner, 'inline');
-      assertProjectIoOwner(owner);
-      await refsPrepareFile(copy, owner, 'inline');
-      assertProjectIoOwner(owner);
-      const payload = serializedProjectJson(null, copy);
-      const blob = new Blob([payload], { type: 'application/json' });
-      const delivery = await deliverBlobFile(blob, (owner.project.projectId || 'conte_project') + '.conte.json', 'project');
-      if (!delivery) return false;
-      if (projectIoOwnerCurrent(owner)) state.projectSavedSnapshot = baseline;
-      return true;
-    }
-
-    // Mobile, genga, and projects opened from a linked original save a self-contained ZIP.
-    // The save menu and command share this choice so they do not offer duplicate actions.
-    function saveIsShareZipExport() {
-      return !fileSystemAccessAvailable() || Boolean(state.project && state.project.kind === 'genga')
-        || Boolean(projectFileSources.get(state.project));
-    }
-    // An explicit save during a stroke or an uncommitted stamp drag would write the drawing without
-    // the in-flight pixels and report success. Both save entries (saveJson and the ZIP menu) stop here.
-    function warnIfUnfinishedEdit() {
-      paintBucketFlush();
-      if (!strokeInProgress() && !(typeof gengaStampDrag !== 'undefined' && gengaStampDrag)) return false;
-      showToast(t('status.save.finishStroke'), {});
-      return true;
-    }
-    async function saveJson(owner) {
-      // Ctrl+S does not blur the focused field. Commit it before acquiring the save owner or freezing any snapshot:
-      // Dialogue blocks keep focus and run their change command. Blur other text fields, such as inspector action, cut number, 尺,
-      // and inline 用紙 editors, so their change or blur handler commits.
-      const input = document.activeElement;
-      if (input && input.matches('.dialog-blocks .dlgblk-body, .dialog-blocks .dlgblk-speaker') && !input.readOnly) {
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      } else if (input && input !== document.body && input.matches('input, textarea, [contenteditable="true"]') && !input.readOnly) {
-        input.blur();
-      }
-      if (warnIfUnfinishedEdit()) return false;
-      owner = owner || projectIoOwner();
-      try {
-        assertProjectIoOwner(owner);
-        // Mobile (no File System Access): export a self-contained ZIP (separate media entries) — sidesteps the inline
-        // single-JSON ~512MB string limit. exportConteFolderZip delivers it via the OS share sheet / download.
-        // Genga also uses a ZIP with separate drawing/audio entries. The exported file is the durable copy;
-        // IndexedDB autosave is an evictable local safety net.
-        if (saveIsShareZipExport()) {
-          const saved = await exportConteFolderZip({ owner: owner, reuseSource: true });
-          if (saved) { scheduleStorageSweep('save-zip'); window.moartUsage.note('manual-save'); }
-          return saved;
-        }
-        const firstFolder = !owner.handle;
-        if (firstFolder) {
-          // Folder setup is part of the pending save/replacement, not a competing load request.
-          const request = owner.request || beginProjectFileLoad();
-          owner.request = request;
-          request.owner = owner;
-          if (!await askConfirm(t('msg.workspace.firstSavePrompt'))) return false;
-          assertProjectIoOwner(owner);
-          const selected = await selectWorkspaceFolder({ silent: true, loadExisting: false, saveCurrent: false, request: request });
-          if (!selected) return false;
-          assertProjectIoOwner(request.owner);
-          // Adopt only the connection committed by this request; later edits still need saving.
-          Object.assign(owner, request.owner);
-          workspaceFirstSaves.set(owner.project, owner.handle);
-        }
-        const saved = await saveProjectToWorkspace(owner, { retireIndexedDbAutosave: workspaceFirstSaves.get(owner.project) === owner.handle });
-        if (saved) { scheduleStorageSweep('save'); window.moartUsage.note('manual-save'); }
-        return saved;
-      } catch (error) {
-        alert(t('msg.err.jsonSave', (error && error.message ? error.message : error)));
-        return false;
+        throw projectFileOperationError(error, 'backup', fileName);
       }
     }
 
