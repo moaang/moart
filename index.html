@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3547</title>
+  <title>MoArt ver3548</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -53352,23 +53352,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return throttled;
     }
 
+    function pointerDragAcceptsButton(event, buttons) {
+      return event.button == null || (buttons ? buttons.includes(event.button) : event.button === 0);
+    }
+
     function beginDragStrand(event, spec) {
       // Left-button-only is the right default (a strand must not start under a context menu), but it is
       // not universal — the whole-existence-region drag is deliberately bound to the right button,
       // so for it the guard would reject the very press it exists to serve. anyButton:true opts out.
-      if (!spec.anyButton && event.button != null && event.button !== 0) return null;
+      if (!spec.anyButton && !pointerDragAcceptsButton(event)) return null;
       const noCancel = typeof spec.onCancel !== 'function';
       if (noCancel) console.warn('[beginDragStrand] onCancel is required — a strand with no explicit cancel policy is how "cancel committed the preview" keeps happening');
       const el = spec.el || null;
       // draggingClass:null → no class at all (the element is still wanted for pointer capture)
       const cls = (spec.draggingClass === null || spec.draggingClass === false) ? null : (spec.draggingClass || 'dragging');
-      const pointerId = spec.pointerId === false ? null : event.pointerId;
       const ctx = { startX: event.clientX, startY: event.clientY, el: el, moved: false };
       // The pressed trim handle owns capture; the clip owns the dragging class.
       // Use captureEl: false on replaceable rail nodes. Document listeners survive the render.
-      const capEl = spec.captureEl === false ? null : (spec.captureEl || el);
+      const capEl = spec.captureEl === undefined ? el || undefined : spec.captureEl;
       if (el && cls) el.classList.add(cls);
-      if (capEl && capEl.setPointerCapture && pointerId != null) { try { capEl.setPointerCapture(pointerId); } catch (e) {} }
       let raf = 0, latest = null;
       const flush = function() { raf = 0; if (latest) spec.onMove(latest, ctx); };
       // preventDefault is opt-in, off by default. Several strands deliberately let the move default
@@ -53397,12 +53399,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           latest = null;
         }
         if (el && cls) el.classList.remove(cls);
-        if (capEl && capEl.releasePointerCapture && pointerId != null) { try { capEl.releasePointerCapture(pointerId); } catch (e) {} }
         if (ue && ue.type === 'pointercancel') { if (!noCancel) spec.onCancel(ctx, ue); return; }
         spec.onCommit(ue, ctx);
       };
-      bindOwnedPointerDrag(event, {
+      const session = bindOwnedPointerDrag(event, {
         key: spec.key,
+        captureEl: capEl,
         owner: spec.owner,
         target: listenOn,
         capture: cap,
@@ -53411,6 +53413,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         move: move,
         up: finish
       });
+      ctx.capture = session.capture; // A clip move takes explicit capture only after crossing its drag threshold.
       if (spec.preventStartDefault !== false) event.preventDefault();
       // stopPropagation is the default because most strands start on a control that owns its press, but it is
       // not free — this app has document-level bubble pointerdown listeners that close the stage-settings and
@@ -53874,13 +53877,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Flag it with `escape: true` so sessions can distinguish it from OS cancellation, as with playhead restoration.
     // Sessions with `spec.escape: false` opt out.
     var pointerDragSessions = new Map();
+    // Both drawing surfaces cache DOM geometry during pointer input. Fill the caches lazily:
+    // a coalesced sample loop must not read layout per sample.
+    let paintPointerGeometryOpen = false;
+    let gengaPointerCanvasRect = null;
+    let videoPaperElGesture = null;
+    function resetPointerGeometry(open) {
+      paintPointerGeometryOpen = open === true;
+      gengaPointerCanvasRect = null;
+      videoPaperElGesture = null;
+    }
+    document.addEventListener('pointerdown', function() { resetPointerGeometry(true); }, true);
+    for (const type of ['pointerup', 'pointercancel']) document.addEventListener(type, resetPointerGeometry, true);
+    window.addEventListener('resize', resetPointerGeometry);
+    window.addEventListener('orientationchange', resetPointerGeometry);
+
     function cancelPointerDragsIn(root) {
       if (!pointerDragSessions) return; // early boot before registry initialization
       Array.from(pointerDragSessions.values()).forEach(function(session) {
         if (!root || root.contains(session.owner || session.source.target)) session.cancel();
       });
     }
-    function cancelPointerDrags() { cancelPointerDragsIn(null); }
+    function cancelPointerDrags() {
+      if (!pointerDragSessions) return;
+      cancelPointerDragsIn(null);
+      resetPointerGeometry();
+    }
     function pointerDragCanStart(key, event) {
       const previous = pointerDragSessions.get(key);
       if (!previous) return true;
@@ -53888,19 +53910,88 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       previous.cancel();
       return true;
     }
+    function trySetPointerCapture(canvas, pointerId) {
+      if (!canvas || !canvas.setPointerCapture || pointerId == null) return false;
+      try {
+        canvas.setPointerCapture(pointerId);
+        return canvas.hasPointerCapture(pointerId);
+      } catch (error) { return false; }
+    }
+
+    // Pair this with the settings path and share error handling.
+    function safeReleasePointerCapture(el, pointerId) {
+      if (!el || !el.releasePointerCapture || pointerId == null) return;
+      try { el.releasePointerCapture(pointerId); } catch (error) {}
+    }
+    // Keep the element as well as its rect. A rotated bounding box cannot supply untransformed dimensions.
+    // offsetWidth gives transform-independent layout pixels.
+    // Map pointers on the rotated video surface to paper-local pixels for the camera and gizmo.
+    // Use uiPointerLocalX/Y when there is no rotation or mirroring. Take the center from getBoundingClientRect
+    // and the layout size from offsetWidth.
+    function videoPointerLocal(clientX, clientY) {
+      const rot = previewViewRotEff();
+      // Undo mirroring as in getVideoPaintPointFromEventRaw so dragging a flipped camera frame follows the finger.
+      // Use the default mapping only when both rotation and mirror are absent.
+      const el = (rot || previewViewFlipSign() < 0) ? videoPaperEl() : null;
+      if (!el || !(el.offsetWidth > 0) || !(el.offsetHeight > 0)) {
+        return { x: uiPointerLocalX(clientX), y: uiPointerLocalY(clientY) };
+      }
+      const uz = uiReadScale() || 1;
+      const n = viewClientToLocalNorm(el, null, clientX, clientY, rot, previewViewFlipSign());
+      const raw = el.getBoundingClientRect();
+      const w = el.offsetWidth, h = el.offsetHeight; // Already in local pixels.
+      const cx = (raw.left + raw.width / 2) / uz, cy = (raw.top + raw.height / 2) / uz;
+      return { x: cx - w / 2 + n.x * w, y: cy - h / 2 + n.y * h };
+    }
+    // Cache elements per gesture so each coalesced storyboard sample avoids DOM lookups.
+    // videoPaintBaseRect caches the rectangle. Share paintPointerGeometryOpen's document gesture lifetime:
+    // initialize on pointerdown and release on up, cancel, or resize.
+    // Requery a node detached by a mid-stroke rebuild.
+    function videoPaperEl() {
+      if (paintPointerGeometryOpen && videoPaperElGesture && videoPaperElGesture.isConnected) return videoPaperElGesture;
+      const stage = document.getElementById('conteVideoStage');
+      const el = stage && stage.querySelector ? stage.querySelector('.conte-paper') : null;
+      if (paintPointerGeometryOpen) videoPaperElGesture = el;
+      return el;
+    }
+    function videoPaintBaseRect() {
+      // The pointer/display anchor is the paper (norm 0..1 = paper edges), taken directly off .conte-paper (not
+      // the .video-preview-camera-target child) — same rect, but the paper never carries the camera transform,
+      // so its gBCR is the stable paper box.
+      const stage = document.getElementById('conteVideoStage');
+      const paper = stage && stage.querySelector ? stage.querySelector('.conte-paper') : null;
+      return paper ? paper.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
+    }
+
     function bindOwnedPointerDrag(event, spec) {
       const target = spec.target || window, capture = !!spec.capture;
       const pid = spec.pointerId === false ? null : event.pointerId;
       const key = spec.key || spec.up;
       const owns = function(ev) { return pid == null || !ev || ev.pointerId == null || ev.pointerId === pid; };
-      let ended = false;
+      const pressTarget = spec.captureEl === false ? null : (spec.captureOwner || event.target);
+      let captureEl = null, ended = false;
+      const takeCapture = function(el) {
+        if (ended || pid == null || !el) return;
+        if (trySetPointerCapture(el, pid)) captureEl = el;
+      };
+      const lost = function(ev) {
+        if (ev.pointerId !== pid) return;
+        const el = captureEl || pressTarget;
+        if (!el || el.hasPointerCapture(pid)) return;
+        const removedOwner = ev.target === document && !el.isConnected;
+        if (!removedOwner && ev.target !== el && (captureEl || ev.target !== event.target)) return;
+        if (spec.captureOwner) resetPointerGeometry();
+        session.cancel(ev);
+      };
       const dispose = function() {
         if (ended) return;
         ended = true;
         target.removeEventListener('pointermove', move, capture);
         target.removeEventListener('pointerup', finish, capture);
         target.removeEventListener('pointercancel', finish, capture);
+        document.removeEventListener('lostpointercapture', lost, true);
         if (pointerDragSessions.get(key) === session) pointerDragSessions.delete(key);
+        if (captureEl) safeReleasePointerCapture(captureEl, pid);
       };
       const finish = function(ev) {
         if (ended || !owns(ev)) return;
@@ -53916,8 +54007,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (ev.buttons === 0 && ev.pointerType !== 'touch') { finish(ev); return; }
         spec.move(ev);
       };
-      const session = { pid: pid, type: event.pointerType, source: event, owner: spec.owner, dispose: dispose,
-        cancel: function() { finish({ type: 'pointercancel', pointerId: pid, pointerType: event.pointerType }); },
+      const session = { pid: pid, type: event.pointerType, source: event, owner: spec.owner, dispose: dispose, capture: takeCapture,
+        cancel: function(ev) { finish(pointerCancelEvent(event, ev)); },
         escape: spec.escape === false ? null : function() {
           finish({
             type: 'pointercancel',
@@ -53928,10 +54019,57 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
       };
       pointerDragSessions.set(key, session);
-      target.addEventListener('pointermove', move, { capture: capture, passive: spec.passive === true });
+      if (spec.move) target.addEventListener('pointermove', move, { capture: capture, passive: spec.passive === true });
       target.addEventListener('pointerup', finish, capture);
       target.addEventListener('pointercancel', finish, capture);
+      if (pressTarget) document.addEventListener('lostpointercapture', lost, true);
+      if (spec.captureEl) takeCapture(spec.captureEl);
       return session;
+    }
+    function bindPaintPointerEnd(press, surface, up, cancel) {
+      // The FIFO may replay a copied down after the physical up. Only the dispatch registers a lifetime.
+      if (!surface || !press.currentTarget || !(press instanceof PointerEvent)) return;
+      const key = paintPointerKey(press.pointerId);
+      if (pointerDragSessions.has(key)) return;
+      bindOwnedPointerDrag(press, {
+        key: key, owner: surface, captureOwner: surface, target: document, capture: true, escape: false,
+        up: up, cancel: cancel
+      });
+    }
+    function bindPinchPointerEnd(press, host, captureOwner, pointers, teardown) {
+      bindOwnedPointerDrag(press, {
+        owner: host, captureOwner: captureOwner, target: document, capture: true, escape: false,
+        up: function(end) {
+          pointers.delete(press.pointerId);
+          if (pointers.size < 2 || twoFingerPinLost(pointers)) teardown(end.type);
+        }
+      });
+    }
+
+    function paintPointerKey(id) { return 'paint-surface:' + id; }
+    function disposePaintPointer(id) {
+      const session = pointerDragSessions && pointerDragSessions.get(paintPointerKey(id));
+      if (session) session.dispose();
+    }
+    function capturePaintPointer(press, surface) {
+      const session = pointerDragSessions.get(paintPointerKey(press.pointerId));
+      if (session && session.source.timeStamp === press.timeStamp && session.source.target === press.target) session.capture(surface);
+    }
+
+    function pointerCancelEvent(press, end) {
+      return {
+        type: 'pointercancel',
+        interrupted: true,
+        pointerId: press.pointerId,
+        pointerType: press.pointerType,
+        target: press.target,
+        currentTarget: press.currentTarget || press.target,
+        clientX: end ? end.clientX : press.clientX,
+        clientY: end ? end.clientY : press.clientY,
+        cancelable: false,
+        preventDefault: function() {},
+        stopPropagation: function() {}
+      };
     }
     bindAppInterrupted(cancelPointerDrags);
     window.addEventListener('keydown', function(k) {
@@ -53948,16 +54086,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }, true);
     function retainLongPressMenuUntilRelease(event, close) {
-      const sub = { cancel: function() { session.dispose(); longPressContacts.unwatch(sub); close(); } };
-      const session = bindOwnedPointerDrag(event, { move: function() {},
-        up: function() { longPressContacts.unwatch(sub); }, cancel: function() { sub.cancel(); } });
+      const sub = { cancel: function() { session.cancel(); } };
+      const release = function() { longPressContacts.unwatch(sub); };
+      const session = bindOwnedPointerDrag(event, {
+        target: document, capture: true, up: release,
+        cancel: function() { release(); close(); }
+      });
       longPressContacts.watch(sub);
     }
-    // What "a long press" is (520ms / LONG_PRESS.movePx), for the binder below. Two hand-rolled presses that cannot use it (one
-    // cancels on a frame change, the other competes with a hold-to-show action: the ruler scrub and the parapara
-    // button) keep their own timers but take "how long is long" from here. Anything else that needs "keep dragging
-    // after the long press" uses the kernel's onFire/onDragOut (the koma ripple arm does): two 520ms timers on one
-    // press would not know each other and the later one would take down the menu the earlier one opened.
+    // Ruler scrubbing and hold-to-flip share this deadline with context menus.
+    // Each caller decides which movement or competing action invalidates its wait.
     // Drag starts at 4px for a mouse and 8px for touch or pen.
     // Share the threshold across timeline presses and long-press wobble tolerance
     // so the same motion is interpreted consistently.
@@ -53972,6 +54110,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Math.hypot(ev.clientX - startX, ev.clientY - startY) >= pointerDragStartPx(typeEv || ev);
     }
     const LONG_PRESS = { delay: 520, movePx: DRAG_START_PX.touch };
+    function startLongPressWait(callback, delay) {
+      if (longPressContacts.blocked()) return null;
+      const project = state.project;
+      const timer = setTimeout(function() {
+        wait.cancel();
+        if (state.project === project) callback();
+      }, delay || LONG_PRESS.delay);
+      const wait = {
+        cancel: function() {
+          clearTimeout(timer);
+          longPressContacts.unwatch(wait);
+        }
+      };
+      longPressContacts.watch(wait);
+      return wait;
+    }
     // options:
     // `ignore(event)`: let another nested target own the press.
     // `delay`: per-target duration, defaulting to `LONG_PRESS.delay`.
@@ -53999,7 +54153,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return hit && el.contains(hit) ? hit : null;
       };
       let owner = null;
-      let timer = 0;
+      let wait = null, session = null;
       let startX = 0;
       let startY = 0;
       let pointerId = null;
@@ -54016,16 +54170,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (hadFired && who && longPressMenuOwner === who) hideConteLayerContextMenu();   // Dismiss only the menu opened by this owner.
         } };
       const clear = function() {
-        if (timer) window.clearTimeout(timer);
-        timer = 0;
+        if (wait) wait.cancel();
+        wait = null;
+        if (session) session.dispose();
+        session = null;
         owner = null;
         pointerId = null;
         fired = false;
         armed = null;
         surface = null;
         longPressContacts.unwatch(holdSub);
-        document.removeEventListener('pointerup', releaseHold, true);
-        document.removeEventListener('pointercancel', releaseHold, true);
       };
       el.addEventListener('pointerdown', function(event) {
         if (!touchInputCapable()) return; // Enable finger/pen long-press menus on a Movink touchscreen (mouse filtered out by pointerType below)
@@ -54043,12 +54197,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         startY = event.clientY;
         pointerId = event.pointerId;
         surface = options.holdSurface ? options.holdSurface(event) : null;
-        document.addEventListener('pointerup', releaseHold, true);
-        document.addEventListener('pointercancel', releaseHold, true);
-        const sourceEvent = event, sourceProject = state.project, own = pressed;
-        timer = window.setTimeout(function() {
-          if (!own.isConnected || state.project !== sourceProject || longPressContacts.blocked()) { clear(); return; }
-          timer = 0;
+        session = bindOwnedPointerDrag(event, {
+          owner: pressed, target: document, capture: true, escape: false,
+          up: clear, cancel: holdSub.cancel
+        });
+        const sourceEvent = event, own = pressed;
+        wait = startLongPressWait(function() {
+          if (!own.isConnected) { clear(); return; }
           // Keep `pointerId` while post-fire moves still need ownership checks.
           // Use `fired` for completion. Cleanup resets both fields.
           // elementFromPoint can miss the element if it became pointer-events:none on touch-down
@@ -54058,7 +54213,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const withinRect = px >= r.left && px <= r.right && py >= r.top && py <= r.bottom;
           if (!withinRect) {
             const hit = document.elementFromPoint(startX, startY);
-            if (hit && hit !== own && !own.contains(hit)) return;
+            if (hit && hit !== own && !own.contains(hit)) { clear(); return; }
           }
           fired = true;
           // `onFire` takes over an active action. A koma arms ripple and invalidates its own drag here.
@@ -54072,7 +54227,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           handler(syntheticContextMenuEventFromPointer(sourceEvent, own));
           const opened = document.getElementById('conteLayerContextMenu');
           if (opened && !opened.hidden && (menuWasHidden || opened.innerHTML !== priorContents)) longPressMenuOwner = own;
-        }, options.delay || LONG_PRESS.delay);
+        }, options.delay);
       }, { passive: true, capture: Boolean(options.capture) });
       // For delegated input, check only events within the owner, as a direct listener would.
       const fromOwner = function(event) { return !delegate || (owner && event.target && owner.contains(event.target)); };
@@ -54094,9 +54249,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }, { passive: true });
       if (options.holdSurface) el.addEventListener('pointerout', function(event) {
         if (surface && event.pointerId === pointerId && !surface.contains(event.relatedTarget)) clear();
-      }, { passive: true });
-      el.addEventListener('lostpointercapture', function(event) {
-        if (fromOwner(event)) releaseHold(event);
       }, { passive: true });
       el.addEventListener('click', function(event) {
         const who = ownerAt(event.target);   // Consume the marker on the node that fired, even after the gesture ends.
@@ -57938,7 +58090,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const groupMove = slotEl.hasAttribute('data-conte-cut-tab');
         const totalFrames = Math.max(1, Math.round(Number(slotEl.dataset.timelineTotalFrames) || videoTimelineDisplayTotalFrames(state.project) || 1));
         const startX = event.clientX, startY = event.clientY;
-        const pointerId = event.pointerId;
         let dragging = false;
         let plan = null;
         let boundaries = [];
@@ -57947,7 +58098,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           root.querySelectorAll('.panel-move-source').forEach(function(el) { el.classList.remove('panel-move-source'); });
           hideConteDragGuide(root);
         };
-        const begin = function() {
+        const begin = function(ctx) {
           dragging = true;
           let ids = selectedPicturePanelIdArray(false);
           if (ids.indexOf(cutId) < 0) {
@@ -57976,18 +58127,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             const id = el.dataset.videoSlotCutId || el.dataset.contePanelCutId || '';
             if (movingSet.has(id)) el.classList.add('panel-move-source');
           });
-          try { slotEl.setPointerCapture(pointerId); } catch (e) {}
+          ctx.capture(slotEl);
         };
-        const releaseCapture = function() { if (slotEl.releasePointerCapture && pointerId != null) { try { slotEl.releasePointerCapture(pointerId); } catch (e) {} } };
         // Thin spec on beginDragStrand. No spec.el — like the audio clip move, this one arms late (DRAG_START_PX),
         // and only then takes the pointer capture and suppresses the move default; a sub-threshold move has to
         // stay untouched so a press that turns into a scroll or a long-press still behaves.
         beginDragStrand(event, {
           owner: root,
-          onMove: function(me) {
+          onMove: function(me, ctx) {
             if (!dragging) {
               if (!pointerDragPassed(me, startX, startY)) return;
-              begin();
+              begin(ctx);
             }
             if (me.cancelable) me.preventDefault();
             const frame = timelineFrameAtPointer(root, me, totalFrames);
@@ -58010,12 +58160,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             else hideConteDragGuide(root);
           },
           // cancel = drop the guide and the source highlight, commit nothing
-          onCancel: function() { clearVisual(); releaseCapture(); },
+          onCancel: clearVisual,
           onCommit: function(ue) {
             if (!dragging) return; // plain click — the click handler owns it
             clearVisual();
             trailingClickGuard.arm('contePanelMove'); // event-bounded — a setTimeout(…,0) guard is dead on touch, where click lands a task later
-            releaseCapture();
             if (!boundary || !plan) return;
             commitContePanelMove(plan.entryIds.slice(), boundary.beforeCutId, groupMove);
           }
@@ -58353,13 +58502,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           let latestPointerEvent = event;
           let seekRaf = 0;
           let dragging = true;
-          const pointerId = event.pointerId;
-          if (track.setPointerCapture && pointerId != null) {
-            try { track.setPointerCapture(pointerId); } catch (error) {}
-          }
-          const isSeekPointerEvent = function(candidate) {
-            return !candidate || pointerId == null || candidate.pointerId == null || candidate.pointerId === pointerId;
-          };
           // Use shared edge autoscroll for both playhead-handle and ruler drags. Recompute the frame under the pointer each tick.
           // Update the scrollbar once on release through `scheduleTimelineScrollbarDomUpdate`.
           const edgePan = edgeAutoScroll({ axis: 'x', view: function() { return seekRects.scrollEl; },
@@ -58376,7 +58518,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             seekTimelineFromPointer(root, track, latestPointerEvent, currentTotalFrames(), false, { stopPlayback: false, rects: seekRects });
           };
           const move = function(moveEvent) {
-            if (!isSeekPointerEvent(moveEvent)) return;
             latestPointerEvent = moveEvent;
             moveEvent.preventDefault();
             if (!seekDragStarted) {
@@ -58389,7 +58530,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (!seekRaf) seekRaf = requestAnimationFrame(tickCoalescedSeek);
           };
           const up = function(upEvent) {
-            if (!isSeekPointerEvent(upEvent)) return;
             // Ignore pointercancel coordinates, which can be (0, 0).
             // Using those coordinates after an OS gesture could seek to frame zero.
             // Settle at the last actual move, as in `beginAxisDrag`.
@@ -58413,11 +58553,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               seekTimelineFromPointer(root, track, latestPointerEvent, currentTotalFrames(), true, { stopPlayback: false, rects: seekRects });
             }
             scheduleTimelineScrollbarDomUpdate(root);
-            if (track.releasePointerCapture && pointerId != null) {
-              try { track.releasePointerCapture(pointerId); } catch (error) {}
-            }
           };
-          bindOwnedPointerDrag(event, { key: 'conte-seek', owner: root, target: window, capture: false, move: move, up: up });
+          bindOwnedPointerDrag(event, { key: 'conte-seek', owner: root, captureEl: track, move: move, up: up });
         });
       });
     }
@@ -59345,7 +59482,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let lastPreviewFrame = originalStart;
       let lastPreviewTrackId = originalTrackId;
       let lastSnapped = false;
-      const pointerId = event.pointerId;
       // Build the current plan's group or single ghost on drag start and after leaving ripple mode.
       const buildMovePreview = function() {
         if (groupPlan) {
@@ -59360,15 +59496,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           movePreviewEl = createAudioDragPreview(track, originalStart, originalClip.durationFrames, liveTotalFrames());
         }
       };
-      const activateMoveDrag = function() {
+      const activateMoveDrag = function(ctx) {
         if (dragActive) return;
         dragActive = true;
         clipEl.classList.add('dragging');
         buildMovePreview();
-        try { clipEl.setPointerCapture(pointerId); } catch (error) {}
+        ctx.capture(clipEl);
       };
-      // No el: this session owns delayed capture/class/preview; the kernel owns listeners and rAF.
-      // The kernel cancels a queued preview before onCommit/onCancel can tear it down.
+      // The adapter owns the class and preview; the session owns delayed capture and queued movement.
       const dropGroupGhosts = function() {
         if (!groupPlan) return;
         groupPlan.ghosts.forEach(function(ghost) {
@@ -59411,17 +59546,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         updateTimelineSnapGuide(root, 0, 1, false);
         spec.removePreview(movePreviewEl);
         movePreviewEl = null;
-        try { clipEl.releasePointerCapture(pointerId); } catch (error) {}
       };
       beginDragStrand(event, {
         key: press,
         owner: press.owner,
         raf: true,
-        onMove: function(moveEvent) {
+        onMove: function(moveEvent, ctx) {
           if (!press.isCurrent(false)) { press.cancel(); return; }
           if (moveEvent.shiftKey) switchToRipple(); else leaveRipple();
           if (!dragActive && !pointerDragPassed(moveEvent, startX, startY, event)) return;
-          activateMoveDrag();
+          activateMoveDrag(ctx);
           if (groupPlan) {
             const delta = groupDelta(timelineDragFrameDelta(startX, moveEvent.clientX, liveTotalFrames(), track));
             if (originalStart + delta === lastPreviewFrame) return;
@@ -61830,149 +61964,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       return false;
     }
-    // ── document-level gesture-state janitor ──
-    // A pinch finger's end event can be delivered to a different element (capture on another node, system
-    // gesture takeover, finger lifted outside) — then gengaPreviewPointerEnd never runs for it, gengaPointers
-    // keeps the id, gengaPinch never clears, and every subsequent canvas touch is swallowed by
-    // gengaPreviewPointerDown's pinch guard: drawing + pinch dead, all other UI alive (an intermittent iPad
-    // lockup). So pointerup/pointercancel are watched at the document capture phase — wherever they land, the
-    // id is dropped from gengaPointers and a sub-2-finger pinch is cleared. Idempotent vs gengaPreviewPointerEnd
-    // (it re-deletes a gone id and skips an already-null pinch, same terminal state). The conte twin
-    // (paintRasterOp stuck for the same reason → beginVideoPaintStroke's first guard eats every pointerdown) is
-    // handled one frame deferred so the canvas's own end handler always gets first claim.
-    let gestureJanitorBound = false;
-    function bindGestureStateJanitor() {
-      if (gestureJanitorBound) return;
-      gestureJanitorBound = true;
+    let paintInputLifecycleBound = false;
+    function bindPaintInputLifecycle() {
+      if (paintInputLifecycleBound) return;
+      paintInputLifecycleBound = true;
       for (const type of ['pointerdown', 'click', 'keydown', 'wheel']) document.addEventListener(type, paintInputBeforeInteraction, { capture: true, passive: true });
-      const janitor = function(ev) {
-        const id = ev.pointerId;
-        if (id == null) return;
-        // Pinch cleanup is deferred like every other janitor client below: this capture-phase listener runs
-        // before the surface's bubble-phase handler, and the two-finger-tap (undo/redo) decision lives inside
-        // that handler's `if (pinch…)` guard — nulling the pinch synchronously here would falsify it, so the
-        // tap would never fire on 用紙/genga. One rAF gives the surface handler first claim (normal path: tap
-        // fires there, these become no-ops); a survivor here is a genuine leak (end event landed on a foreign
-        // element) and the shared teardown still runs the tap decision, so a finger lifted over a floating
-        // window still undoes. A stranded pointer is still swept, just one frame later. Share cleanup for 原画, 用紙, and storyboard preview in one table.
-        // An end event may land outside its surface, such as over a floating window or during OS gesture takeover.
-        // Leftover pointers can keep pinch armed and consume later touches as part of that pinch.
-        // The animation-frame recheck skips surfaces that already handled the end event.
-        // Register any new surface in the same table.
-        if (ev.pointerType === 'touch') {
-          const evType = ev.type;
-          const sweeps = [
-            [typeof gengaPointers !== 'undefined' ? gengaPointers : null, teardownGengaPinch],
-            [typeof paperPointers !== 'undefined' ? paperPointers : null, teardownPaperPinch],
-            [typeof videoPreviewPointers !== 'undefined' ? videoPreviewPointers : null, teardownVideoPreviewPinch]
-          ];
-          for (let si = 0; si < sweeps.length; si += 1) {
-            const map = sweeps[si][0], teardown = sweeps[si][1];
-            if (!map || !map.has(id)) continue;
-            const pointer = map.get(id);
-            requestAnimationFrame(function() {
-              if (map.get(id) !== pointer) return;   // the surface's own end handler got there first
-              map.delete(id);
-              if (map.size < 2) teardown(evType);
-            });
-          }
-        }
-        if (state.paintRasterOp && state.paintPointerId === id) {
-          const owner = state.paintRasterOp;
-          requestAnimationFrame(function() { // the canvas's pointerup/cancel handler ends it normally; this only fires on a leak
-            if (state.paintRasterOp === owner && state.paintPointerId === id && !paintInputQueuedPointer(id)) {
-              cancelActivePaintRasterStroke({ pointerId: id, type: 'janitor', cancelable: false, preventDefault: function() {}, stopPropagation: function() {} });
-            }
-          });
-        }
-        // Genga camera / selection / lasso drags are the same class — their end event can be delivered
-        // off-canvas and never reach the handler, leaving the drag armed forever. Same rAF-deferred shape as
-        // paintRasterOp above: the normal handler ends it first; a survivor is a leak. These are commit-on-up
-        // drags, so the janitor only discards (redraw from data) — it never commits.
-        if (gengaCamDrag && gengaCamDrag.pointerId === id) {
-          const owner = gengaCamDrag;
-          requestAnimationFrame(function() {
-            if (gengaCamDrag === owner && gengaCamDrag.pointerId === id) { gengaCancelCameraDrag(); drawGengaPreview(); } // Share the discard path.
-          });
-        }
-        if ((gengaSelDrag && gengaSelDrag.pointerId === id) || (gengaLasso && gengaLasso.pointerId === id)) {
-          const selection = gengaSelDrag, lasso = gengaLasso;
-          requestAnimationFrame(function() {
-            let leaked = false;
-            if (gengaSelDrag && gengaSelDrag === selection && gengaSelDrag.pointerId === id) { gengaSelDrag = null; leaked = true; }
-            if (gengaLasso && gengaLasso === lasso && gengaLasso.pointerId === id) { gengaLasso = null; leaked = true; }
-            if (leaked) drawGengaPreview();
-          });
-        }
-        // finger flip has the same issue: gengaFlipTouchEnd listens on the canvas and misses releases outside the margin.
-        // The touch branch clears only gengaPointers, leaving the flip preview frame visible.
-        // Pointer ID matching protects fresh input, and the next flip or pinch clears the state
-        // through paintCancelSingleFingerOps.
-        if (gengaFlipTouch && gengaFlipTouch.pointerId === id) {
-          const owner = gengaFlipTouch;
-          requestAnimationFrame(function() {
-            if (gengaFlipTouch === owner && gengaFlipTouch.pointerId === id) { gengaFlipTouch = null; gengaSetParaparaFrame(null); }
-          });
-        }
-        // Storyboard flip preview also gets stuck if the end event misses #conteVideoStage.
-        // That surface calls endPreviewPanelFlipTouch through endVideoPaintStroke or cancelActivePaintRasterStroke.
-        // Normal teardown requires the matching pointerId and currentTarget to release capture.
-        // Here, clear state and the overlay as paintCancelSingleFingerOps does.
-        // The browser implicitly releases capture on pointerup or pointercancel.
-        // If normal teardown runs first, the animation-frame check skips it. If this runs first,
-        // the normal path's pointer ID guard skips duplicate cleanup.
-        if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === id) {
-          const owner = state.previewPanelFlipTouch;
-          requestAnimationFrame(function() {
-            if (state.previewPanelFlipTouch === owner && state.previewPanelFlipTouch.pointerId === id) {
-              state.previewPanelFlipTouch = null;
-              clearParaparaPreviewOverlay();
-            }
-          });
-        }
-        // A stranded stamp gesture leaves uncommitted stamps in work. The next tap could commit them with the new stamp.
-        // Discard them without committing, as with the other drags above.
-        if (gengaStampDrag && gengaStampDrag.pointerId === id) {
-          const owner = gengaStampDrag;
-          requestAnimationFrame(function() {
-            if (gengaStampDrag === owner && gengaStampDrag.pointerId === id) { gengaDiscardStampDrag(); drawGengaPreview(); }
-          });
-        }
-        // A stranded 原画 pen or shape session can keep drawing on every pointermove.
-        // Release the session and temporary assets, then redraw.
-        // Drop the session and redraw the previously committed drawing.
-        // Skip a pending first-stage curve with pointerId === null, as with storyboard's pending raster operation.
-        if (gengaDrawSession && gengaDrawSession.pointerId === id) {
-          const owner = gengaDrawSession;
-          requestAnimationFrame(function() {
-            if (gengaDrawSession === owner && gengaDrawSession.pointerId === id && !paintInputQueuedPointer(id)) { gengaEndDrawSession(); drawGengaPreview(); }
-          });
-        }
-      };
-      document.addEventListener('pointerup', janitor, true);
-      document.addEventListener('pointercancel', janitor, true);
-      // App/tab losing focus mid-drag delivers no pointer event at all —
-      // reset the genga drag states outright (blur has no competing normal handler, so no rAF needed).
-      window.addEventListener('blur', function() {
+      bindAppInterrupted(function() {
+        // Complete a released stroke's queued input. Abort work from a press that never released.
         if (paintInputQueueState) {
           if (paintInputQueueState.stats.deferredEnds) paintInputFlushSync();
           else { paintInputQueueState.stats.cancelled = true; paintInputQueueAbort(paintInputQueueState); }
         }
+        // A first-stage Animation curve can be waiting for its second press.
         if (gengaDrawSession) { gengaEndDrawSession(); drawGengaPreview(); }
-        if (gengaCamDrag || gengaSelDrag || gengaLasso) {
-          gengaCancelCameraDrag();
-          gengaSelDrag = null;
-          gengaLasso = null;
-          drawGengaPreview();
-        } // Share the discard path.
-        if (gengaFlipTouch) { gengaFlipTouch = null; gengaSetParaparaFrame(null); } // Clear the flip gesture too.
-        if (state.previewPanelFlipTouch) { state.previewPanelFlipTouch = null; clearParaparaPreviewOverlay(); } // Clear the storyboard flip as in the cleanup branch above.
-        if (gengaStampDrag) { gengaDiscardStampDrag(); drawGengaPreview(); } // Discard the stamp gesture too.
       });
-      // Genga's pan shares state.paintSpacePanDrag/paintSpacePanActive with conte (see
-      // startPaintViewportPanDrag), so it is covered by conte's document-level
-      // pointerup/pointercancel→endPaintSpacePan and window-blur→cancelPaintSpacePan handlers (bound near the
-      // other document listeners) — no genga-specific backstop here.
     }
 
     function twoFingerGestureClear() { twoFingerTapCandidate = null; twoFingerLongPressCancel(); twoFingerUnpin(); }
@@ -62118,7 +62123,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ── live pinch state for the conte video preview ────────────────────────────────────────────────
     // Pointer events, not TouchEvent listeners: once finger 1 starts a stroke the surface calls
-    // safePaintSetPointerCapture(#conteVideoStage), and iOS then stops delivering that touch to other listeners
+    // captures #conteVideoStage, and iOS then stops delivering that touch to other listeners
     // — so a TouchEvent pinch would be dead exactly when a user reaches in with a second finger, and the
     // two-finger-tap undo with it (genga and 用紙 use the same pointer model). Module scope (not a closure
     // local) so bindGestureStateJanitor() can drain it — the janitor can only drain what it can see.
@@ -62164,6 +62169,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (event.pointerType !== 'touch' || !videoPreviewPinchActive()) return;
         pinchPointersSweepStale(videoPreviewPointers, event, teardownVideoPreviewPinch);
         videoPreviewPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        bindPinchPointerEnd(event, surface, surface, videoPreviewPointers, teardownVideoPreviewPinch);
         twoFingerGestureNotePoints(videoPreviewPointers.size);
         // `>= 2 && !pinch`, not `=== 2`: exact equality only arms on the frame the map is exactly two, so one
         // survivor would make a real two-finger pinch (size 3) unreachable; the `!pinch` guard keeps an armed
@@ -62218,13 +62224,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (event.cancelable) event.preventDefault();
       }, { passive: false, capture: true });
-      const endVideoPreviewPinch = function(event) {
-        if (event && event.pointerId != null) videoPreviewPointers.delete(event.pointerId);
-        if (videoPreviewPointers.size < 2 || twoFingerPinLost(videoPreviewPointers)) teardownVideoPreviewPinch(event && event.type); // Decide tap in teardown. Losing either chosen contact ends the gesture.
-      };
-      surface.addEventListener('pointerup', endVideoPreviewPinch, { passive: true, capture: true });
-      surface.addEventListener('pointercancel', endVideoPreviewPinch, { passive: true, capture: true });
-      bindGestureStateJanitor(); // the janitor covers videoPreviewPointers / videoPreviewPinch
+      bindPaintInputLifecycle();
       // Safari runs its own legacy gesturestart/change/end path alongside touch-action (Apple: "To
       // disable pinch open and pinch close gestures, implement the gesturestart and gesturechange event
       // handlers"), so touch-action:none alone still lets iOS zoom the page, and pointer listeners do not suppress
@@ -62543,9 +62543,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         startY: event.clientY,
         offset: 0
       };
-      if (surfaceEl && surfaceEl.setPointerCapture) {
-        try { surfaceEl.setPointerCapture(event.pointerId); } catch (error) {}
-      }
+      capturePaintPointer(event, surfaceEl);
       event.preventDefault();
       event.stopPropagation();
     }
@@ -62569,10 +62567,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const touch = state.previewPanelFlipTouch;
       if (!touch || touch.pointerId !== event.pointerId) return;
       state.previewPanelFlipTouch = null;
-      const surfaceEl = event.currentTarget;
-      if (surfaceEl && surfaceEl.releasePointerCapture) {
-        try { surfaceEl.releasePointerCapture(event.pointerId); } catch (error) {}
-      }
       clearParaparaPreviewOverlay();
       event.preventDefault();
       event.stopPropagation();
@@ -82526,7 +82520,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!type || !pointerDragCanStart('color-picker', event)) return;
       state.paintColorPickerDrag = { pointerId: event.pointerId, type: type, session: bindOwnedPointerDrag(event, { key: 'color-picker', target: document, capture: true, move: movePaintColorPickerDrag, up: endPaintColorPickerDrag }) };
       updatePaintColorFromPickerPoint(event, type);
-      safePaintSetPointerCapture(canvas, event.pointerId);
+      trySetPointerCapture(canvas, event.pointerId);
       event.preventDefault();
     }
 
@@ -88022,7 +88016,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       if (textStamp) state.paintRasterOp.textOwner = { project: state.project, layerId: layerTarget.layerId, frame: state.videoPlayheadFrames };
       state.paintPointerId = event.pointerId;
-      safePaintSetPointerCapture(canvas, event.pointerId);
+      capturePaintPointer(event, canvas);
       if (!textStamp) paintStampPathPoints(state.paintRasterOp, { x: conteNormToPlaneX(localPoint.x, opTarget.geometry.paper), y: conteNormToPlaneY(localPoint.y, opTarget.geometry.paper) }, state.paintStamp);
       drawPaintStampAtPoint(state.paintRasterOp, localPoint);
       imageBrushSyncActiveStamp();
@@ -100384,7 +100378,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!event || event.pointerType !== 'touch') { run(); return; }   // Mouse and pen have no two-finger tap.
       state.paintPendingBucketFill = { pointerId: event.pointerId, run: run };
       // Capture a deferred pointer so release still arrives outside the canvas.
-      try { if (event.target && event.target.setPointerCapture) event.target.setPointerCapture(event.pointerId); } catch (e) {}
+      capturePaintPointer(event, event.target);
     }
     // Fill only on a clean release. Cancellation or gesture takeover drops the pending fill.
     // While a two-finger candidate is active, drop the fill here as on tap cancellation
@@ -104861,7 +104855,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         closed: false
       };
       state.paintPointerId = event.pointerId;
-      safePaintSetPointerCapture(canvas, event.pointerId);
+      capturePaintPointer(event, canvas);
       ensurePaintRasterOpBounds(state.paintRasterOp, paintLayerPointsBounds([localPoint], 2, opTarget.geometry.paper));
       updatePaintEditOverlays(layerTarget.drawingRef);
       return true;
@@ -106189,6 +106183,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
 
     function beginPaintTransformOp(event, canvas, layerTarget, localPoint) {
+      watchStoryboardPaintPointer(event, canvas);
       const mode = paintTransformMode(); // Snapshot the mode for this drag in op.mode.
       const target = prepareLayerRasterTarget(layerTarget);
       if (!target) return false;
@@ -106226,6 +106221,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         hit: hit,
         startPointPx: pointPx,
         startBox: clonePaintTransformBox(box),
+        startPreview: existingPreview,
         box: clonePaintTransformBox(box),
         startMoveDx: existingPreview ? Math.round(Number(existingPreview.moveDx) || 0) : 0,
         startMoveDy: existingPreview ? Math.round(Number(existingPreview.moveDy) || 0) : 0,
@@ -106234,7 +106230,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         changed: false
       };
       state.paintPointerId = event.pointerId;
-      safePaintSetPointerCapture(canvas, event.pointerId);
+      capturePaintPointer(event, canvas);
       return true;
     }
 
@@ -107344,9 +107340,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Not TouchEvent listeners: once the first finger starts a stroke the canvas calls setPointerCapture, and iOS
       // stops delivering that touch to other listeners, so a TouchEvent pinch handler is dead exactly when a user
       // reaches in with a second finger. Track pointers in a Map (the gengaPointers pattern, field-verified on iPad)
-      // and treat size>=2 as a pinch. bindGestureStateJanitor() clears paperPointers wherever the end event lands,
-      // so a finger lifted off-stage can't strand the gesture.
-      // Use capture for all four listeners so a child cannot block a second touch.
+      // and treat size>=2 as a pinch. The shared session clears paperPointers even when a finger lifts off-stage.
+      // Capture the down/move so a child cannot block a second touch.
       // The first finger can create state.paintRasterOp, causing beginPaintStroke to stop the second pointerdown.
       // Without capture that finger never enters paperPointers, leaving the count at one
       // and preventing a pinch or two-finger tap from forming.
@@ -107358,6 +107353,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (event.pointerType !== 'touch' || !paperZoomControlsActive() || stage !== paperScrollHostEl()) return;
         pinchPointersSweepStale(paperPointers, event, teardownPaperPinch);
         paperPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        bindPinchPointerEnd(event, stage, document.getElementById('memoCanvas'), paperPointers, teardownPaperPinch);
         twoFingerGestureNotePoints(paperPointers.size);
         if (paperPointers.size >= 2 && !paperPinch) { // See the video surface for why not `=== 2`
           const v = paperPinchVals();
@@ -107398,12 +107394,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
         if (event.cancelable) event.preventDefault();
       }, { passive: false, capture: true });
-      const endPaperPinch = function(event) {
-        if (event && event.pointerId != null) paperPointers.delete(event.pointerId);
-        if (paperPointers.size < 2 || twoFingerPinLost(paperPointers)) teardownPaperPinch(event && event.type); // Use shared teardown for tap detection and when the selected pair breaks.
-      };
-      stage.addEventListener('pointerup', endPaperPinch, { passive: true, capture: true });
-      stage.addEventListener('pointercancel', endPaperPinch, { passive: true, capture: true });
       // Leave ordinary wheel events as scroll. Handle Ctrl+wheel and trackpad pinch as cursor-centered zoom
       // so the browser does not zoom the whole page, matching the timesheet window.
       stage.addEventListener('wheel', function(event) {
@@ -107412,7 +107402,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const factor = viewWheelZoomFactor(event);
         if (factor !== 1) setPaperZoom(paperZoomValue() * factor, event.clientX, event.clientY);
       }, { passive: false });
-      bindGestureStateJanitor();
+      bindPaintInputLifecycle();
       // Safari runs its own legacy gesturestart/change/end path alongside touch-action (Apple: "To disable
       // pinch open and pinch close gestures, implement the gesturestart and gesturechange event handlers"),
       // so touch-action alone still lets iOS zoom the page here. Swallow them on the stage only.
@@ -107615,12 +107605,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function cancelPaintSpacePan() {
       gengaFlipHoverEnd(false);
-      const wasGengaDrag = state.paintSpacePanDrag && state.paintSpacePanDrag.inGenga;
+      const drag = state.paintSpacePanDrag;
+      if (drag && drag.session) drag.session.dispose();
       state.paintSpacePanActive = false;
       state.paintViewHoldKey = ''; state.paintViewHoldCode = '';
       state.paintSpacePanDrag = null;
       updatePaintSpacePanCursorClass();
-      if (wasGengaDrag) scheduleGengaPreviewRedraw();
+      if (drag && drag.inGenga) scheduleGengaPreviewRedraw();
     }
 
     function handlePaintSpacePanKeyup(event) {
@@ -107642,11 +107633,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // handlePaintSpacePanPointerDown: a drag starting on #memoCanvas (painting while holding Space)
     // stopPropagation()s, so it never reaches the document-level handler, and the video-only transform pan below
     // is a silent no-op on paper (applyPaintViewportPan only moves #conteVideoStage).
-    // Genga (canvas-redraw, state.gengaPanX/Y) arms/drags through this same choke point + shared state
-    // (state.paintSpacePanActive/paintSpacePanDrag), so it inherits conte's backstops: the document-level
-    // pointerup/pointercancel→endPaintSpacePan below and the window-blur→cancelPaintSpacePan handler (see
-    // bindGestureStateJanitor / the blur listener near the other document binds).
+    function bindPaintSpacePan(event, canvas) {
+      updatePaintSpacePanCursorClass();
+      const drag = state.paintSpacePanDrag;
+      drag.session = bindOwnedPointerDrag(event, {
+        key: 'paint-view-pan', owner: canvas, captureEl: canvas, target: document,
+        escape: false, move: continuePaintSpacePan, up: endPaintSpacePan
+      });
+      event.preventDefault();
+      event.stopPropagation();
+      return true;
+    }
+
     function startPaintViewportPanDrag(event, canvas, mode) {
+      if (!pointerDragCanStart('paint-view-pan', event)) return false;
       gengaFlipHoverEnd(false);   // A press starts pan and returns the hover-triggered flip to its starting drawing.
       const inGenga = Boolean(state.project && state.project.kind === 'genga');
       // Shift+Space+drag = rotate the view (the paint tool). Angle is accumulated incrementally around the
@@ -107656,11 +107656,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         state.paintSpacePanDrag = { pointerId: event.pointerId, mode: 'zoom', inGenga: inGenga,
           surfaceKey: rotKey, startX: event.clientX, startY: event.clientY,
           baseZoom: VIEW_SURFACES[rotKey].zoomGet() };
-        updatePaintSpacePanCursorClass();
-        safePaintSetPointerCapture(canvas, event.pointerId);
-        event.preventDefault();
-        event.stopPropagation();
-        return true;
+        return bindPaintSpacePan(event, canvas);
       }
       if (mode === 'rotate' && rotKey) {
         const pivot = spaceRotatePivot(rotKey);
@@ -107671,11 +107667,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           baseRot: VIEW_SURFACES[rotKey].rotGet(),
           accum: 0
         };
-        updatePaintSpacePanCursorClass();
-        safePaintSetPointerCapture(canvas, event.pointerId);
-        event.preventDefault();
-        event.stopPropagation();
-        return true;
+        return bindPaintSpacePan(event, canvas);
       }
       // If the surface cannot rotate, leave a dedicated rotation key idle instead of starting a pan.
       if (mode === 'zoom' || (mode === 'rotate' && !viewHoldPans(event))) return false;
@@ -107689,11 +107681,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         baseX: inGenga ? (Number(state.gengaPanX) || 0) : Math.round(Number(state.paintViewportPanX) || 0),
         baseY: inGenga ? (Number(state.gengaPanY) || 0) : Math.round(Number(state.paintViewportPanY) || 0)
       };
-      updatePaintSpacePanCursorClass();
-      safePaintSetPointerCapture(canvas, event.pointerId);
-      event.preventDefault();
-      event.stopPropagation();
-      return true;
+      return bindPaintSpacePan(event, canvas);
     }
 
     function beginPaintSpacePan(event, canvas) {
@@ -107712,6 +107700,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const inGenga = Boolean(state.project && state.project.kind === 'genga');
       if (state.paintRasterOp || !(paintInteractionActive() || inGenga)) return false;
       return startPaintViewportPanDrag(event, canvas);
+    }
+
+    function paintSpacePanOwns(event) {
+      return state.paintSpacePanDrag && state.paintSpacePanDrag.pointerId === event.pointerId;
     }
 
     function continuePaintSpacePan(event) {
@@ -107765,7 +107757,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
-    function endPaintSpacePan(event, canvas) {
+    function endPaintSpacePan(event) {
       const drag = state.paintSpacePanDrag;
       if (!drag || drag.pointerId !== event.pointerId) return false;
       state.paintSpacePanDrag = null;
@@ -107774,9 +107766,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Pan is not persisted in either mode (editorUiStatePayload leaves the video-preview view out); the conte
       // path saves the rest of the editor UI state here.
       if (!(state.project && state.project.kind === 'genga')) saveEditorUiState();
-      if (canvas && canvas.releasePointerCapture) {
-        try { canvas.releasePointerCapture(event.pointerId); } catch (error) {}
-      }
       event.preventDefault();
       event.stopPropagation();
       return true;
@@ -108007,7 +107996,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       state.paintCurrentStroke = stroke;
       state.paintPointerId = event.pointerId;
-      safePaintSetPointerCapture(canvas, event.pointerId);
+      capturePaintPointer(event, canvas);
       ensurePaintRasterOpBounds(state.paintRasterOp, initialDrawBounds);
       // Render the first dab through paintDrawFirstDab → paintLiveStrokeRedraw for whole-path strokes.
       // Drawing an initial ctx.arc through drawCurrentLayerStrokeSegment would flash a round mark
@@ -108096,7 +108085,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintInputChannel = null, paintInputTicket = 0;
     function paintInputEventCopy(event, samples) {
       const out = {};
-      for (const key of ['type','pointerId','pointerType','isPrimary','button','buttons','clientX','clientY','pressure','tiltX','tiltY','altitudeAngle','azimuthAngle','twist','timeStamp','shiftKey','altKey','ctrlKey','metaKey','target','currentTarget','cancelable']) out[key] = event[key];
+      for (const key of ['type','pointerId','pointerType','isPrimary','button','buttons','clientX','clientY','pressure','tiltX','tiltY','altitudeAngle','azimuthAngle','twist','timeStamp','shiftKey','altKey','ctrlKey','metaKey','target','currentTarget','cancelable','interrupted']) out[key] = event[key];
       if (samples && samples.length) {
         const last = samples[samples.length - 1];
         for (const key of ['clientX','clientY','pressure','tiltX','tiltY','altitudeAngle','azimuthAngle','twist','timeStamp']) out[key] = last[key];
@@ -108235,10 +108224,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!q || q.running) return false;
       q.entries.push({ action: action }); paintInputQueuePost(q); return true;
     }
-    function paintInputQueuedPointer(id) {
-      const q = paintInputQueueState;
-      return Boolean(q && q.entries.slice(q.head).some(function(e) { return e && e.event && e.event.pointerId === id; }));
-    }
     function paintInputCancelOwner(owner) {
       const q = paintInputQueueState;
       if (q && !q.running && q.owner === owner) paintInputQueueDone(q);
@@ -108376,7 +108361,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       state.paintCurrentStroke = stroke;
       state.paintPointerId = event.pointerId;
-      safePaintSetPointerCapture(canvas, event.pointerId);
+      capturePaintPointer(event, canvas);
       // Defer the first point as on video and genga. A two-finger tap cancels the entire stroke
       // before any mark appears. Stamping immediately would make the tap's Undo remove that mark.
       // Mouse and pen also draw on motion or confirmed tap release.
@@ -108472,19 +108457,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       redrawActiveLayerCanvasTargets(op.drawingRef);
     }
 
-    function endPaintTransformDocument(event) {
-      const op = state.paintRasterOp;
-      if (!op || op.type !== 'transform-edit' || state.paintPointerId !== event.pointerId) return false;
-      continuePaintTransformDocument(event);
-      const canvas = op.target && op.target.type === 'video-conte-layer' ? document.getElementById('conteVideoStage') : document.getElementById('memoCanvas');
-      safeReleasePointerCapture(canvas, event.pointerId);
-      clearPaintPointerSession();
-      finishPaintTransformOp(op);
-      clearActiveLayerCanvasTargets();
-      updatePaintUndoRedoButtonsOnly();
-      return true;
-    }
-
     function memoPrimaryPointerDownAllowed(event) {
       const pointerType = String(event && event.pointerType || '').toLowerCase();
       if (pointerType === 'pen' || pointerType === 'touch') return true;
@@ -108493,6 +108465,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function beginPaintStroke(event) {
+      watchStoryboardPaintPointer(event, document.getElementById('memoCanvas'));
       if (paintInputDeferEvent(event, beginPaintStroke, paintPresentQueuedInput)) return;
       // Middle-click drag = pan (parity with beginVideoPaintStroke and genga's gengaPreviewPointerDown). Must run
       // before memoPrimaryPointerDownAllowed, which only lets button-0 mouse presses through; otherwise a bare
@@ -108546,7 +108519,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           state.paintRasterOp.pageLiveBase = base;
           state.paintCurrentStroke = pendingPage.stroke;
           state.paintPointerId = event.pointerId;
-          safePaintSetPointerCapture(canvas, event.pointerId);
+          capturePaintPointer(event, canvas);
           return;
         }
         cancelPendingCurvePage();
@@ -108573,7 +108546,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     let paintMemoSurfaceLayerOpWarned = false;
     function continuePaintStroke(event) {
       if (paintInputDeferEvent(event, continuePaintStroke, paintPresentQueuedInput)) return;
-      if (continuePaintSpacePan(event)) return;
+      if (paintSpacePanOwns(event)) return;
       if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) {
         return; // No paper stamp ghost — paper mode has no conte-layer access
       }
@@ -108661,8 +108634,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (paintInputDeferEvent(event, endPaintStroke, paintPresentQueuedInput, state.paintPointerId === event.pointerId ? state.paintRasterOp : null)) return;
       const endingStroke = state.paintRasterOp;
       try {
-        const canvas = document.getElementById('memoCanvas');
-        if (endPaintSpacePan(event, canvas)) return;
         if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) return;
         event.preventDefault();
         paintStabilizeCatchupReplay(state.paintRasterOp, event, continuePaintStroke, state.paintCurrentStroke);   // Flush the stabilizer lag toward convergence with interpolated pressure.
@@ -108670,9 +108641,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         cancelScheduledMemoCanvasRedraw();
         paintFlushPendingFirstDab(); // Finish a stationary tap by drawing one dot.
         const op = state.paintRasterOp;
-        const pointerId = event.pointerId;
         clearPaintPointerSession();
-        safeReleasePointerCapture(canvas, pointerId);
         if (op.type === 'page-draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
           // Page curve phase 1: the chord stroke stays in page.strokes as the visible ghost;
           // the next pointerdown with the curve tool becomes the bend gesture (see beginPaintStroke).
@@ -108720,57 +108689,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return document.getElementById('conteVideoStage');
     }
 
-    function safePaintSetPointerCapture(canvas, pointerId) {
-      if (!canvas || !canvas.setPointerCapture || pointerId == null) return;
-      try { canvas.setPointerCapture(pointerId); } catch (error) {}
-    }
-
-    // Pair this with the settings path and share error handling.
-    function safeReleasePointerCapture(el, pointerId) {
-      if (!el || !el.releasePointerCapture || pointerId == null) return;
-      try { el.releasePointerCapture(pointerId); } catch (error) {}
-    }
-    // Keep the element as well as its rect. A rotated bounding box cannot supply untransformed dimensions.
-    // offsetWidth gives transform-independent layout pixels.
-    // Map pointers on the rotated video surface to paper-local pixels for the camera and gizmo.
-    // Use uiPointerLocalX/Y when there is no rotation or mirroring. Take the center from getBoundingClientRect
-    // and the layout size from offsetWidth.
-    function videoPointerLocal(clientX, clientY) {
-      const rot = previewViewRotEff();
-      // Undo mirroring as in getVideoPaintPointFromEventRaw so dragging a flipped camera frame follows the finger.
-      // Use the default mapping only when both rotation and mirror are absent.
-      const el = (rot || previewViewFlipSign() < 0) ? videoPaperEl() : null;
-      if (!el || !(el.offsetWidth > 0) || !(el.offsetHeight > 0)) {
-        return { x: uiPointerLocalX(clientX), y: uiPointerLocalY(clientY) };
-      }
-      const uz = uiReadScale() || 1;
-      const n = viewClientToLocalNorm(el, null, clientX, clientY, rot, previewViewFlipSign());
-      const raw = el.getBoundingClientRect();
-      const w = el.offsetWidth, h = el.offsetHeight; // Already in local pixels.
-      const cx = (raw.left + raw.width / 2) / uz, cy = (raw.top + raw.height / 2) / uz;
-      return { x: cx - w / 2 + n.x * w, y: cy - h / 2 + n.y * h };
-    }
-    // Cache elements per gesture so each coalesced storyboard sample avoids DOM lookups.
-    // videoPaintBaseRect caches the rectangle. Share gengaPointerGestureOpen's document gesture lifetime:
-    // initialize on pointerdown and release on up, cancel, or resize.
-    // Requery a node detached by a mid-stroke rebuild.
-    let videoPaperElGesture = null;
-    function videoPaperEl() {
-      if (gengaPointerGestureOpen && videoPaperElGesture && videoPaperElGesture.isConnected) return videoPaperElGesture;
-      const stage = document.getElementById('conteVideoStage');
-      const el = stage && stage.querySelector ? stage.querySelector('.conte-paper') : null;
-      if (gengaPointerGestureOpen) videoPaperElGesture = el;
-      return el;
-    }
-    function videoPaintBaseRect() {
-      // The pointer/display anchor is the paper (norm 0..1 = paper edges), taken directly off .conte-paper (not
-      // the .video-preview-camera-target child) — same rect, but the paper never carries the camera transform,
-      // so its gBCR is the stable paper box.
-      const stage = document.getElementById('conteVideoStage');
-      const paper = stage && stage.querySelector ? stage.querySelector('.conte-paper') : null;
-      return paper ? paper.getBoundingClientRect() : { left: 0, top: 0, width: 1, height: 1 };
-    }
-
     // The mirror is undone on the normalized value because the paper's gBCR is identical mirrored or not, so
     // the sign comes from state.
     // A rotated bounding box cannot map raw coordinates by width and height ratios alone.
@@ -108781,6 +108699,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function beginVideoPaintStroke(event) {
+      watchStoryboardPaintPointer(event, document.getElementById('conteVideoStage'));
       if (paintInputDeferEvent(event, beginVideoPaintStroke, paintPresentQueuedInput)) return;
       // Middle-click drag = pan (unify with genga). Must run before memoPrimaryPointerDownAllowed, which only
       // lets button-0 mouse presses through, so a bare middle-click would never reach pan logic.
@@ -108818,7 +108737,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           state.videoPaintPointerCanvasRect = bendCanvas ? videoPaintBaseRect() : null;
           state.paintPointerId = event.pointerId;
           state.paintCurrentStroke = pendingCurve.stroke;
-          safePaintSetPointerCapture(bendCanvas, event.pointerId);
+          capturePaintPointer(event, bendCanvas);
           return;
         }
         // A pending curve chord survives an eyedropper sample (genga order: the eyedropper step precedes the
@@ -108928,7 +108847,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function continueVideoPaintStroke(event) {
       if (paintInputDeferEvent(event, continueVideoPaintStroke, paintPresentQueuedInput)) return;
       if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { continuePreviewPanelFlipTouch(event); return; } // Parapara flip owns this pointer
-      if (continuePaintSpacePan(event)) return;
+      if (paintSpacePanOwns(event)) return;
       if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) {
         if (!state.paintRasterOp) updatePaintStampPreviewFromVideoEvent(event);
         return;
@@ -109015,8 +108934,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return; } // End the parapara flip
         const owner = state.paintRasterOp && state.paintRasterOp.textOwner;
         if (owner && (owner.project !== state.project || owner.layerId !== state.selectedConteLayerId || owner.frame !== state.videoPlayheadFrames)) { cancelActivePaintRasterStroke(event); return; }
-        const canvas = document.getElementById('conteVideoStage'); // Capture surface = viewport
-        if (endPaintSpacePan(event, canvas)) return;
         if (!state.paintRasterOp || state.paintPointerId !== event.pointerId) return;
         event.preventDefault();
         event.stopPropagation();
@@ -109024,12 +108941,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         continueVideoPaintStroke(event);
         paintFlushPendingFirstDab(); // Finish a stationary tap by drawing one dot.
         const op = state.paintRasterOp;
-        const pointerId = event.pointerId;
         clearPaintPointerSession();
-        safeReleasePointerCapture(canvas, pointerId);
         if (op.type === 'draw' && op.shapeKind === 'curve' && op.shapeMoved && !op.curveChord) {
           // Curve phase 1 done: keep the op alive as a pending chord (the ghost stays painted). paintPointerId
-          // stays null → nothing is blocked, the gesture janitor ignores it, and the active canvas list stays
+          // stays null → nothing is blocked, and the active canvas list stays
           // set so async repaints can't wipe the ghost (paintCanvasHasActiveStroke).
           op.curveChord = {
             a: { x: op.shapeAnchor.x, y: op.shapeAnchor.y },
@@ -109105,7 +109020,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (paintInputDeferEvent(event, cancelActivePaintRasterStroke, paintPresentQueuedInput)) return true;
       const endingStroke = state.paintRasterOp;
       try {
-        paintFlushPendingBucketFill(event); // Cancellation discards the pending work. Only pointerup can commit it.
+        if (state.paintPendingBucketFill && state.paintPendingBucketFill.pointerId === event.pointerId) paintFlushPendingBucketFill(event);
         if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return true; } // Cancel = end the parapara flip
         const op = state.paintRasterOp;
         if (!op || state.paintPointerId !== event.pointerId) return false;
@@ -109115,8 +109030,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (op.type === 'page-draw') {
           if (event.cancelable) event.preventDefault();
           event.stopPropagation();
-          const memoCanvas = document.getElementById('memoCanvas');
-          if (event.type !== 'lostpointercapture') safeReleasePointerCapture(memoCanvas, event.pointerId);
           paintRemovePageStroke(op);
           // Clear any pending first-stage curve that owns this stroke so its ghost cannot remain.
           if (state.memoPageCurvePending && state.memoPageCurvePending.stroke === op.stroke) {
@@ -109128,29 +109041,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           updatePaintUndoRedoButtonsOnly();
           return true;
         }
-        if (op.target && op.target.type === 'memo-page') {
-          // Page changes and OS cancellation discard an unfinished selection/transform, never finish it on another page.
-          const canvas = document.getElementById('memoCanvas');
-          clearPaintPointerSession();
-          state.paintLassoPreview = null;
-          if (op.type === 'transform-edit') { state.paintTransformBox = null; state.paintTransformPreview = null; }
-          if (event.type !== 'lostpointercapture') safeReleasePointerCapture(canvas, event.pointerId);
-          updatePaintEditOverlays(op.drawingRef);
-          return true;
-        }
-        if (op.type !== 'draw' && op.type !== 'stamp') return endActivePaintRasterStrokeFromDocument(event);
         if (event.cancelable) event.preventDefault();
         event.stopPropagation();
         const target = op.target || {};
-        const canvas = target.type === 'video-conte-layer'
-          ? document.getElementById('conteVideoStage') // Capture surface = viewport
-          : document.getElementById('memoCanvas');
-        if (event.type !== 'lostpointercapture') safeReleasePointerCapture(canvas, event.pointerId);
-        const drawingRef = op.drawingRef;
         clearPaintPointerSession();
+        const drawingRef = op.drawingRef;
+        if (op.type === 'lasso-select' || op.type === 'lasso-stamp') state.paintLassoPreview = null;
+        if (op.type === 'transform-edit') {
+          state.paintTransformBox = op.startBox;
+          state.paintTransformPreview = op.startPreview;
+        }
         cancelScheduledMemoCanvasRedraw();
-        redrawActiveLayerCanvasTargets(drawingRef);
+        if (target.type === 'memo-page') redrawMemoCanvas();
+        else redrawActiveLayerCanvasTargets(drawingRef);
         clearActiveLayerCanvasTargets();
+        updatePaintEditOverlays(drawingRef);
         updatePaintUndoRedoButtonsOnly();
         return true;
       } finally {
@@ -109158,7 +109063,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function endActivePaintRasterStrokeFromDocument(event) {
+    function watchStoryboardPaintPointer(event, surface) {
+      bindPaintPointerEnd(event, surface, function(end) {
+        if (!paintInputDeferEvent(end, endStoryboardPaintPointer, paintPresentQueuedInput)) endStoryboardPaintPointer(end);
+      }, cancelActivePaintRasterStroke);
+    }
+
+    function endStoryboardPaintPointer(event) {
+      if ((state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) ||
+          (state.paintPendingBucketFill && state.paintPendingBucketFill.pointerId === event.pointerId)) {
+        endVideoPaintStroke(event);
+        return;
+      }
       const op = state.paintRasterOp;
       if (!op || state.paintPointerId !== event.pointerId) return;
       if (op.type === 'page-draw' && event.pointerType === 'touch' && paperPinch) { discardActivePaintStrokeForGesture(); return; }
@@ -109180,11 +109096,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         stage.dataset.paintBound = 'true';
         stage.addEventListener('pointerdown', beginVideoPaintStroke);
         stage.addEventListener('pointermove', continueVideoPaintStroke);
-        stage.addEventListener('pointerup', endVideoPaintStroke);
-        stage.addEventListener('pointercancel', cancelActivePaintRasterStroke);
         stage.addEventListener('contextmenu', handlePaintSurfaceContextMenu);
         addCanvasTouchGuards(stage);
-        bindGestureStateJanitor(); // Document-level backstop (see its comment near gengaPreviewPointerEnd)
+        bindPaintInputLifecycle();
       }
     }
 
@@ -112083,6 +111997,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Cancel the common pointer session with the shared kernel in both engines.
     // applyContePaperMemoArmed and resetProjectTransientRuntime also use it.
     function paintAbortGestureSession() {
+      disposePaintPointer(state.paintPointerId);
       const abandoned = state.paintRasterOp;
       paintDiscardPendingBucketFill();
       paintReleaseStrokeBuffers(state.paintRasterOp);
@@ -112118,16 +112033,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!(state.project && state.project.kind === 'genga')) return;
       if (toolChanged) {
         gengaSelectionRequest = null;
-        const canvas = document.getElementById('gengaPreviewCanvas');
         if (gengaDrawSession) {
-          const pointerId = gengaDrawSession.pointerId;
+          disposePaintPointer(gengaDrawSession.pointerId);
           gengaEndDrawSession();
-          safeReleasePointerCapture(canvas, pointerId);
         }
         const selectionPointer = gengaSelDrag || gengaLasso;
+        if (selectionPointer) disposePaintPointer(selectionPointer.pointerId);
         gengaSelDrag = null;
         gengaLasso = null;
-        if (selectionPointer) safeReleasePointerCapture(canvas, selectionPointer.pointerId);
       }
       if (typeof gengaSel !== 'undefined' && gengaSel && String(nextTool || '') !== String(prevTool || '')) {
         // Tool changes discard lifted pixels while preserving the user's selection and transform coordinates.
@@ -115197,27 +115110,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function bindPaintControls() {
       bindPaintWindowHeaders();
       // The five paint-window drags run through beginPanelDrag (kernel owns move/up/cancel)
-      document.addEventListener('pointermove', continuePaintSpacePan);
       document.addEventListener('pointermove', continuePaintTransformDocument);
-      document.addEventListener('pointerup', endActivePaintRasterStrokeFromDocument, true);
-      document.addEventListener('pointerup', function(event) { endPaintSpacePan(event, null); });
-      document.addEventListener('pointerup', endPaintTransformDocument);
       document.addEventListener('pointerup', endCameraFrameDrag);
-      document.addEventListener('pointercancel', cancelActivePaintRasterStroke, true);
-      document.addEventListener('lostpointercapture', cancelActivePaintRasterStroke, true);
-      document.addEventListener('pointercancel', function(event) { endPaintSpacePan(event, null); });
-      document.addEventListener('pointercancel', endPaintTransformDocument);
       document.addEventListener('pointercancel', endCameraFrameDrag);
       document.addEventListener('contextmenu', handlePaintContextMenu);
       document.addEventListener('contextmenu', suppressDefaultContextMenu); // Block the browser default outside app menus / text selections
       const paraparaBtn = document.getElementById('paintParaparaBtn');
       if (paraparaBtn) {
         gengaLoadParaparaCfg();
-        let ppLpTimer = 0, ppLpFired = false, ppHolding = false, ppPrimaryDown = false;
+        let ppWait = null, ppLpFired = false, ppHolding = false, ppPrimaryDown = false;
         let ppSession = null;
         // Cancel this menu timer on a second contact while leaving hold playback running.
-        const ppMenuSub = { cancel: function() { ppClear(); } };
-        const ppClear = function() { if (ppLpTimer) { clearTimeout(ppLpTimer); ppLpTimer = 0; } longPressContacts.unwatch(ppMenuSub); };
+        const ppClear = function() { if (ppWait) { ppWait.cancel(); ppWait = null; } };
         const ppHoldMode = function() { return state.gengaParaparaMode === 'hold'; }; // mode is shared conte+genga
         // settings popover opens in both conte and genga (right-click / long-press)
         paraparaBtn.addEventListener('contextmenu', function(ev) {
@@ -115229,21 +115133,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (ev.button != null && ev.button !== 0) return;
           if (!pointerDragCanStart('parapara-hold', ev)) return;
           ev.preventDefault();
-          ppSession = bindOwnedPointerDrag(ev, { key: 'parapara-hold', target: document, capture: true, move: function() {}, up: ppEnd });
+          ppSession = bindOwnedPointerDrag(ev, { key: 'parapara-hold', target: document, capture: true, up: ppEnd });
           ppLpFired = false;
           ppHolding = false;
           ppPrimaryDown = true;
-          if (!longPressContacts.blocked()) { // long-press → settings, at the app's one long-press length
-            longPressContacts.watch(ppMenuSub);
-            ppLpTimer = setTimeout(function() {
-              longPressContacts.unwatch(ppMenuSub);
-              ppLpFired = true;
-              if (ppHolding) { paraparaClear(); ppHolding = false; }
-              windowSetOpen(windowDefById('windowParapara'), true);
-              const opened = anchoredPopover;
-              retainLongPressMenuUntilRelease(ev, function() { if (anchoredPopover === opened) closeAnchoredPopover(); });
-            }, LONG_PRESS.delay);
-          }
+          ppWait = startLongPressWait(function() {
+            ppLpFired = true;
+            if (ppHolding) { paraparaClear(); ppHolding = false; }
+            windowSetOpen(windowDefById('windowParapara'), true);
+            const opened = anchoredPopover;
+            retainLongPressMenuUntilRelease(ev, function() { if (anchoredPopover === opened) closeAnchoredPopover(); });
+          });
           if (ppHoldMode()) { paraparaShow(true); ppHolding = true; } // Hold-mode shows on press (conte + genga)
         });
         // only a primary press that started here may fire (a long-press that opened settings is suppressed)
@@ -115342,8 +115242,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const canvas = document.getElementById('memoCanvas');
       canvas.addEventListener('pointerdown', beginPaintStroke);
       canvas.addEventListener('pointermove', continuePaintStroke);
-      canvas.addEventListener('pointerup', endPaintStroke);
-      canvas.addEventListener('pointercancel', cancelActivePaintRasterStroke);
       canvas.addEventListener('contextmenu', handlePaintSurfaceContextMenu);
       addCanvasTouchGuards(canvas);
       document.addEventListener('pointerdown', handleTimelinePanPointerDown, true); // Give timeline capture the first chance.
@@ -126801,6 +126699,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // instance-merge). A flush is a sync toDataURL per still-pending ref — normally zero to a few rapid strokes
     // deep, a no-op when idle. The crop also seeds the decode-race fallback, using the current consumer's
     // placement; no second full-paper surface is retained by the encoder.
+    let gengaLastStrokeCanvas = null; // { dataUrl, canvas } — last committed crop, reused while its dataUrl decodes
     let gengaPendingDrawingEncode = new Map(); // ref → { canvas, drawing, layerId, frame }
     function gengaPutDrawingCanvas(canvas, w, h, x, y, meta) {
       const out = { w: Math.max(1, Math.round(Number(w) || 1)), h: Math.max(1, Math.round(Number(h) || 1)) };
@@ -126813,6 +126712,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaStartDrawingEncode(entry) {
       const ref = gengaNewDrawRef(), canvas = entry.canvas;
+      entry.project = state.project;
       entry.drawing.ref = ref;
       gengaPendingDrawingEncode.set(ref, entry);
       const finish = function(dataUrl, blob) {
@@ -126851,6 +126751,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         } catch (e) { console.error('[gengaEncode] IndexedDB write threw for gd:' + ref, e); }
       }
       gengaTrimDrawStore(ref);   // Protect the new insertion and evict only over-budget entries.
+      if (entry.project !== state.project) return; // Finish storage without publishing view caches into a replacement.
       // Bake the panel thumbnail asynchronously through toBlob and redraw the cell on completion.
       // Crop to the full trim canvas, equivalent to the tile commit's ink bounds.
       // Skip immediate gengaUpdateExposureDom while baking. The immediate call remains the fallback when no bake starts.
@@ -129036,11 +128937,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const tracks = (gt.audioClips || []).filter(function(c) { return String(c.id) !== String(clipId); }).map(function(c) { return c.track || 0; });
       return gengaAudioLaneCompaction(tracks.concat([landTrack])).remap[landTrack];
     }
-    function gengaAudioClipPointerMove(ev) {
+    function gengaAudioClipPointerMove(ev, ctx) {
       if (!gengaAudioDrag) return;
       if (!gengaAudioDrag.started) {
         if (!pointerDragPassed(ev, gengaAudioDrag.startX, gengaAudioDrag.startY)) return;
         gengaAudioDrag.started = true;
+        ctx.capture(gengaAudioDrag.el);
       }
       const cw = gengaCellW();
       let f = gengaCellsAtClientX(ev.clientX, gengaAudioDrag.rect.left) - gengaAudioDrag.grabOffset + 1;
@@ -150609,12 +150511,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         moved: false, pid: ev.pointerId, arrow: arrow ? Number(arrow.dataset.numStep) : 0 }, ctx);
       el.classList.add('scrubbing');
       // A generated gauge can be replaced during live rendering. Capture on the stable root.
-      s.captureEl = document.documentElement;
-      s.lostCapture = function(e) { if (e.pointerId === s.pid && host.state === s) s.session.cancel(); };
       s.session = bindOwnedPointerDrag(ev, { key: 'fx-scrub', target: document, capture: true,
-        move: function(e) { fxScrubMove(e, host); }, up: function(e) { fxScrubUp(e, host); } });
-      s.captureEl.addEventListener('lostpointercapture', s.lostCapture);
-      try { s.captureEl.setPointerCapture(ev.pointerId); } catch (e) {}
+        captureEl: document.documentElement, move: function(e) { fxScrubMove(e, host); }, up: function(e) { fxScrubUp(e, host); } });
     }
     // ── Apply live updates at most once per frame ──
     // Keep dx → clamp → s.value synchronous and defer only host.applyLive. A high-polling mouse can send several events per frame.
@@ -150659,8 +150557,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       fxScrubFlushPending(); // Last synchronous value must reach the model before commit.
       host.state = null;
       s.session.dispose();
-      s.captureEl.removeEventListener('lostpointercapture', s.lostCapture);
-      try { if (s.captureEl.hasPointerCapture(s.pid)) s.captureEl.releasePointerCapture(s.pid); } catch (e) {}
       s.el.classList.remove('scrubbing');
       if (host.preRelease) host.preRelease(s);
       // The browser's trailing click must not activate a row rebuilt by the commit or refocus the editor.
@@ -154463,34 +154359,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
 
     // ## SECTION: Animation pointer coordinates and stroke preview
-    // The canvas box, cached for the duration of one pointer gesture. gengaPreviewPointerXY is the genga twin of
-    // conte's viewClientToLocalNorm, which caches the canvas rect at pointerdown (state.paintPointerCanvasRect).
-    // getBoundingClientRect forces the browser to flush pending layout, and the drawing loop calls this once per
-    // coalesced sample, so one pointermove from a 240Hz Pencil would pay for it several times over (the
-    // `no-layout-read-in-sync-functions` rule). Lifecycle instead of per-call-site plumbing: a gesture opens on
-    // pointerdown and closes on pointerup/cancel, so the cache is filled lazily on the first sample of a gesture
-    // (nothing is read for gestures that never sample) and dropped at its end. Nothing can move the canvas within
-    // one gesture — a pinch changes gengaPreviewXform, which is read live below, not the element's box — except a
-    // resize, which is covered.
-    let gengaPointerCanvasRect = null; // { el, rect } while a gesture is open
-
-    // The document-wide gesture listener has no 原画 gate, so storyboard videoPaperElGesture shares its lifetime.
-    // One listener serves both caches.
-    let gengaPointerGestureOpen = false;
-    document.addEventListener('pointerdown', function() {
-      gengaPointerCanvasRect = null;
-      videoPaperElGesture = null;
-      gengaPointerGestureOpen = true;
-    }, true);
-    const gengaClosePointerRectCache = function() {
-      gengaPointerCanvasRect = null;
-      videoPaperElGesture = null;
-      gengaPointerGestureOpen = false;
-    };
-    document.addEventListener('pointerup', gengaClosePointerRectCache, true);
-    document.addEventListener('pointercancel', gengaClosePointerRectCache, true);
-    window.addEventListener('resize', gengaClosePointerRectCache);
-    window.addEventListener('orientationchange', gengaClosePointerRectCache);
     // Viewport pointer → the preview canvas's local px, with the view mirror already undone — one place for the
     // main pointer path, the FX gizmo's press and its drag, and the finger flip edge test (a mirror added to each
     // separately is four chances to get the sign wrong). Pass a cached rect when you already measured one.
@@ -154535,7 +154403,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!canvas || !gengaPreviewXform) return null;
       let rect;
       if (batch && batch.rect) rect = batch.rect;
-      else if (gengaPointerGestureOpen) {
+      else if (paintPointerGeometryOpen) {
         if (!gengaPointerCanvasRect || gengaPointerCanvasRect.el !== canvas) gengaPointerCanvasRect = { el: canvas, rect: canvas.getBoundingClientRect() };
         rect = gengaPointerCanvasRect.rect;
       } else {
@@ -154945,7 +154813,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // The cleanup listener skips a null pointer ID.
         // Otherwise it would treat phase one's pointerup as a leak and clear the pending chord.
         shapeSess.pointerId = null;
-        safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
         return;
       }
       gengaEndDrawSession(true);
@@ -154962,7 +154829,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         } else {
           drawGengaPreview();   // A tap alone leaves the layer unchanged.
         }
-        safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
         return;
       }
       if (shapeSess.closedFillInput && shapeSess.shapeMoved) {
@@ -154996,10 +154862,17 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       } else {
         drawGengaPreview(); // degenerate tap: the layer is untouched, just drop the session preview
       }
-      safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
     }
 
     // ## SECTION: Animation drawing history and pointer strokes
+    // Keep the latest tile commit's paper canvas and cel key. Reuse pixels for the same cel and ref
+    // to skip per-tile drawing, readiness checks, and full-paper allocation.
+    // The active canvas is authoritative while it matches. No separate invalidation hook is needed:
+    // Undo, Redo, transforms, and paste change the ref, expId distinguishes sibling cels, and the check includes paper size.
+    // Unregister when a session takes ownership and re-register only after successful commit, so abandoned strokes cannot survive.
+    // Release it on project replacement alongside gengaLastStrokeCanvas.
+    let gengaActiveCanvas = null; // { layerId, expId, ref, canvas }
+
     // ── the commit-time ink scan's readback window (the "union scan") ────────────────────────
     // Every drawing commit has to find the ink bbox of a paper-res canvas, and that readback dominates a
     // stroke's pointerup cost: one getImageData over the whole paper is a fixed cost, independent of stroke
@@ -155231,11 +155104,23 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             if (ev.target === pv) handler(ev);
           }, options);
         };
-        bind('pointerdown', gengaPreviewPointerDown);
+        bind('pointerdown', function(ev) {
+          const finish = function(end) {
+            const routed = paintInputEventCopy(end);
+            routed.currentTarget = pv;
+            routed.preventDefault = function() { end.preventDefault(); };
+            routed.stopPropagation = function() { end.stopPropagation(); };
+            if (end.type === 'pointerup' && end.target !== pv && !gengaPinch && !gengaFlipTouch) {
+              routed.type = 'pointercancel';
+              routed.interrupted = true;
+            }
+            gengaPreviewPointerEnd(routed);
+          };
+          bindPaintPointerEnd(ev, pv, finish, finish);
+          gengaPreviewPointerDown(ev);
+        });
         bind('pointermove', gengaPreviewPointerMove);
-        bind('pointerup', gengaPreviewPointerEnd);
-        bind('pointercancel', gengaPreviewPointerEnd);
-        bindGestureStateJanitor(); // Document-level backstop — see its comment
+        bindPaintInputLifecycle();
         bind('touchmove', gengaCanvasTouchGuard, { passive: false }); // iPad Pencil stroke guard
         bind('contextmenu', function(ev) {
           if (gengaStamp) {
@@ -155395,7 +155280,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (state.paintTool === 'curve') {
           gengaDrawSession.curveBending = true;
           gengaDrawSession.pointerId = ev.pointerId; // The pending phase has no owner. The bending gesture claims the session again.
-          try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+          capturePaintPointer(ev, ev.currentTarget || ev.target);
           ev.preventDefault();
           return;
         }
@@ -155444,7 +155329,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!gengaBeginVectorEraseSession(ev, target)) { ev.preventDefault(); return; }
       } else gengaBeginPenSession(ev, target, vectorDraw, eraser);
       // Capture and layer selection stay synchronous even while the first dab is pending.
-      try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+      capturePaintPointer(ev, ev.currentTarget || ev.target);
       if (String(state.gengaSelectedLayerId) !== String(layer.id)) { selectGengaLayer(layer.id); gengaCenterLayerIntoView(layer.id); } // Drawing retargeted the layer — show which one
       if (gengaDrawSession?.pendingFirstDab) scheduleGengaPreviewRedraw();
       else drawGengaPreview();
@@ -155938,7 +155823,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return;
       } // pinch owns it
       if (gengaFlipTouch && gengaFlipTouch.pointerId === ev.pointerId) { gengaFlipTouchMove(ev); return; }
-      if (continuePaintSpacePan(ev)) return; // shared with conte
+      if (paintSpacePanOwns(ev)) return;
       if (gengaFlipHoverMove(ev)) return;
       if (gengaCamDrag) { gengaCameraPointerMove(ev); return; }
       if (state.paintEditTool === 'onion-peg') { if (!onionPegDragging) onionPegHoverCursor(ev); return; }
@@ -156083,16 +155968,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       )) return;
       const endingStroke = gengaDrawSession;
       try {
-        gengaFlushPendingFirstDab(); // A tap without movement produces one dab here.
+        if (ev.type === 'pointerup' && gengaDrawSession && gengaDrawSession.pointerId === ev.pointerId) {
+          gengaFlushPendingFirstDab(); // A tap without movement produces one dab here.
+        }
         paintFlushPendingBucketFill(ev); // Run a deferred bucket action here unless pointercancel discards it.
         if (ev.pointerType === 'touch') gengaPointers.delete(ev.pointerId);
         if (gengaPinch) {
           if (gengaPointers.size < 2 || twoFingerPinLost(gengaPointers)) teardownGengaPinch(ev.type); // Share teardown and tap handling. Losing the selected pair also ends the session.
-          safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
           return;
         }
         if (gengaFlipTouch && gengaFlipTouch.pointerId === ev.pointerId) { gengaFlipTouchEnd(ev); return; }
-        if (endPaintSpacePan(ev, ev.currentTarget || ev.target)) return; // shared with conte
         if (gengaCamDrag) { gengaCameraPointerEnd(ev); return; }
         if (gengaSelDrag || gengaLasso) { gengaSelectPointerEnd(ev); return; }
         if (gengaStampDrag && gengaStampDrag.pointerId === ev.pointerId) { gengaStampPointerEnd(ev); return; } // Commit once when the gesture ends.
@@ -156101,12 +155986,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (gengaDrawSession.pointerId !== ev.pointerId) return; // Only the owning pointer can commit a stroke.
         // Discard canceled strokes, as with camera, FX, and audio drags. The OS or palm rejection can cancel input.
         // Session start unregistered the active canvas, so dropping the session and redrawing restores
-        // the committed drawing. Selection tools use their end paths above. 原画 image stamps commit on cancel,
-        // while storyboard stamps are discarded by cancelActivePaintRasterStroke.
+        // the committed drawing. Selection tools use their end paths above.
         if (ev.type === 'pointercancel') {
           gengaEndDrawSession();
           drawGengaPreview();
-          safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
           return;
         }
         if (gengaDrawSession.shape) { gengaShapePointerEnd(ev, gengaDrawSession); return; }
@@ -156143,7 +156026,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (sess.vectorErase) {
           gengaCommitVectorErase(sess);
           drawGengaPreview();
-          safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
           return;
         }
         // Vector points remain authoritative. An eligible finalized shape uses the same
@@ -156153,11 +156035,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             sess.livePaint && sess.livePaint.roundMode && !paintWaterEdgeFrom(sess) && !paintDualFrom(sess) && sess.penColor === sess.vectorColor && !sess.shiftLine && sess.pts.length > 1
               ? sess.shapeBuf
               : null);
-          safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
           return;
         }
         gengaCommitCanvas(sess.layerId, sess.frame, sess.canvas, '原画描画', gengaScanRectFor(sess, sess.canvas), null, sess); // ink-bbox trimmed + decode-race fallback; union scan
-        safeReleasePointerCapture(ev.currentTarget || ev.target, ev.pointerId);
       } finally {
         if (endingStroke && gengaDrawSession !== endingStroke) paintReleaseStrokeBuffers(endingStroke);
       }
@@ -156972,7 +156852,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
                              // and therefore change the key.
     let gengaStampPt = null; // { x, y } paper-coord preview point following the cursor in stamp mode
     // A stamp drag owns { layerId, frame, pointerId, last, pts[] }. Commit one Undo step per gesture, including a tap.
-    // Register its cleanup for missed pointer ends.
     let gengaStampDrag = null;
     let gengaCamDrag = null; // { mode:'move'|'rotate'|'resize', pointerId, startX, startY, startAngle, orig:{x,y,w,h,rotation}, live } while editing the camera frame
     // Project replacement clears 原画's project-bound stencil, transform box, stamps, and gestures.
@@ -157067,8 +156946,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaPreviewRender.viewState = null;
       gengaCamKeyHandleScreenCache = [];
       gengaCamKeyCenterScreenCache = [];
-      gengaPointerCanvasRect = null;
-      gengaPointerGestureOpen = false;
+      resetPointerGeometry();
       gengaFlipTouch = null;
       gengaFlipHover = null;
       gengaPinch = null;
@@ -157170,14 +157048,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     let gengaFlipTouch = null; // { pointerId, startY, offset } while finger-flipping in the margin
     let gengaPointers = new Map(); // active touch pointerId -> {x,y} (client px); 2+ → pinch (one input model: Pointer Events)
     let gengaPinch = null;     // two-finger pinch zoom+pan (iPad) — driven by gengaPointers via Pointer Events (not TouchEvents)
-    let gengaLastStrokeCanvas = null; // { dataUrl, canvas } — last committed stroke, seeds the next stroke before its dataUrl decodes
-    // Keep the latest tile commit's paper canvas and cel key. Reuse pixels for the same cel and ref
-    // to skip per-tile drawing, readiness checks, and full-paper allocation.
-    // The active canvas is authoritative while it matches. No separate invalidation hook is needed:
-    // Undo, Redo, transforms, and paste change the ref, expId distinguishes sibling cels, and the check includes paper size.
-    // Unregister when a session takes ownership and re-register only after successful commit, so abandoned strokes cannot survive.
-    // Release it on project replacement alongside gengaLastStrokeCanvas.
-    let gengaActiveCanvas = null; // { layerId, expId, ref, canvas }
+
 
     // ## SECTION: Animation selection compositing and transforms
     // identity quad = the bounds rect corners — "no transform pending".
@@ -159894,8 +159765,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaStampPointerEnd(ev) {
       const owner = gengaStampDrag;
-      if (owner && owner.textStamp
-        && ((ev && ev.type === 'pointercancel') || owner.project !== state.project || owner.layerId !== String(state.gengaSelectedLayerId) || owner.frame !== gengaCurrentFrame())) {
+      // Native pointercancel keeps the image stamp's existing commit policy. An interrupted
+      // surface has no release coordinate and discards its working copy.
+      const canceled = ev && ev.type === 'pointercancel';
+      const staleText = owner && owner.textStamp &&
+        (canceled || owner.project !== state.project || owner.layerId !== String(state.gengaSelectedLayerId) || owner.frame !== gengaCurrentFrame());
+      if (staleText || (canceled && ev.interrupted)) {
         gengaDiscardStampDrag();
         drawGengaPreview();
         return;
@@ -159960,10 +159835,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         imageBrushSyncActiveStamp();
         drawGengaPreview();
-        try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+        capturePaintPointer(ev, ev.currentTarget || ev.target);
       } else {
         gengaLasso = { pts: [[p.x, p.y]], stamp: true, pointerId: ev.pointerId }; // janitor id-match
-        try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+        capturePaintPointer(ev, ev.currentTarget || ev.target);
       }
       ev.preventDefault();
     }
@@ -160264,7 +160139,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         paperRight = gengaPreviewXform.ox + gengaPreviewXform.pw * gengaPreviewXform.scale;
       if (lx >= paperLeft && lx <= paperRight) return false; // inside the paper → normal drawing
       gengaFlipTouch = { pointerId: ev.pointerId, x: ev.clientX, y: ev.clientY, origin: gengaCurrentFrame(), offset: 0 };
-      try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+      capturePaintPointer(ev, ev.currentTarget || ev.target);
       ev.preventDefault();
       return true;
     }
@@ -160278,7 +160153,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!s) return;
       gengaFlipTouch = null;
       gengaFlipFinish(s, !ev || ev.type !== 'pointercancel');
-      try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
     }
     // For desktop Space hover flip, hold the pan key and move the pen or mouse without pressing. A press gives pan priority
     // and restores the starting drawing (startPaintViewportPanDrag). Releasing the key ends the flip (handlePaintSpacePanKeyup).
@@ -160347,8 +160221,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         anchorY: (mcy - gengaPreviewXform.oy) / gengaPreviewXform.scale
       };
     }
-    // The one place a genga pinch ends — the canvas's own end handler and the janitor's
-    // deferred leak check both call this; guarded + candidate-consuming, so it runs exactly once.
+    // The shared surface session routes releases even when the pointer ends over another element.
     function teardownGengaPinch(evType) {
       if (!gengaPinch) return;
       gengaPinch = null;
@@ -161229,7 +161102,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             orig: origK,
             live: { x: origK.x, y: origK.y, w: origK.w, h: origK.h, rotation: origK.rotation }
           };
-          try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+          capturePaintPointer(ev, ev.currentTarget || ev.target);
         }
         return;
       }
@@ -161248,7 +161121,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       gengaCamDrag.clientX0 = ev.clientX;
       gengaCamDrag.clientY0 = ev.clientY;
-      try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {}
+      capturePaintPointer(ev, ev.currentTarget || ev.target);
       ev.preventDefault();
     }
     // pointermove only records the latest event; the compute + full drawGengaPreview runs at most once per
@@ -161336,7 +161209,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
       }
       drawGengaPreview();
-      try { if (ev.pointerId != null) (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
     }
 
     // ## SECTION: Animation selection masks and pointer gestures
@@ -161730,8 +161602,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const sel = (gengaSel && String(gengaSel.layerId) === String(layer.id)) ? gengaSel : null;
       const tool = gengaActiveEditTool();
       const view = gengaPreviewXform ? gengaPreviewXform.scale : 1;
-      const cap = function() { try { (ev.currentTarget || ev.target).setPointerCapture(ev.pointerId); } catch (e) {} };
-      // pointerId on the drag state → janitor matches this pointer only. Every mode operates on the quad — move
+      const cap = function() { capturePaintPointer(ev, ev.currentTarget || ev.target); };
+      // Every mode operates on the quad — move
       // is quadmove, scale/rotate carry the base quad + pivot (the quad's centroid).
       if (sel && (tool === 'perspective' || tool === 'transform')) {
         // shared quad-drag kernel — paintQuadDragHitTest/Seed. constraint
@@ -161796,10 +161668,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaSelectPointerEnd(ev) {
       const owner = gengaSelDrag || gengaLasso;
       if (owner && owner.pointerId !== ev.pointerId) return;
+      if (ev.type === 'pointercancel') {
+        if (gengaSelDrag && gengaSel) gengaSetTransformBoxQuad(gengaSel, gengaSelDrag.base);
+        gengaSelDrag = null;
+        gengaLasso = null;
+        drawGengaPreview();
+        return;
+      }
       if (gengaSelDrag) {
         gengaSelDrag = null;
         // Release ends only the gesture. Enter applies the pending transform and Undo cancels it.
-        try { (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
         drawGengaPreview();
         return;
       }
@@ -161815,7 +161693,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             if (gengaLiftSelection(layer, gengaCurrentFrame(), pts, selMode)) gengaPushSelCommand('選択', before, gengaSelSnapshot());
           }
         }
-        try { (ev.currentTarget || ev.target).releasePointerCapture(ev.pointerId); } catch (e) {}
         drawGengaPreview();
         drawGengaLayerThumbs();
       }
@@ -163195,7 +163072,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const edgePan = gengaTimelineEdgePan(content0, function(e) { if (!lpFired) scrub(e); });
       // iPad has no right-click: a long-press (touch/pen held for LONG_PRESS.delay within LONG_PRESS.movePx) opens the In/Out menu at that frame.
       const sx = ev.clientX, sy = ev.clientY;
-      let lpFired = false, lpTimer = 0, lpStartFrame = 0;
+      let lpFired = false, menuWait = null, lpStartFrame = 0;
       let scrubRaf = 0, latestScrubEvent = null;
       const scrub = function(e) {
         const f = edgePan.frameAt(e.clientX);
@@ -163209,7 +163086,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         // rAF-coalesced, so it lands within one animation frame of the move, far inside the LONG_PRESS.delay
         // window, and the LONG_PRESS.movePx still-radius test below stays synchronous so any real drag cancels
         // immediately.
-        if (lpTimer && state.gengaFrame !== lpStartFrame) { clearTimeout(lpTimer); lpTimer = 0; }
+        if (menuWait && state.gengaFrame !== lpStartFrame) menuWait.cancel();
       };
       // RAF-coalesced seek, mirroring conte's tickCoalescedSeek — pointermove only records the latest
       // event; the actual work (playhead DOM, chunk rebuild, drawGengaPreview full composite, scrub audio) runs
@@ -163228,7 +163105,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       lpStartFrame = state.gengaFrame; // Frame after the initial down-scrub
       const cleanup = function(flush) {
         edgePan.stop();
-        if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; }
+        if (menuWait) menuWait.cancel();
         if (scrubRaf) {
           cancelAnimationFrame(scrubRaf);
           scrubRaf = 0;
@@ -163237,11 +163114,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         pointerSession.dispose();
         stopGengaScrubAudio();
         gengaScrubInFlight = false;
-        longPressContacts.unwatch(scrubMenuSub);
         drawGengaLayerThumbs();
       }; // After flush, redraw header thumbnails once at the final frame and release the session.
       const move = function(e) {
-        if (lpTimer && Math.hypot(e.clientX - sx, e.clientY - sy) >= LONG_PRESS.movePx) { clearTimeout(lpTimer); lpTimer = 0; }
+        if (menuWait && Math.hypot(e.clientX - sx, e.clientY - sy) >= LONG_PRESS.movePx) menuWait.cancel();
         if (lpFired) return;
         latestScrubEvent = e;
         edgePan.update(e);
@@ -163259,18 +163135,16 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // guard. Pen is included (gated behind touchInputCapable()) like that helper's touch and pen coverage.
       // Cancel only the menu timer when a second finger touches. Scrubbing keeps its current frame
       // because restoring the old one would cause a jump. Skip the timer for multi-touch groups.
-      const scrubMenuSub = { cancel: function() { if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; } longPressContacts.unwatch(scrubMenuSub); } };
-      if (!longPressContacts.blocked() && (ev.pointerType === 'touch' || (ev.pointerType === 'pen' && touchInputCapable()))) {
-        longPressContacts.watch(scrubMenuSub);
-        lpTimer = setTimeout(function() {
-          longPressContacts.unwatch(scrubMenuSub);
+      const menuOwner = {};
+      if (ev.pointerType === 'touch' || (ev.pointerType === 'pen' && touchInputCapable())) {
+        menuWait = startLongPressWait(function() {
           lpFired = true;
           cleanup(false);
           gengaShowIoMenu(sx, sy);
           const menu = document.getElementById('conteLayerContextMenu');
-          longPressMenuOwner = scrubMenuSub;
-          retainLongPressMenuUntilRelease(ev, function() { if (longPressMenuOwner === scrubMenuSub && menu && !menu.hidden) hideConteLayerContextMenu(); });
-        }, LONG_PRESS.delay);
+          longPressMenuOwner = menuOwner;
+          retainLongPressMenuUntilRelease(ev, function() { if (longPressMenuOwner === menuOwner && menu && !menu.hidden) hideConteLayerContextMenu(); });
+        });
       }
       const pointerSession = bindOwnedPointerDrag(ev, { key: 'genga-scrub', target: document, capture: false, move: move, up: up }); // Live scrub — cancel = same cleanup (also kills the long-press timer + scrub audio)
     }
@@ -163342,7 +163216,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function timelineRailDown(ev, vs, lanes, bar, thumb, sync, axis, owner) {
       const ax = axis || TIMELINE_RAIL_AXIS.v;
-      if (ev.button != null && ev.button !== 0) return;
+      if (!pointerDragAcceptsButton(ev)) return;
       if (!vs || !bar || !thumb) return;
       const barR = bar.getBoundingClientRect(), thR = thumb.getBoundingClientRect();
       const inset = TIMELINE_RAIL_INSET * (barR[ax.size] / Math.max(1, bar[ax.clientSize])); // local px → gBCR space
@@ -163837,6 +163711,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       beginDragStrand(event, {
         key: key,
         owner: adapter.owner,
+        captureEl: false,
         preventDefault: true,
         stopPropagation: false,
         onMove: move,
@@ -163845,7 +163720,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
     }
     function timelineViewportScrollbarDown(event, adapter) {
-      if (event.button != null && event.button !== 0) return;
+      if (!pointerDragAcceptsButton(event)) return;
       if (!pointerDragCanStart('timeline-viewport-scroll', event)) return;
       const parts = adapter.read(), m = parts && timelineViewportScrollbarMetrics(parts.view, parts.bar);
       if (!m) return;
@@ -169637,7 +169512,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           if (zone) dockWindowToSide(el.id, zone, sideDockInsertIndexAt(zone, lastY));
         }
       };
-      bindOwnedPointerDrag(event, { key: 'panel-drag', target: window, capture: false, move: move, up: up });
+      const handle = el.contains(event.target) ? event.target : el;
+      bindOwnedPointerDrag(event, { key: 'panel-drag', owner: el, captureEl: handle, move: move, up: up });
       event.preventDefault();
       return true;
     }
@@ -169654,13 +169530,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // it every apply (timeline/genga behavior under html zoom).
     // capturePointer: true  setPointerCapture on the grip for the gesture (paint windows).
     function beginAxisDrag(event, spec) {
-      if (event.button != null && !(spec.buttons || [0]).includes(event.button)) return null;
+      if (!pointerDragAcceptsButton(event, spec.buttons)) return null;
       if (!pointerDragCanStart('axis-drag', event)) return;
       const useRaf = spec.raf !== false;
       const gestureScale = spec.liveScale === false ? (uiReadScale() || 1) : null;
       const startX = event.clientX, startY = event.clientY;
       const handle = spec.capturePointer ? event.currentTarget : null;
-      if (handle) { try { if (handle.setPointerCapture) handle.setPointerCapture(event.pointerId); } catch (e) {} }
       let raf = 0, lastX = startX, lastY = startY;
       // Zero signX or signY omits that axis. An edge grip uses only one axis.
       // A sign of -1 reverses the delta for left or top edges.
@@ -169689,7 +169564,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           lastY = startY;
         }
         applyNow();
-        if (handle) { try { if (handle.releasePointerCapture && ue) handle.releasePointerCapture(ue.pointerId); } catch (e) {} }
         // Pass the release event to End so the corner grip can identify pointercancel
         // and skip toggling or saving on cancellation.
         if (typeof spec.end === 'function') spec.end(ue);
@@ -169699,6 +169573,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // and skip the filter for synthetic starts without an ID.
       const pointerSession = bindOwnedPointerDrag(event, {
         key: 'axis-drag',
+        captureEl: handle || undefined,
         pointerId: spec.pointerId,
         target: window,
         capture: false,
@@ -171090,7 +170965,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function bindEvents() {
       document.querySelectorAll('input[type="search"]').forEach(function(input) { wrapSearchInput(input, input.className); });
       updateRuntimeDeviceClasses();
-      bindGestureStateJanitor(); // active from boot regardless of which editor renders first
+      bindPaintInputLifecycle(); // active from boot regardless of which editor renders first
       // Put the 用紙/映像編集 switch and its popover anchors next to the topbar brand.
       (function relocateModeSwitchToTopbar() {
         const modeSwitch = document.querySelector('.stage-mode-switch');
