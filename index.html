@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3556</title>
+  <title>MoArt ver3557</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -22485,7 +22485,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           en: function(stale) { return ' / needs update ' + stale; },
           zh: function(stale) { return ' / 需更新 ' + stale; }
         },
-        'msg.workspace.generatedAudioUnsaved': { ja: function(n){ return '生成した音声 ' + n + ' 件を作業フォルダに保存できませんでした（詳細はコンソール）'; }, ko: function(n){ return '생성한 음성 ' + n + '개를 작업 폴더에 저장하지 못했습니다(자세한 내용은 콘솔)'; }, en: function(n){ return n + ' generated audio clip(s) could not be saved to the working folder (see the console)'; }, zh: function(n){ return '有 ' + n + ' 个生成的音频未能保存到工作文件夹（详见控制台）'; } },
         'msg.workspace.audioSaveComplete': {
           ja: function(path) { return 'Audio保存完了\n' + path; },
           ko: function(path) { return '오디오 저장 완료\n' + path; },
@@ -25450,9 +25449,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       speechVoices: [],
       voicevoxSpeakers: [],
       voicevoxStatus: '',
-      voicevoxGenerating: false,
-      voicevoxCancelRequested: false,
-      voicevoxAbortController: null,
       get timelineStatus() {
         const request = timelineStatusState.applyRequest;
         if (request && !request.stillPending()) {
@@ -25465,7 +25461,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         timelineStatusState.value = value;
         if (timelineStatusState.applyRequest) timelineStatusState.applyRequest.ownsStatus = false;
       },
-      ttsPendingClipIds: new Set(),
       get videoEditMode() { return Boolean(this.project && this.project.kind !== 'genga'); },
       videoPlayheadFrames: 0,
       videoPlaying: false,
@@ -30892,7 +30887,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Even clearing can then target the stale reference. Only same-project Undo or Redo opts out with `sameProject`.
       // Default to clearing for new callers.
       if (!options.sameProject) resetProjectTransientRuntime();
-      else { cancelPointerDrags(); if (longPressContacts) longPressContacts.cancelPending(); }
+      else {
+        discardVoicePreparation();
+        cancelPointerDrags();
+        if (longPressContacts) longPressContacts.cancelPending();
+      }
       state.project = normalizeProjectSnapshot(project);
       gengaAudioLaneEpoch += 1;   // Restore, including Undo and Redo, may replace the entire audio lane structure tracked by `gengaAudioLaneShape`.
       // A queued history action replaces the snapshot, not the FIFO's project. Real project
@@ -30980,6 +30979,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function resetProjectTransientRuntime() {
+      discardVoicePreparation();
       state.selectedDialogBlockId = '';
       twoFingerLastTapAt = 0;
       twoFingerLastTapUndid = false;
@@ -31162,6 +31162,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // `opts.sameProject` reopens the same project, such as when linking a folder on first save.
     function setProjectActive(active, opts) {
       state.projectActive = Boolean(active);
+      currentVoicePreparation();
       // Opening or creating a different project clears the previous sheet-import report. Undo and Redo bypass this path.
       if (!(opts && opts.sameProject)) state.sheetImportReport = null;
       if (state.projectActive) {
@@ -46838,20 +46839,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return message + ' / VOICEVOX Engine is unreachable at ' + endpoint + '. Start VOICEVOX Engine, check port 50021, and if the browser blocks CORS use the conte local server proxy.' + fileHint;
     }
 
-    async function fetchVoicevox(path, options) {
-      const endpoints = voicevoxCandidateEndpoints(state.project);
+    async function fetchVoicevox(project, path, options) {
+      const endpoints = voicevoxCandidateEndpoints(project);
       const errors = [];
       for (let index = 0; index < endpoints.length; index += 1) {
         const endpoint = endpoints[index];
         try {
-          const fetchOptions = Object.assign({}, options || {});
-          if (state.voicevoxAbortController && !fetchOptions.signal) fetchOptions.signal = state.voicevoxAbortController.signal;
+          if (options.signal) options.signal.throwIfAborted();
           return {
             endpoint: endpoint,
-            response: await fetch(endpoint + path, fetchOptions)
+            response: await fetch(endpoint + path, options)
           };
         } catch (error) {
-          if (state.voicevoxCancelRequested) throw error;
+          if (options.signal && options.signal.aborted) throw error;
           errors.push(voicevoxFetchErrorMessage(endpoint, error));
         }
       }
@@ -46866,7 +46866,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const isCurrent = () => state.voicevoxSpeakersRequest === request && state.project === project && project.projectId === projectId && voicevoxEndpoint(project) === endpoint;
       state.voicevoxStatus = t('status.voicevox.connecting');
       try {
-        const result = await fetchVoicevox('/speakers', { method: 'GET' });
+        const result = await fetchVoicevox(project, '/speakers', { method: 'GET' });
         const response = result.response;
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const speakers = await response.json();
@@ -47192,7 +47192,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const profile = ensureCharacterVoiceProfile(state.project, name, {});
       if (profile.ttsProvider === 'voicevox') {
         try {
-          const blob = await synthesizeVoicevoxBlob(characterSpeechSample(state.project, name), profile);
+          const project = state.project;
+          const blob = await synthesizeVoicevoxBlob(project, characterSpeechSample(project, name), profile);
+          if (state.project !== project) return;
           const url = URL.createObjectURL(blob);
           const audio = new Audio(url);
           const release = function() { URL.revokeObjectURL(url); };
@@ -47229,12 +47231,78 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (Math.round(Number(clip.durationFrames) || 0) > tight) clip.durationFrames = tight;
     }
 
-    // Per-block VoiceVox generation: create/link an audio clip for this dialog block,
-    // place it at the cut's (OL-aware) start frame, synthesize, and link block<->clip.
-    async function generateVoiceForDialogBlock(cutId, blockId) {
-      if (state.voicevoxGenerating) return;
-      if (!await ensureWorkspaceForVoicevoxGeneration()) return;
-      const project = state.project;
+    // The file transaction supplies the live project and destination identity. Only the
+    // folder transaction started by this request may move it to a new destination.
+    let voicePreparation = null;
+    let voiceWriteRetries = null;
+
+    function discardVoicePreparation() {
+      voiceWriteRetries = null;
+      const job = voicePreparation;
+      if (!job) return;
+      voicePreparation = null;
+      job.controller.abort();
+      state.voicevoxStatus = '';
+    }
+
+    function currentVoicePreparation() {
+      if (voiceWriteRetries && !projectIoOwnerCurrent(voiceWriteRetries.owner)) voiceWriteRetries = null;
+      const job = voicePreparation;
+      if (job && !projectIoOwnerCurrent(job.folderRequest ? job.folderRequest.owner : job.owner)) {
+        discardVoicePreparation();
+      }
+      return voicePreparation;
+    }
+
+    function assertVoicePreparation(job) {
+      if (currentVoicePreparation() !== job) throw new DOMException('Voice preparation was superseded', 'AbortError');
+      job.controller.signal.throwIfAborted();
+    }
+
+    async function runVoicePreparation(mode, target) {
+      if (currentVoicePreparation()) return;
+      const job = { owner: projectIoOwner(), controller: new AbortController(), folderRequest: null, changed: false };
+      voicePreparation = job;
+      const project = job.owner.project;
+      updateVoiceSettingsSection();
+      try {
+        if (mode === 'reset') {
+          const confirmed = await askConfirm(t('msg.voicevox.confirmResetLinks'), { okLabel: t('toolbar.voicevox.resetBtn'), danger: true });
+          assertVoicePreparation(job);
+          if (!confirmed) return;
+          const cleared = clearAllVoicevoxTimelineAudio(project);
+          state.voicevoxStatus = t('status.voicevox.resetDone', cleared);
+          if (job.owner.handle) await saveVoicePreparation(job);
+        } else if (await ensureWorkspaceForVoicevoxGeneration(job)) {
+          assertVoicePreparation(job);
+          if (mode === 'block') await prepareVoiceForDialogBlock(job, target.cutId, target.blockId);
+          else await prepareVoicevoxTimeline(job, mode);
+        }
+      } catch (error) {
+        if (currentVoicePreparation() !== job) return;
+        if (job.controller.signal.aborted) {
+          state.voicevoxStatus = t('status.voicevox.stopped');
+          // A canceled batch may already have published earlier takes.
+          if (job.changed) await saveVoicePreparation(job);
+        } else {
+          state.voicevoxStatus = t('msg.voicevox.generateFailed') + (error && error.message ? error.message : error);
+          alert(state.voicevoxStatus);
+        }
+      } finally {
+        if (currentVoicePreparation() === job) {
+          voicePreparation = null;
+          renderTimingDashboard();
+          if (mode === 'block') guardedRender('inspector', renderInspector);
+        }
+      }
+    }
+
+    function generateVoiceForDialogBlock(cutId, blockId) {
+      return runVoicePreparation('block', { cutId: cutId, blockId: blockId });
+    }
+
+    async function prepareVoiceForDialogBlock(job, cutId, blockId) {
+      const project = job.owner.project;
       const cut = project.cuts.find(function(c) { return c.id === cutId; });
       if (!cut) return;
       const view = materializeDialogBlocks(project, cut).find(function(b) { return b.id === blockId; });
@@ -47252,6 +47320,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         : block.audioClipId ? clips.find(function(c) { return c.id === block.audioClipId; })
         : null;
       if (!clip) clip = clips.find(function(c) { return c.dialogBlockId === blockId; });
+      if (clip && audioClipIsUserMedia(clip)) return;
       if (!clip) {
         // Unlinking keeps `audio-<blockId>` on the timeline.
         // Add a numeric suffix until the ID is free so the playback URL or file name cannot refer to and overwrite older audio.
@@ -47269,6 +47338,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       clip.dialogBlockId = block.id;
       if (!(Number(clip.startFrame) > 0)) clip.startFrame = startFrame;
       block.audioClipId = clip.id;
+      invalidateDialogueDerived(project);
       const voiceGroup = ensureDialogueGroup(project, block, cut);
       if (voiceGroup) {
         clip.dialogueGroupIds = Array.from(new Set((clip.dialogueGroupIds || []).concat(voiceGroup.id)));
@@ -47276,126 +47346,135 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       deriveDialogTextFromBlocks(cut);
       normalizeAudioClips(project);
-      state.voicevoxGenerating = true;
-      state.voicevoxCancelRequested = false;
       state.voicevoxStatus = t('msg.voicevox.generating') + (clip.characterName || '') + ' ' + String(block.body).slice(0, 14);
       renderTimingDashboard();
-      try {
-        state.voicevoxAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        const url = await ensureVoicevoxAudioForClip(clip, { skipProjectSave: true });
-        state.voicevoxAbortController = null;
-        if (url) fitDialogClipBoxToAudio(clip);
-        if (!group) clip.startFrame = startFrame;
-        sortAudioClips(project);
-        syncDialogueGroups(project);
-        await hydrateWorkspaceAudioRefs(project);
-        if (state.workspaceHandle) await saveProjectToWorkspace(null, { cleanup: false });
-        state.voicevoxStatus = url ? ('音声生成完了: ' + (clip.characterName || '')) : '音声生成: 読めるテキストなし';
-      } catch (error) {
-        state.voicevoxAbortController = null;
-        if (state.voicevoxCancelRequested) {
-          // Treat user-initiated abort as cancellation, as in batch generation.
-          state.voicevoxStatus = t('status.voicevox.stopped');
-        } else {
-          state.voicevoxStatus = t('msg.voicevox.generateFailed') + (error && error.message ? error.message : error);
-          alert(state.voicevoxStatus);
-        }
-      } finally {
-        state.voicevoxGenerating = false;
-        renderTimingDashboard();
-        guardedRender('inspector', renderInspector);
-      }
+      await prepareVoicevoxClip(job, clip);
+      assertVoicePreparation(job);
+      if (!group) clip.startFrame = startFrame;
+      sortAudioClips(project);
+      syncDialogueGroups(project);
+      await hydrateWorkspaceAudioRefs(project, job.owner);
+      assertVoicePreparation(job);
+      if (!await saveVoicePreparation(job)) return;
+      assertVoicePreparation(job);
+      state.voicevoxStatus = clip.audioFileName ? ('音声生成完了: ' + (clip.characterName || '')) : '音声生成: 読めるテキストなし';
     }
 
-    async function ensureVoicevoxAudioForClip(clip, options) {
-      if (!clip || !clip.id) return '';
-      const owner = projectIoOwner(); // every await below re-checks that this project is still the open one
-      if (dialogueClipProtectsAudio(state.project, clip)) {
-        showToast(t('dialog.follow.audioProtected', 1), { warn: true, id: 'dialogue-audio-protected' });
-        return state.workspaceObjectUrls.audio[clip.id] || '';
-      }
-      const profile = clipVoiceProfile(state.project, clip, ensureCharacterVoiceProfile);
-      const bodyText = voicevoxClipSpeechText(clip, profile);
-      if (!bodyText) return '';
+    function voicevoxClipEditSignature(project, clip, profile, text) {
+      return JSON.stringify([clip.id, clip.startFrame, clip.durationFrames, clip.trackId,
+        clip.audioTrimStartFrames, clip.audioTrimDurationFrames, clip.dialogueVoiceId, clip.sourceCutId,
+        audioClipLinkedDialogBlocks(project, clip).map(function(block) { return block.id; }),
+        workspaceAssetSignature('audio', clip), text, profile.ttsProvider, profile.voicevoxSpeakerId,
+        profile.rate, profile.pitch, mediaFpsForProject(project), voicevoxEndpoint(project),
+        dialogAudioEffectSettings(clip).signature]);
+    }
+
+    async function prepareVoicevoxClip(job, clip, force) {
+      assertVoicePreparation(job);
+      const owner = job.owner, project = owner.project;
+      if (!project.audio.clips.includes(clip) || audioClipIsUserMedia(clip)) return false;
       const cached = state.workspaceObjectUrls.audio[clip.id];
-      if (cached && !voicevoxClipAudioIsStale(clip, bodyText, profile)) {
-        if (state.workspaceHandle && !clip.audioFileName) {
-          const cachedBlob = await fetch(cached).then(function(response) { return response.blob(); });
-          assertProjectIoOwner(owner);
-          await saveGeneratedAudioBlobToWorkspace(
-            clip.id,
-            cachedBlob,
-            clip.audioMime || cachedBlob.type || 'audio/wav',
-            { skipProjectSave: Boolean(options && options.skipProjectSave) }
-          );
-        }
-        if (!clip.audioTrimDurationFrames) {
-          await analyzeAudioUrlForClip(clip, state.workspaceObjectUrls.audio[clip.id] || cached).catch(function(error) { warnOnce('audioAnalyzeEnsure', '[audio] 파형 분석 실패(재생 준비) — 그 클립의 파형이 안 그려진다', error); });
-          assertProjectIoOwner(owner);
-          sortAudioClips(state.project);
-        }
-        ensureCutDurationsForAudioClips(state.project, [clip]);
-        return state.workspaceObjectUrls.audio[clip.id] || cached;
+      const protectedAudio = dialogueClipProtectsAudio(project, clip);
+      const unsaved = cached && !clip.audioFileName && clip.ttsProvider === 'voicevox';
+      if (protectedAudio && !unsaved) {
+        showToast(t('dialog.follow.audioProtected', 1), { warn: true, id: 'dialogue-audio-protected' });
+        return Boolean(cached);
       }
-      if (cached) clearGeneratedAudioForClip(clip);
-      if (state.ttsPendingClipIds.has(clip.id)) return '';
-      const pending = state.ttsPendingClipIds;
-      pending.add(clip.id);
-      const editSignature = function() { return JSON.stringify([clip.startFrame, clip.durationFrames, clip.audioTrimStartFrames,
-        clip.audioTrimDurationFrames, voicevoxClipSpeechText(clip, profile), dialogAudioEffectSettings(clip).signature]); };
-      const signature = editSignature();
+      const profile = clipVoiceProfile(project, clip, ensureCharacterVoiceProfile);
+      const text = voicevoxClipSpeechText(project, clip, profile);
+      if (!text && !unsaved) return false;
+      const signature = voicevoxClipEditSignature(project, clip, profile, text);
       const assertCurrent = function() {
-        assertProjectIoOwner(owner);
-        if (state.voicevoxCancelRequested || !owner.project.audio.clips.includes(clip) || editSignature() !== signature) {
+        assertVoicePreparation(job);
+        const liveProfile = clipVoiceProfile(project, clip, peekCharacterVoiceProfile);
+        if (!project.audio.clips.includes(clip) || audioClipIsUserMedia(clip) ||
+            voicevoxClipEditSignature(project, clip, liveProfile, voicevoxClipSpeechText(project, clip, liveProfile)) !== signature ||
+            state.workspaceObjectUrls.audio[clip.id] !== cached) {
           throw new DOMException('Audio clip changed during generation: ' + clip.id, 'AbortError');
         }
       };
-      try {
-        const blob = await synthesizeVoicevoxBlob(bodyText, profile, clip);
+
+      const reuse = Boolean(cached && (protectedAudio || !text || !force && !voicevoxClipAudioIsStale(clip, text, profile)));
+      const needsAnalysis = !protectedAudio && (!reuse || voicevoxClipNeedsAudioAnalysis(clip));
+      if (reuse && !unsaved && !needsAnalysis) return true;
+      let take = voiceWriteRetries && voiceWriteRetries.takes.get(clip);
+      if (take) voiceWriteRetries.takes.delete(clip);
+      if (!take || take.signature !== signature || take.reuse !== reuse || reuse && take.cached !== cached) {
+        const blob = reuse ? await blobFromMediaUrl(cached)
+          : await synthesizeVoicevoxBlob(project, text, profile, clip, job.controller.signal);
         assertCurrent();
-        // A new take is a new source: measure it whole on a copy (as the recorder does). The box it replaces is
-        // not a user trim of this take; the box only grows here and fitDialogClipBoxToAudio trims a surplus.
-        const measured = Object.assign({}, clip, { durationFrames: 0, audioTrimStartFrames: 0, audioTrimDurationFrames: 0 });
-        const analyzed = await analyzeAudioBlobForClip(measured, blob).catch(function(error) {
-          assertCurrent();
-          clip.meta = clip.meta || {};
-          clip.meta.audioAnalysisWarning = error && error.message ? error.message : String(error);
-          return false;
+        // Analyze a copy so latency or a failed write cannot change the live clip's trim.
+        const measured = Object.assign({}, clip, reuse ? {} : {
+          durationFrames: 0, audioTrimStartFrames: 0, audioTrimDurationFrames: 0
         });
+        let warning = '';
+        const analyzed = needsAnalysis && await analyzeAudioBlobForClip(measured, blob).catch(function(error) {
+            warning = error && error.message ? error.message : String(error);
+            return false;
+          });
         assertCurrent();
-        await saveGeneratedAudioBlobToWorkspace(clip.id, blob, 'audio/wav', { skipProjectSave: true, assertCurrent: assertCurrent });
-        assertCurrent();
-        if (analyzed) {
-          clip.audioDurationFrames = measured.audioDurationFrames;
-          clip.audioTrimStartFrames = 0;
-          clip.audioTrimDurationFrames = measured.audioTrimDurationFrames;
-          clip.durationFrames = Math.max(Math.round(Number(clip.durationFrames) || 0), measured.durationFrames);
-        }
-        assertProjectIoOwner(owner);
-        ensureCutDurationsForAudioClips(state.project, [clip]);
-        placeAudioClipFast(state.project, clip, clip.trackId || 'dialog-main', { existingLaneOnly: true });
-        sortAudioClips(state.project);
-        clip.ttsProvider = 'voicevox';
-        clip.ttsText = bodyText;
-        clip.ttsVersion = VOICEVOX_TTS_VERSION;
-        clip.ttsSpeakerId = String(profile.voicevoxSpeakerId);
-        clip.ttsRate = Number(profile.rate) || 1;
-        clip.ttsPitch = Number(profile.pitch) || 1;
-        clip.ttsTargetFrames = voicevoxTargetFramesForText(bodyText);
-        clip.ttsEffect = dialogAudioEffectSettings(clip).signature;
-        fitDialogClipBoxToAudio(clip);
-        writeTimelineTracks(state.project);
-        if (!options || !options.skipProjectSave) await saveProjectToWorkspace(owner, { cleanup: false });
-        return state.workspaceObjectUrls.audio[clip.id] || '';
-      } finally {
-        pending.delete(clip.id);
+        take = { signature: signature, reuse: reuse, cached: cached, blob: blob, measured: measured,
+          analyzed: analyzed, warning: warning };
       }
+
+      const oldSource = !reuse && audioClipSourceKey(clip);
+      const publish = function() {
+        job.changed = true;
+        if (oldSource) invalidateAudioSource(oldSource);
+        if (take.warning) {
+          clip.meta = clip.meta || {};
+          clip.meta.audioAnalysisWarning = take.warning;
+        }
+        if (take.analyzed || !reuse) {
+          clip.audioDurationFrames = take.analyzed ? take.measured.audioDurationFrames : 0;
+          clip.audioTrimStartFrames = take.analyzed ? take.measured.audioTrimStartFrames : 0;
+          clip.audioTrimDurationFrames = take.analyzed ? take.measured.audioTrimDurationFrames : 0;
+        }
+        if (take.analyzed) clip.durationFrames = Math.max(Number(clip.durationFrames) || 0, take.measured.durationFrames);
+        if (!reuse) {
+          clip.ttsProvider = 'voicevox';
+          clip.ttsText = text;
+          clip.ttsVersion = VOICEVOX_TTS_VERSION;
+          clip.ttsSpeakerId = String(profile.voicevoxSpeakerId);
+          clip.ttsRate = Number(profile.rate) || 1;
+          clip.ttsPitch = Number(profile.pitch) || 1;
+          clip.ttsTargetFrames = voicevoxTargetFramesForText(text);
+          clip.ttsEffect = dialogAudioEffectSettings(clip).signature;
+        }
+      };
+
+      if (!reuse || unsaved) {
+        const mime = reuse ? clip.audioMime || take.blob.type || 'audio/wav' : 'audio/wav';
+        let file;
+        try {
+          file = await writeAudioClipToWorkspace(owner, clip, take.blob, mime, assertCurrent, publish);
+        } catch (error) {
+          assertCurrent();
+          if (!voiceWriteRetries) voiceWriteRetries = { owner: owner, takes: new WeakMap() };
+          voiceWriteRetries.takes.set(clip, take);
+          throw error;
+        }
+        assertVoicePreparation(job);
+        notifyWorkspaceStatus(t('msg.workspace.audioSaveComplete', workspaceAudioFolderLabel() + '/' + file.fileName));
+      } else {
+        assertCurrent();
+        publish();
+      }
+      if (!protectedAudio) {
+        ensureCutDurationsForAudioClips(project, [clip]);
+        if (!reuse) {
+          placeAudioClipFast(project, clip, clip.trackId || 'dialog-main', { existingLaneOnly: true });
+          fitDialogClipBoxToAudio(clip);
+        }
+        sortAudioClips(project);
+        writeTimelineTracks(project);
+      }
+      return true;
     }
 
-    function voicevoxClipSpeechText(clip, profile) {
-      const current = ((state.project.audio && state.project.audio.clips) || []).includes(clip);
-      const body = current ? audioClipDisplayBody(state.project, clip) : String(clip && clip.text || '');
-      return normalizeVoicevoxSpeechText(cleanDialogForSpeech(body, profile && profile.name || clip && clip.characterName || '')).trim();
+    function voicevoxClipSpeechText(project, clip, profile) {
+      const body = audioClipDisplayBody(project, clip);
+      return normalizeVoicevoxSpeechText(cleanDialogForSpeech(body, profile && profile.name || clip.characterName || '')).trim();
     }
 
     function voicevoxClipAudioIsStale(clip, bodyText, profile) {
@@ -47462,7 +47541,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function voicevoxClipGenerationState(project, clip, profile) {
       if (audioClipIsUserMedia(clip) || profile.ttsProvider !== 'voicevox') return null;
       if (dialogueClipProtectsAudio(project, clip)) return { protected: true };
-      const text = voicevoxClipSpeechText(clip, profile);
+      const text = voicevoxClipSpeechText(project, clip, profile);
       if (!text) return { empty: true };
       const generated = Boolean(clip.audioFileName);
       const stale = generated && voicevoxClipAudioIsStale(clip, text, profile);
@@ -47496,11 +47575,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function confirmVoicevoxGeneration(mode, stats) {
-      if (!state.workspaceHandle) {
-        state.voicevoxStatus = t('status.voicevox.blocked');
-        renderTimingDashboard();
-        return false;
-      }
       const action = mode === 'regenerate' ? t('msg.voicevox.actionRegenerate') : t('msg.voicevox.actionMissingOnly');
       const message = t(
         'msg.voicevox.confirmGenerate',
@@ -47513,11 +47587,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function requestStopVoicevoxGeneration() {
-      if (!state.voicevoxGenerating) return;
-      state.voicevoxCancelRequested = true;
-      if (state.voicevoxAbortController) {
-        try { state.voicevoxAbortController.abort(); } catch (error) {}
-      }
+      const job = currentVoicePreparation();
+      if (!job || job.controller.signal.aborted) return;
+      job.controller.abort();
       state.voicevoxStatus = t('status.voicevox.stopRequested');
       renderTimingDashboard();
     }
@@ -47529,6 +47601,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const profile = clipVoiceProfile(project, clip, ensureCharacterVoiceProfile);
         if (audioClipIsUserMedia(clip) || profile.ttsProvider !== 'voicevox' || dialogueClipProtectsAudio(project, clip)) return;
         if (clip.audioFileName) cleared += 1;
+        if (voiceWriteRetries) voiceWriteRetries.takes.delete(clip);
         clearGeneratedAudioForClip(clip);
         clip.ttsProvider = '';
         clip.ttsText = '';
@@ -47538,56 +47611,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return cleared;
     }
 
-    async function resetVoicevoxTimelineAudio() {
-      if (state.voicevoxGenerating) return;
-      if (!await askConfirm(t('msg.voicevox.confirmResetLinks'), { okLabel: t('toolbar.voicevox.resetBtn'), danger: true })) return;
-      if (state.voicevoxGenerating) return;
-      const cleared = clearAllVoicevoxTimelineAudio(state.project);
-      state.voicevoxStatus = t('status.voicevox.resetDone', cleared);
-      renderTimingDashboard();
-      if (state.workspaceHandle) await saveProjectToWorkspace(null, { cleanup: false });
-    }
-
-    async function persistUnsavedGeneratedAudioClips(project) {
-      const stats = { checked: 0, saved: 0, failed: 0 };
-      if (!state.workspaceHandle || !project || !project.audio || !Array.isArray(project.audio.clips)) return stats;
-      for (let index = 0; index < project.audio.clips.length; index += 1) {
-        const clip = project.audio.clips[index];
-        if (!clip || clip.audioFileName || clip.ttsProvider !== 'voicevox') continue;
-        const url = state.workspaceObjectUrls.audio[clip.id];
-        if (!url) continue;
-        stats.checked += 1;
-        try {
-          const blob = await fetch(url).then(function(response) { return response.blob(); });
-          await saveGeneratedAudioBlobToWorkspace(clip.id, blob, clip.audioMime || blob.type || 'audio/wav', { skipProjectSave: true });
-          stats.saved += 1;
-        } catch (error) {
-          stats.failed += 1;
-          console.warn('[workspace] generated audio was not saved to the folder', clip.id, error);
-        }
+    async function saveVoicePreparation(job) {
+      job.changed = false;
+      try {
+        return await saveProjectToWorkspace(job.owner, { cleanup: false });
+      } catch (error) {
+        // The folder write queue can reject before its own save handler runs.
+        if (currentVoicePreparation() !== job) return false;
+        state.voicevoxStatus = t('msg.workspace.saveFailed', error && error.message ? error.message : error);
+        alert(state.voicevoxStatus);
+        return false;
       }
-      return stats;
     }
 
-    async function generateMissingVoicevoxTimelineAudio(options) {
-      options = options || {};
-      if (state.voicevoxGenerating) return;
-      if (!await ensureWorkspaceForVoicevoxGeneration()) return;
-      normalizeAudioClips(state.project);
-      ensureTimelineTracksFresh(state.project);
-      const persisted = await persistUnsavedGeneratedAudioClips(state.project);
-      if (persisted.failed) showToast(t('msg.workspace.generatedAudioUnsaved', persisted.failed), { warn: true });   // Report the failure so the missing voice file is visible.
-      await hydrateWorkspaceAudioRefs(state.project);
+    async function prepareVoicevoxTimeline(job, mode) {
+      const owner = job.owner, project = owner.project, force = mode === 'regenerate';
+      await hydrateWorkspaceAudioRefs(project, owner);
+      assertVoicePreparation(job);
       const stats = voicevoxGenerationStats();
-      if (!options.skipConfirm && !await confirmVoicevoxGeneration('missing', stats)) return;
-      if (state.voicevoxGenerating) return;
-      const owner = projectIoOwner(); // the project whose clips this batch generates; opening another one stops it
+      const confirmed = await confirmVoicevoxGeneration(mode, force ? Object.assign({}, stats, { pending: stats.readable }) : stats);
+      assertVoicePreparation(job);
+      if (!confirmed) return;
       let skippedEmpty = 0;
-      const clips = (state.project.audio && state.project.audio.clips || []).filter(function(clip) {
-        const profile = clipVoiceProfile(state.project, clip, ensureCharacterVoiceProfile);
-        const status = voicevoxClipGenerationState(state.project, clip, profile);
-        if (status && status.empty) skippedEmpty += 1;
-        return Boolean(status && status.pending);
+      const clips = project.audio.clips.filter(function(clip) {
+        const profile = clipVoiceProfile(project, clip, peekCharacterVoiceProfile);
+        const status = voicevoxClipGenerationState(project, clip, profile);
+        const unsaved = !clip.audioFileName && clip.ttsProvider === 'voicevox' && state.workspaceObjectUrls.audio[clip.id];
+        if (status && status.empty && !unsaved) skippedEmpty += 1;
+        return Boolean(unsaved || status && (status.pending || force && status.cached));
       });
       if (!clips.length) {
         const message = skippedEmpty ? 'No readable VOICEVOX text. Skipped ' + skippedEmpty + ' empty clips.' : 'No missing VOICEVOX audio clips.';
@@ -47595,77 +47646,36 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         alert(message);
         return;
       }
-      state.voicevoxGenerating = true;
-      state.voicevoxCancelRequested = false;
-      renderTimingDashboard();
-      let generated = 0;
-      const failed = [];
-      let canceled = false;
-      try {
-        for (let index = 0; index < clips.length; index += 1) {
-          if (state.voicevoxCancelRequested || !projectIoOwnerCurrent(owner)) {
-            canceled = true;
-            state.voicevoxStatus = t('status.voicevox.stoppedAt', index, clips.length, '');
-            break;
-          }
-          state.voicevoxStatus = t('status.voicevox.generating', index + 1, clips.length, workspaceAudioFolderLabel());
-          renderTimingDashboard();
-          await yieldToBrowser();
-          try {
-            state.voicevoxAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
-            const url = await ensureVoicevoxAudioForClip(clips[index], { skipProjectSave: true });
-            state.voicevoxAbortController = null;
-            if (url) generated += 1;
-            else skippedEmpty += 1;
-          } catch (error) {
-            state.voicevoxAbortController = null;
-            if (state.voicevoxCancelRequested || !projectIoOwnerCurrent(owner)) {
-              canceled = true;
-              state.voicevoxStatus = t('status.voicevox.stoppedAt', index + 1, clips.length, '');
-              break;
-            }
-            failed.push({
-              clip: clips[index],
-              message: error && error.message ? error.message : String(error)
-            });
-            state.voicevoxStatus = t('status.voicevox.stoppedAt', index + 1, clips.length, failed[0].message);
-            alert(state.voicevoxStatus);
-            break;
-          }
-        }
-        if (!projectIoOwnerCurrent(owner)) return; // another project is open now; nothing below belongs to it
-        const fileStats = await hydrateWorkspaceAudioRefs(state.project);
-        const folderFiles = await workspaceAudioFileSummary(8);
-        if (state.workspaceHandle) await saveProjectToWorkspace(null, { cleanup: false });
-        const latestFiles = folderFiles.names.length ? ' / latest ' + folderFiles.names.join(', ') : '';
-        state.voicevoxStatus = (canceled ? 'Stopped after generating ' : 'Generated ') + generated + ' audio clips' + (skippedEmpty ? ' / skipped ' + skippedEmpty + ' empty' : '') + (failed.length ? ' / failed ' + failed.length : '') + ' / saved: ' + workspaceAudioFolderLabel() + ' / workspace files ' + folderFiles.count + latestFiles + ' / linked ' + fileStats.found + '/' + fileStats.checked;
-        if (state.workspaceHandle) notifyWorkspaceStatus(t('msg.workspace.audioSaveComplete', workspaceAudioFolderLabel()));
-        if (generated && !folderFiles.count) {
-          alert(t('msg.err.voicevoxNoFileVisible'));
-        }
-        if (failed.length && generated) {
-          alert(t('msg.err.voicevoxBatchFailed', failed.length, failed[0].message));
-        }
-      } finally {
-        state.voicevoxGenerating = false;
-        state.voicevoxCancelRequested = false;
-        state.voicevoxAbortController = null;
-        renderTimingDashboard();
-      }
-    }
 
-    async function regenerateAllVoicevoxTimelineAudio() {
-      if (state.voicevoxGenerating) return;
-      if (!await ensureWorkspaceForVoicevoxGeneration()) return;
-      normalizeAudioClips(state.project); ensureTimelineTracksFresh(state.project);
-      await hydrateWorkspaceAudioRefs(state.project);
-      const stats = voicevoxGenerationStats();
-      if (!await confirmVoicevoxGeneration('regenerate', Object.assign({}, stats, { pending: stats.readable }))) return;
-      if (state.voicevoxGenerating) return;
-      clearAllVoicevoxTimelineAudio(state.project);
-      state.voicevoxStatus = t('status.voicevox.regenerating');
-      renderTimingDashboard();
-      await generateMissingVoicevoxTimelineAudio({ skipConfirm: true });
+      let generated = 0, failure = '';
+      for (let index = 0; index < clips.length; index += 1) {
+        state.voicevoxStatus = t('status.voicevox.generating', index + 1, clips.length, workspaceAudioFolderLabel());
+        renderTimingDashboard();
+        await yieldToBrowser();
+        assertVoicePreparation(job);
+        try {
+          if (await prepareVoicevoxClip(job, clips[index], force)) generated += 1;
+          else skippedEmpty += 1;
+        } catch (error) {
+          assertVoicePreparation(job);
+          failure = error && error.message ? error.message : String(error);
+          state.voicevoxStatus = t('status.voicevox.stoppedAt', index + 1, clips.length, failure);
+          alert(state.voicevoxStatus);
+          break;
+        }
+      }
+      assertVoicePreparation(job);
+      const fileStats = await hydrateWorkspaceAudioRefs(project, owner);
+      assertVoicePreparation(job);
+      const folderFiles = await workspaceAudioFileSummary(owner, 8);
+      assertVoicePreparation(job);
+      if (!await saveVoicePreparation(job)) return;
+      assertVoicePreparation(job);
+      const latestFiles = folderFiles.names.length ? ' / latest ' + folderFiles.names.join(', ') : '';
+      state.voicevoxStatus = 'Generated ' + generated + ' audio clips' + (skippedEmpty ? ' / skipped ' + skippedEmpty + ' empty' : '') + (failure ? ' / failed 1' : '') + ' / saved: ' + workspaceAudioFolderLabel() + ' / workspace files ' + folderFiles.count + latestFiles + ' / linked ' + fileStats.found + '/' + fileStats.checked;
+      notifyWorkspaceStatus(t('msg.workspace.audioSaveComplete', workspaceAudioFolderLabel()));
+      if (generated && !folderFiles.count) alert(t('msg.err.voicevoxNoFileVisible'));
+      if (failure && generated) alert(t('msg.err.voicevoxBatchFailed', 1, failure));
     }
 
     function applyVoicevoxDialogTagEffects(query, clipOrTags) {
@@ -47819,21 +47829,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return query;
     }
 
-    async function synthesizeVoicevoxBlob(text, profile, clip) {
+    async function synthesizeVoicevoxBlob(project, text, profile, clip, signal) {
       const speakerId = encodeURIComponent(String(profile.voicevoxSpeakerId));
       const bodyText = normalizeVoicevoxSpeechText(cleanDialogForSpeech(text || '', profile && profile.name || ''));
       if (!bodyText.trim()) throw new Error('No speech text.');
-      const queryResult = await fetchVoicevox('/audio_query?text=' + encodeURIComponent(bodyText) + '&speaker=' + speakerId, {
-        method: 'POST'
+      const queryResult = await fetchVoicevox(project, '/audio_query?text=' + encodeURIComponent(bodyText) + '&speaker=' + speakerId, {
+        method: 'POST',
+        signal: signal
       });
       const queryResponse = queryResult.response;
       if (!queryResponse.ok) throw new Error('audio_query HTTP ' + queryResponse.status);
+      const rawQuery = await queryResponse.json();
+      if (signal) signal.throwIfAborted();
       const query = applyVoicevoxDialogTagEffects(
-        tuneVoicevoxQueryForDialog(voicevoxApplyProfileToQuery(await queryResponse.json(), profile || {}), bodyText, profile || {}),
+        tuneVoicevoxQueryForDialog(voicevoxApplyProfileToQuery(rawQuery, profile || {}), bodyText, profile || {}),
         clip
       );
-      const synthesisResult = await fetchVoicevox('/synthesis?speaker=' + speakerId, {
+      const synthesisResult = await fetchVoicevox(project, '/synthesis?speaker=' + speakerId, {
         method: 'POST',
+        signal: signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(query)
       });
@@ -49619,7 +49633,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const hasClip = linkedClips.length > 0;
       const items = hasClip
         ? [{ label: t('dialog.follow.voices', linkedClips.length), action: function() { showDialogueVoiceMenu(event, cutId, blockId); } }]
-        : [{ label: t('dialog.block.ctxVoiceGenerate'), action: function() { generateVoiceForDialogBlock(cutId, blockId); } }];
+        : [{ label: t('dialog.block.ctxVoiceGenerate'), action: function() { if (state.project === project) generateVoiceForDialogBlock(cutId, blockId); } }];
       const group = block && dialogueGroupForBlock(project, block);
       if (hasClip) items.unshift({
         label: (group && group.autoDistribute ? '✓ ' : '') + t('dialog.follow.auto'),
@@ -50451,21 +50465,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const isConte = Boolean(state.project && state.project.kind === 'conte');
       sect.hidden = !isConte;
       if (!isConte) return;
+      const busy = Boolean(currentVoicePreparation());
       const stats = voicevoxGenerationStats();
       const ready = stats.readable > 0 && stats.pending === 0 && stats.cached >= stats.readable;
       const gen = document.getElementById('voicevoxGenerateTimelineBtn');
       if (gen) {
-        gen.dataset.voicevoxGenerateMode = state.voicevoxGenerating ? 'stop' : (ready ? 'regenerate' : 'missing');
-        gen.classList.toggle('generating', Boolean(state.voicevoxGenerating));
-        gen.disabled = !state.voicevoxGenerating && (!stats.readable || (!stats.pending && !ready));
-        gen.title = state.voicevoxGenerating ? t('toolbar.voicevox.stopTitle') : (ready ? t('toolbar.voicevox.regenerateTitle') : stats.label);
-        gen.innerHTML = state.voicevoxGenerating
+        gen.dataset.voicevoxGenerateMode = busy ? 'stop' : (ready ? 'regenerate' : 'missing');
+        gen.classList.toggle('generating', busy);
+        gen.disabled = !busy && (!stats.readable || (!stats.pending && !ready));
+        gen.title = busy ? t('toolbar.voicevox.stopTitle') : (ready ? t('toolbar.voicevox.regenerateTitle') : stats.label);
+        gen.innerHTML = busy
           ? '<span class="voicevox-normal-label">' + escapeHtml(t('toolbar.voicevox.generating')) + '</span><span class="voicevox-hover-label">' + escapeHtml(t('toolbar.voicevox.stop')) + '</span>'
           : escapeHtml(ready ? t('toolbar.voicevox.regenerate') : t('toolbar.voicevox.generate'));
       }
       const reset = document.getElementById('voicevoxResetTimelineBtn');
       if (reset) {
-        reset.disabled = Boolean(state.voicevoxGenerating || !stats.generated);
+        reset.disabled = busy || !stats.generated;
         reset.title = t('toolbar.voicevox.resetTitle');
       }
       const st = document.getElementById('tlVoiceStatus');
@@ -50529,13 +50544,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
               if (genBtn.disabled) return;
               const mode = genBtn.dataset.voicevoxGenerateMode || 'missing';
               if (mode === 'stop') { requestStopVoicevoxGeneration(); return; }
-              if (mode === 'regenerate') { regenerateAllVoicevoxTimelineAudio(); return; }
-              generateMissingVoicevoxTimelineAudio();
+              runVoicePreparation(mode);
             });
             const resetBtn = document.getElementById('voicevoxResetTimelineBtn');
             if (resetBtn) resetBtn.addEventListener('click', function() {
               updateVoiceSettingsSection();
-              if (!resetBtn.disabled) resetVoicevoxTimelineAudio();
+              if (!resetBtn.disabled) runVoicePreparation('reset');
             });
           }
           updateVoiceSettingsSection();
@@ -71966,6 +71980,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (state.project && state.project.settings) {
         state.project.settings.localWorkspace = normalizeWorkspaceSettings({ enabled: false });
       }
+      currentVoicePreparation();
       if (options.forgetSavedHandle) {
         deleteWorkspaceDbValue(WORKSPACE_HANDLE_KEY).catch(function(error) { console.warn('[workspace] 저장 연결 핸들 삭제 실패 — 다음 부팅에 끊긴 연결이 남을 수 있다', error); });
       }
@@ -71982,6 +71997,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const handle = await pickRememberedHandle('directory', 'conte-workspace', { mode: 'readwrite' });
         if (!handle) return false;
         assertProjectIoOwner(request.owner);
+        if (options.assertSelectionCurrent) options.assertSelectionCurrent();
         return await connectWorkspaceFolderHandle(handle, options);
       } catch (error) {
         if (error && error.name === 'AbortError') { console.info('[workspace] Folder selection cancelled', error.message); return false; }
@@ -72055,6 +72071,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // This historical handle is only a location memory; failure must not reject a usable folder.
         await saveWorkspaceHandle(handle).catch(function(error) { console.warn('[workspace] Folder handle was not remembered', error); });
         assertProjectIoOwner(owner);
+        if (options.assertSelectionCurrent) options.assertSelectionCurrent();
         if (source) {
           assertProjectReplacement(owner, replacement);
           project = normalizeProjectSnapshot(project);
@@ -72084,6 +72101,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           setProjectFileSource(state.project, null);
         }
         owner = request.owner = projectIoOwner(request);
+        currentVoicePreparation();
         updateWorkspaceSaveButton();
         await hydrateWorkspaceMediaRefs(owner);
         assertProjectIoOwner(owner);
@@ -72116,65 +72134,51 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } finally { hideLoadingOverlay(request); }
     }
 
-    async function ensureWorkspaceForVoicevoxGeneration() {
-      if (state.workspaceHandle) {
-        if (!await ensureWorkspacePermission(state.workspaceHandle, true)) {
-          alert(t('msg.err.workFolderWriteDeniedRetry'));
-          state.workspaceHandle = null;
-          updateWorkspaceUI();
-        } else {
-          await ensureWorkspaceStructure();
-          return ensureWorkspaceAudioWriteAccess();
-        }
+    async function ensureWorkspaceForVoicevoxGeneration(job) {
+      if (job.owner.handle) {
+        const allowed = await ensureWorkspacePermission(job.owner.handle, true);
+        assertVoicePreparation(job);
+        if (allowed) return ensureWorkspaceAudioWriteAccess(job);
+        alert(t('msg.err.workFolderWriteDeniedRetry'));
       }
       state.voicevoxStatus = t('status.voicevox.needFolder');
       state.timelineStatus = t('status.voicevox.needFolderFirst');
       renderTimingDashboard();
-      // Treat this as the audio storage folder. Save the open project there as on first save, backing up existing JSON.
-      const selected = await selectWorkspaceFolder({ silent: true, loadExisting: false });
-      if (!selected || !state.workspaceHandle) {
+      const request = job.folderRequest = beginProjectFileLoad();
+      // Linking from this picker is the one workspace replacement this preparation can follow.
+      const selected = await selectWorkspaceFolder({
+        request: request,
+        silent: true,
+        loadExisting: false,
+        assertSelectionCurrent: function() { assertVoicePreparation(job); }
+      });
+      assertVoicePreparation(job);
+      job.owner = projectIoOwner();
+      job.folderRequest = null;
+      if (!selected || !job.owner.handle) {
         alert(t('msg.voicevox.needFolderSelectFirst'));
         state.voicevoxStatus = t('status.voicevox.blocked');
         state.timelineStatus = t('status.voicevox.blockedNoFolder');
         renderTimingDashboard();
         return false;
       }
-      return ensureWorkspaceAudioWriteAccess();
+      return ensureWorkspaceAudioWriteAccess(job);
     }
 
-    async function ensureWorkspaceAudioWriteAccess() {
-      const project = state.project, root = state.workspaceHandle;
-      if (!await ensureWorkspacePermission(root, true)) throw new Error('Working folder write permission was not granted.');
-      const dir = await getWorkspaceDirectory(project.settings.localWorkspace.audioDir, true, root);
+    async function ensureWorkspaceAudioWriteAccess(job) {
+      const owner = job.owner;
       const blob = new Blob(['conte audio write test ' + new Date().toISOString()], { type: 'text/plain' });
-      let fileName = '', fileHandle = null;
+      const probe = await writeNewWorkspaceFile(owner, owner.settings.audioDir, '__conte_audio_write_test', blob, blob.type, 'txt');
       try {
-        for (let attempt = 0; attempt < 16; attempt += 1) {
-          const candidate = '__conte_audio_write_test_' + crypto.randomUUID() + '.txt';
-          try { await dir.getFileHandle(candidate, { create: false }); continue; }
-          catch (error) { if (error.name !== 'NotFoundError') throw error; }
-          const created = await dir.getFileHandle(candidate, { create: true });
-          if ((await created.getFile()).size !== 0) continue;
-          fileName = candidate; fileHandle = created; break;
-        }
-        if (!fileHandle) throw new Error('Could not reserve a new audio write test file.');
-        await writeBlobToFileHandle(fileHandle, blob, {
-          verify: async function(handle) {
-            const checked = await handle.getFile();
-            if (await checked.text() !== await blob.text()) throw new Error('Audio folder write test failed.');
-          }
-        });
+        if (await probe.blob.text() !== await blob.text()) throw new Error('Audio folder write test failed.');
       } finally {
-        if (fileHandle) {
-          await removeWorkspaceFileIfSameEntry(dir, fileName, fileHandle);
-        }
+        await discardWorkspacePreparedFiles(owner, [probe]);
       }
-      if (state.project !== project || state.workspaceHandle !== root) return false;
+      assertVoicePreparation(job);
       notifyWorkspaceStatus('Audio OK\n' + workspaceAudioFolderLabel());
       updateWorkspaceUI();
       return true;
     }
-
 
     async function ensureWorkspacePermission(handle, write) {
       if (!handle || typeof handle.queryPermission !== 'function') return false;
@@ -76517,10 +76521,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return names.sort(function(left, right) { return left.localeCompare(right); });
     }
 
-    async function workspaceAudioFileSummary(limit) {
+    async function workspaceAudioFileSummary(owner, limit) {
       const max = Math.max(0, Math.round(Number(limit) || 0));
       try {
-        const names = await listWorkspaceFileNames(state.project.settings.localWorkspace.audioDir, /\.(wav|mp3|m4a|aac|ogg|flac|webm)$/i);
+        const names = await listWorkspaceFileNames(owner.settings.audioDir, /\.(wav|mp3|m4a|aac|ogg|flac|webm)$/i, owner.handle);
         return {
           count: names.length,
           names: max ? names.slice(Math.max(0, names.length - max)) : names
@@ -76872,24 +76876,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    async function saveGeneratedAudioBlobToWorkspace(clipId, blob, mime, options) {
-      const owner = projectIoOwner();
-      const clip = owner.project.audio && Array.isArray(owner.project.audio.clips)
-        ? owner.project.audio.clips.find(function(item) { return item.id === clipId; }) : null;
-      if (!clip) return '';
-      if (!owner.handle) throw new Error('No working folder selected for generated audio.');
-      const audioMime = mime || blob.type || 'audio/webm';
-      if (options && options.assertCurrent) options.assertCurrent();
-      const file = await writeAudioClipToWorkspace(owner, clip, blob, audioMime, function() {
-        if (!owner.project.audio.clips.includes(clip)) throw new Error('Audio source changed during save: ' + clipId);
-        if (options && options.assertCurrent) options.assertCurrent();
-      });
-      notifyWorkspaceStatus(t('msg.workspace.audioSaveComplete', workspaceAudioFolderLabel() + '/' + file.fileName));
-      // Live editing now owns the new source. A failed project save must leave it available for retry.
-      if (!options || !options.skipProjectSave) await saveProjectToWorkspace(owner, { cleanup: false });
-      return file.fileName;
-    }
-
     async function saveExternalAudioBlobToWorkspace(clip, blob, mime, owner) {
       if (!clip || !blob) return '';
       owner = owner || projectIoOwner(); assertProjectIoOwner(owner);
@@ -76910,8 +76896,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // Write the audio blob to a new work-folder file for generated or external clips.
     // Before attaching it, recheck ownership, the clip's source signature, and `stillValid`. On mismatch, remove the new file and throw.
+    // publish attaches caller metadata synchronously with the verified file and URL.
     // Opaque names prevent legacy token-based relinking from choosing an arbitrary take.
-    async function writeAudioClipToWorkspace(owner, clip, blob, audioMime, stillValid) {
+    async function writeAudioClipToWorkspace(owner, clip, blob, audioMime, stillValid, publish) {
       const signature = workspaceAssetSignature('audio', clip);
       const prepared = await writeNewWorkspaceFile(owner, owner.settings.audioDir, 'audio', blob, audioMime);
       try {
@@ -76929,6 +76916,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           size: prepared.blob.size, savedAt: new Date().toISOString() } });
       bumpAudioCycle();
       replaceWorkspaceObjectUrl('audio', clip.id, prepared.blob);
+      if (publish) publish();
       return file;
     }
 
@@ -120279,10 +120267,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const closeButton = document.getElementById('exportDialogCloseBtn');
       const status = document.getElementById('exportStatus');
       if (outputButton) {
-        outputButton.disabled = Boolean(busy);
+        outputButton.disabled = busy;
         outputButton.textContent = busy ? t('export.video.busyLabel') : t('export.video.chooseFolderBtn');
       }
-      if (closeButton) closeButton.disabled = Boolean(busy);
+      if (closeButton) closeButton.disabled = busy;
       if (status) status.textContent = message || '';
     }
 
