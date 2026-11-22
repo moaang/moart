@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3552</title>
+  <title>MoArt ver3553</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -20044,33 +20044,45 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // One modal-open contract for static and dynamically-created dialogs (polyfillAllDialogs runs before
     // dynamic dialogs exist). Close handlers for reusable dialogs check dialog.open: a native close event
     // can arrive after the next opening.
+    const editorModalStack = [];
+    let pendingKeydownPaste = null;
+    function activeEditorModal() {
+      while (editorModalStack.length) {
+        const dialog = editorModalStack[editorModalStack.length - 1];
+        if (dialog.isConnected && dialog.hasAttribute('open')) return dialog;
+        editorModalStack.pop();
+      }
+      return null;
+    }
     function openModal(dialog) {
       if (!dialog) return false;
       polyfillDialogElement(dialog);
       // Attach a newly created dialog when it has no parent so `showModal()` can display it.
       // Leave dialogs with an existing parent in place, including a detached parent.
       if (!dialog.parentNode && dialog.ownerDocument === document && document.body) document.body.appendChild(dialog);
-      // The open modal owns keys and pastes (see handleModalDialogKeydown). Same listener → added once.
-      dialog.addEventListener('keydown', handleModalDialogKeydown);
-      dialog.addEventListener('paste', stopModalDialogPaste);
-      if (dialog.open || (dialog.hasAttribute && dialog.hasAttribute('open'))) return true;
-      // Opening a modal ends active `bindOwnedPointerDrag` sessions behind it. Canvas strokes are separate.
-      // A modal opened by a pointer-up callback finds that session already disposed.
+      if (dialog.hasAttribute('open')) return true;
+      // The fallback must obey the same input boundary as the native top layer.
       cancelPointerDrags();
+      pendingKeydownPaste = null;
+      hideConteLayerContextMenu();
       try {
         if (typeof dialog.showModal === 'function') dialog.showModal();
         else if (typeof dialog.show === 'function') dialog.show();
         else dialog.setAttribute('open', '');
-        return true;
       } catch (error) {
         try {
           if (typeof dialog.show === 'function') dialog.show();
           else dialog.setAttribute('open', '');
-          return true;
         } catch (fallbackError) {
-          try { dialog.setAttribute('open', ''); return true; } catch (attributeError) { return false; }
+          try { dialog.setAttribute('open', ''); } catch (attributeError) { return false; }
         }
       }
+      for (let i = editorModalStack.length - 1; i >= 0; i--) {
+        const entry = editorModalStack[i];
+        if (entry === dialog || !entry.isConnected || !entry.hasAttribute('open')) editorModalStack.splice(i, 1);
+      }
+      editorModalStack.push(dialog);
+      return true;
     }
     // SubmitEvent.submitter is also iOS<15.4-gated (undefined on old iPad) → track the last-clicked submit button
     // so dialog forms know which button (作成 vs Cancel) submitted them. Without it, old iPad reads genga 作成 as
@@ -24632,11 +24644,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // (Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z) are fixed too; Save stays assignable. `fixed` rows are
       // shown locked, their saved values and any other command's claim on these chords are ignored.
       { id: 'editCut', category: 'basic', labelKey: 'shortcut.action.editCut', default: 'ctrl+x', scope: 'global', fixed: 'x',
-        run: function() { runContextCut(); } },
+        run: function(event, ctx) { if (ctx.inGenga) runGengaClipboardCopy(true); else runContextCut(); } },
       { id: 'editCopy', category: 'basic', labelKey: 'shortcut.action.editCopy', default: 'ctrl+c', scope: 'global', fixed: 'c',
-        run: function() { runContextCopy(); } },
+        run: function(event, ctx) { if (ctx.inGenga) runGengaClipboardCopy(false); else runContextCopy(); } },
       { id: 'editPaste', category: 'basic', labelKey: 'shortcut.action.editPaste', default: 'ctrl+v', scope: 'global', fixed: 'v', manualEvent: true,
-        run: function(event) { runContextPaste(event); } }, // Camera keys consume the event; image/layer paste retains the native clipboard route.
+        run: handleEditorPasteKey },
       { id: 'editDelete', category: 'basic', labelKey: 'shortcut.action.editDelete', default: 'delete', scope: 'global',
         run: function(ev) { runContextDelete(ev); } },
       // A selected Storyboard layer can be cleared outside the Animation and video drawing surfaces.
@@ -25054,11 +25066,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function fixedShortcutDef(event) {
       return event ? fixedShortcutDefOf(event.ctrlKey || event.metaKey, event.shiftKey, event.altKey, shortcutKeyName(event)) : null;
-    }
-    // The genga clipboard handlers only own Copy/Cut/Paste.
-    function fixedClipboardKey(event) {
-      const def = fixedShortcutDef(event);
-      return def && /^[cxv]$/.test(def.fixed) ? def.fixed : '';
     }
     // Stored chords list modifiers in normalizeShortcutKeyFromEvent order ('ctrl+shift+z', 'shift+meta+z').
     function shortcutChordIsFixed(value) {
@@ -25720,7 +25727,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Otherwise leave Escape within a text input or open dialog to that control.
       document.addEventListener('keydown', function(ev) {
         if (ev.key !== 'Escape' || ev.isComposing) return;
-        const passThrough = (isTypingTarget(ev.target)) || !!document.querySelector('dialog[open]');
+        const passThrough = isTypingTarget(ev.target) || !!activeEditorModal();
         if (passThrough) {
           if (anchoredPopover) { closeAnchoredPopover(); ev.preventDefault(); }
           return;
@@ -62429,19 +62436,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paraparaFlashMs() { return Math.max(60, Math.min(500, Math.round(Number(state.gengaParaparaMs) || 160))); }
     function beginParaparaKeyHold(event) {
       paraparaShow(true); // also settles any earlier keyboard-owned preview
-      paraparaKeyHold = { code: String(event && event.code || ''), key: String(event && event.key || '').toLowerCase() };
-      document.addEventListener('keyup', finishParaparaKeyHold, true);
+      paraparaKeyHold = editorPhysicalKey(event);
     }
     function finishParaparaKeyHold(event) {
       const hold = paraparaKeyHold;
       if (!hold) return;
-      if (event && event.type === 'keyup') {
-        const ownKey = hold.code && event.code ? hold.code === event.code : hold.key === String(event.key || '').toLowerCase();
-        if (!ownKey) return;
-      }
+      if (event && !editorPhysicalKeyMatches(hold, event)) return;
       paraparaClear();
     }
-    bindAppInterrupted(finishParaparaKeyHold);
     function paraparaShow(persist) {
       if (paraparaKeyHold) paraparaClear();
       const target = paraparaTargetVal();
@@ -62468,7 +62470,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paraparaClear() {
       paraparaKeyHold = null;
-      document.removeEventListener('keyup', finishParaparaKeyHold, true);
       if (state.project && state.project.kind === 'genga') {
         if (gengaParaparaFrame != null) gengaSetParaparaFrame(null);
         if (gengaParaparaSoloLayerId) { gengaParaparaSoloLayerId = null; drawGengaPreview(); }
@@ -102896,7 +102897,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // editing/copy/scroll still work. The live mini tutorial deliberately owns a sandbox project.
     function guideHandleInput(event) {
       const guide = document.getElementById('guideBook');
-      if (!guide || guide.hidden || document.querySelector('dialog[open]')) return;
+      if (!guide || guide.hidden || activeEditorModal()) return;
       if (event.type === 'keydown' && event.key === 'Escape' && !event.isComposing) {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -104043,7 +104044,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Give Escape to the current dialog first, as in bindUiHiddenEscape. A genga プロジェクト設定 dialog opened during practice
       // still holds tutorial data, and 「適用」 targets the live state.project.
       // Closing practice first could let that dialog edit the restored user project.
-      if (ev.key === 'Escape' && tlTut && !document.querySelector('dialog[open]')){ ev.preventDefault(); ev.stopPropagation(); tlTutExit(); }
+      if (ev.key === 'Escape' && tlTut && !activeEditorModal()){ ev.preventDefault(); ev.stopPropagation(); tlTutExit(); }
     }, true);
 
     // ## SECTION: Selection overlays and shared raster transforms
@@ -107594,7 +107595,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function handlePaintSpacePanKeydown(event) {
       const which = viewHoldKeyOf(event);
-      if (!spacePanEligible() || isTypingTarget(event.target) || !which) return false;
+      if (!spacePanEligible() || !which) return false;
+      if (event.repeat) { event.preventDefault(); return true; } // A repeat cannot start or replace a physical hold.
       state.paintSpacePanActive = true;
       state.paintViewHoldKey = shortcutMainKey(normalizeShortcutKeyFromEvent(event));
       state.paintViewHoldCode = event.code || '';
@@ -107603,8 +107605,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
-    function cancelPaintSpacePan() {
-      gengaFlipHoverEnd(false);
+    function finishPaintViewHold(commitFlip) {
+      gengaFlipHoverEnd(commitFlip);
       const drag = state.paintSpacePanDrag;
       if (drag && drag.session) drag.session.dispose();
       state.paintSpacePanActive = false;
@@ -107616,13 +107618,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function handlePaintSpacePanKeyup(event) {
       if (!isViewHoldKeyRelease(event)) return;
-      // Always end the pan on the pan-key keyup. A `!spacePanEligible() || isTypingTarget` guard before
-      // cancelPaintSpacePan would leave the flag stuck true if eligibility/focus changed between keydown and keyup
-      // (hold the key, click a tool-panel input, or leave paint/genga, then release), and the next left-drag would
-      // pan instead of drawing. (window blur only backstops window focus loss, not in-document focus/mode changes.)
-      gengaFlipHoverEnd(true);   // In genga the same key also controls flip. Release ends the hold.
+      // The initiating key owns release even when focus or the active engine has changed.
       const wasActive = state.paintSpacePanActive || state.paintSpacePanDrag;
-      cancelPaintSpacePan();
+      finishPaintViewHold(true);
       if (wasActive && event.cancelable) event.preventDefault();
     }
 
@@ -112824,20 +112822,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function openGuideBookShortcut(event) {
-      if (!event.repeat && !document.querySelector('dialog[open]')) openGuideBook();
+      if (!event.repeat && !activeEditorModal()) openGuideBook();
     }
 
     // The same entry points as the start screen and the + tab (cancel, unsaved and replace prompts
     // included). Held-key repeat and an already open modal do not start another flow.
     function runProjectEntryShortcut(event, start) {
-      if (!event.repeat && !document.querySelector('dialog[open]')) start();
+      if (!event.repeat && !activeEditorModal()) start();
     }
     function newConteProjectShortcut(event) { runProjectEntryShortcut(event, startNewConteProject); }
     function newGengaProjectShortcut(event) { runProjectEntryShortcut(event, startNewGengaProject); }
     function openProjectFileShortcut(event) { runProjectEntryShortcut(event, openProjectFile); }
 
     function openPreferencesShortcut(event) {
-      if (!event.repeat && !document.querySelector('dialog[open]:not(#prefsDialog)')) openPrefsWindow('interface');
+      if (!event.repeat && (!activeEditorModal() || activeEditorModal().id === 'prefsDialog')) openPrefsWindow('interface');
     }
 
     function openShortcutSettingsCategory() { openPrefsWindow('shortcut'); }
@@ -113451,28 +113449,57 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Editor keyboard routing
-    // An open modal owns its input. Editor raw keys (arrows, Delete, clipboard) and assigned shortcuts
-    // listen on document in the bubble phase, so stopping at the dialog keeps the focused control, the dialog's
-    // own listeners and native defaults (typing, Tab, Escape) intact. keyup is not stopped: a hold or Space pan
-    // that began before the dialog opened must still end on release.
-    function handleModalDialogKeydown(event) {
-      const dialog = event.currentTarget;
-      if (!(dialog.open || dialog.hasAttribute('open'))) return; // focus left on a closed dialog's control
-      event.stopPropagation();
-      if (event.isComposing) return;
+    // Local controls run before editor commands. Capture handles the exceptions that
+    // must survive a local stopPropagation: Save in text fields and release of a held key.
+    function handleEditorKeyCapture(event) {
+      if (blockInputBehindModal(event) || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+      if (isTypingTarget(event.target) && isSaveShortcutKey(normalizeShortcutKeyFromEvent(event))) {
+        handleConfiguredShortcut(event);
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (!activeEditorModal()) handleEditorMenuKey(event);
+    }
+
+    function blockInputBehindModal(event) {
+      const dialog = activeEditorModal();
+      if (!dialog || (event.target instanceof Node && dialog.contains(event.target))) return false;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return true;
+    }
+
+    function handleEditorModalKey(event, dialog) {
       const key = normalizeShortcutKeyFromEvent(event);
-      if (!key) return;
-      // An assigned save key still saves and suppresses the browser's page save; the handler ignores key repeat.
-      if (isSaveShortcutKey(key)) { handleConfiguredShortcut(event); return; }   // Recognize the Cmd+S alias inside dialogs too.
+      if (isSaveShortcutKey(key)) return handleConfiguredShortcut(event);
       if (event.repeat || dialog.id !== 'prefsDialog') return;
       for (const id of ['windowPreferences', 'windowShortcutSettings', 'windowBackup']) {
-        if (shortcutChordMatches(key, state.shortcuts[id])) { handleConfiguredShortcut(event); return; }
+        if (shortcutChordMatches(key, state.shortcuts[id])) return handleConfiguredShortcut(event);
       }
     }
 
-    function stopModalDialogPaste(event) {
-      const dialog = event.currentTarget;
-      if (dialog.open || dialog.hasAttribute('open')) event.stopPropagation(); // text fields keep the native paste
+    function editorPhysicalKey(event) {
+      return { code: event.code, key: shortcutKeyName(event) };
+    }
+    function editorPhysicalKeyMatches(pressed, event) {
+      return pressed.code && event.code ? pressed.code === event.code : pressed.key === shortcutKeyName(event);
+    }
+
+    function handleEditorKeyup(event) {
+      onShortcutHoldKeyUp(event);
+      finishParaparaKeyHold(event);
+      handlePaintSpacePanKeyup(event);
+      const pending = pendingKeydownPaste;
+      if (!pending || !editorPhysicalKeyMatches(pending.key, event)) return;
+      pendingKeydownPaste = null;
+      if (!activeEditorModal() && !isTypingTarget(event.target) && pending.project === state.project) routeEditorPaste(null);
+    }
+
+    function interruptEditorInput() {
+      pendingKeydownPaste = null;
+      endPaintToolHold();
+      finishParaparaKeyHold();
+      finishPaintViewHold(false);
     }
 
     function bindSettingsAndShortcutControls() {
@@ -113618,14 +113645,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const el = event.target;
         if (el && el.tagName === 'SELECT' && !el.matches(':focus-visible') && typeof el.blur === 'function') el.blur();
       }, true);
-      // Handle Ctrl+S for text inputs in window capture so an input listener cannot divert it to the browser save dialog.
-      // Outside text fields, handleConfiguredShortcut owns the shortcut.
-      window.addEventListener('keydown', function(event) {
-        if (!isTypingTarget(event.target) || !isSaveShortcutKey(normalizeShortcutKeyFromEvent(event))) return;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        if (state.projectActive && !event.repeat) saveJson();
-      }, true);
       // Shortcuts live in their own surface (環境設定), not inside the Tools window, so the capture inputs can
       // never grab focus or leave a stray white outline while drawing. The inputs were bound above; moving the
       // nodes keeps their listeners. (The blur backstop + isTypingTarget readonly rule still stand as defence.)
@@ -113707,17 +113726,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const prevEditTool = state.paintEditTool;
       enter();
       paintToolHoldActive = Object.assign({ source: source, prevTool: prevTool, prevEditTool: prevEditTool }, meta || {});
-      if (source === 'shortcut') document.addEventListener('keyup', onShortcutHoldKeyUp, true);
-      window.addEventListener('blur', endPaintToolHold, true); // the release event never fires if focus leaves the window mid-hold
     }
 
-    // End the hold before restoring the tool. Remove listeners and release the key's anchored action, then return the hold or null.
+    // End the hold before restoring the tool and release the key's anchored action.
     function releasePaintToolHold() {
       const hold = paintToolHoldActive;
       if (!hold) return null;
       paintToolHoldActive = null;
-      document.removeEventListener('keyup', onShortcutHoldKeyUp, true);
-      window.removeEventListener('blur', endPaintToolHold, true);
       if (ONION_PEG_MODE_OF[hold.actionId]) onionPeg.mode = '';
       return hold;
     }
@@ -113748,7 +113763,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function onShortcutHoldKeyUp(event) {
       const hold = paintToolHoldActive;
       if (!hold || hold.source !== 'shortcut') return;
-      if (hold.code && event.code ? hold.code !== event.code : shortcutKeyName(event) !== hold.rawKey) return; // a different key released — not ours
+      if (!editorPhysicalKeyMatches({ code: hold.code, key: hold.rawKey }, event)) return;
       if (hold.rawKey === 'alt') event.preventDefault();   // Keep Alt release away from the browser menu bar.
       // If the hold key is released during a stroke, keep the tool until that stroke's pointer is released.
       // Switching immediately would discard the stroke. Defer as onPenEraserPointerUp does.
@@ -113908,7 +113923,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Warn when assigning a browser accelerator that a page can intercept but still overlaps browser behavior.
     const SHORTCUT_BROWSER_KEYS = /^((ctrl|meta)\+(r|p|f|g|l|h|j|u|k|e|o|d|[1-9]|=|-|0|\+|;)|(ctrl|meta)\+shift\+(r|g|o|d|i|j|c|b|delete|\+|=)|(ctrl\+|shift\+|ctrl\+shift\+)?f5|(shift\+)?f3|f(6|10|11|12)|alt\+(arrowleft|arrowright|d|e|f))$/;
     function shortcutTabFree() {
-      if (document.querySelector('dialog[open]')) return false;
+      if (activeEditorModal()) return false;
       const el = document.activeElement;
       return !el || el === document.body || el.tagName === 'CANVAS';
     }
@@ -113977,7 +113992,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function handleVideoTimelinePanelArrowKey(event) {
-      if (!state.videoEditMode || isTypingTarget(event.target)) return false;
+      if (!state.videoEditMode) return false;
       if (event.ctrlKey || event.metaKey || event.altKey) return false;
       const delta = event.key === 'ArrowLeft' ? -1 : (event.key === 'ArrowRight' ? 1 : 0);
       if (!delta) return false;
@@ -114003,7 +114018,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // and arrow binding). Same guards (video-edit-mode only, not while typing; native <input>/<select> stepping
     // excluded via isTypingTarget) and event handling as ←/→ above (panel step).
     function handleConteLayerRowArrowKey(event) {
-      if (!state.videoEditMode || isTypingTarget(event.target)) return false;
+      if (!state.videoEditMode) return false;
       if (event.ctrlKey || event.metaKey || event.altKey) return false;
       if (state.project && state.project.kind === 'genga') return false;
       const delta = event.key === 'ArrowUp' ? -1 : (event.key === 'ArrowDown' ? 1 : 0);
@@ -114034,7 +114049,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (nf != null) setGengaFrame(nf);
     }
     function handleGengaTimelineArrowKey(event) {
-      if (!(state.project && state.project.kind === 'genga') || isTypingTarget(event.target)) return false;
+      if (!(state.project && state.project.kind === 'genga')) return false;
       const key = event.key;
       // Ctrl/Cmd+Left or Right normally moves between panel heads. This fixed handler runs before configured shortcut resolution,
       // so yield if that chord is explicitly bound to another action.
@@ -114113,7 +114128,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Esc = cancel (drop the selection → the exposure.drawing is untouched until commit, so this restores the original).
     function handleGengaSelectionKey(event) {
       if (!(state.project && state.project.kind === 'genga') || (!gengaSel && !(gengaSelectionRequest && event.key === 'Escape'))) return false;
-      if (isTypingTarget(event.target)) return false; // don't hijack the instance-value inline edit
       // Enter applies a transform only while the transform tool is active.
       // A drawing tool cannot bake an earlier, invisible transform.
       if (event.key === 'Enter' && !isImeEnter(event) && !event.ctrlKey && !event.metaKey && !event.altKey && (state.paintEditTool === 'transform' || state.paintEditTool === 'perspective')) {
@@ -114147,7 +114161,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return shortcutChordMatches(normalizeShortcutKeyFromEvent(event), bound) || (bound === 'delete' && isDeleteKeyEvent(event));
     }
     function deleteInputBlocked(event) {
-      return event.isComposing || event.keyCode === 229 || isTypingTarget(event.target) || paintStrokeInProgress();
+      return event.isComposing || event.keyCode === 229 || paintStrokeInProgress();
     }
     // Backspace normally runs clearDrawing. For non-drawing targets such as clips, camera or FX keys, standalone layers,
     // and storyboard cuts or panels, accept it as Delete because the Mac key labeled Delete sends Backspace.
@@ -114155,8 +114169,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!state.project) return false;
       if (state.project.kind === 'genga') {
         if (gengaSel && !gengaSel.auto) return false;   // A selection makes the drawing the target.
-        return !!(state.gengaSelectedAudioId || gengaSelectedCamKfs().length || gengaSelectedFxKfs().length || (state.gengaSoloLayerId && gengaLayerById(state.gengaSoloLayerId))
-          || (!state.gengaCellSel && state.paintEditTool === 'camera'));
+        const scope = gengaTimelineSelectionScope();
+        return scope ? scope !== 'cell' : state.paintEditTool === 'camera';
       }
       if (state.paintSelection || paintTargetIsMemoPage()) return false;   // A selection or 用紙 memo makes the drawing the target.
       return !!state.videoEditMode && ['audio', 'video', 'camera', 'cut', 'panel'].indexOf(state.activeConteSelectionType) >= 0;
@@ -114188,8 +114202,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Suppress repeat so a second keydown cannot fall through to the playhead panel
       // after the first clears the selected target.
       if (event.repeat) { event.preventDefault(); return true; }
+      const scope = gengaTimelineSelectionScope();
       // 0a) an explicitly selected audio clip → delete it
-      if (state.gengaSelectedAudioId) {
+      if (scope === 'audio') {
         const ca = (gt.audioClips || []).find(function(x) { return String(x.id) === String(state.gengaSelectedAudioId); });
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -114198,7 +114213,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return true;
       }
       // 0) a cell selection → delete the komas in that range (leaves a gap, as Cut does — nothing ripples)
-      if (state.gengaCellSel) {
+      if (scope === 'cell') {
         const cs = state.gengaCellSel;
         const lid = cs.layerId, s = cs.start, e = cs.end;
         event.preventDefault();
@@ -114217,7 +114232,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       // 1) a camera keyframe is selected
       const selCamKfs = gengaSelectedCamKfs().filter(function(f) { return gengaHasCameraKeyframe(gt, f); });
-      if (selCamKfs.length) { // The whole selection, one undo entry
+      if (scope === 'camera' && selCamKfs.length) { // The whole selection, one undo entry
         event.preventDefault();
         event.stopImmediatePropagation();
         state.gengaSelectedCamKfs = [];
@@ -114225,7 +114240,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return true;
       }
       // 1b) an FX keyframe is selected
-      if (gengaSelectedFxKfs().length) { // The whole selection, one undo entry
+      if (scope === 'fx') { // The whole selection, one undo entry
         const ks = gengaSelectedFxKfs();
         state.gengaSelectedFxKfs = [];
         event.preventDefault();
@@ -114236,7 +114251,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       // 2) a layer is solo-selected (standalone) — with several layers selected, Delete takes them all
       // Same target as the trash button).
-      if (state.gengaSoloLayerId && gengaLayerById(state.gengaSoloLayerId)) {
+      if (scope === 'layer' && gengaLayerById(state.gengaSoloLayerId)) {
         event.preventDefault();
         event.stopImmediatePropagation();
         const id = state.gengaSoloLayerId;
@@ -114268,7 +114283,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Escape cancels a lasso while drawing through the shared gesture session.
     // Let it cancel before any selection-clear action.
     function cancelInProgressLassoOnEscape(event) {
-      if (event.key !== 'Escape' || isTypingTarget(event.target)) return false;
+      if (event.key !== 'Escape') return false;
       const op = state.paintRasterOp;
       const drawingLasso = op && (op.type === 'lasso-select' || op.type === 'lasso-stamp' || op.type === 'lasso-fill');
       const gengaLassoLive = (typeof gengaLasso !== 'undefined') && gengaLasso;
@@ -114285,7 +114300,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Cancel an in-progress lasso first so Escape cannot erase the previous selection
     // while the replacement is still being drawn.
     function handleConteSelectionEscape(event) {
-      if (event.key !== 'Escape' || isTypingTarget(event.target)) return false;
+      if (event.key !== 'Escape') return false;
       if (state.project && state.project.kind === 'genga') return false; // Genga's handler claims the key first.
       // First Escape cancels only a pending transform, using the same action as the first Ctrl+Z.
       if (cancelPendingPaintTransform()) {
@@ -114311,7 +114326,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Holding Alt switches pen, eraser, or fill to the eyedropper. Shapes keep center anchoring and selection keeps subtraction.
     // Release through beginPaintToolHold, after the owning pointer lifts when a stroke is active.
     function handleAltEyedropperKey(event) {
-      if (event.key !== 'Alt' || event.repeat || event.ctrlKey || event.metaKey || event.shiftKey || isTypingTarget(event.target)) return false;
+      if (event.key !== 'Alt' || event.repeat || event.ctrlKey || event.metaKey || event.shiftKey) return false;
       if (paintToolHoldActive || paintStrokeInProgress() || state.paintEditTool || ['pen', 'eraser', 'bucket'].indexOf(state.paintTool) < 0) return false;
       const def = SHORTCUT_ACTION_DEFS.find(function(x) { return x.id === 'eyedropper'; });
       const inGenga = !!(state.project && state.project.kind === 'genga');
@@ -114320,14 +114335,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       beginPaintToolHold('shortcut', { actionId: 'eyedropper', rawKey: 'alt' }, function() { def.run(event, { inGenga: inGenga }); });
       return true;
     }
-    function handlePaintKeydown(event) {
-      if (event.defaultPrevented) return;
-      if (event.key === 'Escape' && !event.isComposing && !isTypingTarget(event.target) && state.paintEditTool === 'text-stamp') {
+    function handleEditorKeydown(event) {
+      if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+      const modal = activeEditorModal();
+      if (modal) return handleEditorModalKey(event, modal);
+      if (isTypingTarget(event.target)) return;
+      const inGenga = state.project && state.project.kind === 'genga';
+      if (inGenga ? handleGengaTimelineArrowKey(event) :
+        (handleVideoTimelinePanelArrowKey(event) || handleConteLayerRowArrowKey(event))) return;
+      if (event.key === 'Escape' && state.paintEditTool === 'text-stamp') {
         event.preventDefault();
         setActivePaintTool('pen');
         return;
       }
-      if (event.key === 'Escape' && !event.isComposing && !isTypingTarget(event.target) && state.paintEditTool === 'tap-adjust') {
+      if (event.key === 'Escape' && state.paintEditTool === 'tap-adjust') {
         event.preventDefault();
         gengaTapAdjustEnd(false);
         return;
@@ -114345,12 +114366,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (cancelInProgressLassoOnEscape(event)) { event.preventDefault(); return; }
       if (handleGengaSelectionKey(event)) return;
       if (handleConteSelectionEscape(event)) return; // Match genga.
-      if (event.key === 'Escape' && !isTypingTarget(event.target) && cancelAnyPendingCurve()) {
+      if (event.key === 'Escape' && cancelAnyPendingCurve()) {
         event.preventDefault();
         return;
       }
       // In genga, clear timeline arming and selection after all canvas-level dismissals are exhausted.
-      if (event.key === 'Escape' && !isTypingTarget(event.target) && state.project && state.project.kind === 'genga' && (state.gengaRegionMoveArmed || gengaTimelineSelectionLive())) {
+      if (event.key === 'Escape' && state.project && state.project.kind === 'genga' && (state.gengaRegionMoveArmed || gengaTimelineSelectionScope())) {
         event.preventDefault();
         if (state.gengaRegionMoveArmed) { gengaDisarmRegionMove(); return; }
         gengaClearOtherSelections('');
@@ -114359,9 +114380,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (handleBackspaceAsDelete(event)) return;
       if (handleGengaDeleteKey(event)) return;
-      if (handleGengaKeyframeClipboardKey(event)) return; // Most specific selection wins — see its own note
-      if (handleGengaCellClipboardKey(event)) return;
-      if (handleGengaLayerClipboardKey(event)) return;
       if (handlePaintSpacePanKeydown(event)) return;
       if (handlePaintTransformEnterKey(event)) return;
       if (handleAltEyedropperKey(event)) return;
@@ -114381,27 +114399,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return key === 'Backspace' || code === 'Backspace';
     }
 
-    // Ctrl+V arms the shared internal paste without preventing the OS paste event.
-    // handleEditorPaste consumes the arm and imports an external image when present, otherwise it pastes internally.
-    // If no paste event arrives before the initiating key's release, run the fallback at keyup.
-    // The fallback uses event order rather than a timer, including when Chromium dispatches paste during keydown.
-    // A window blur abandons the arm
-    // because the remaining event order is no longer reliable.
-    let pendingKeydownPaste = null;
-    function armKeydownPaste(event, run) {
-      pendingKeydownPaste = run;
-      const code = event.code;
-      const settle = function(e) {
-        if (e.type === 'keyup' && e.code !== code) return; // Wait for V keyup even if Ctrl is released first.
-        window.removeEventListener('keyup', settle, true);
-        window.removeEventListener('blur', settle);
-        if (pendingKeydownPaste !== run) return;
-        pendingKeydownPaste = null;
-        if (e.type === 'keyup') run();
-      };
-      window.addEventListener('keyup', settle, true);
-      window.addEventListener('blur', settle);
-      return true;
+    // Camera keys have an explicit destination and suppress native paste. Other targets
+    // wait for the browser's clipboard data, with the initiating key's release as fallback.
+    function handleEditorPasteKey(event) {
+      if (pasteEditorCameraKeys()) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      pendingKeydownPaste = { key: editorPhysicalKey(event), project: state.project };
     }
     // ## SECTION: Clipboard actions and asset publication
     // Prepare copied assets without publishing anything into the destination document.
@@ -114457,14 +114463,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (label) label.textContent = message;
     }
 
-    function timelineCameraPasteContext(selected) { return state.paintEditTool === 'camera' || selected; }
-
-    // Keydown and native paste enter the same owner gate before the image/layer routes.
-    function pasteTimelineKeyframeClipboard(event) {
-      if (!state.project || (event && isTypingTarget(event.target))) return false;
-      return state.project.kind === 'genga' ? gengaPasteKeyframeClipboard(event) : contePasteCameraKeyframes(event);
-    }
-
     // Session-only numeric snapshot: independent of layer/image clipboards and project history.
     let conteCameraClipboard = null;
 
@@ -114487,14 +114485,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
-    // True means this paste belongs to camera keys, including a rejected destination.
-    // Both keydown and native paste use this gate; consuming keydown prevents a second image paste.
-    // A cut-header selection leaves the camera-key highlight intact; its active target type is not the paste owner.
-    function contePasteCameraKeyframes(event) {
-      if (!(state.videoEditMode && state.project && state.project.kind !== 'genga' && conteCameraClipboard &&
-          timelineCameraPasteContext(selectedCameraKeyframeSet().size > 0))) return false;
-      if (event) { event.preventDefault(); event.stopPropagation(); }
-      pendingKeydownPaste = null;
+    // Camera paste has already claimed the input, including a rejected destination.
+    function contePasteCameraKeyframes() {
       const project = state.project, clipboard = conteCameraClipboard;
       const firstFrame = Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0));
       const destinations = new Map();
@@ -114791,14 +114783,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       guardedRender('timing', renderTimingDashboard);
     }
 
-    // Camera keys consume the keydown. Otherwise let native paste inspect image/marker data;
-    // if no native event arrives, retain the existing internal layer fallback.
-    function runContextPaste(event) {
-      if (pasteTimelineKeyframeClipboard(event)) return;
-      const media = timelineMediaClipboardIsNewest();
-      if (!(state.videoEditMode && (media || (state.conteLayerClipboard && (state.conteLayerClipboard.layerId || state.conteLayerClipboard.layerIds))))) return;
-      armKeydownPaste(event, function() { if (timelineMediaClipboardIsNewest()) pasteTimelineMediaClipboard(); else contePasteLayerClipboard(); });
-    }
     // Whether A/V clips were copied more recently than storyboard layers.
     function timelineMediaClipboardIsNewest() {
       return Boolean(state.videoEditMode && state.timelineClipboardKind === 'media' && state.timelineMediaClipboard);
@@ -115065,46 +115049,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    function bindTimelineSelectionAndMenuKeys() {
-      // Capture phase. Every koma / number-strip / lane pointerdown starts a beginDragStrand, which
-      // stopPropagation()s the press by default, so a bubble-phase closer would never see presses on a koma and
-      // the menu would only dismiss on a stray non-strand spot (ruler, gutter, scrollbar). Capture runs at
-      // document before any element handler can stop it, so a press anywhere outside the menu closes it. No
-      // self-close on open: the closer runs before the opening contextmenu handler, when the menu is still hidden.
-      document.addEventListener('pointerdown', function(event) {
-        const menu = document.getElementById('conteLayerContextMenu');
-        if (menu && !menu.hidden && !event.target.closest('#conteLayerContextMenu')) hideConteLayerContextMenu();
+    function handleEditorPointerDown(event) {
+      pendingKeydownPaste = null;
+      if (activeEditorModal()) return;
+      const target = event.target;
+      const menu = document.getElementById('conteLayerContextMenu');
+      if (menu && !menu.hidden && !menu.contains(target)) hideConteLayerContextMenu();
+      if (state.project && state.project.kind === 'genga') {
+        gengaSelOutsidePress(event);
+      } else {
+        // Capture the old clip selection before an empty-space press clears it, for marquee Escape.
+        conteMediaMarqueePress(event);
+        conteTimelineOutsidePress(event);
+      }
+    }
+
+    // Menus handle activation and dismiss before the key can edit the captured selection.
+    function handleEditorMenuKey(event) {
+      const menu = document.getElementById('conteLayerContextMenu');
+      if (!menu || menu.hidden || /^(Shift|Control|Alt|Meta)$/.test(event.key)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const buttons = Array.from(menu.querySelectorAll('button:not([disabled])'));
+      const at = buttons.indexOf(document.activeElement);
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        const down = event.key === 'ArrowDown', n = buttons.length;
+        const next = n ? buttons[at < 0 ? (down ? 0 : n - 1) : (at + (down ? 1 : n - 1)) % n] : null;
+        if (next) next.focus();
+        return;
+      }
+      if ((event.key === 'Enter' || event.key === ' ') && at >= 0) { buttons[at].click(); return; }
+      hideConteLayerContextMenu();
+    }
+
+    function bindEditorInput() {
+      window.addEventListener('keydown', handleEditorKeyCapture, true);
+      window.addEventListener('keyup', handleEditorKeyup, true);
+      window.addEventListener('pointerdown', blockInputBehindModal, true);
+      window.addEventListener('click', function(event) {
+        // A programmatic link click can deliver an export started by the modal.
+        if (event.isTrusted) blockInputBehindModal(event);
       }, true);
-      // Press empty timeline space (below the last layer, the gutter, another cell) → drop the cell
-      // selection. capture so a child's stopPropagation can't hide it; see the function for the skip rules.
-      document.addEventListener('pointerdown', gengaSelOutsidePress, true);
-      // Conte-side sibling — press empty conte-timeline space drops the clip/camera-kf
-      // highlights (conte-layer/panel/cut untouched — see the function).
-      // Dragging an empty A/V lane starts a marquee. Capture selection before clearing it so Escape can restore it.
-      document.addEventListener('pointerdown', conteMediaMarqueePress, true);
-      document.addEventListener('pointerdown', conteTimelineOutsidePress, true);
-      // An open menu owns the keyboard. Escape closes, arrows move, and Enter activates.
-      // Other keys dismiss the menu without reaching the underlying view,
-      // where Delete, Undo, or Escape could invalidate its captured target.
-      window.addEventListener('keydown', function(event) {
-        const menu = document.getElementById('conteLayerContextMenu');
-        if (!menu || menu.hidden || event.isComposing || /^(Shift|Control|Alt|Meta)$/.test(event.key)) return;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        const buttons = Array.from(menu.querySelectorAll('button:not([disabled])'));
-        const at = buttons.indexOf(document.activeElement);
-        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-          const down = event.key === 'ArrowDown', n = buttons.length;
-          const next = n ? buttons[at < 0 ? (down ? 0 : n - 1) : (at + (down ? 1 : n - 1)) % n] : null;
-          if (next) next.focus();
-          return;
-        }
-        if ((event.key === 'Enter' || event.key === ' ') && at >= 0) { buttons[at].click(); return; }
-        hideConteLayerContextMenu();
-      }, true);
-      document.addEventListener('keydown', handleVideoTimelinePanelArrowKey);
-      document.addEventListener('keydown', handleConteLayerRowArrowKey);
-      document.addEventListener('keydown', handleGengaTimelineArrowKey);
+      window.addEventListener('paste', handleEditorPasteCapture, true);
+      document.addEventListener('keydown', handleEditorKeydown);
+      document.addEventListener('paste', handleEditorPaste);
+      // Read the old selection before local drag handlers can stop propagation or replace it.
+      document.addEventListener('pointerdown', handleEditorPointerDown, true);
+      bindAppInterrupted(interruptEditorInput);
     }
 
     function bindPaintControls() {
@@ -115267,16 +115258,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }, { passive: false });
       }
       document.addEventListener('pointermove', continueCameraFrameDrag);
-      bindTimelineSelectionAndMenuKeys();
-      document.addEventListener('keydown', handlePaintKeydown);
-      document.addEventListener('keyup', handlePaintSpacePanKeyup);
+      bindEditorInput();
       // whole-app image drop (genga → new-layer import dialog) + Ctrl+V image paste (genga → current koma /
       // conte video-edit → selected layer drawing)
       document.addEventListener('dragover', gengaDocDragOver);
       document.addEventListener('drop', gengaDocDrop);
-      document.addEventListener('paste', handleEditorPaste);
       document.addEventListener('pointermove', gengaSilHover); // 診断 silhouette-fix +/- hover badge (genga only, self-gated)
-      window.addEventListener('blur', cancelPaintSpacePan);
       window.addEventListener('blur', osClipMirrorNoteWindowLeft); // After window blur, external copying is possible, so clipMarkerIsOurs relies on the marker alone.
       // Alt-tabbing mid camera-frame drag delivers neither pointerup nor pointercancel, so
       // state.cameraFrameDrag would stay armed — beyond the stuck gizmo, workspaceAutosaveCanRunNow() treats
@@ -135842,7 +135829,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaDialogueEndAlign(true);
       const clips = gengaDialogueAlignClips(gt, e);
       // Give Escape to a text input or open dialog first so it can cancel its edit or close.
-      const onKey = function(ev) { if (ev.key === 'Escape' && gengaDlgAlign && !isTypingTarget(ev.target) && !document.querySelector('dialog[open]')) { ev.stopPropagation(); gengaDialogueEndAlign(); } };
+      const onKey = function(ev) { if (ev.key === 'Escape' && gengaDlgAlign && !isTypingTarget(ev.target) && !activeEditorModal()) { ev.stopPropagation(); gengaDialogueEndAlign(); } };
       document.addEventListener('keydown', onKey, true);
       // Show auto initially when audio exists and no glyphs were manually placed. Require 「自動」 to replace manual positions.
       gengaDlgAlign = {
@@ -148266,8 +148253,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (gengaClearOtherSelections(gengaCellSelHoldsCurrent() ? 'cell' : '')) gengaUpdateStandaloneDom();
       gengaDisarmRegionMove(); // A canvas edit also disarms the next timeline drag.
     }
-    function gengaTimelineSelectionLive() {
-      return !!(state.gengaSoloLayerId != null || gengaSelectedCamKfs().length || state.gengaCellSel || gengaSelectedFxKfs().length || state.gengaSelectedAudioId);
+    function gengaTimelineSelectionScope() {
+      if (state.gengaSelectedAudioId) return 'audio';
+      if (state.gengaCellSel) return 'cell';
+      if (gengaSelectedCamKfs().length) return 'camera';
+      if (gengaSelectedFxKfs().length) return 'fx';
+      if (state.gengaSoloLayerId != null) return 'layer';
+      return '';
     }
     // ---- standalone "delete target" selection (distinct from the playhead-linked active layer) ----
     // Exactly one of the five exclusive timeline selections is active at a time (gengaClearOtherSelections); when
@@ -159378,70 +159370,70 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
       } catch (e) { mirrorFailed(e); }
     }
-    // Determine whether the OS clipboard holds an internal copy. handleEditorPaste shares this check
+    // Determine whether the OS clipboard holds an internal copy. routeEditorPaste shares this check
     // for GENGA_CLIP_MARKERS and storyboard ourConteLayer and ourMedia.
     function clipMarkerIsOurs(cd, marker) {
       if (cd && String(cd.getData('text/plain') || '').indexOf(marker) === 0) return true; // The mirror is now visible on the OS clipboard.
       return osClipMirror.marker === marker && !osClipMirror.settled && !osClipMirror.leftWindow;
     }
-    function handleEditorPaste(ev) {
-      if (isTypingTarget(ev.target)) return;
-      // the native paste fired — it (not the keyup fallback) decides now
-      const pending = pendingKeydownPaste;
-      pendingKeydownPaste = null;
-      const genga = Boolean(state.project && state.project.kind === 'genga');
-      // Handle 原画 camera context before checking external images. Paste FX keys after the external-image check below.
-      if (genga ? (gengaKfClipboard && gengaKfClipboard.kind === 'camera' && pasteTimelineKeyframeClipboard(ev)) : pasteTimelineKeyframeClipboard(ev)) return;
-      // A delayed or denied reference clipboard mirror leaves the internal copy newest (refsClipboardIsNewest).
-      if (refsClipboardIsNewest()) {
-        ev.preventDefault();
-        refsPasteInternal();
-        return;
+    function pasteEditorCameraKeys() {
+      const project = state.project;
+      if (!project) return false;
+      if (project.kind === 'genga') {
+        const scope = gengaTimelineSelectionScope();
+        if (!gengaKfClipboard || gengaKfClipboard.kind !== 'camera' ||
+            !((scope === 'camera' && gengaSelectedCamKfs().some(function(frame) { return gengaHasCameraKeyframe(project.gengaTimeline, frame); })) ||
+              (!scope && state.paintEditTool === 'camera'))) return false;
+        return gengaPasteKeyframes();
       }
-      const cd = ev.clipboardData;
+      const scope = state.activeConteSelectionType;
+      if (!state.videoEditMode || !conteCameraClipboard ||
+          !(conteCameraSelectionActive() || (!scope && cameraToolActive()))) return false;
+      return contePasteCameraKeyframes();
+    }
+
+    function handleEditorPasteCapture(event) {
+      pendingKeydownPaste = null; // Native paste arrived, even if a local handler consumes it.
+      blockInputBehindModal(event);
+    }
+
+    function handleEditorPaste(event) {
+      if (event.defaultPrevented || activeEditorModal() || isTypingTarget(event.target)) return;
+      if (routeEditorPaste(event.clipboardData)) event.preventDefault();
+    }
+
+    // Both native paste and the no-native-event fallback use this same target order.
+    // Explicit camera context wins, then a pending reference, then a foreign image.
+    // Our clipboard markers distinguish external images from the app's bitmap mirror.
+    function routeEditorPaste(cd) {
+      if (pasteEditorCameraKeys()) return true;
+      if (refsClipboardIsNewest()) { refsPasteInternal(); return true; }
       const files = cd ? Array.from(cd.files || []).filter(function(f) { return /^image\//.test(String(f.type || '')); }) : [];
-      if (genga) {
-        const ours = GENGA_CLIP_MARKERS.some(function(marker) { return clipMarkerIsOurs(cd, marker); });
-        if (files.length && !ours) { // a foreign image on the OS clipboard → import into the current koma
-          ev.preventDefault();
+      if (state.project && state.project.kind === 'genga') {
+        if (files.length && !GENGA_CLIP_MARKERS.some(function(marker) { return clipMarkerIsOurs(cd, marker); })) {
           gengaOpenImageImportDialog(files, { kind: 'current' });
-          return;
+          return true;
         }
-        if (pending) {
-          ev.preventDefault();
-          pending();
-          return;
-        } // the internal paste Ctrl+V armed
-        // Menu paste without keydown uses the recent-copy order: FX keys, layers, then cels.
-        if (pasteTimelineKeyframeClipboard(ev)) return;
-        if (gengaLayerClipboard && gengaClipIsNewest('layer')) {
-          ev.preventDefault();
-          gengaPasteLayer();
-          return;
-        }
-        if (gengaKomaClipboard) {
-          ev.preventDefault();
-          gengaPasteCells(gengaPasteTargetRange());
-          return;
-        } // our own koma copy (or no image)
-        return;
+        if (gengaKfClipboard && gengaKfClipboard.kind === 'fx' && gengaClipIsNewest('kf')) return gengaPasteKeyframes();
+        if (gengaLayerClipboard && gengaClipIsNewest('layer')) { gengaPasteLayer(); return true; }
+        if (gengaKomaClipboard) { gengaPasteCells(); return true; }
+        return false;
       }
-      // The native event distinguishes a foreign image from our layer or A/V clipboard.
-      // A pending mirror can still make an internal copy the newest.
       const ourConteLayer = clipMarkerIsOurs(cd, CONTE_LAYER_CLIP_MARKER);
       const ourMedia = clipMarkerIsOurs(cd, CONTE_MEDIA_CLIP_MARKER);
-      if (files.length && !ourConteLayer && !ourMedia) { if (conteHandleImagePaste(files)) ev.preventDefault(); return; } // foreign image wins
-      // A/V clips: our own CONTEMEDIA marker, or no marker of ours and the clip copy is the newer internal one
-      if ((ourMedia || (!ourConteLayer && timelineMediaClipboardIsNewest())) && state.timelineMediaClipboard) { if (pasteTimelineMediaClipboard()) ev.preventDefault(); return; }
+      if (files.length && !ourConteLayer && !ourMedia) return conteHandleImagePaste(files);
+      if ((ourMedia || (!ourConteLayer && timelineMediaClipboardIsNewest())) && state.timelineMediaClipboard) {
+        return pasteTimelineMediaClipboard();
+      }
       if (ourConteLayer && !state.conteLayerClipboard) {
-        console.warn('conte paste: CONTE marker on OS clipboard but no internal layer clipboard (stale marker from an earlier session) — ignored');
-        return;
-      } // detection only, no auto-heal
-      if (contePasteLayerClipboard()) ev.preventDefault(); // our own marker (or nothing pasteable) → internal layer paste
+        console.warn('conte paste: CONTE marker on OS clipboard but no internal layer clipboard (stale marker from an earlier session) - ignored');
+        return false;
+      }
+      return contePasteLayerClipboard();
     }
     // conte: Ctrl+V with an image on the system clipboard opens the placement dialog for the selected layer's drawing
     // (video edit mode; the dialog composites over the existing bitmap as one Undo step). Recency
-    // against the internal conte-layer clipboard is decided by handleEditorPaste's CONTE-marker check
+    // against the internal conte-layer clipboard is decided by routeEditorPaste's CONTE-marker check
     // (clipMarkerIsOurs), not here.
     function conteHandleImagePaste(files) {
       if (!state.videoEditMode || !state.selectedConteLayerId) return false;
@@ -160708,37 +160700,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       return true;
     }
 
-    function gengaPasteKeyframeClipboard(event) {
-      const project = state.project, clipboard = gengaKfClipboard;
-      if (!project || project.kind !== 'genga' || !clipboard || !clipboard.keys.length) return false;
-      const selectedCamera = gengaSelectedCamKfs().some(function(frame) { return gengaHasCameraKeyframe(project.gengaTimeline, frame); });
-      if (clipboard.kind === 'camera' ? !timelineCameraPasteContext(selectedCamera) : !gengaClipIsNewest('kf')) return false;
-      // Paste immediately when camera tool or key selection makes the context explicit. FX keys use recent-copy order and defer to external images.
-      if (event && event.type === 'keydown' && clipboard.kind !== 'camera') { event.stopImmediatePropagation(); return armKeydownPaste(event, gengaPasteKeyframes); }
-      if (event) { event.preventDefault(); event.stopImmediatePropagation(); }
-      pendingKeydownPaste = null;
-      gengaPasteKeyframes();
-      return true;
-    }
-
-    // Ctrl+C/X/V for keyframes. Ordered before the koma-range and whole-layer handlers in handlePaintKeydown
-    // because a keyframe selection is the most specific one: a user who just clicked a camera diamond means
-    // that key, not the layer it sits above. Falls through (returns false) whenever no keyframe is selected,
-    // so the koma/layer clipboards keep their existing keys untouched.
-    function handleGengaKeyframeClipboardKey(event) {
-      if (!(state.project && state.project.kind === 'genga')) return false;
-      const k = isTypingTarget(event.target) ? '' : fixedClipboardKey(event);
-      if (!k) return false;
-      const hasKfSel = gengaSelectedCamKfs().length > 0 || gengaSelectedFxKfs().length > 0;
-      if ((k === 'c' || k === 'x') && hasKfSel) {
-        if (!gengaCopyKeyframes(k === 'x')) return false;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return true;
-      }
-      if (k === 'v') return pasteTimelineKeyframeClipboard(event);
-      return false;
-    }
     function gengaRemoveCameraKeyframe(frame) { gengaRemoveCameraKeyframes([frame]); }
     // Delete a whole selection in one undo entry (deleting N keys must not push N history steps).
     function gengaRemoveCameraKeyframes(frames) {
@@ -162044,11 +162005,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return true;
     }
-    // Ctrl+V replaces the visible cell selection even if the playhead is elsewhere.
-    // Without a selection, insert at the playhead, as in TVPaint.
-    function gengaPasteTargetRange() {
-      return state.gengaCellSel || null;
-    }
+    // Paste replaces the visible cell selection, even when the playhead is elsewhere.
     function gengaPasteCells(targetRange) {
       const clipboard = gengaKomaClipboard;
       if (!clipboard || !clipboard.komas.length) return false;
@@ -162170,56 +162127,23 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaPasteFlashTimers.push(setTimeout(function() { d.classList.add('fade'); }, 1000));
       gengaPasteFlashTimers.push(setTimeout(function() { if (d.parentNode) d.parentNode.removeChild(d); }, 2050));
     }
-    function handleGengaCellClipboardKey(event) {
-      if (!(state.project && state.project.kind === 'genga')) return false;
-      const k = isTypingTarget(event.target) ? '' : fixedClipboardKey(event);
-      if (!k) return false;
-      if (k === 'c' || k === 'x') {
-        let selection = state.gengaCellSel;
-        if (!selection && !state.gengaSoloLayerId && !state.gengaSelectedAudioId && !gengaSel) {
-          // Without a selection, target one frame at the playhead even within a held cel.
-          const layer = gengaLayerById(state.gengaSelectedLayerId), frame = gengaCurrentFrame();
-          const exp = layer && !gengaLayerIsFixedRow(layer) && gengaExposureAt(layer, frame);
-          if (exp) selection = { layerId: layer.id, start: frame, end: frame };
-        }
-        if (selection) {
-          event.preventDefault();
-          event.stopImmediatePropagation();
-          // Implicit copy must not create a range selection: Paste inserts at the playhead.
-          gengaCopyOrCutCells(k === 'x', selection);
-          return true;
+    function runGengaClipboardCopy(cut) {
+      const scope = gengaTimelineSelectionScope();
+      if (scope === 'camera' || scope === 'fx') { gengaCopyKeyframes(cut); return; }
+      let selection = scope === 'cell' ? state.gengaCellSel : null;
+      if (!scope && !gengaSel) {
+        // Without a selection, copy one frame at the playhead even within a held cel.
+        const layer = gengaLayerById(state.gengaSelectedLayerId), frame = gengaCurrentFrame();
+        if (layer && !gengaLayerIsFixedRow(layer) && gengaExposureAt(layer, frame)) {
+          selection = { layerId: layer.id, start: frame, end: frame };
         }
       }
-      if (k === 'v' && gengaKomaClipboard && gengaClipIsNewest('koma')) { // Camera context is claimed first; FX still follows copy recency.
-        event.stopImmediatePropagation();
-        return armKeydownPaste(event, function() { gengaPasteCells(gengaPasteTargetRange()); });
+      if (selection) { gengaCopyOrCutCells(cut, selection); return; }
+      const layer = scope === 'layer' && gengaLayerById(state.gengaSoloLayerId);
+      if (layer) {
+        if (cut) gengaCutLayer(layer.id);
+        else gengaCopyLayer(layer.id);
       }
-      return false;
-    }
-    // Whole-layer copy/cut requires the highlighted name/thumbnail (gengaSoloLayerId).
-    // The active drawing layer alone is not an explicit layer selection. Paste keeps clipboard recency.
-    function handleGengaLayerClipboardKey(event) {
-      if (!(state.project && state.project.kind === 'genga')) return false;
-      const k = isTypingTarget(event.target) ? '' : fixedClipboardKey(event);
-      if (!k) return false;
-      // A live cel range owns copy and cut. Paste still uses the recent-copy stamp,
-      // so a just-copied layer can be pasted while cels are selected.
-      if (state.gengaCellSel && k !== 'v') return false;
-      const layer = state.gengaSoloLayerId && gengaLayerById(state.gengaSoloLayerId);
-      if (k === 'c' && layer) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        gengaCopyLayer(layer.id);
-        return true;
-      }
-      if (k === 'x' && layer) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        gengaCutLayer(layer.id);
-        return true;
-      }
-      if (k === 'v' && gengaLayerClipboard && gengaClipIsNewest('layer')) { event.stopImmediatePropagation(); return armKeydownPaste(event, gengaPasteLayer); }
-      return false;
     }
     // would [s,e] overlap any other koma in the layer? (drag-move is rejected on overlap; jump-over to a free gap is fine)
     function gengaRangeOverlapsOther(layer, expId, s, e) {
