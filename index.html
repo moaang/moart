@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3551</title>
+  <title>MoArt ver3552</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -19748,6 +19748,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //
     // Storyboard layers, panels and media
     //   Storyboard layer data and selection
+    //   Storyboard cut, panel and row coordinates
     //   Storyboard layer rows and cut structure
     //   Media tracks and audio clips
     //   Video clips, timeline slots and dissolves
@@ -39623,16 +39624,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function conteLayerOwnerStartIndex(project, cutIdOrIndex) {
-      const index = typeof cutIdOrIndex === 'number' ? cutIdOrIndex : cutIndexById(project, cutIdOrIndex);
-      return cutGroupStartIndex(project, index);
-    }
-
-    function conteLayerOwnerCut(project, cutIdOrIndex) {
-      const startIndex = conteLayerOwnerStartIndex(project, cutIdOrIndex);
-      return startIndex >= 0 ? project.cuts[startIndex] : null;
-    }
-
     function selectedPicturePanelSet() {
       if (!(state.selectedPicturePanelIds instanceof Set)) {
         state.selectedPicturePanelIds = new Set(Array.isArray(state.selectedPicturePanelIds) ? state.selectedPicturePanelIds : []);
@@ -40110,6 +40101,678 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ##################################################################################
 
+    // ## SECTION: Storyboard cut, panel and row coordinates
+    // Resolve numbered cut ownership, timed panel slots and layer rows from the project.
+    // Paper places those same panel IDs in page order. Timeline interaction and rendering share the frame axis.
+    // ##################################################################################
+
+    function cutIndexById(project, cutId) {
+      return project.cuts.findIndex(function(item) { return item.id === cutId; });
+    }
+
+    function cutGroupStartIndex(project, index) {
+      if (!project || index < 0 || index >= project.cuts.length) return -1;
+      for (let cursor = index; cursor >= 0; cursor -= 1) {
+        if (String(project.cuts[cursor] && project.cuts[cursor].cutNo || '').trim()) {
+          const lastIndex = cutGroupLastIndex(project, cursor);
+          return index <= lastIndex ? cursor : -1;
+        }
+      }
+      return -1;
+    }
+
+    function cutGroupLastIndex(project, startIndex) {
+      if (!project || startIndex < 0 || startIndex >= project.cuts.length) return -1;
+      let cursor = startIndex + 1;
+      while (cursor < project.cuts.length && !String(project.cuts[cursor] && project.cuts[cursor].cutNo || '').trim()) {
+        cursor += 1;
+      }
+      const markerBound = cursor - 1;
+      if (cursor < project.cuts.length) return markerBound;
+      let lastContentIndex = startIndex;
+      for (let tail = startIndex + 1; tail <= markerBound; tail += 1) {
+        if (hasCutSlotInformation(project.cuts[tail])) lastContentIndex = tail;
+      }
+      return lastContentIndex;
+    }
+
+    function cutGroupOwnerIdOf(project, cutId) {
+      // Return no owner when the project has no cuts. `cutIndexById` assumes `project.cuts` exists.
+      // In particular, `cutGroupHasOl({}, '')` returns false.
+      if (!project || !Array.isArray(project.cuts)) return '';
+      return conteLayerOwnerCut(project, cutId)?.id || '';
+    }
+
+    function conteLayerOwnerStartIndex(project, cutIdOrIndex) {
+      const index = typeof cutIdOrIndex === 'number' ? cutIdOrIndex : cutIndexById(project, cutIdOrIndex);
+      return cutGroupStartIndex(project, index);
+    }
+
+    function conteLayerOwnerCut(project, cutIdOrIndex) {
+      const startIndex = conteLayerOwnerStartIndex(project, cutIdOrIndex);
+      return startIndex >= 0 ? project.cuts[startIndex] : null;
+    }
+
+    function collectCutTimingGroups(project) {
+      const groups = [];
+      if (!project || !Array.isArray(project.cuts)) return groups;
+      for (let index = 0; index < project.cuts.length; index += 1) {
+        const cut = project.cuts[index];
+        if (!String(cut && cut.cutNo || '').trim()) continue;
+        const lastIndex = cutGroupLastIndex(project, index);
+        groups.push({
+          startIndex: index,
+          lastIndex: lastIndex,
+          cutNo: String(cut.cutNo || '').trim(),
+          durationFrames: Math.max(0, Math.round(Number(cut.durationFrames) || 0)),
+          cuts: project.cuts.slice(index, lastIndex + 1)
+        });
+        index = lastIndex;
+      }
+      return groups;
+    }
+
+    function cutGroupTimelineItems(project) {
+      const groups = collectCutTimingGroups(project);
+      const items = [];
+      let cursor = 0;
+      groups.forEach(function(group, gi) {
+        const frames = Math.max(0, Math.round(Number(group.durationFrames) || 0));
+        let start = cursor;
+        let olPrevFrames = 0;
+        if (gi > 0) {
+          const prev = items[gi - 1];
+          // Clamp so overlaps stay strictly pairwise (at most two cuts overlap at any instant; the CUT-bar toggle
+          // is binary, so a 3-way overlap would be untoggleable):
+          // - <= frames (own length): the overlap can't exceed this cut itself.
+          // - <= prev.frames - prev.olPrevFrames (prev's clean length, not already overlapped from its left):
+          //   keeps this cut from reaching back over the cut before prev.
+          const prevClean = Math.max(0, prev.frames - prev.olPrevFrames);
+          const requested = Math.max(0, Math.min(cutGroupOlPrevFrames(group), frames, prevClean));
+          start = Math.max(prev.startFrame, cursor - requested);
+          olPrevFrames = cursor - start;
+        }
+        items.push({
+          group: group,
+          owner: group.cuts[0],
+          startFrame: start,
+          endFrame: start + frames,
+          frames: frames,
+          olPrevFrames: olPrevFrames
+        });
+        cursor = start + frames;
+      });
+      return items;
+    }
+
+    function timelineGroupItemForOwner(project, ownerCutId) {
+      return cutGroupTimelineItems(project).find(function(item) {
+        return item.owner && item.owner.id === ownerCutId;
+      }) || null;
+    }
+
+    function invalidateVideoTimelineCache() {
+      state.videoTimelineCache = null;
+    }
+
+    function videoTimelineSignature(project) {
+      const activeProject = project || state.project;
+      const meta = activeProject && activeProject.historyMeta || {};
+      const cutCount = activeProject && Array.isArray(activeProject.cuts) ? activeProject.cuts.length : 0;
+      return String(meta.videoTimelineRevision || meta.updatedAt || 0) + ':' + cutCount;
+    }
+
+    // INVARIANT: nothing on a render path may call normalizeProject — it bumps the revision this cache is keyed
+    // on, and one render asks for the timeline thousands of times (a changing key makes the render orders of
+    // magnitude slower).
+    // OL (overlap / cross-dissolve): how many frames this cut group is pulled back over the
+    // previous group. Stored on the group-owner cut (the cutNo / group-start cut). 0 = no OL.
+    function cutGroupOlPrevFrames(group) {
+      const owner = group && group.cuts && group.cuts[0];
+      if (!owner) return 0;
+      // The live timeline and main preview reflect the pending overlap draft before 適用.
+      // Commit writes it into meta; cancel drops it. Without a draft this reads meta.olPrevFrames.
+      const draft = state.olDraft;
+      if (draft && draft.active && draft.frames && Object.prototype.hasOwnProperty.call(draft.frames, owner.id)) {
+        const dv = Number(draft.frames[owner.id]);
+        return dv && dv > 0 ? Math.round(dv) : 0;
+      }
+      const value = owner.meta ? Number(owner.meta.olPrevFrames) : 0;
+      return value && value > 0 ? Math.round(value) : 0;
+    }
+
+    function buildVideoTimelineCached(project) {
+      const activeProject = project || state.project;
+      const signature = videoTimelineSignature(activeProject);
+      const cache = state.videoTimelineCache;
+      if (cache && cache.project === activeProject && cache.signature === signature) return cache.timeline;
+      const timeline = buildVideoTimeline(activeProject);
+      state.videoTimelineCache = { project: activeProject, signature, timeline };
+      return timeline;
+    }
+
+    function buildVideoTimeline(project) {
+      const groups = cutGroupTimelineItems(project);
+      const slots = [];
+      const slotsByGroup = [];
+      const slotByCutId = new Map();   // Index by cut for `videoSlotForCutCached` so it can skip the slot scan.
+      groups.forEach(function(item, groupIndex) {
+        const group = item.group;
+        const cuts = group.cuts && group.cuts.length ? group.cuts : [];
+        slotsByGroup[groupIndex] = [];
+        if (!cuts.length) return;
+        let cursor = item.startFrame;
+        cuts.forEach(function(cut) {
+          const frames = allocatedPictureFrames(cut);
+          const slot = {
+            index: slots.length,
+            groupIndex: groupIndex,
+            group: group,
+            groupStartFrame: item.startFrame,
+            groupEndFrame: item.endFrame,
+            cut: cut,
+            cutNo: group.cutNo,
+            startFrame: Math.min(cursor, item.endFrame),
+            endFrame: Math.min(item.endFrame, cursor + frames),
+            frames: frames
+          };
+          slots.push(slot);
+          slotsByGroup[groupIndex].push(slot);
+          if (!slotByCutId.has(String(cut.id))) slotByCutId.set(String(cut.id), slot);
+          cursor += frames;
+        });
+      });
+      const totalFrames = groups.reduce(function(max, item) { return Math.max(max, item.endFrame); }, 0);
+      // OL support: overlaps[] drives the cross-dissolve preview; primarySegments gives a single
+      // non-overlapping slot per frame (the "active" cut) so frame->slot lookups stay deterministic.
+      // When no OL exists, overlaps is empty and primarySegments is null.
+      const overlaps = buildVideoTimelineOverlaps(groups);
+      const primarySegments = overlaps.length ? buildVideoTimelinePrimarySegments(groups, slotsByGroup, overlaps) : null;
+      const primaryByOwner = overlaps.length ? buildVideoTimelinePrimaryByOwner(groups, overlaps) : null;
+      return {
+        groups: groups,
+        slots: slots,
+        slotsByGroup: slotsByGroup,
+        slotByCutId: slotByCutId,
+        totalFrames: Math.max(1, totalFrames),
+        overlaps: overlaps,
+        primarySegments: primarySegments,
+        primaryByOwner: primaryByOwner
+      };
+    }
+
+    // Shared by buildVideoTimelinePrimaryByOwner/buildVideoTimelinePrimarySegments: "which group a group-boundary
+    // frame belongs to" via the incomingActiveByGroup/pStart math, so the two primary-range consumers can't drift.
+    function videoTimelinePrimaryGroupStarts(items, overlaps) {
+      const incomingActiveByGroup = {};
+      overlaps.forEach(function(ol) { incomingActiveByGroup[ol.groupIndex] = ol.activeIncoming; });
+      return items.map(function(item, gi) {
+        if (gi === 0 || !item.olPrevFrames) return item.startFrame;
+        // overlap window belongs to the incoming group unless the active cut is the outgoing one
+        return incomingActiveByGroup[gi] === false ? items[gi - 1].endFrame : item.startFrame;
+      });
+    }
+
+    function videoTimelinePrimaryGroupRange(items, pStart, gi) {
+      const segStart = pStart[gi];
+      const segEnd = (gi < items.length - 1) ? Math.max(segStart, pStart[gi + 1]) : items[gi].endFrame;
+      return { start: segStart, end: segEnd };
+    }
+
+    // Per-owner primary frame range [start, end): the slice of the timeline where this cut group is
+    // the active/shown one (overlap windows assigned to whichever cut is active). Drives clipping of
+    // the conte layer lane so an overlap region only shows the active cut's layers.
+    function buildVideoTimelinePrimaryByOwner(items, overlaps) {
+      const pStart = videoTimelinePrimaryGroupStarts(items, overlaps);
+      const byOwner = {};
+      items.forEach(function(item, gi) {
+        const owner = item.group && item.group.cuts && item.group.cuts[0];
+        if (!owner) return;
+        byOwner[String(owner.id)] = videoTimelinePrimaryGroupRange(items, pStart, gi);
+      });
+      return byOwner;
+    }
+
+    function olOwnerPrimaryRange(ownerId) {
+      const video = buildVideoTimelineCached(state.project);
+      const map = video && video.primaryByOwner;
+      return map ? (map[String(ownerId || '')] || null) : null;
+    }
+
+    function buildVideoTimelineOverlaps(items) {
+      const overlaps = [];
+      items.forEach(function(item, gi) {
+        if (gi === 0 || !item.olPrevFrames) return;
+        const prev = items[gi - 1];
+        const ownerCut = item.group.cuts[0];
+        const prevCuts = prev.group.cuts;
+        overlaps.push({
+          startFrame: item.startFrame,
+          endFrame: prev.endFrame,
+          frames: item.olPrevFrames,
+          groupIndex: gi,
+          prevGroupIndex: gi - 1,
+          inCutId: ownerCut ? ownerCut.id : '',
+          outCutId: prevCuts && prevCuts.length ? prevCuts[prevCuts.length - 1].id : '',
+          inCutNo: item.group.cutNo,
+          outCutNo: prev.group.cutNo,
+          activeCutId: (ownerCut && ownerCut.meta && ownerCut.meta.olActiveCutId) ? String(ownerCut.meta.olActiveCutId) : (ownerCut ? ownerCut.id : ''),
+          activeIncoming: cutGroupOlActiveIncoming(item)
+        });
+      });
+      return overlaps;
+    }
+
+    function buildVideoTimelinePrimarySegments(items, slotsByGroup, overlaps) {
+      const pStart = videoTimelinePrimaryGroupStarts(items, overlaps);
+      const segments = [];
+      items.forEach(function(item, gi) {
+        const range = videoTimelinePrimaryGroupRange(items, pStart, gi);
+        (slotsByGroup[gi] || []).forEach(function(slot) {
+          const a = Math.max(slot.startFrame, range.start);
+          const b = Math.min(slot.endFrame, range.end);
+          if (b > a) segments.push({ startFrame: a, endFrame: b, slot: slot });
+        });
+      });
+      segments.sort(function(x, y) { return x.startFrame - y.startFrame; });
+      return segments;
+    }
+
+    // Find the element containing the target in the array sorted by `startFrame` and `endFrame`.
+    // Use half-open intervals `[start, end)` so a boundary frame belongs to the following item. `cameraSlotAtFrame` shares this search.
+    // Return the original item. Callers read members such as `.slot` themselves.
+    function frameSpanBinarySearch(items, target) {
+      const list = items || [];
+      let low = 0;
+      let high = list.length - 1;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        const item = list[mid];
+        if (target < item.startFrame) high = mid - 1;
+        else if (target >= item.endFrame) low = mid + 1;
+        else return item;
+      }
+      return null;
+    }
+
+    function videoSlotAtFrame(project, frame) {
+      const video = buildVideoTimelineCached(project);
+      const target = Math.max(0, Math.round(Number(frame) || 0));
+      // When OL overlaps exist, slots can overlap at boundaries; use the precomputed non-overlapping
+      // primary segments (active cut wins) so the binary search stays valid and deterministic.
+      const primary = video.primarySegments;
+      if (primary && primary.length) {
+        const seg = frameSpanBinarySearch(primary, target);
+        return seg ? seg.slot : null;
+      }
+      return frameSpanBinarySearch(video.slots || [], target);
+    }
+
+    function videoSlotForCutCached(project, cutId) {
+      const targetId = String(cutId || '');
+      if (!targetId) return null;
+      return buildVideoTimelineCached(project).slotByCutId.get(targetId) || null;
+    }
+
+    // Return the cut's first slot index or −1. Use the index rather than scanning slots on each playback tick.
+    function videoSlotIndexOfCut(video, cutId) {
+      const slot = cutId != null ? video.slotByCutId.get(String(cutId)) : null;
+      return slot ? slot.index : -1;
+    }
+
+    function cutGroupOwnerIdFromSlot(slot) {
+      const owner = slot && slot.group && slot.group.cuts && slot.group.cuts[0];
+      return owner && owner.id || '';
+    }
+
+    function conteLayerOwnerSlotBounds(slots, ownerCutId) {
+      let start = -1;
+      let end = -1;
+      (slots || []).forEach(function(slot, index) {
+        if (cutGroupOwnerIdFromSlot(slot) !== ownerCutId) return;
+        if (start < 0) start = index;
+        end = index;
+      });
+      return { start: start, end: end };
+    }
+
+    // Start from `startPanelCutId` or the owning cut plus `panelStart`, falling back to zero when necessary.
+    // Clamp within available slots. `layerSlotIndexRange` and `conteLayerRangeFromTimelineLayout` share this rule.
+    function conteLayerSlotRange(video, layer, ownerCut) {
+      const slots = video && video.slots || [];
+      const ownerIndex = Math.max(0, ownerCut && video ? videoSlotIndexOfCut(video, ownerCut.id) : -1);
+      let startIndex = layer && video ? videoSlotIndexOfCut(video, layer.startPanelCutId) : -1;
+      if (startIndex < 0) startIndex = ownerIndex + Math.max(0, Math.round(Number(layer && layer.panelStart) || 0));
+      startIndex = clampInt(startIndex, 0, Math.max(0, slots.length - 1), ownerIndex);
+      const span = clampInt(layer && layer.panelSpan, 1, Math.max(1, slots.length - startIndex), 1);
+      return { startIndex: startIndex, endIndex: Math.min(slots.length - 1, startIndex + span - 1), span: span, slots: slots };
+    }
+
+    function layerSlotIndexRange(project, layer, ownerCut) {
+      return conteLayerSlotRange(buildVideoTimelineCached(project), layer, ownerCut);
+    }
+
+    function timelineSlotRangeFrames(slots, startIndex, endIndex) {
+      const startSlot = slots && slots[startIndex];
+      const endSlot = slots && slots[endIndex];
+      if (!startSlot || !endSlot) return 0;
+      return Math.max(1, Math.round(Number(endSlot.endFrame) || 0) - Math.round(Number(startSlot.startFrame) || 0));
+    }
+
+    function conteLayerLineKey(layer) {
+      if (!layer) return '';
+      return String(layer.layerLineId || layer.originLayerId || layer.id || '');
+    }
+
+    function conteLayerRowsTopToBottom(ownerCut) {
+      const rows = new Map();
+      const layers = Array.isArray(ownerCut && ownerCut.conteLayers) ? ownerCut.conteLayers : [];
+      layers.forEach(function(layer, sourceIndex) {
+        if (!layer || !layer.id) return;
+        const key = conteLayerLineKey(layer);
+        if (!rows.has(key)) rows.set(key, { key: key, sourceIndex: sourceIndex, order: -Infinity, items: [] });
+        const row = rows.get(key);
+        row.order = Math.max(row.order, Math.max(0, Math.round(Number(layer.layerLineOrder || layer.order) || 0)));
+        row.items.push({ layer: layer, sourceIndex: sourceIndex });
+      });
+      return Array.from(rows.values()).sort(function(left, right) {
+        if (left.order !== right.order) return right.order - left.order;
+        return left.sourceIndex - right.sourceIndex;
+      });
+    }
+
+    function normalizeConteLayerRowIndexValue(value, fallback) {
+      const number = Math.round(Number(value));
+      if (Number.isFinite(number) && number >= 0) return number;
+      const fallbackNumber = Math.round(Number(fallback));
+      return Number.isFinite(fallbackNumber) && fallbackNumber >= 0 ? fallbackNumber : -1;
+    }
+
+    function conteLayerRowIndexForOwnerLineKey(ownerCut, lineKey) {
+      const key = String(lineKey || '');
+      if (!ownerCut || !key) return -1;
+      const rows = conteLayerRowsTopToBottom(ownerCut);
+      return rows.findIndex(function(row) { return row && row.key === key; });
+    }
+
+    function conteLayerRowIndexForLayer(project, layerId) {
+      const found = findConteLayerById(project, layerId);
+      if (!found || !found.layer || !found.ownerCut) return -1;
+      return conteLayerRowIndexForOwnerLineKey(found.ownerCut, conteLayerLineKey(found.layer));
+    }
+
+    function conteLayerRowForCut(project, cutId, rowIndex) {
+      const ownerCut = conteLayerOwnerCut(project, cutId);
+      const rows = conteLayerRowsTopToBottom(ownerCut);
+      const index = normalizeConteLayerRowIndexValue(rowIndex, -1);
+      return index >= 0 ? (rows[index] || null) : null;
+    }
+
+    function conteLayerLineKeyForRowIndex(project, cutId, rowIndex) {
+      const row = conteLayerRowForCut(project, cutId, rowIndex);
+      return row && row.key ? String(row.key) : '';
+    }
+
+    function conteLayerRowActiveAtPanel(project, cutId, rowIndex) {
+      const key = conteLayerLineKeyForRowIndex(project, cutId, rowIndex);
+      return key ? conteLayerLineActiveAtPanel(project, cutId, key) : null;
+    }
+
+    function createConteTimelineRenderLayout(video) {
+      const layout = {
+        video: video,
+        rangeByLayerId: new Map(),
+        rowsByOwnerId: new Map(),
+        laneMapByOwnerId: new Map(),
+        displayNameMapByOwnerId: new Map(),
+        trackHeight: 0
+      };
+      const maxLayers = (video.groups || []).reduce(function(max, item) {
+        const owner = item.owner;
+        const layers = Array.isArray(owner.conteLayers) ? owner.conteLayers : [];
+        const rows = conteLayerRowsTopToBottom(owner);
+        const laneMap = conteLayerLaneMapForOwner(owner, rows);
+        layout.rowsByOwnerId.set(owner.id, rows);
+        layout.laneMapByOwnerId.set(owner.id, laneMap);
+        layout.displayNameMapByOwnerId.set(owner.id, conteLayerTimelineDisplayNameMap(layers, laneMap, layout.rangeByLayerId));
+        return Math.max(max, rows.length);
+      }, 1);
+      layout.trackHeight = conteLayerTrackHeight(maxLayers);
+      return layout;
+    }
+
+    function conteLayerRangeFromTimelineLayout(layer, ownerCut, layout) {
+      const cacheKey = layer && layer.id || '';
+      if (cacheKey && layout && layout.rangeByLayerId && layout.rangeByLayerId.has(cacheKey)) {
+        return layout.rangeByLayerId.get(cacheKey);
+      }
+      const range = conteLayerSlotRange(layout && layout.video, layer, ownerCut);
+      if (cacheKey && layout && layout.rangeByLayerId) layout.rangeByLayerId.set(cacheKey, range);
+      return range;
+    }
+
+    function conteLayerLaneMapForOwner(ownerCut, rows = conteLayerRowsTopToBottom(ownerCut)) {
+      const result = new Map();
+      rows.forEach(function(row, index) {
+        row.items.forEach(function(entry) { result.set(entry.layer.id, index); });
+      });
+      return result;
+    }
+
+    function conteLayerRowTop(index) {
+      return index * CONTE_LAYER_DEFAULT_HEIGHT;
+    }
+
+    function conteLayerRowAtY(y, rowCount) {
+      if (!rowCount) return -1;
+      return clampInt(Math.floor(y / CONTE_LAYER_DEFAULT_HEIGHT), 0, rowCount - 1, 0);
+    }
+
+    function conteLayerTrackHeight(rowCount) {
+      return conteLayerRowTop(Math.max(1, rowCount)) + 10; // Track inset.
+    }
+
+    function pageNoForCut(cut) {
+      return Math.max(1, Math.round(Number(cut && cut.pageNo) || 1));
+    }
+
+    // Reuse `rowSpans` already measured for this project, such as during camera edit detection. Otherwise measure here.
+    function relayoutProject(project, rowSpans) {
+      rowSpans = rowSpans || contePanelRowSpans(project);
+      const pages = [];
+      let pageNo = 1;
+      let row = 1;
+      project.cuts.forEach(function(cut, index) {
+        const rowSpan = rowSpans[index];
+        if (row + rowSpan - 1 > ROWS_PER_PAGE) {
+          pageNo += 1;
+          row = 1;
+        }
+        cut.pageNo = pageNo;
+        cut.startRow = row;
+        cut.rowSpan = rowSpan;
+        pages[pageNo - 1] = pages[pageNo - 1] || { pageNo: pageNo, placements: [] };
+        pages[pageNo - 1].placements.push({
+          pageNo: pageNo,
+          cutId: cut.id,
+          startRow: row,
+          rowSpan: rowSpan
+        });
+        row += rowSpan;
+        if (row > ROWS_PER_PAGE) {
+          pageNo += 1;
+          row = 1;
+        }
+      });
+      project.layout.pages = pages.filter(Boolean);
+    }
+
+    // Compute row spans in cut order. Collect and group camera keys once because pagination does not change them.
+    function contePanelRowSpans(project) {
+      const keysByOwnerCut = project.cuts.some(function(cut) { return cut && cut.id; }) ? cameraKeyframesByOwnerCut(project) : null;
+      const metrics = contePaperMetrics();
+      return project.cuts.map(function(cut) {
+        return clampInt(
+          contePanelRowSpan(project, cut, cameraWorkPaperBounds(project, cut, keysByOwnerCut), metrics),
+          1, ROWS_PER_PAGE, 1
+        );
+      });
+    }
+
+    // The row after the last cut is the insertion slot. Only its add button creates a cut.
+    function nextCutGridSlot(project) {
+      const last = project.cuts[project.cuts.length - 1];
+      if (!last) return { pageNo: 1, row: 1 };
+      const { pageNo, startRow, rowSpan } = contePaperPlacement(last);
+      const bottomAbs = contePaperAbsoluteRow(pageNo, startRow + rowSpan - 1);
+      return { pageNo: Math.floor(bottomAbs / ROWS_PER_PAGE) + 1, row: bottomAbs % ROWS_PER_PAGE + 1 };
+    }
+
+    function setCurrentPageToCut(project, cutId) {
+      if (!project || !Array.isArray(project.cuts) || !cutId) return false;
+      const cut = project.cuts.find(function(item) { return item && item.id === cutId; });
+      if (!cut) return false;
+      project.currentPage = pageNoForCut(cut);
+      project.currentPage = clampInt(project.currentPage, 1, totalPagesForProject(project), 1);
+      return true;
+    }
+
+    function cutInsertIndexAfterPage(project, pageNo) {
+      if (!project || !Array.isArray(project.cuts)) return 0;
+      const targetPage = Math.max(1, Math.round(Number(pageNo) || 1));
+      let index = -1;
+      project.cuts.forEach(function(cut, cutIndex) {
+        if (pageNoForCut(cut) <= targetPage) index = cutIndex;
+      });
+      return Math.min(project.cuts.length, Math.max(0, index + 1));
+    }
+
+    function cutIsOnCurrentPage(project, cutId) {
+      if (!project || !Array.isArray(project.cuts) || !cutId) return false;
+      const pageNo = Math.max(1, Math.round(Number(project.currentPage) || 1));
+      const index = cutIndexById(project, cutId);
+      if (index < 0) return false;
+      const cut = project.cuts[index];
+      const cutPage = Math.round(Number(cut && cut.pageNo) || 0);
+      if (cutPage > 0) return cutPage === pageNo;
+      const start = (pageNo - 1) * ROWS_PER_PAGE;
+      return index >= start && index < start + ROWS_PER_PAGE;
+    }
+
+    function firstCutOnCurrentPage(project) {
+      if (!project || !Array.isArray(project.cuts) || !project.cuts.length) return null;
+      const pageNo = Math.max(1, Math.round(Number(project.currentPage) || 1));
+      const byPage = project.cuts.find(function(cut) {
+        return Math.round(Number(cut && cut.pageNo) || 0) === pageNo;
+      });
+      if (byPage) return byPage;
+      return project.cuts[(pageNo - 1) * ROWS_PER_PAGE] || project.cuts[0] || null;
+    }
+
+    // Navigation adds one spare blank page. Exclude it from export with `contentOnly`,
+    // or a user viewing that page could export a blank sheet.
+    function totalPagesForProject(project, opts) {
+      const pages = project && project.layout && Array.isArray(project.layout.pages) ? project.layout.pages : [];
+      if (!pages.length) return 1; // zero cuts -> a single empty page to start drawing on
+      if (opts && opts.contentOnly) return pages.length;
+      // Always offer one trailing empty page so you can navigate one page past the content even when
+      // the current page isn't full (the extra page's cells skip-create panels as usual).
+      return pages.length + 1;
+    }
+
+    function contePaperPlacement(cut) {
+      return {
+        pageNo: pageNoForCut(cut),
+        startRow: Math.max(1, Math.round(Number(cut && cut.startRow) || 1)),
+        rowSpan: clampInt(cut && cut.rowSpan, 1, ROWS_PER_PAGE, 1)
+      };
+    }
+
+    function contePaperPanelsOnPage(project, pageNo) {
+      return project.cuts.filter(function(cut) { return cut.pageNo === pageNo; });
+    }
+
+    function contePaperAbsoluteRow(pageNo, row) {
+      return (pageNo - 1) * ROWS_PER_PAGE + row;
+    }
+
+    function framePercent(frames, targetFrames) {
+      // No target (0) => no proportional bar. Flooring a 0 target to 1 would let any segment (e.g. 間) overflow to full width while the target seconds are unset.
+      const target = Math.round(Number(targetFrames) || 0);
+      if (target <= 0) return 0;
+      return Math.max(0, Math.min(100, Math.round(Number(frames) || 0) / target * 100));
+    }
+
+    // Read the total frames used to lay out the current screen.
+    // `prepareTimelineRuntimeDom` records it on `#timingDashboard` after full and partial renders.
+    // A binding-time total goes stale after partial renders and makes drag deltas wrong.
+    // Do not recalculate `videoTimelineDisplayTotalFrames`: playhead reach can shift it during a drag.
+    function runtimeTimelineTotalFrames(root, anchor, fallback) {
+      const anchorFrames = anchor && anchor.dataset ? Number(anchor.dataset.timelineTotalFrames) : 0;
+      const rootEl = root || state.timelineRuntimeRoot || document.getElementById('timingDashboard');
+      const rootFrames = rootEl && rootEl.dataset ? Number(rootEl.dataset.timelineTotalFrames) : 0;
+      return Math.max(1, Math.round(anchorFrames || rootFrames || Number(fallback) || videoTimelineDisplayTotalFrames(state.project) || 1));
+    }
+
+    function timelineInnerWidthForFramePx(totalFrames, framePx) {
+      const contentWidth = Math.round(Math.max(1, totalFrames) * Math.max(1, framePx));
+      return Math.max(1, contentWidth);
+    }
+
+    function timelineContentWidth(track) {
+      const width = Number(state.timelineInnerWidth) || (track && localRect(track).width) || 1;
+      return Math.max(1, Math.round(width));
+    }
+
+    function timelineXAtFrame(frame, totalFrames, width) {
+      return framePercent(frame, totalFrames) / 100 * width;
+    }
+
+    // For intervals use floor / ceil; seek and move round to the nearest frame. Deltas may be negative.
+    function timelineFrameAtX(x, totalFrames, width, round) {
+      return round(x / width * Math.max(1, totalFrames));
+    }
+
+    function timelineFrameToPixel(frame, totalFrames) {
+      return Math.round(timelineXAtFrame(frame, Math.max(1, totalFrames), timelineContentWidth()));
+    }
+
+    function timelineDragFrameDelta(startX, currentX, totalFrames, track) {
+      return timelineFrameAtX(uiPointerLocalX(currentX - startX), totalFrames, timelineContentWidth(track), Math.round);
+    }
+
+    function timelineFrameFromPointer(track, event, totalFrames, round = Math.round) {
+      const width = timelineContentWidth(track);
+      const x = uiPointerLocalX(event.clientX) - localRect(track).left;
+      return timelineFrameAtX(Math.max(0, Math.min(width, x)), totalFrames, width, round);
+    }
+
+    function timelineFrameAtPointer(root, event, totalFrames) {
+      const lane = root.querySelector('[data-conte-layer-lane="true"]');
+      return lane ? timelineFrameFromPointer(lane, event, totalFrames) : 0;
+    }
+
+    function videoSlotAtTimelinePointer(root, event, totalFrames) {
+      const lane = root.querySelector('[data-conte-layer-lane="true"]');
+      return lane ? videoSlotAtFrame(state.project, timelineFrameFromPointer(lane, event, totalFrames)) : null;
+    }
+
+    function conteSlotsForOwner(video, ownerId) {
+      const head = video.slotByCutId.get(ownerId);
+      return head ? video.slotsByGroup[head.groupIndex] : [];
+    }
+
+    // A grabbed koma stays on its own cut's panel axis, including inside an OL shared with another cut.
+    function conteOwnerSlotAtPointer(root, event, totalFrames, slots, round) {
+      const lane = root.querySelector('[data-conte-layer-lane="true"]');
+      if (!lane || !slots.length) return -1;
+      const frame = timelineFrameFromPointer(lane, event, totalFrames, round);
+      const slot = frameSpanBinarySearch(slots, frame);
+      return (slot || (frame < slots[0].startFrame ? slots[0] : slots[slots.length - 1])).index;
+    }
+
+    // ##################################################################################
+
     // ## SECTION: Storyboard layer rows and cut structure
     // ##################################################################################
     function conteLayerIsBg(layer) {
@@ -40150,47 +40813,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
       });
       return out;
-    }
-
-    function conteLayerLineKey(layer) {
-      return conteLayerLanePreferredKey(layer);
-    }
-
-    function normalizeConteLayerRowIndexValue(value, fallback) {
-      const number = Math.round(Number(value));
-      if (Number.isFinite(number) && number >= 0) return number;
-      const fallbackNumber = Math.round(Number(fallback));
-      return Number.isFinite(fallbackNumber) && fallbackNumber >= 0 ? fallbackNumber : -1;
-    }
-
-    function conteLayerRowIndexForOwnerLineKey(ownerCut, lineKey) {
-      const key = String(lineKey || '');
-      if (!ownerCut || !key) return -1;
-      const rows = conteLayerRowsTopToBottom(ownerCut);
-      return rows.findIndex(function(row) { return row && row.key === key; });
-    }
-
-    function conteLayerRowIndexForLayer(project, layerId) {
-      const found = findConteLayerById(project, layerId);
-      if (!found || !found.layer || !found.ownerCut) return -1;
-      return conteLayerRowIndexForOwnerLineKey(found.ownerCut, conteLayerLineKey(found.layer));
-    }
-
-    function conteLayerRowForCut(project, cutId, rowIndex) {
-      const ownerCut = conteLayerOwnerCut(project, cutId);
-      const rows = conteLayerRowsTopToBottom(ownerCut);
-      const index = normalizeConteLayerRowIndexValue(rowIndex, -1);
-      return index >= 0 ? (rows[index] || null) : null;
-    }
-
-    function conteLayerLineKeyForRowIndex(project, cutId, rowIndex) {
-      const row = conteLayerRowForCut(project, cutId, rowIndex);
-      return row && row.key ? String(row.key) : '';
-    }
-
-    function conteLayerRowActiveAtPanel(project, cutId, rowIndex) {
-      const key = conteLayerLineKeyForRowIndex(project, cutId, rowIndex);
-      return key ? conteLayerLineActiveAtPanel(project, cutId, key) : null;
     }
 
     // Resolve the playhead row from the remembered index, then `lineKey`, then the selected layer ID, then row zero.
@@ -40706,17 +41328,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Sum their durations while preserving picture-panel boundaries and both groups' camera keys.
     // Normalization remaps camera-key owners and local-frame offsets after the groups are combined.
     // Only immediate neighbors qualify; OL on either group prevents merging.
-    function cutGroupOwnerIdOf(project, cutId) {
-      // Return no owner when the project has no cuts. `cutIndexById` assumes `project.cuts` exists.
-      // In particular, `cutGroupHasOl({}, '')` returns false.
-      if (!project || !Array.isArray(project.cuts)) return '';
-      const index = cutIndexById(project, cutId);
-      if (index < 0) return '';
-      const start = cutGroupStartIndex(project, index);
-      const owner = start >= 0 ? project.cuts[start] : null;
-      return owner && owner.id ? owner.id : '';
-    }
-
     function adjacentCutGroupMergeInfo(project, cutId, side) {
       const ownerId = cutGroupOwnerIdOf(project, cutId);
       if (!ownerId) return null;
@@ -41072,30 +41683,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
     }
 
-    function conteLayerRowsTopToBottom(ownerCut) {
-      const rows = new Map();
-      const layers = Array.isArray(ownerCut && ownerCut.conteLayers) ? ownerCut.conteLayers : [];
-      layers.forEach(function(layer, sourceIndex) {
-        if (!layer || !layer.id) return;
-        const key = conteLayerLineKey(layer);
-        if (!rows.has(key)) rows.set(key, { key: key, sourceIndex: sourceIndex, order: -Infinity, items: [] });
-        const row = rows.get(key);
-        row.sourceIndex = Math.min(row.sourceIndex, sourceIndex);
-        row.order = Math.max(row.order, Math.max(0, Math.round(Number(layer.layerLineOrder || layer.order) || 0)));
-        row.items.push({ layer: layer, sourceIndex: sourceIndex });
-      });
-      return Array.from(rows.values()).sort(function(left, right) {
-        if (left.order !== right.order) return right.order - left.order;
-        return left.sourceIndex - right.sourceIndex;
-      }).map(function(row) {
-        row.items.sort(function(left, right) {
-          if (left.sourceIndex !== right.sourceIndex) return left.sourceIndex - right.sourceIndex;
-          return String(left.layer.id || '').localeCompare(String(right.layer.id || ''));
-        });
-        return row;
-      });
-    }
-
     function conteLayerRowBgBundleId(row) {
       const item = row && Array.isArray(row.items) ? row.items.find(function(entry) {
         const layer = entry && entry.layer;
@@ -41191,21 +41778,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
-    // Start from `startPanelCutId` or the owning cut plus `panelStart`, falling back to zero when necessary.
-    // Clamp within available slots. `layerSlotIndexRange` and `conteLayerRangeFromTimelineLayout` share this rule.
-    function conteLayerSlotRange(video, layer, ownerCut) {
-      const slots = video && video.slots || [];
-      const ownerIndex = Math.max(0, ownerCut && video ? videoSlotIndexOfCut(video, ownerCut.id) : -1);
-      let startIndex = layer && video ? videoSlotIndexOfCut(video, layer.startPanelCutId) : -1;
-      if (startIndex < 0) startIndex = ownerIndex + Math.max(0, Math.round(Number(layer && layer.panelStart) || 0));
-      startIndex = clampInt(startIndex, 0, Math.max(0, slots.length - 1), ownerIndex);
-      const span = clampInt(layer && layer.panelSpan, 1, Math.max(1, slots.length - startIndex), 1);
-      return { startIndex: startIndex, endIndex: Math.min(slots.length - 1, startIndex + span - 1), span: span, slots: slots };
-    }
-    function layerSlotIndexRange(project, layer, ownerCut) {
-      return conteLayerSlotRange(buildVideoTimelineCached(project), layer, ownerCut);
-    }
-
     function activeConteLayersForCut(project, cutId) {
       const targetId = String(cutId || '');
       if (!project || !targetId) return [];
@@ -41215,7 +41787,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const ownerCut = conteLayerOwnerCut(project, targetId);
       const layers = Array.isArray(ownerCut && ownerCut.conteLayers) ? ownerCut.conteLayers : [];
       if (!ownerCut || !layers.length) return [];
-      const laneMap = conteLayerLaneMapForOwner(project, ownerCut);
+      const laneMap = conteLayerLaneMapForOwner(ownerCut);
       layers.forEach(function(layer, index) {
         const range = layerSlotIndexRange(project, layer, ownerCut);
         if (targetIndex < range.startIndex || targetIndex > range.endIndex) return;
@@ -41728,37 +42300,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return leftStart <= rightEnd && rightStart <= leftEnd;
     }
 
-    function conteLayerLanePreferredKey(layer) {
-      if (!layer) return '';
-      return String(layer.layerLineId || layer.originLayerId || layer.id || '');
-    }
-
-    function conteLayerLaneMapForOwner(project, ownerCut) {
-      const result = new Map();
-      const layers = Array.isArray(ownerCut && ownerCut.conteLayers) ? ownerCut.conteLayers : [];
-      const rows = new Map();
-      layers.forEach(function(layer, index) {
-        if (!layer || !layer.id) return;
-        const key = conteLayerLanePreferredKey(layer);
-        if (!rows.has(key)) {
-          rows.set(key, { key: key, order: -Infinity, sourceIndex: index, ids: [] });
-        }
-        const row = rows.get(key);
-        row.order = Math.max(row.order, Math.max(0, Math.round(Number(layer.layerLineOrder || layer.order) || 0)));
-        row.sourceIndex = Math.min(row.sourceIndex, index);
-        row.ids.push(layer.id);
-      });
-      Array.from(rows.values()).sort(function(left, right) {
-        if (left.order !== right.order) return right.order - left.order;
-        return left.sourceIndex - right.sourceIndex;
-      }).forEach(function(row, lane) {
-        row.ids.forEach(function(id) {
-          result.set(id, lane);
-        });
-      });
-      return result;
-    }
-
     function conteLayerTimelineDisplayNameMap(layers, laneMap, rangeByLayerId) {
       const rowItems = new Map();
       let maxDrawingLane = -1;
@@ -42231,13 +42772,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function conteLayerLineRangeCollision(project, found, startIndex, endIndex, movingIds) {
       if (!project || !found || !found.layer || !found.ownerCut) return false;
-      const lineKey = conteLayerLanePreferredKey(found.layer);
+      const lineKey = conteLayerLineKey(found.layer);
       if (!lineKey) return false;
       const ids = movingIds instanceof Set ? movingIds : new Set();
       const layers = Array.isArray(found.ownerCut.conteLayers) ? found.ownerCut.conteLayers : [];
       return layers.some(function(layer) {
         if (!layer || !layer.id || ids.has(layer.id)) return false;
-        if (conteLayerLanePreferredKey(layer) !== lineKey) return false;
+        if (conteLayerLineKey(layer) !== lineKey) return false;
         const range = layerSlotIndexRange(project, layer, found.ownerCut);
         return conteLayerRangesOverlap(startIndex, endIndex, range.startIndex, range.endIndex);
       });
@@ -42373,78 +42914,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
     }
 
-    function setCurrentPageToCut(project, cutId) {
-      if (!project || !Array.isArray(project.cuts) || !cutId) return false;
-      const cut = project.cuts.find(function(item) { return item && item.id === cutId; });
-      if (!cut) return false;
-      project.currentPage = pageNoForCut(cut);
-      project.currentPage = clampInt(project.currentPage, 1, totalPagesForProject(project), 1);
-      return true;
-    }
-
-    function cutInsertIndexAfterPage(project, pageNo) {
-      if (!project || !Array.isArray(project.cuts)) return 0;
-      const targetPage = Math.max(1, Math.round(Number(pageNo) || 1));
-      let index = -1;
-      project.cuts.forEach(function(cut, cutIndex) {
-        if (pageNoForCut(cut) <= targetPage) index = cutIndex;
-      });
-      return Math.min(project.cuts.length, Math.max(0, index + 1));
-    }
-
-    // Compute row spans in cut order. Collect and group camera keys once because pagination does not change them.
-    function contePanelRowSpans(project) {
-      const keysByOwnerCut = project.cuts.some(function(cut) { return cut && cut.id; }) ? cameraKeyframesByOwnerCut(project) : null;
-      const metrics = contePaperMetrics();
-      return project.cuts.map(function(cut) {
-        return clampInt(
-          contePanelRowSpan(project, cut, cameraWorkPaperBounds(project, cut, keysByOwnerCut), metrics),
-          1, ROWS_PER_PAGE, 1
-        );
-      });
-    }
-    // Reuse `rowSpans` already measured for this project, such as during camera edit detection. Otherwise measure here.
-    function relayoutProject(project, rowSpans) {
-      rowSpans = rowSpans || contePanelRowSpans(project);
-      const pages = [];
-      let pageNo = 1;
-      let row = 1;
-      project.cuts.forEach(function(cut, index) {
-        const rowSpan = rowSpans[index];
-        if (row + rowSpan - 1 > ROWS_PER_PAGE) {
-          pageNo += 1;
-          row = 1;
-        }
-        cut.pageNo = pageNo;
-        cut.startRow = row;
-        cut.rowSpan = rowSpan;
-        pages[pageNo - 1] = pages[pageNo - 1] || { pageNo: pageNo, placements: [] };
-        pages[pageNo - 1].placements.push({
-          pageNo: pageNo,
-          cutId: cut.id,
-          startRow: row,
-          rowSpan: rowSpan
-        });
-        row += rowSpan;
-        if (row > ROWS_PER_PAGE) {
-          pageNo += 1;
-          row = 1;
-        }
-      });
-      project.layout.pages = pages.filter(Boolean);
-    }
-
-    // Navigation adds one spare blank page. Exclude it from export with `contentOnly`,
-    // or a user viewing that page could export a blank sheet.
-    function totalPagesForProject(project, opts) {
-      const pages = project && project.layout && Array.isArray(project.layout.pages) ? project.layout.pages : [];
-      if (!pages.length) return 1; // zero cuts -> a single empty page to start drawing on
-      if (opts && opts.contentOnly) return pages.length;
-      // Always offer one trailing empty page so you can navigate one page past the content even when
-      // the current page isn't full (the extra page's cells skip-create panels as usual).
-      return pages.length + 1;
-    }
-
     function totalPages() {
       return totalPagesForProject(state.project);
     }
@@ -42454,7 +42923,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function visibleCuts() {
-      return state.project.cuts.filter(function(cut) { return cut.pageNo === state.project.currentPage; });
+      return contePaperPanelsOnPage(state.project, state.project.currentPage);
     }
 
     function pageHasConteInformation(project, pageNo) {
@@ -42464,36 +42933,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-
-    function cutIndexById(project, cutId) {
-      return project.cuts.findIndex(function(item) { return item.id === cutId; });
-    }
-
-    function cutGroupStartIndex(project, index) {
-      if (!project || index < 0 || index >= project.cuts.length) return -1;
-      for (let cursor = index; cursor >= 0; cursor -= 1) {
-        if (String(project.cuts[cursor] && project.cuts[cursor].cutNo || '').trim()) {
-          const lastIndex = cutGroupLastIndex(project, cursor);
-          return index <= lastIndex ? cursor : -1;
-        }
-      }
-      return -1;
-    }
-
-    function cutGroupLastIndex(project, startIndex) {
-      if (!project || startIndex < 0 || startIndex >= project.cuts.length) return -1;
-      let cursor = startIndex + 1;
-      while (cursor < project.cuts.length && !String(project.cuts[cursor] && project.cuts[cursor].cutNo || '').trim()) {
-        cursor += 1;
-      }
-      const markerBound = cursor - 1;
-      if (cursor < project.cuts.length) return markerBound;
-      let lastContentIndex = startIndex;
-      for (let tail = startIndex + 1; tail <= markerBound; tail += 1) {
-        if (hasCutSlotInformation(project.cuts[tail])) lastContentIndex = tail;
-      }
-      return lastContentIndex;
-    }
 
     function hasCutSlotInformation(cut) {
       return Boolean(cut && (
@@ -42735,25 +43174,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         else merged.push(r);
         return merged;
       }, []);
-    }
-
-    function collectCutTimingGroups(project) {
-      const groups = [];
-      if (!project || !Array.isArray(project.cuts)) return groups;
-      for (let index = 0; index < project.cuts.length; index += 1) {
-        const cut = project.cuts[index];
-        if (!String(cut && cut.cutNo || '').trim()) continue;
-        const lastIndex = cutGroupLastIndex(project, index);
-        groups.push({
-          startIndex: index,
-          lastIndex: lastIndex,
-          cutNo: String(cut.cutNo || '').trim(),
-          durationFrames: Math.max(0, Math.round(Number(cut.durationFrames) || 0)),
-          cuts: project.cuts.slice(index, lastIndex + 1)
-        });
-        index = lastIndex;
-      }
-      return groups;
     }
 
     function fpsForProject(project) {
@@ -43993,30 +44413,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ## SECTION: Video clips, timeline slots and dissolves
     // ##################################################################################
-    // Return the cut's first slot index or −1. Use the index rather than scanning slots on each playback tick.
-    function videoSlotIndexOfCut(video, cutId) {
-      const slot = cutId != null ? video.slotByCutId.get(String(cutId)) : null;
-      return slot ? slot.index : -1;
-    }
-
-    function timelineItemsWithOwners(project) {
-      return cutGroupTimelineItems(project).map(function(item) {
-        const owner = item.group && item.group.cuts && item.group.cuts[0];
-        return Object.assign({}, item, { owner: owner });
-      });
-    }
-
-    function timelineGroupItemForOwner(project, ownerCutId) {
-      return timelineItemsWithOwners(project).find(function(item) {
-        return item.owner && item.owner.id === ownerCutId;
-      }) || null;
-    }
-
-    function cutGroupOwnerIdFromSlot(slot) {
-      const owner = slot && slot.group && slot.group.cuts && slot.group.cuts[0];
-      return owner && owner.id || '';
-    }
-
     function setCutGroupFramesByOwnerId(project, ownerCutId, frames) {
       const item = timelineGroupItemForOwner(project, ownerCutId);
       if (!item || !item.group) return;
@@ -44914,69 +45310,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       if (project === state.project) bumpVideoClipCycle();   // Every V1 command passes here (normalizeProject), so the caches re-key
     }
-    function invalidateVideoTimelineCache() {
-      state.videoTimelineCache = null;
-    }
-
-    function videoTimelineSignature(project) {
-      const activeProject = project || state.project;
-      const meta = activeProject && activeProject.historyMeta || {};
-      const cutCount = activeProject && Array.isArray(activeProject.cuts) ? activeProject.cuts.length : 0;
-      return String(meta.videoTimelineRevision || meta.updatedAt || 0) + ':' + cutCount;
-    }
-
-    // INVARIANT: nothing on a render path may call normalizeProject — it bumps the revision this cache is keyed
-    // on, and one render asks for the timeline thousands of times (a changing key makes the render orders of
-    // magnitude slower).
-    // OL (overlap / cross-dissolve): how many frames this cut group is pulled back over the
-    // previous group. Stored on the group-owner cut (the cutNo / group-start cut). 0 = no OL.
-    function cutGroupOlPrevFrames(group) {
-      const owner = group && group.cuts && group.cuts[0];
-      if (!owner) return 0;
-      // The live timeline and main preview reflect the pending overlap draft before 適用.
-      // Commit writes it into meta; cancel drops it. Without a draft this reads meta.olPrevFrames.
-      const draft = state.olDraft;
-      if (draft && draft.active && draft.frames && Object.prototype.hasOwnProperty.call(draft.frames, owner.id)) {
-        const dv = Number(draft.frames[owner.id]);
-        return dv && dv > 0 ? Math.round(dv) : 0;
-      }
-      const value = owner.meta ? Number(owner.meta.olPrevFrames) : 0;
-      return value && value > 0 ? Math.round(value) : 0;
-    }
-
-    function cutGroupTimelineItems(project) {
-      const groups = collectCutTimingGroups(project);
-      const items = [];
-      let cursor = 0;
-      groups.forEach(function(group, gi) {
-        const frames = Math.max(0, Math.round(Number(group.durationFrames) || 0));
-        let start = cursor;
-        let olPrevFrames = 0;
-        if (gi > 0) {
-          const prev = items[gi - 1];
-          // Clamp so overlaps stay strictly pairwise (at most two cuts overlap at any instant; the CUT-bar toggle
-          // is binary, so a 3-way overlap would be untoggleable):
-          // - <= frames (own length): the overlap can't exceed this cut itself.
-          // - <= prev.frames - prev.olPrevFrames (prev's clean length, not already overlapped from its left):
-          //   keeps this cut from reaching back over the cut before prev.
-          const prevClean = Math.max(0, prev.frames - prev.olPrevFrames);
-          const requested = Math.max(0, Math.min(cutGroupOlPrevFrames(group), frames, prevClean));
-          start = Math.max(prev.startFrame, cursor - requested);
-          olPrevFrames = cursor - start;
-        }
-        items.push({
-          group: group,
-          startFrame: start,
-          endFrame: start + frames,
-          frames: frames,
-          olPrevFrames: olPrevFrames
-        });
-        cursor = start + frames;
-      });
-      return items;
-    }
-
-
     function timelineContentTotalFrames(project) {
       const video = buildVideoTimelineCached(project);
       const audioEnd = audioTimelineDisplayClips(project).reduce(function(max, clip) {
@@ -45029,101 +45362,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ##################################################################################
 
-    function buildVideoTimelineCached(project) {
-      const activeProject = project || state.project;
-      const signature = videoTimelineSignature(activeProject);
-      const cache = state.videoTimelineCache;
-      if (cache && cache.project === activeProject && cache.signature === signature) return cache.timeline;
-      const timeline = buildVideoTimeline(activeProject);
-      state.videoTimelineCache = { project: activeProject, signature, timeline };
-      return timeline;
-    }
 
-    function buildVideoTimeline(project) {
-      const groups = cutGroupTimelineItems(project);
-      const slots = [];
-      const slotsByGroup = [];
-      const slotByCutId = new Map();   // Index by cut for `videoSlotForCutCached` so it can skip the slot scan.
-      groups.forEach(function(item, groupIndex) {
-        const group = item.group;
-        const cuts = group.cuts && group.cuts.length ? group.cuts : [];
-        slotsByGroup[groupIndex] = [];
-        if (!cuts.length) return;
-        let cursor = item.startFrame;
-        cuts.forEach(function(cut) {
-          const frames = allocatedPictureFrames(cut);
-          const slot = {
-            index: slots.length,   // `slotByCutId` maps each cut ID directly to its index in `slots`.
-            group: group,
-            groupStartFrame: item.startFrame,
-            groupEndFrame: item.endFrame,
-            cut: cut,
-            cutNo: group.cutNo,
-            startFrame: Math.min(cursor, item.endFrame),
-            endFrame: Math.min(item.endFrame, cursor + frames),
-            frames: frames
-          };
-          slots.push(slot);
-          slotsByGroup[groupIndex].push(slot);
-          if (!slotByCutId.has(String(cut.id))) slotByCutId.set(String(cut.id), slot);
-          cursor += frames;
-        });
-      });
-      const totalFrames = groups.reduce(function(max, item) { return Math.max(max, item.endFrame); }, 0);
-      // OL support: overlaps[] drives the cross-dissolve preview; primarySegments gives a single
-      // non-overlapping slot per frame (the "active" cut) so frame->slot lookups stay deterministic.
-      // When no OL exists, overlaps is empty and primarySegments is null.
-      const overlaps = buildVideoTimelineOverlaps(groups);
-      const primarySegments = overlaps.length ? buildVideoTimelinePrimarySegments(groups, slotsByGroup, overlaps) : null;
-      const primaryByOwner = overlaps.length ? buildVideoTimelinePrimaryByOwner(groups, overlaps) : null;
-      return {
-        groups: groups,
-        slots: slots,
-        slotsByGroup: slotsByGroup,
-        slotByCutId: slotByCutId,
-        totalFrames: Math.max(1, totalFrames),
-        overlaps: overlaps,
-        primarySegments: primarySegments,
-        primaryByOwner: primaryByOwner
-      };
-    }
-
-    // Shared by buildVideoTimelinePrimaryByOwner/buildVideoTimelinePrimarySegments: "which group a group-boundary
-    // frame belongs to" via the incomingActiveByGroup/pStart math, so the two primary-range consumers can't drift.
-    function videoTimelinePrimaryGroupStarts(items, overlaps) {
-      const incomingActiveByGroup = {};
-      overlaps.forEach(function(ol) { incomingActiveByGroup[ol.groupIndex] = ol.activeIncoming; });
-      return items.map(function(item, gi) {
-        if (gi === 0 || !item.olPrevFrames) return item.startFrame;
-        // overlap window belongs to the incoming group unless the active cut is the outgoing one
-        return incomingActiveByGroup[gi] === false ? items[gi - 1].endFrame : item.startFrame;
-      });
-    }
-    function videoTimelinePrimaryGroupRange(items, pStart, gi) {
-      const segStart = pStart[gi];
-      const segEnd = (gi < items.length - 1) ? Math.max(segStart, pStart[gi + 1]) : items[gi].endFrame;
-      return { start: segStart, end: segEnd };
-    }
-
-    // Per-owner primary frame range [start, end): the slice of the timeline where this cut group is
-    // the active/shown one (overlap windows assigned to whichever cut is active). Drives clipping of
-    // the conte layer lane so an overlap region only shows the active cut's layers.
-    function buildVideoTimelinePrimaryByOwner(items, overlaps) {
-      const pStart = videoTimelinePrimaryGroupStarts(items, overlaps);
-      const byOwner = {};
-      items.forEach(function(item, gi) {
-        const owner = item.group && item.group.cuts && item.group.cuts[0];
-        if (!owner) return;
-        byOwner[String(owner.id)] = videoTimelinePrimaryGroupRange(items, pStart, gi);
-      });
-      return byOwner;
-    }
-
-    function olOwnerPrimaryRange(ownerId) {
-      const video = buildVideoTimelineCached(state.project);
-      const map = video && video.primaryByOwner;
-      return map ? (map[String(ownerId || '')] || null) : null;
-    }
 
     // Clips a [startFrame, endFrame) span to the owner cut's primary (active) range so OL overlap
     // regions show/hit only the active cut. Returns null when the span falls entirely in the other
@@ -45143,81 +45382,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const activeId = owner && owner.meta ? String(owner.meta.olActiveCutId || '') : '';
       if (!activeId) return true;
       return activeId === String(owner && owner.id || '');
-    }
-
-    function buildVideoTimelineOverlaps(items) {
-      const overlaps = [];
-      items.forEach(function(item, gi) {
-        if (gi === 0 || !item.olPrevFrames) return;
-        const prev = items[gi - 1];
-        const ownerCut = item.group.cuts[0];
-        const prevCuts = prev.group.cuts;
-        overlaps.push({
-          startFrame: item.startFrame,
-          endFrame: prev.endFrame,
-          frames: item.olPrevFrames,
-          groupIndex: gi,
-          prevGroupIndex: gi - 1,
-          inCutId: ownerCut ? ownerCut.id : '',
-          outCutId: prevCuts && prevCuts.length ? prevCuts[prevCuts.length - 1].id : '',
-          inCutNo: item.group.cutNo,
-          outCutNo: prev.group.cutNo,
-          activeCutId: (ownerCut && ownerCut.meta && ownerCut.meta.olActiveCutId) ? String(ownerCut.meta.olActiveCutId) : (ownerCut ? ownerCut.id : ''),
-          activeIncoming: cutGroupOlActiveIncoming(item)
-        });
-      });
-      return overlaps;
-    }
-
-    function buildVideoTimelinePrimarySegments(items, slotsByGroup, overlaps) {
-      const pStart = videoTimelinePrimaryGroupStarts(items, overlaps);
-      const segments = [];
-      items.forEach(function(item, gi) {
-        const range = videoTimelinePrimaryGroupRange(items, pStart, gi);
-        (slotsByGroup[gi] || []).forEach(function(slot) {
-          const a = Math.max(slot.startFrame, range.start);
-          const b = Math.min(slot.endFrame, range.end);
-          if (b > a) segments.push({ startFrame: a, endFrame: b, slot: slot });
-        });
-      });
-      segments.sort(function(x, y) { return x.startFrame - y.startFrame; });
-      return segments;
-    }
-
-    // Find the element containing the target in the array sorted by `startFrame` and `endFrame`.
-    // Use half-open intervals `[start, end)` so a boundary frame belongs to the following item. `cameraSlotAtFrame` shares this search.
-    // Return the original item. Callers read members such as `.slot` themselves.
-    function frameSpanBinarySearch(items, target) {
-      const list = items || [];
-      let low = 0;
-      let high = list.length - 1;
-      while (low <= high) {
-        const mid = Math.floor((low + high) / 2);
-        const item = list[mid];
-        if (target < item.startFrame) high = mid - 1;
-        else if (target >= item.endFrame) low = mid + 1;
-        else return item;
-      }
-      return null;
-    }
-
-    function videoSlotAtFrame(project, frame) {
-      const video = buildVideoTimelineCached(project);
-      const target = Math.max(0, Math.round(Number(frame) || 0));
-      // When OL overlaps exist, slots can overlap at boundaries; use the precomputed non-overlapping
-      // primary segments (active cut wins) so the binary search stays valid and deterministic.
-      const primary = video.primarySegments;
-      if (primary && primary.length) {
-        const seg = frameSpanBinarySearch(primary, target);
-        return seg ? seg.slot : null;
-      }
-      return frameSpanBinarySearch(video.slots || [], target);
-    }
-
-    function videoSlotForCutCached(project, cutId) {
-      const targetId = String(cutId || '');
-      if (!targetId) return null;
-      return buildVideoTimelineCached(project).slotByCutId.get(targetId) || null;
     }
 
     // OL cross-dissolve: if the playhead is inside an overlap window, returns the outgoing/incoming
@@ -49543,7 +49707,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const innerWidth = timelineInnerWidthForFramePx(totalFrames, framePx);
       state.timelineInnerWidth = innerWidth;
       beginConteTimelineWindow(totalFrames, CONTE_INITIAL_WINDOW_BUFFER_VW); // Full shell starts with a compact overscan; scrolling restores the normal window.
-      const playheadX = playheadLeft / 100 * innerWidth;
+      const playheadX = timelineXAtFrame(state.videoPlayheadFrames, totalFrames, innerWidth);
       // Sibling-column structure: the scroll content reserves no label zone — labels live in a real flex
       // sibling column (.timeline-label-col). Content x=0 is frame 0.
       const innerStyle = 'width:' + innerWidth + 'px;--timeline-label-width:0px';
@@ -50013,8 +50177,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const viewportWidth = scroll.clientWidth ? Math.max(360, scroll.clientWidth) : (targetRoot.clientWidth ? Math.max(360, targetRoot.clientWidth - 24) : (state.timelineViewportWidth || 960));
       state.timelineViewportWidth = viewportWidth;
       const innerWidth = timelineInnerWidthForFramePx(totalFrames, framePx);
+      const sameAxis = state.timelineInnerWidth === innerWidth && Number(targetRoot.dataset.timelineTotalFrames) === totalFrames;
       state.timelineInnerWidth = innerWidth;
-      beginConteTimelineWindow(totalFrames); // Pin the render window before rebuilding the conte tracks
+      // A filtered patch can only describe the existing window: the other owners and shared seams stay in the DOM.
+      const patchOwnerCutIds = sameAxis && state.conteRenderWindow ? options.patchOwnerCutIds : null;
+      if (wants('conte') && !patchOwnerCutIds) beginConteTimelineWindow(totalFrames);
       inner.style.width = innerWidth + 'px';
       inner.style.setProperty('--timeline-label-width', '0px');
 
@@ -50022,7 +50189,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // applyTimelineTrack: an identical string means the DOM already shows this content, and on a large project
       // the conte keyed diff alone is expensive to prove it. An audio-only render never asks for the conte lane,
       // so its koma thumbnails survive instead of being rebuilt + redrawn (a thumbnail flash on every audio edit).
-      const trackCtx = { totalFrames: totalFrames, innerWidth: innerWidth, video: video, patchOwnerCutIds: options.patchOwnerCutIds };
+      const trackCtx = { totalFrames: totalFrames, innerWidth: innerWidth, video: video, patchOwnerCutIds: patchOwnerCutIds };
       let trackFailure = false;
       let conteTrack = inner.querySelector('.conte-video-track');
       let cameraRebuilt = false;
@@ -50727,11 +50894,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return true;
     }
 
-    function timelineInnerWidthForFramePx(totalFrames, framePx) {
-      const contentWidth = Math.round(Math.max(1, totalFrames) * Math.max(1, framePx));
-      return Math.max(1, contentWidth);
-    }
-
     function setTimelineScrollLeftState(scrollLeft) {
       const nextLeft = Math.max(0, Math.round(Number(scrollLeft) || 0));
       state.timelineScrollLeft = nextLeft;
@@ -50758,7 +50920,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Before explicit allocation, use the natural Storyboard height and the existing lower share. Scroll overflowing rows within their area.
     function timelineSectionRowHeight(collapsed) { return collapsed ? TIMELINE_COLLAPSED_ROW_HEIGHT : TIMELINE_AUDIO_SECTION_ROW_HEIGHT; }
     function timelineTracksBounds() {
-      const conteMin = CONTE_LAYER_DEFAULT_HEIGHT + 10;   // One row plus the 10px track inset from `createConteTimelineRenderLayout`.
+      const conteMin = conteLayerTrackHeight(1);
       const lowerMin = timelineSectionRowHeight(state.timelineVideoTracksCollapsed) + timelineSectionRowHeight(state.timelineAudioTracksCollapsed);
       const min = conteMin + lowerMin;
       return { conteMin: conteMin, lowerMin: lowerMin, min: min, max: Math.max(min, Math.round(uiLocalViewportH() - 160)),
@@ -50807,7 +50969,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       let nextLeft = clampInt(state.timelineScrollLeft, 0, maxScroll, 0);
       if (options.centerPlayhead) {
         const totalFrames = Math.max(1, Math.round(Number(options.totalFrames) || 1));
-        const contentX = framePercent(state.videoPlayheadFrames, totalFrames) / 100 * Math.max(1, Math.round(Number(innerWidth) || 1));
+        const contentX = timelineXAtFrame(state.videoPlayheadFrames, totalFrames, Math.max(1, Math.round(Number(innerWidth) || 1)));
         nextLeft = clampInt(Math.round(contentX - liveViewportWidth * 0.5), 0, maxScroll, nextLeft);
       }
       state.timelineScrollLeft = nextLeft;
@@ -51000,47 +51162,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Storyboard timeline layout and dialogue lane
-    function conteLayerRangeFromTimelineLayout(layer, ownerCut, layout) {
-      const cacheKey = layer && layer.id || '';
-      if (cacheKey && layout && layout.rangeByLayerId && layout.rangeByLayerId.has(cacheKey)) {
-        return layout.rangeByLayerId.get(cacheKey);
-      }
-      const range = conteLayerSlotRange(layout && layout.video, layer, ownerCut);
-      if (cacheKey && layout && layout.rangeByLayerId) layout.rangeByLayerId.set(cacheKey, range);
-      return range;
-    }
-
-    function conteLayerLaneMapForOwnerWithLayout(project, ownerCut, layout) {
-      const ownerId = ownerCut && ownerCut.id || '';
-      if (layout && layout.laneMapByOwnerId && layout.laneMapByOwnerId.has(ownerId)) return layout.laneMapByOwnerId.get(ownerId);
-      const result = conteLayerLaneMapForOwner(project, ownerCut);
-      if (layout && layout.laneMapByOwnerId) layout.laneMapByOwnerId.set(ownerId, result);
-      return result;
-    }
-
-    function createConteTimelineRenderLayout(video) {
-      const layout = {
-        video: video,
-        slots: video && video.slots || [],
-        rangeByLayerId: new Map(),
-        laneMapByOwnerId: new Map(),
-        displayNameMapByOwnerId: new Map(),
-        trackHeight: 0
-      };
-      const maxLayers = (video.groups || []).reduce(function(max, item) {
-        const owner = item.group && item.group.cuts && item.group.cuts[0];
-        const layers = owner && Array.isArray(owner.conteLayers) ? owner.conteLayers : [];
-        const laneMap = owner ? conteLayerLaneMapForOwnerWithLayout(state.project, owner, layout) : new Map();
-        if (owner) layout.displayNameMapByOwnerId.set(owner.id, conteLayerTimelineDisplayNameMap(layers, laneMap, layout.rangeByLayerId));
-        return Math.max(max, layers.reduce(function(layerMax, layer, index) {
-          const lane = laneMap.has(layer.id) ? laneMap.get(layer.id) : conteLayerLaneFallbackIndex(index);
-          return Math.max(layerMax, lane + 1);
-        }, 0));
-      }, 1);
-      layout.trackHeight = Math.max(1, maxLayers) * CONTE_LAYER_DEFAULT_HEIGHT + 10;
-      return layout;
-    }
-
 
     // Storyboard セリフ欄 shows when dialogue appears as bold text or subtitles in preview and export.
     // Persist visibility per engine in `localStorage`, defaulting to off. Draw spans from `dialoguePlaybackIndex`.
@@ -52159,13 +52280,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Storyboard timeline window and layer rows
-    function framePercent(frames, targetFrames) {
-      // No target (0) => no proportional bar. Flooring a 0 target to 1 would let any segment (e.g. 間) overflow to full width while the target seconds are unset.
-      const target = Math.round(Number(targetFrames) || 0);
-      if (target <= 0) return 0;
-      return Math.max(0, Math.min(100, Math.round(Number(frames) || 0) / target * 100));
-    }
-
 
     // CUT, camera, and C1 share the same panel band helper so selection reads as one continuous column.
     // Render bands for unselected panels too and toggle `.selected`.
@@ -52219,8 +52333,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return {
         windowed: true,
         rearmVw: Math.min(CONTE_WINDOW_RERENDER_VW, buffer / vw / 2),
-        startFrame: Math.floor(startPx / inner * tf),
-        endFrame: Math.ceil(endPx / inner * tf),
+        startFrame: timelineFrameAtX(startPx, tf, inner, Math.floor),
+        endFrame: timelineFrameAtX(endPx, tf, inner, Math.ceil),
         atStart: startPx <= 0,
         atEnd: endPx >= inner
       };
@@ -52281,7 +52395,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const scroll = clampInt(state.timelineScrollLeft, 0, Math.max(0, inner), 0);
       const trigger = vw * (win.rearmVw == null ? CONTE_WINDOW_RERENDER_VW : win.rearmVw);
       const total = runtimeTimelineTotalFrames();
-      const startPx = win.startFrame / total * inner, endPx = win.endFrame / total * inner;
+      const startPx = timelineXAtFrame(win.startFrame, total, inner), endPx = timelineXAtFrame(win.endFrame, total, inner);
       if (!win.atStart && (scroll - startPx) < trigger) return true;
       if (!win.atEnd && (endPx - (scroll + vw)) < trigger) return true;
       return false;
@@ -52397,17 +52511,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!owner || !Array.isArray(owner.conteLayers) || !owner.conteLayers.length) return '';
         if (!frameSpanInConteWindow(item.startFrame, item.startFrame + item.frames)) return '';
         const ownerId = String(owner.id || '');
-        const rows = conteLayerRowsTopToBottom(owner);
+        const rows = layout.rowsByOwnerId.get(owner.id);
         if (!rows.length) return '';
-        const laneMap = conteLayerLaneMapForOwnerWithLayout(state.project, owner, layout); // layout is always built by the one caller
         const displayNames = layout && layout.displayNameMapByOwnerId && layout.displayNameMapByOwnerId.get(owner.id) || conteLayerDisplayNameMap(owner.conteLayers);
         const ownerSlots = slotsByGroup[groupIndex] || [];
         return rows.map(function(row, rowIndex) {
           const anchorEntry = (row.items || []).find(function(entry) { return entry && entry.layer; }) || null;
           const anchorLayer = anchorEntry && anchorEntry.layer || null;
           if (!anchorLayer) return '';
-          const lane = laneMap.has(anchorLayer.id) ? laneMap.get(anchorLayer.id) : rowIndex;
-          const top = lane * CONTE_LAYER_DEFAULT_HEIGHT;
+          const lane = rowIndex;
+          const top = conteLayerRowTop(lane);
           const lineKey = row.key || conteLayerLineKey(anchorLayer);
           const displayName = displayNames.get(anchorLayer.id) || layerOrderCode(anchorLayer.order);
           return ownerSlots.map(function(slot) {
@@ -52475,7 +52588,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const owner = item.group && item.group.cuts && item.group.cuts[0];
         if (!owner || !Array.isArray(owner.conteLayers)) return '';
         if (conteGroupStartsAfterWindow(item)) return '';
-        const laneMap = conteLayerLaneMapForOwnerWithLayout(state.project, owner, layout); // layout is always built by the one caller
+        const laneMap = layout.laneMapByOwnerId.get(owner.id);
         const bundles = new Map();
         owner.conteLayers.forEach(function(layer, index) {
           if (!layer || layer.layerRole !== 'bg' || !layer.bgBundleId) return;
@@ -52508,8 +52621,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (!box) return;
           const left = box.left;
           const width = box.width;
-          const top = bundle.minLane * CONTE_LAYER_DEFAULT_HEIGHT;
-          const height = (bundle.maxLane - bundle.minLane + 1) * CONTE_LAYER_DEFAULT_HEIGHT;
+          const top = conteLayerRowTop(bundle.minLane);
+          const height = conteLayerRowTop(bundle.maxLane - bundle.minLane + 1);
           parts.push('<span class="conte-layer-bundle-box" data-conte-owner-cut-id="' + escapeAttr(owner.id)
             + '" data-conte-bg-bundle-id="' + escapeAttr(key)
             + '" style="--left:' + left.toFixed(4) + '%;--width:' + width.toFixed(4) + '%;--bundle-top:' + top + 'px;--bundle-height:' + height + 'px"></span>');
@@ -52578,7 +52691,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!owner || !Array.isArray(owner.conteLayers) || !owner.conteLayers.length) return '';
         if (!frameSpanInConteWindow(item.startFrame, item.startFrame + item.frames)) return '';
         const displayNames = layout && layout.displayNameMapByOwnerId && layout.displayNameMapByOwnerId.get(owner.id) || conteLayerDisplayNameMap(owner.conteLayers);
-        const laneMap = conteLayerLaneMapForOwnerWithLayout(state.project, owner, layout); // layout is always built by the one caller
+        const laneMap = layout.laneMapByOwnerId.get(owner.id);
         const byLane = new Map();
         owner.conteLayers.forEach(function(layer, index) {
           if (!layer || !layer.id) return;
@@ -52589,7 +52702,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const left = framePercent(item.startFrame, totalFrames);
         const parts = [];
         byLane.forEach(function(layer, lane) {
-          const top = lane * CONTE_LAYER_DEFAULT_HEIGHT + Math.max(0, Math.floor((CONTE_LAYER_DEFAULT_HEIGHT - CONTE_LAYER_ROW_HANDLE_SIZE) / 2));
+          const top = conteLayerRowTop(lane) + Math.max(0, Math.floor((CONTE_LAYER_DEFAULT_HEIGHT - CONTE_LAYER_ROW_HANDLE_SIZE) / 2));
           // A shared drawing changes in every koma that references it. Only BG uses this path.
           // Dragging, pasting, and edge extension pass `shareDrawing: true` only for `layerRole === 'bg'`.
           // `pasteConteLayerKomaToCell` copies other artwork to a new `drawingRef`.
@@ -52625,7 +52738,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (conteGroupStartsAfterWindow(item)) return '';
         const layers = owner.conteLayers || [];
         const displayNames = layout.displayNameMapByOwnerId.get(owner.id) || conteLayerDisplayNameMap(layers);
-        const laneMap = conteLayerLaneMapForOwnerWithLayout(state.project, owner, layout);
+        const laneMap = layout.laneMapByOwnerId.get(owner.id);
         return layers.map(function(layer, index) {
           const range = conteLayerRangeFromTimelineLayout(layer, owner, layout), startIndex = range.startIndex, span = range.span;
           const startSlot = slots[startIndex] || slots[0];
@@ -52639,7 +52752,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const left = box.left;
           const width = box.width;
           const lane = laneMap.has(layer.id) ? laneMap.get(layer.id) : conteLayerLaneFallbackIndex(index);
-          const top = lane * CONTE_LAYER_DEFAULT_HEIGHT;
+          const top = conteLayerRowTop(lane);
           const selected = selectedLayerIds.has(layer.id) ? ' selected' : '';
           const lineFocus = focusLayerIds.has(layer.id) ? ' line-focus' : '';
           // Mark shared artwork on the eye control with `.conte-layer-row-handle.shared`.
@@ -55937,7 +56050,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           try {
             layerName = conteLayerTimelineDisplayNameMap(
               ref.ownerCut.conteLayers || [],
-              conteLayerLaneMapForOwner(state.project, ref.ownerCut),
+              conteLayerLaneMapForOwner(ref.ownerCut),
               null
             ).get(String(layerId)) || ref.obj.canonicalLayerName || '';
           }
@@ -57004,21 +57117,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ], { width: 170, height: 125 });
     }
 
-    function conteLayerRowIndexAtPointer(root, event, ownerCut) {
-      const lane = root && root.querySelector ? root.querySelector('[data-conte-layer-lane="true"]') : null;
-      const rows = conteLayerRowsTopToBottom(ownerCut);
-      if (!lane || !rows.length) return -1;
-      const rect = lane.getBoundingClientRect();
-      const visualIndex = Math.floor(Math.max(0, (uiPointerY(event.clientY) - rect.top) / uiReadScale()) / CONTE_LAYER_DEFAULT_HEIGHT); // Convert pointer to rectangle coordinates. Row DOM begins at lane y = 0 and advances by row height.
-      return clampInt(visualIndex, 0, rows.length - 1, rows.length - 1);
-    }
-
-    function conteLayerLineKeyAtPointer(root, event, ownerCut) {
-      const rows = conteLayerRowsTopToBottom(ownerCut);
-      const row = rows[conteLayerRowIndexAtPointer(root, event, ownerCut)];
-      return row && row.key || '';
-    }
-
     // The caller sets `onPanel` from the slot at the pressed frame.
     // Beyond all panels, Add Layer has no visible target row.
     // Offer only cut and panel extension there. Empty area below rows within a panel can
@@ -57232,8 +57330,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const slot = videoSlotAtTimelinePointer(root, event, boundTotalFrames(lane));
         const cutId = slot && slot.cut && slot.cut.id || currentPicturePanelId();
         const ownerCut = conteLayerOwnerCut(state.project, cutId);
-        const rowIndex = conteLayerRowIndexAtPointer(root, event, ownerCut);
-        const lineKey = conteLayerLineKeyAtPointer(root, event, ownerCut);
+        const rows = conteLayerRowsTopToBottom(ownerCut);
+        const rowIndex = conteLayerRowAtY(uiPointerLocalY(event.clientY) - localRect(lane).top, rows.length);
+        const lineKey = rows[rowIndex]?.key || '';
         if (cutId && rowIndex >= 0) selectConteLayerCellFromTimeline(root, cutId, rowIndex, '', false);
         else selectTimelinePanelForContextAction(root, cutId);
         // No slot means no panel at that frame. Fall back to the current selection for `cutId`.
@@ -57246,62 +57345,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-
-    // Shared by
-    // videoSlotAtTimelinePointer/videoSlotIndexAtTimelinePointer/timelineFrameAtPointer/layerEdgeSlotIndexAtTimelinePointer
-    // so the lane rect/width read and the clamped [0,1] pointer ratio cannot drift between callers.
-    function conteTimelineLanePointerRatio(root, event) {
-      const lane = root.querySelector('[data-conte-layer-lane="true"]');
-      if (!lane) return null;
-      const rect = lane.getBoundingClientRect();
-      // Normalize the matched pointer/gBCR delta before combining it with local timelineInnerWidth.
-      const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || (rect.width / uiReadScale()) || 1));
-      return Math.max(0, Math.min(1, (uiPointerX(event.clientX) - rect.left) / uiReadScale() / width));
-    }
-
-    function videoSlotAtTimelinePointer(root, event, totalFrames) {
-      const ratio = conteTimelineLanePointerRatio(root, event);
-      if (ratio === null) return null;
-      const frame = Math.round(ratio * totalFrames);
-      return videoSlotAtFrame(state.project, frame);
-    }
-
-    function videoSlotIndexAtTimelinePointer(root, event, totalFrames) {
-      const ratio = conteTimelineLanePointerRatio(root, event);
-      if (ratio === null) return -1;
-      const frame = Math.round(ratio * totalFrames);
-      const slots = buildVideoTimelineCached(state.project).slots || [];
-      for (let index = 0; index < slots.length; index += 1) {
-        if (frame >= slots[index].startFrame && frame < slots[index].endFrame) return index;
-      }
-      return slots.length ? slots.length - 1 : -1;
-    }
-
-    function timelineFrameAtPointer(root, event, totalFrames) {
-      const ratio = conteTimelineLanePointerRatio(root, event);
-      if (ratio === null) return 0;
-      return Math.round(ratio * Math.max(1, totalFrames));
-    }
-
-    function layerEdgeSlotIndexAtTimelinePointer(root, event, totalFrames) {
-      const slots = buildVideoTimelineCached(state.project).slots || [];
-      if (!slots.length) return -1;
-      const ratio = conteTimelineLanePointerRatio(root, event);
-      if (ratio === null) return -1;
-      const frame = Math.max(0, Math.min(Math.max(1, totalFrames) - 1, Math.floor(ratio * Math.max(1, totalFrames))));
-      for (let index = 0; index < slots.length; index += 1) {
-        const slot = slots[index];
-        if (!slot) continue;
-        if (frame >= slot.startFrame && frame < slot.endFrame) return index;
-      }
-      if (frame < slots[0].startFrame) return 0;
-      return slots.length - 1;
-    }
-
-    function timelineFrameDeltaFromPointer(startX, clientX, totalFrames) {
-      const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || 1));
-      return Math.round(uiPointerX(clientX - startX) / uiReadScale() / width * Math.max(1, totalFrames)); // Pointer delta→rect space
-    }
 
     // Fixed-height row geometry is independent of transformed previews. BG bundles stay atomic.
     function createConteLayerSortPreview(root, found) {
@@ -57328,14 +57371,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
         const start = cursor;
         cursor += block.rows.length;
-        return { top: top + start * CONTE_LAYER_DEFAULT_HEIGHT, bottom: top + cursor * CONTE_LAYER_DEFAULT_HEIGHT, nodes: nodes, row: start };
+        return { top: top + conteLayerRowTop(start), bottom: top + conteLayerRowTop(cursor), nodes: nodes, row: start };
       });
       const preview = createListSortPreview(items, from);
       let target = from;
       return {
         rowAt: function(ev) {
           const offset = scrolls.reduce(function(sum, item) { return sum + item.node.scrollTop - item.top; }, 0);
-          return Math.max(0, Math.min(cursor - 1, Math.floor((uiPointerLocalY(ev.clientY) - top + offset) / CONTE_LAYER_DEFAULT_HEIGHT)));
+          return conteLayerRowAtY(uiPointerLocalY(ev.clientY) - top + offset, cursor);
         },
         place: function(row) {
           target = conteLayerRowBlockIndexForRowIndex(blocks, row);
@@ -57347,13 +57390,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         changed: function() { return target !== from; },
         clear: preview.clear
       };
-    }
-
-    function timelineSlotRangeFrames(slots, startIndex, endIndex) {
-      const startSlot = slots && slots[startIndex];
-      const endSlot = slots && slots[endIndex];
-      if (!startSlot || !endSlot) return 0;
-      return Math.max(1, Math.round(Number(endSlot.endFrame) || 0) - Math.round(Number(startSlot.startFrame) || 0));
     }
 
     function applyLayerPreviewToSlotRange(layerEl, slots, startIndex, endIndex, totalFrames) {
@@ -57421,17 +57457,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
 
-    function conteLayerOwnerSlotBounds(slots, ownerCutId) {
-      let start = -1;
-      let end = -1;
-      (slots || []).forEach(function(slot, index) {
-        if (cutGroupOwnerIdFromSlot(slot) !== ownerCutId) return;
-        if (start < 0) start = index;
-        end = index;
-      });
-      return { start: start, end: end };
-    }
-
     // Storyboard lane resizing applies head overwrite and tail ripple on the panel axis.
     // Return the entire row layout from one drag delta, as `gengaHeadDragLayout` does.
     // Share it between preview and commit, restore preview when rejected, and stay inside the owner group.
@@ -57445,11 +57470,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (found.layer.layerRole === 'bg') return null;
       const bounds = conteLayerOwnerSlotBounds(slots, found.ownerCut.id);
       if (bounds.start < 0 || bounds.end < bounds.start) return null;
-      const lineKey = conteLayerLanePreferredKey(found.layer);
+      const lineKey = conteLayerLineKey(found.layer);
       if (!lineKey) return null;
       const layers = Array.isArray(found.ownerCut.conteLayers) ? found.ownerCut.conteLayers : [];
       const lane = layers
-        .filter(function(one) { return one && one.id && one.layerRole !== 'bg' && conteLayerLanePreferredKey(one) === lineKey; })
+        .filter(function(one) { return one && one.id && one.layerRole !== 'bg' && conteLayerLineKey(one) === lineKey; })
         .map(function(one) {
         const r = layerSlotIndexRange(project, one, found.ownerCut);
         return { id: String(one.id), start: r.startIndex, end: r.endIndex };
@@ -57574,9 +57599,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Use vertical movement from the bar body or the vertical-only empty-cell drag.
         const found = findConteLayerById(state.project, layerId);
         if (!found) return;
-        const range = layerSlotIndexRange(state.project, found.layer, found.ownerCut);
-        const slots = range.slots || [];
-        if (!slots.length) return;
+        const video = buildVideoTimelineCached(state.project);
+        const range = conteLayerSlotRange(video, found.layer, found.ownerCut);
+        const slots = range.slots;
+        const ownerSlots = conteSlotsForOwner(video, found.ownerCut.id);
+        if (!ownerSlots.length) return;
         event.preventDefault();
         event.stopPropagation();
         const additivePointer = Boolean(event.shiftKey || event.ctrlKey || event.metaKey);
@@ -57594,11 +57621,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const bodyDragMaxStart = ownerBoundsForBodyDrag.end >= bodyDragMinStart
           ? Math.max(bodyDragMinStart, ownerBoundsForBodyDrag.end - startSpan + 1)
           : startSlotIndex;
-        const pointerDownSlotIndex = videoSlotIndexAtTimelinePointer(root, event, totalFrames);
+        const pointerDownSlotIndex = conteOwnerSlotAtPointer(root, event, totalFrames, ownerSlots, Math.round);
         const dragSlotAnchorOffset = edgeHandle
           ? 0
           : clampInt(pointerDownSlotIndex - startSlotIndex, 0, Math.max(0, startSpan - 1), 0);
-        const startLaneMap = conteLayerLaneMapForOwner(state.project, found.ownerCut);
+        const startLaneMap = conteLayerLaneMapForOwner(found.ownerCut);
         const orderedStartLayers = conteLayersTopToBottom(found.ownerCut.conteLayers || []);
         const startVisualIndex = startLaneMap.has(layerId)
           ? startLaneMap.get(layerId)
@@ -57629,7 +57656,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (!pointerMoved) return;   // Stay in place until the drag threshold is crossed.
           if (edgeHandle) {
             const edge = edgeHandle.dataset.conteLayerEdge || 'right';
-            const targetIndex = layerEdgeSlotIndexAtTimelinePointer(root, moveEvent, totalFrames);
+            const targetIndex = conteOwnerSlotAtPointer(root, moveEvent, totalFrames, ownerSlots, Math.floor);
             if (targetIndex < 0) return;
             if (edge === 'left') {
               latestStart = Math.min(targetIndex, latestEnd);
@@ -57644,7 +57671,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             const rowAtPointer = rowSort.rowAt(moveEvent);
             const onOwnRow = !(rowAtPointer >= 0) || rowAtPointer === startVisualIndex;
             if (onOwnRow) {
-              const targetIndex = videoSlotIndexAtTimelinePointer(root, moveEvent, totalFrames);
+              const targetIndex = conteOwnerSlotAtPointer(root, moveEvent, totalFrames, ownerSlots, Math.round);
               if (targetIndex < 0) return;
               latestStart = clampInt(
                 targetIndex - dragSlotAnchorOffset,
@@ -57839,7 +57866,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           preventDefault: true,
           onMove: function(moveEvent) {
             if (!hasMoveDelta && !pointerDragPassed(moveEvent, startX, startY)) return;   // Stay in place until the drag threshold is crossed.
-            const deltaFrames = timelineFrameDeltaFromPointer(startX, moveEvent.clientX, totalFrames);
+            const deltaFrames = timelineDragFrameDelta(startX, moveEvent.clientX, totalFrames);
             latestDeltaFrames = deltaFrames;
             hasMoveDelta = true;
             const preview = previewForDelta(deltaFrames);
@@ -57851,7 +57878,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           onCommit: function(upEvent) {
             teardown();
             const deltaFrames = hasMoveDelta ? latestDeltaFrames
-              : (pointerDragPassed(upEvent, startX, startY) ? timelineFrameDeltaFromPointer(startX, upEvent.clientX, totalFrames) : 0);
+              : (pointerDragPassed(upEvent, startX, startY) ? timelineDragFrameDelta(startX, upEvent.clientX, totalFrames) : 0);
             // Name Undo by the grip type. Both use the same resize kernel.
             const label = handle.closest('.conte-cut-grips') ? 'Resize cut edge' : 'Resize picture panel timeline edge';
             commitContePanelEdgeResize(panelCutId, edge, deltaFrames, label, previewForDelta);
@@ -58601,9 +58628,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const keepSettledUi = !state.videoPlaying && !state.videoPlaybackStarting
         && !state.audioPlaybackMisses && !(inspector && inspector.contains(document.activeElement));
       if (options.stopPlayback !== false) stopTimelinePlayback(false);
-      const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || 1));
-      const percent = timelineSeekContentXFromPointer(root, track, event, options) / width;
-      state.videoPlayheadFrames = clampTimelinePlayheadFrame(Math.round(percent * totalFrames), totalFrames);
+      const width = timelineContentWidth();
+      const x = timelineSeekContentXFromPointer(root, track, event, options);
+      state.videoPlayheadFrames = clampTimelinePlayheadFrame(timelineFrameAtX(x, totalFrames, width, Math.round), totalFrames);
       updateTimelinePlayheadDom(root, totalFrames);
       updateTimelineTimecodeDom(root, totalFrames);
       if (shouldRender) {
@@ -58655,7 +58682,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const width = Math.max(1, state.timelineInnerWidth || 1);
       playheads.forEach(function(playhead) {
         playhead.style.setProperty('--playhead-left', left.toFixed(2) + '%');
-        playhead.style.setProperty('--playhead-x', (left / 100 * width).toFixed(1) + 'px');
+        playhead.style.setProperty('--playhead-x', timelineXAtFrame(state.videoPlayheadFrames, totalFrames, width).toFixed(1) + 'px');
       });
       // Light the key under the playhead, as genga does. Gated on the integer frame, so playback pays one compare
       // per tick and touches the DOM only when the frame changes; the node list is cached for the lane's lifetime
@@ -58761,7 +58788,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function keepTimelinePlayheadVisible(root, totalFrames) {
       const scrollEl = root.querySelector('.timeline-scroll');
       if (!scrollEl) return;
-      const x = framePercent(state.videoPlayheadFrames, totalFrames) / 100 * Math.max(1, state.timelineInnerWidth || timelineInnerWidthForFramePx(totalFrames, state.timelineFramePx));
+      const x = timelineXAtFrame(state.videoPlayheadFrames, totalFrames, state.timelineInnerWidth || timelineInnerWidthForFramePx(totalFrames, state.timelineFramePx));
       const left = scrollEl.scrollLeft;
       const right = left + scrollEl.clientWidth;
       const margin = 26;
@@ -58816,22 +58843,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       jumpTimelineViewportToScrollLeft(targetRoot, 0);
     }
 
-    // Read the total frames used to lay out the current screen.
-    // `prepareTimelineRuntimeDom` records it on `#timingDashboard` after full and partial renders.
-    // A binding-time total goes stale after partial renders and makes drag deltas wrong.
-    // Do not recalculate `videoTimelineDisplayTotalFrames`: playhead reach can shift it during a drag.
-    function runtimeTimelineTotalFrames(root, anchor, fallback) {
-      const anchorFrames = anchor && anchor.dataset ? Number(anchor.dataset.timelineTotalFrames) : 0;
-      const rootEl = root || state.timelineRuntimeRoot || document.getElementById('timingDashboard');
-      const rootFrames = rootEl && rootEl.dataset ? Number(rootEl.dataset.timelineTotalFrames) : 0;
-      return Math.max(1, Math.round(anchorFrames || rootFrames || Number(fallback) || videoTimelineDisplayTotalFrames(state.project) || 1));
-    }
-
-    function timelineDragFrameDelta(startX, currentX, totalFrames, track) {
-      const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || (track ? track.getBoundingClientRect().width / uiReadScale() : 0) || 1));
-      return Math.round(uiPointerLocalX(currentX - startX) / width * Math.max(1, Math.round(Number(totalFrames) || 1))); // pointer delta (visual px) -> local px on both engines, like timelineFrameDeltaFromPointer
-    }
-
     function audioTrimEdgeFromPointer(clipEl, event) {
       const explicitEdge = event.target && event.target.dataset ? event.target.dataset.audioTrimEdge || '' : '';
       if (explicitEdge) return explicitEdge;
@@ -58845,13 +58856,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (leftDistance <= edgePx) return 'left';
       if (rightDistance <= edgePx) return 'right';
       return '';
-    }
-
-    function timelineFrameToPixel(frame, totalFrames) {
-      const total = Math.max(1, Math.round(Number(totalFrames) || 1));
-      const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || 1));
-      const value = clampInt(Math.round(Number(frame) || 0), 0, total, 0);
-      return Math.round(value / total * width);
     }
 
     function updateAudioDragPreview(previewEl, startFrame, durationFrames, totalFrames) {
@@ -59884,13 +59888,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const name = String(file && file.name || '');
       const type = String(file && file.type || '');
       return /^audio\//i.test(type) || /\.(wav|mp3|m4a|aac|ogg|flac|webm)$/i.test(name);
-    }
-
-    function timelineFrameFromPointer(track, event, totalFrames) {
-      const rect = track.getBoundingClientRect();
-      const width = Math.max(1, Math.round(Number(state.timelineInnerWidth) || (rect.width / uiReadScale()) || 1)); // viewport→local
-      const percent = Math.max(0, Math.min(1, (uiPointerX(event.clientX) - rect.left) / uiReadScale() / width)); // Pointer→rect space
-      return clampInt(Math.round(percent * totalFrames), 0, totalFrames, 0);
     }
 
     function selectAudioClip(clipId, root) {
@@ -66015,32 +66012,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       pageHost.dataset.moved = 'true';
     }
 
-    function pageNoForCut(cut) {
-      return Math.max(1, Math.round(Number(cut && cut.pageNo) || 1));
-    }
-
-    function cutIsOnCurrentPage(project, cutId) {
-      if (!project || !Array.isArray(project.cuts) || !cutId) return false;
-      const pageNo = Math.max(1, Math.round(Number(project.currentPage) || 1));
-      const index = cutIndexById(project, cutId);
-      if (index < 0) return false;
-      const cut = project.cuts[index];
-      const cutPage = Math.round(Number(cut && cut.pageNo) || 0);
-      if (cutPage > 0) return cutPage === pageNo;
-      const start = (pageNo - 1) * ROWS_PER_PAGE;
-      return index >= start && index < start + ROWS_PER_PAGE;
-    }
-
-    function firstCutOnCurrentPage(project) {
-      if (!project || !Array.isArray(project.cuts) || !project.cuts.length) return null;
-      const pageNo = Math.max(1, Math.round(Number(project.currentPage) || 1));
-      const byPage = project.cuts.find(function(cut) {
-        return Math.round(Number(cut && cut.pageNo) || 0) === pageNo;
-      });
-      if (byPage) return byPage;
-      return project.cuts[(pageNo - 1) * ROWS_PER_PAGE] || project.cuts[0] || null;
-    }
-
     function updatePaperSelectionToCurrentPage(project) {
       if (state.videoEditMode || !project || !Array.isArray(project.cuts) || !project.cuts.length) return false;
       if (cutIsOnCurrentPage(project, currentPicturePanelId())) return false;
@@ -66271,23 +66242,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function renderEmptyGridCells(bodyEl, cuts, addRow) {
       const occupied = new Set();
       cuts.forEach(function(cut) {
-        const row = Math.max(1, Math.round(Number(cut.startRow) || 1));
-        const span = clampInt(cut.rowSpan, 1, ROWS_PER_PAGE, 1);
+        const { startRow: row, rowSpan: span } = contePaperPlacement(cut);
         for (let r = row; r <= row + span - 1; r += 1) occupied.add(r);
       });
       for (let row = 1; row <= ROWS_PER_PAGE; row += 1) {
         if (occupied.has(row)) continue;
         appendEmptyGridRow(bodyEl, row, row === addRow);
       }
-    }
-
-    // The row after the last cut is the insertion slot. Only its add button creates a cut.
-    function nextCutGridSlot(project) {
-      const last = project.cuts[project.cuts.length - 1];
-      if (!last) return { pageNo: 1, row: 1 };
-      const bottomAbs = (Math.max(1, Math.round(Number(last.pageNo) || 1)) - 1) * ROWS_PER_PAGE
-        + Math.max(1, Math.round(Number(last.startRow) || 1)) + clampInt(last.rowSpan, 1, ROWS_PER_PAGE, 1) - 1;
-      return { pageNo: Math.floor(bottomAbs / ROWS_PER_PAGE) + 1, row: bottomAbs % ROWS_PER_PAGE + 1 };
     }
 
     // An empty-area click clears selection and keeps the playhead and current panel pointer.
@@ -66357,15 +66318,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Empty grid cells accept a dragged cut marker too: dropping a cut onto an empty row below it
     // moves it down (inserts continuation panels) so the cut lands on that row.
     function makeEmptyCellCutDropTarget(el, targetRow) {
-      const targetAbsRow = (Math.max(1, state.project.currentPage) - 1) * ROWS_PER_PAGE + Math.max(1, targetRow);
+      const targetAbsRow = contePaperAbsoluteRow(Math.max(1, state.project.currentPage), Math.max(1, targetRow));
       // Rows are not cut indices (a camera-work cut spans 2-3 rows, a page break leaves rows empty). Moving down
       // inserts 1+0 panels right after the previous cut, so the destination is the source index plus the rows
       // between the previous cut's bottom and the dropped row (the gap is filled with the previous cut's 1+0 panels).
       const destinationIndex = function(project, sourceIndex) {
         const previous = project.cuts[sourceIndex - 1];
         if (!previous) return sourceIndex;
-        const previousBottomAbs = (Math.max(1, Math.round(Number(previous.pageNo) || 1)) - 1) * ROWS_PER_PAGE
-          + Math.max(1, Math.round(Number(previous.startRow) || 1)) + clampInt(previous.rowSpan, 1, ROWS_PER_PAGE, 1) - 1;
+        const { pageNo, startRow, rowSpan } = contePaperPlacement(previous);
+        const previousBottomAbs = contePaperAbsoluteRow(pageNo, startRow + rowSpan - 1);
         return sourceIndex + targetAbsRow - previousBottomAbs - 1;
       };
       el.addEventListener('dragover', function(event) {
@@ -66398,8 +66359,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Use the given paper display settings or the project defaults. Export preview passes its own copy.
     function renderCut(cut, bodyEl, display) {
       display = display || contePaperDisplay(state.project);
-      const row = cut.startRow;
-      const rowSpan = clampInt(cut.rowSpan, 1, ROWS_PER_PAGE, 1);
+      const { startRow: row, rowSpan } = contePaperPlacement(cut);
       const gridRow = rowSpan > 1 ? row + ' / span ' + rowSpan : String(row);
       const cameraBounds = cameraWorkPaperBounds(state.project, cut);
       const cellLayout = paperCellDomLayout(cut, cameraBounds, display);
@@ -119878,7 +119838,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const host = document.getElementById('exportPaperPreviewHost'),
         paper = defaultPaperSpec(),
         display = exportPaperDisplay();
-      const cuts = state.project.cuts.filter(function(cut) { return cut.pageNo === pageNo; });
+      const cuts = contePaperPanelsOnPage(state.project, pageNo);
       const stage = document.createElement('div');
       stage.className = 'conte-paper-stage export-paper-preview-stage';
       stage.inert = true;   // This view is read-only. Keep sheet handles and cells from receiving pointer events or focus.
@@ -122314,7 +122274,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Return bottom-to-top cels [{code, exposures: [{start, end, layers}]}] with bottom-to-top layers and cut-local [start,end).
     function conteCtCelPlan(project, ownerCut, layout) {
       const totalFrames = Math.max(1, Math.round(Number(ownerCut.durationFrames) || 1));
-      const laneMap = conteLayerLaneMapForOwner(project, ownerCut);
+      const laneMap = conteLayerLaneMapForOwner(ownerCut);
       const byLane = new Map();
       (Array.isArray(ownerCut.conteLayers) ? ownerCut.conteLayers : []).forEach(function(l) {
         if (!l || l.visible === false || !layerDrawingHasInk(ensureLayerDrawingData(project, l.drawingRef), l.drawingRef)) return;
@@ -122966,7 +122926,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     async function renderOutputLayers(pageNo, project, display, carry) {
       pageNo = pageNo == null ? project.currentPage : pageNo;
       display = display || contePaperDisplay(project);
-      const cuts = project.cuts.filter(function(cut) { return cut.pageNo === pageNo; });
+      const cuts = contePaperPanelsOnPage(project, pageNo);
       const paper = defaultPaperSpec();
       const width = paper.width;
       const height = paper.height;
@@ -123025,8 +122985,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       const interiorRowBoundaries = new Set();
       cuts.forEach(function(cut) {
-        const start = Math.max(1, Math.round(Number(cut && cut.startRow) || 1));
-        const span = clampInt(cut && cut.rowSpan, 1, ROWS_PER_PAGE, 1);
+        const { startRow: start, rowSpan: span } = contePaperPlacement(cut);
         for (let offset = 1; offset < span; offset += 1) {
           interiorRowBoundaries.add(start + offset - 1);
         }
