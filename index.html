@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3557</title>
+  <title>MoArt ver3558</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -23928,7 +23928,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           en: function(reason) { return 'Recording blocked: ' + reason; },
           zh: function(reason) { return '已阻止录音：' + reason; }
         },
-        'status.audioRecording.discardedProjectChanged': { ja: '録音を破棄しました：録音中にプロジェクトが切り替わりました。', ko: '녹음을 폐기했습니다: 녹음 중에 프로젝트가 바뀌었습니다.', en: 'Recording discarded: the project changed while recording.', zh: '已放弃录音：录音期间项目已切换。' },
         'status.audioRecording.discardedEmpty': { ja: '録音を破棄しました：音声データがありません。', ko: '녹음을 폐기했습니다: 오디오 데이터가 없습니다.', en: 'Recording discarded: no audio data.', zh: '已放弃录音：没有音频数据。' },
         'status.audioRecording.inProgress': {
           ja: function(trackLabel) { return '録音中… ' + trackLabel; },
@@ -25496,8 +25495,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       activeSpeechClipId: '',
       renderedActiveSpeechClipId: '',
       audioDrag: null,
-      audioRecordingSession: null,
-      audioRecordingStopEl: null,
       playingAudioElements: [],
       videoPreloadedLayerImages: new Map(), // byte-budgeted LRU Map
       videoPreloadFrame: -1,
@@ -30937,6 +30934,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           if (Object.prototype.hasOwnProperty.call(nowSettings, key)) nextSettings[key] = nowSettings[key]; else delete nextSettings[key];
         });
         restoreLayerLiveBitmapsFromSnapshot(previousProject, state.project);
+        restoreAnimationRecordingOwner(previousProject);
       }
       if (!options.sameProject) {
         clearProjectHistory();
@@ -30984,6 +30982,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       twoFingerLastTapAt = 0;
       twoFingerLastTapUndid = false;
       if (paraparaKeyHold) paraparaClear();
+      cancelAudioRecording();
       closeAudioInputSettings();
       cancelPointerDrags();
       if (longPressContacts) longPressContacts.cancelPending();
@@ -31066,7 +31065,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function resetProjectForNewProject(opts) {
       const previousId = String(state.project && state.project.projectId || '');
       const previousHead = projectSaveHeads.get(previousId);
-      try { stopActiveAudioRecording(); } catch (error) {} // a new project must not leave the mic recording into the old one (finalize discards on the projectId mismatch)
       teardownProjectFloatingWindows();
       resetProjectTransientRuntime();
       clearWorkspaceConnection({ forgetSavedHandle: true });
@@ -31115,35 +31113,37 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return true; // not comparable → same contract as the baseline writer: assume there is something to lose
       }
     }
-    // A replacement owns both the project identity and the content the user agreed to discard.
     async function confirmProjectReplacement(owner, messageKey) {
       if (!projectIoOwnerCurrent(owner)) return null;
+      if (!await settleAudioRecordingBeforeProjectExit(owner)) return null;
       const before = projectUnsavedSnapshot();
-      if (!(await confirmDiscardUnsaved(messageKey, owner))) return null;
+      if (!(await confirmDiscardProjectEdits(messageKey, owner))) return null;
       if (!projectIoOwnerCurrent(owner)) return null;
       const snapshot = projectUnsavedSnapshot();
-      // Edits made while the question was open are not covered by the original consent.
       if (snapshot !== before && projectHasUnsavedChanges()) throw new Error(t('msg.project.changedDuringLoad'));
       return snapshot;
     }
     function assertProjectReplacement(owner, snapshot) {
       assertProjectIoOwner(owner);
-      if (snapshot !== projectUnsavedSnapshot()) throw new Error(t('msg.project.changedDuringLoad'));
+      if (audioRecordingInProgress(owner.project) || owner.request?.canLeaveRecording?.() === false || snapshot !== projectUnsavedSnapshot()) {
+        throw new Error(t('msg.project.changedDuringLoad'));
+      }
     }
-    // Ask only when a project is open; the locked start screen has nothing to lose.
     async function confirmDiscardUnsavedForNew() {
       return confirmDiscardUnsaved('msg.project.unsavedNew');
     }
-    // Shared by every "this will drop the in-memory project" action. messageKey picks the prompt so
     // the dialog says what is actually about to happen — 'new project' vs 'close this tab'.
-    async function confirmDiscardUnsaved(messageKey, owner) {
-      owner = owner || projectIoOwner();
+    async function confirmDiscardUnsaved(messageKey, owner = projectIoOwner()) {
       if (!projectIoOwnerCurrent(owner)) return false;
+      return await settleAudioRecordingBeforeProjectExit(owner) && await confirmDiscardProjectEdits(messageKey, owner);
+    }
+
+    async function confirmDiscardProjectEdits(messageKey, owner) {
       if (!projectHasUnsavedChanges()) return true;
       const choice = await askUnsavedChoice(messageKey);
       if (choice === 'cancel' || !projectIoOwnerCurrent(owner)) return false;
       if (choice === 'save' && !await saveJson(owner)) return false;
-      return projectIoOwnerCurrent(owner);
+      return projectIoOwnerCurrent(owner) && !audioRecordingInProgress(owner.project);
     }
     function askUnsavedChoice(messageKey) {
       return askActionChoice(t(messageKey || 'msg.project.unsavedNew'), [
@@ -31388,10 +31388,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Do not render/auto-pin until projectActive is false.
       await unpinProjectSlot(id, { deferRender: true });
       if (!projectIoOwnerCurrent(request.owner)) { console.info('[project-load] Previous tab close discarded'); return; }
+      if (audioRecordingInProgress(request.owner.project)) {
+        renderProjectTabBar();
+        alert(t('msg.project.switchBlockedBySave'));
+        return;
+      }
       stopTimelinePlayback(false);
       stopGengaPlayback();
-      stopActiveAudioRecording();
-      gengaStopRecording(gengaRecSession, true);
       releaseProjectTabHistory(id);
       clearProjectHistory();
       setProjectActive(false, { handingOver: Boolean(nextId) });
@@ -54453,7 +54456,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return candidates.find(function(type) { return MediaRecorder.isTypeSupported(type); }) || '';
     }
 
-    // Recording input belongs to this browser, never to a project or exported preferences.
     const AUDIO_INPUT_STORAGE_KEY = 'moartAudioInputDevice';
     let audioInputChoice = null;
     let audioInputRequestPending = false;
@@ -54514,7 +54516,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const fill = meter.firstElementChild;
       const media = navigator.mediaDevices;
       let closed = false, probe = null, listGeneration = 0;
-      const recording = state.audioRecordingSession || gengaRecSession;
+      const recording = activeAudioRecording;
       const busy = Boolean(recording || audioInputRequestPending);
       const setStatus = function(message) { if (!closed) status.textContent = message; };
       const showTrack = function(stream) {
@@ -54526,7 +54528,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         probe = null;
         if (previous) {
           cancelAnimationFrame(previous.raf);
-          if (previous.stream) previous.stream.getTracks().forEach(function(track) { track.stop(); });
+          releaseAudioRecordingStream(previous.stream);
           if (previous.source) previous.source.disconnect();
           if (previous.context) previous.context.close().catch(function(error) { console.warn('[audio input] Test context close failed.', error); });
         }
@@ -54560,7 +54562,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (audioInputDialog && audioInputDialog.element === dlg) audioInputDialog = null;
       };
       const close = function() { cleanup(); if (dlg.open) dlg.close('close'); };
-      // Backgrounding stops only an active input test. Keep busy recording text and other statuses.
       const onVisibility = function() { if (document.hidden && probe) { stopTest(); setStatus(t('audio.input.ready')); } };
       audioInputDialog = { element: dlg, close: close };
       select.disabled = busy;
@@ -54581,7 +54582,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         setStatus(t('audio.input.requesting'));
         try {
           const stream = await requestAudioInputStream();
-          if (closed || probe !== current) { stream.getTracks().forEach(function(track) { track.stop(); }); return; }
+          if (closed || probe !== current) {
+            releaseAudioRecordingStream(stream);
+            return;
+          }
           current.stream = stream;
           showTrack(stream);
           refreshDevices();
@@ -54590,7 +54594,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           current.source = current.context.createMediaStreamSource(stream);
           const analyser = current.context.createAnalyser();
           analyser.fftSize = 256;
-          current.source.connect(analyser); // Deliberately no speaker connection: no feedback or saved audio.
+          current.source.connect(analyser);
           await current.context.resume();
           if (closed || probe !== current) return;
           const samples = new Float32Array(analyser.fftSize);
@@ -54628,9 +54632,200 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       finally { cleanup(); dlg.remove(); }
     }
 
+    let activeAudioRecording = null;
+    const audioRecordingPublications = new WeakMap();
+
+    function recordingPublications(project) {
+      let pending = audioRecordingPublications.get(project);
+      if (!pending) {
+        pending = { jobs: new Set(), revision: 0, failed: false };
+        audioRecordingPublications.set(project, pending);
+      }
+      return pending;
+    }
+
+    function trackAudioRecordingPublication(project, publish) {
+      const pending = recordingPublications(project);
+      pending.revision += 1;
+      const tracked = Promise.resolve().then(publish).then(function(ok) {
+        if (ok !== true) pending.failed = true;
+      }, function(error) {
+        pending.failed = true;
+        console.error('[recording] Publication failed', error);
+      }).finally(function() { pending.jobs.delete(tracked); });
+      pending.jobs.add(tracked);
+    }
+
+    async function awaitAudioRecordingPublications(project) {
+      const pending = recordingPublications(project);
+      while (pending.jobs.size) await Promise.all(pending.jobs);
+      const ok = !pending.failed;
+      pending.failed = false;
+      return ok;
+    }
+
+    function audioRecordingRevision(project) {
+      return audioRecordingPublications.get(project)?.revision || 0;
+    }
+
+    function audioRecordingInProgress(project) {
+      return activeAudioRecording?.owner.project === project || Boolean(audioRecordingPublications.get(project)?.jobs.size);
+    }
+
+    function audioRecordingInputBusy() {
+      return Boolean(activeAudioRecording || audioInputRequestPending);
+    }
+
+    function releaseAudioRecordingStream(stream) {
+      if (!stream) return;
+      for (const track of stream.getTracks()) {
+        try { track.stop(); }
+        catch (error) { console.warn('[recording] Track release failed', error); }
+      }
+    }
+
+    function restoreAnimationRecordingOwner(previousProject) {
+      const recording = activeAudioRecording;
+      if (recording?.kind === 'genga' && recording.owner.project === previousProject) {
+        recording.owner = projectIoOwner();
+      }
+    }
+
+    function assertAudioRecordingStart(session) {
+      if (activeAudioRecording !== session) throw new DOMException('Recording cancelled', 'AbortError');
+      assertProjectIoOwner(session.owner);
+    }
+
+    async function abortAudioRecordingDestination(session) {
+      try { await session.take.abort?.(); }
+      catch (error) { console.warn('[recording] Destination abort failed', error); }
+    }
+
+    function detachAudioRecording(session, phase) {
+      session.phase = phase;
+      activeAudioRecording = null;
+      releaseAudioRecordingStream(session.stream);
+      session.stream = null;
+      session.take.render(session, 'idle');
+    }
+
+    function finishAudioRecording(session) {
+      if (activeAudioRecording !== session) return;
+      session.stoppedAt ??= performance.now();
+      trackAudioRecordingPublication(session.owner.project, async function() {
+        try {
+          assertProjectIoOwner(session.owner);
+          if (session.error) throw session.error;
+          return await session.take.publish(session);
+        } catch (error) {
+          await abortAudioRecordingDestination(session);
+          if (projectIoOwnerCurrent(session.owner)) session.take.saveFailed(error);
+          return false;
+        }
+      });
+      detachAudioRecording(session, 'publishing');
+      session.resolveStopped();
+    }
+
+    function cancelAudioRecording() {
+      const session = activeAudioRecording;
+      if (!session) return;
+      const starting = session.phase === 'starting';
+      detachAudioRecording(session, 'cancelled');
+      try { stopMediaRecorder(session.recorder); }
+      catch (error) { console.warn('[recording] Recorder stop failed', error); }
+      if (!starting) void abortAudioRecordingDestination(session);
+      session.resolveStopped();
+    }
+
+    function stopMediaRecorder(recorder) {
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+    }
+
+    function stopAudioRecording(session) {
+      if (!session || activeAudioRecording !== session || session.phase === 'stopping') return;
+      if (session.phase === 'starting') {
+        cancelAudioRecording();
+        session.take.cancelled?.();
+        return;
+      }
+      session.phase = 'stopping';
+      session.stoppedAt = performance.now();
+      session.take.render(session, 'stopping');
+      try {
+        stopMediaRecorder(session.recorder);
+      } catch (error) {
+        session.error ||= error;
+        finishAudioRecording(session);
+      }
+      return session.stopped;
+    }
+
+    function failAudioRecording(session, error) {
+      session.error ||= error;
+      stopAudioRecording(session);
+    }
+
+    async function startAudioRecording(kind, take) {
+      if (audioRecordingInputBusy()) return;
+      const session = { kind: kind, owner: projectIoOwner(), take: take, phase: 'starting' };
+      session.stopped = new Promise(function(resolve) { session.resolveStopped = resolve; });
+      activeAudioRecording = session;
+      recordingPublications(session.owner.project).revision += 1;
+      try {
+        take.render(session, 'starting');
+        if (take.prepare) await take.prepare(session);
+        assertAudioRecordingStart(session);
+        closeAudioInputSettings();
+        session.stream = await requestAudioInputStream();
+        assertAudioRecordingStart(session);
+        const options = audioRecordingOptions();
+        const recorder = session.recorder = new MediaRecorder(session.stream, options);
+        session.mimeType = recorder.mimeType || options.mimeType || 'audio/webm';
+        if (take.open) await take.open(session);
+        assertAudioRecordingStart(session);
+        recorder.addEventListener('dataavailable', function(event) {
+          if (activeAudioRecording === session && !session.error && event.data?.size) take.chunk(session, event.data);
+        });
+        recorder.addEventListener('stop', function() { finishAudioRecording(session); });
+        recorder.addEventListener('error', function(event) {
+          if (activeAudioRecording === session) failAudioRecording(session, event.error || new Error('MediaRecorder error'));
+        });
+        session.startedAt = performance.now();
+        recorder.start(250);
+        take.started(session);
+        session.phase = 'recording';
+      } catch (error) {
+        const current = activeAudioRecording === session;
+        if (current) cancelAudioRecording();
+        else releaseAudioRecordingStream(session.stream);
+        await abortAudioRecordingDestination(session);
+        if (current && projectIoOwnerCurrent(session.owner)) take.startFailed(error);
+      }
+    }
+
+    async function awaitStoppedAudioRecordings(project) {
+      const recording = activeAudioRecording;
+      if (recording?.owner.project === project && recording.phase === 'stopping') {
+        await recording.stopped;
+      }
+      return !audioRecordingInputBusy() && await awaitAudioRecordingPublications(project);
+    }
+
+    async function settleAudioRecordingBeforeProjectExit(owner) {
+      assertProjectIoOwner(owner);
+      const recording = activeAudioRecording;
+      if (recording?.owner.project === owner.project) {
+        stopAudioRecording(recording);
+        await recording.stopped;
+      }
+      await awaitAudioRecordingPublications(owner.project);
+      return projectIoOwnerCurrent(owner) && !audioRecordingInProgress(owner.project);
+    }
+
     function audioRecordingDisabledReason() {
       if (!audioRecordingSupported()) return t('msg.audio.recordingUnsupported');
-      if (state.audioRecordingSession || audioInputRequestPending) return t('msg.audio.recordingInProgress');
+      if (audioRecordingInputBusy()) return t('msg.audio.recordingInProgress');
       if (!state.workspaceHandle && !mobileAudioRecordingStorageAvailable()) return t('msg.audio.workspaceNotSet');
       return '';
     }
@@ -56495,150 +56690,103 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Storyboard audio recording
-    function showAudioRecordingStopButton(x, y) {
-      hideAudioRecordingStopButton();
+    function showAudioRecordingStopButton(session, x, y) {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'audio-recording-stop-popover';
       button.textContent = t('audio.recordStop');
-      button.style.left = Math.min(uiLocalViewportW() - 96, Math.max(8, Math.round(uiPointerLocalX(Number(x) || 8)))) + 'px'; // pointer (visual px) -> LOCAL, as positionContextMenuNearPointer
+      button.style.left = Math.min(uiLocalViewportW() - 96, Math.max(8, Math.round(uiPointerLocalX(Number(x) || 8)))) + 'px';
       button.style.top = Math.min(uiLocalViewportH() - 42, Math.max(8, Math.round(uiPointerLocalY(Number(y) || 8)))) + 'px';
       button.addEventListener('click', function(event) {
         event.preventDefault();
         event.stopPropagation();
-        stopActiveAudioRecording();
+        stopAudioRecording(session);
       });
       document.body.appendChild(button);
-      state.audioRecordingStopEl = button;
+      return button;
     }
 
-    function hideAudioRecordingStopButton() {
-      if (state.audioRecordingStopEl && state.audioRecordingStopEl.parentNode) {
-        state.audioRecordingStopEl.parentNode.removeChild(state.audioRecordingStopEl);
-      }
-      state.audioRecordingStopEl = null;
-    }
-
-    function stopAudioRecordingStream(session) {
-      if (!session || !session.stream) return;
-      session.stream.getTracks().forEach(function(track) {
-        try { track.stop(); } catch (error) {}
-      });
-    }
-
-    async function startAudioRecordingForTrack(trackId, x, y) {
-      const owner = projectIoOwner();
+    function startAudioRecordingForTrack(trackId, x, y) {
       const reason = audioRecordingDisabledReason();
       if (reason) {
         state.timelineStatus = t('status.audioRecording.blocked', reason);
         guardedRender('timing', renderTimingDashboard);
         return;
       }
-      let stream = null;
-      let writable = null; // outside the try: a failed start must release the writable it opened
-      try {
-        const useWorkspaceStorage = Boolean(state.workspaceHandle);
-        const useIndexedDbStorage = !useWorkspaceStorage && mobileAudioRecordingStorageAvailable();
-        if (useWorkspaceStorage) {
-          if (!await ensureWorkspacePermission(state.workspaceHandle, true)) {
+      const target = { trackId: String(trackId || 'dialog-main'), bytesWritten: 0, writeQueue: Promise.resolve() };
+      let button;
+      return startAudioRecording('conte', {
+        async prepare(session) {
+          const owner = session.owner;
+          if (!owner.handle) return;
+          if (!await ensureWorkspacePermission(owner.handle, true)) {
             throw new Error('Working folder write permission was not granted.');
           }
-          await ensureWorkspaceStructure();
-        }
-        closeAudioInputSettings();
-        stream = await requestAudioInputStream();
-        assertProjectIoOwner(owner);
-        const options = audioRecordingOptions();
-        const mimeType = options.mimeType || '';
-        const recorder = new MediaRecorder(stream, options);
-        const clipId = 'audio-record-' + Date.now().toString(36) + '-' + Math.abs(hashString(String(performance.now() || Date.now())));
-        const actualMime = recorder.mimeType || mimeType || 'audio/webm';
-        const fileName = recordedAudioFileName(clipId, actualMime);
-        let fileHandle = null;
-        if (useWorkspaceStorage) {
-          const audioDir = await getWorkspaceDirectory(state.project.settings.localWorkspace.audioDir, true);
-          fileHandle = await audioDir.getFileHandle(fileName, { create: true });
-          writable = await fileHandle.createWritable();
-        }
-        assertProjectIoOwner(owner);
-        const session = {
-          owner: owner,
-          recorder: recorder,
-          stream: stream,
-          clipId: clipId,
-          fileName: fileName,
-          fileHandle: fileHandle,
-          writable: writable,
-          writeQueue: Promise.resolve(),
-          storageKind: useWorkspaceStorage ? 'workspace' : 'indexeddb',
-          recordedChunks: useIndexedDbStorage ? [] : null,
-          bytesWritten: 0,
-          trackId: String(trackId || 'dialog-main'),
-          startFrame: Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0)),
-          startedAt: performance.now(),
-          mimeType: actualMime,
-          projectId: String((state.project && state.project.projectId) || ''), // pin the target project so a mid-recording swap can't misroute this clip
-          stopRequested: false,
-          finalizeStarted: false
-        };
-        recorder.addEventListener('dataavailable', function(event) {
-          if (!event.data || !event.data.size) return;
-          const chunk = event.data;
-          session.bytesWritten += Math.round(Number(chunk.size) || 0);
-          if (session.recordedChunks) {
-            if (session.bytesWritten > MOBILE_RECORDING_MAX_BYTES) {
-              session.error = new Error('Recording is too large for mobile IndexedDB storage.');
-              stopActiveAudioRecording();
-              return;
-            }
-            session.recordedChunks.push(chunk);
+          assertAudioRecordingStart(session);
+          await ensureWorkspaceStructure(owner);
+        },
+        async open(session) {
+          const owner = session.owner;
+          target.clipId = 'audio-record-' + Date.now().toString(36) + '-' + Math.abs(hashString(String(performance.now() || Date.now())));
+          target.mimeType = session.mimeType;
+          target.storageKind = owner.handle ? 'workspace' : 'indexeddb';
+          target.fileName = recordedAudioFileName(target.clipId, target.mimeType);
+          if (!owner.handle) {
+            target.recordedChunks = [];
+            return;
           }
-          session.writeQueue = session.writeQueue.then(function() {
-            return session.writable ? session.writable.write(chunk) : null;
-          }).catch(function(error) {
-            session.error = error;
-            stopActiveAudioRecording();
-          });
-        });
-        recorder.addEventListener('error', function(event) {
-          session.error = event.error || new Error('MediaRecorder error');
-          stopActiveAudioRecording();
-        });
-        recorder.addEventListener('stop', function() {
-          publishAudioRecordingSession(session).catch(function(error) {
-            alert(t('msg.err.recordingSave', (error && error.message ? error.message : error)));
-          });
-        });
-        state.audioRecordingSession = session;
-        recorder.start(250);
-        showAudioRecordingStopButton(x, y);
-        state.timelineStatus = t('status.audioRecording.inProgress', audioTrackDisplayLabel(session.trackId));
-      } catch (error) {
-        if (stream) stream.getTracks().forEach(function(track) { try { track.stop(); } catch (stopError) {} });
-        if (writable) { try { await writable.abort(); } catch (abortError) {} } // as finalizeAudioRecordingSession's failure path
-        state.audioRecordingSession = null;
-        hideAudioRecordingStopButton();
-        alert(t('msg.err.recordingStart', (error && error.message ? error.message : error)));
-      }
-    }
-
-    function stopActiveAudioRecording() {
-      const session = state.audioRecordingSession;
-      if (!session || session.stopRequested) return;
-      session.stopRequested = true;
-      if (state.audioRecordingStopEl) {
-        state.audioRecordingStopEl.disabled = true;
-        state.audioRecordingStopEl.textContent = t('audio.recordSaving');
-      }
-      session.stoppedAt = performance.now();
-      try {
-        if (session.recorder && session.recorder.state !== 'inactive') {
-          session.recorder.stop();
-          return;
-        }
-      } catch (error) {}
-      publishAudioRecordingSession(session).catch(function(error) {
-        alert(t('msg.err.recordingSave', (error && error.message ? error.message : error)));
+          const dir = await getWorkspaceDirectory(owner.settings.audioDir, true, owner.handle);
+          assertAudioRecordingStart(session);
+          target.fileHandle = await dir.getFileHandle(target.fileName, { create: true });
+          assertAudioRecordingStart(session);
+          target.writable = await target.fileHandle.createWritable();
+        },
+        started() {
+          target.startFrame = Math.max(0, Math.round(Number(state.videoPlayheadFrames) || 0));
+          state.timelineStatus = t('status.audioRecording.inProgress', audioTrackDisplayLabel(target.trackId));
+        },
+        render(session, phase) {
+          if (phase === 'starting') button = showAudioRecordingStopButton(session, x, y);
+          else if (phase === 'stopping') {
+            button.disabled = true;
+            button.textContent = t('audio.recordSaving');
+          } else if (phase === 'idle') button.remove();
+        },
+        chunk(session, chunk) {
+          target.bytesWritten += chunk.size;
+          if (target.recordedChunks) {
+            if (target.bytesWritten > MOBILE_RECORDING_MAX_BYTES) {
+              failAudioRecording(session, new Error('Recording is too large for mobile IndexedDB storage.'));
+            } else target.recordedChunks.push(chunk);
+          } else {
+            target.writeQueue = target.writeQueue.then(function() {
+              if (!session.error && session.phase !== 'cancelled') {
+                return target.writable.write(chunk);
+              }
+            }).catch(function(error) { failAudioRecording(session, error); });
+          }
+        },
+        async abort() {
+          await target.writeQueue;
+          if (target.writable) await target.writable.abort();
+        },
+        async publish(session) {
+          await target.writeQueue;
+          if (session.error) throw session.error;
+          assertProjectIoOwner(session.owner);
+          if (target.writable) {
+            await target.writable.close();
+            target.writable = null;
+          }
+          assertProjectIoOwner(session.owner);
+          const file = target.fileHandle
+            ? await target.fileHandle.getFile()
+            : new Blob(target.recordedChunks, { type: target.mimeType });
+          assertProjectIoOwner(session.owner);
+          return publishStoryboardRecording(session, target, file);
+        },
+        startFailed(error) { alert(t('msg.err.recordingStart', error.message || String(error))); },
+        saveFailed(error) { alert(t('msg.err.recordingSave', error.message || String(error))); }
       });
     }
 
@@ -56669,57 +56817,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return clips.find(function(clip) { return clip && clip.id === id; }) || null;
     }
 
-    function publishAudioRecordingSession(session) {
-      if (!session) return Promise.resolve(false);
-      if (!session.finalizeJob) {
-        session.finalizeJob = finalizeAudioRecordingSession(session);
-        trackAudioRecordingPublication(session.owner && session.owner.project || state.project, session.finalizeJob);
-      }
-      return session.finalizeJob;
-    }
-    async function finalizeAudioRecordingSession(session) {
-      if (!session || session.finalizeStarted) return false;
-      session.finalizeStarted = true;
-      if (!session.stoppedAt) session.stoppedAt = performance.now();
-      const owner = session.owner || projectIoOwner();
-      if (state.audioRecordingSession === session) state.audioRecordingSession = null;
-      stopAudioRecordingStream(session);
-      hideAudioRecordingStopButton();
-      try {
-        if (session.writeQueue) await session.writeQueue;
-        if (session.writable) await session.writable.close();
-        session.writable = null;
-      } catch (error) {
-        try {
-          if (session.writable && typeof session.writable.abort === 'function') await session.writable.abort();
-        } catch (abortError) {}
-        throw error;
-      }
-      if (session.error) throw session.error;
-      const recordedFile = session.fileHandle
-        ? await session.fileHandle.getFile()
-        : (session.recordedChunks && session.recordedChunks.length ? new Blob(session.recordedChunks, { type: session.mimeType || 'audio/webm' }) : null);
-      if (!recordedFile || !recordedFile.size) {
+    async function publishStoryboardRecording(recording, target, recordedFile) {
+      const owner = recording.owner;
+      if (!recordedFile.size) {
         state.timelineStatus = t('status.audioRecording.discardedEmpty');
-        guardedRender('timing', renderTimingDashboard);
-        return false;
-      }
-      // The project may be swapped mid-recording. Finalize reads state.project live, so pushing now would misroute
-      // this clip into the current project and, in workspace mode, point its storage at the new project's folder
-      // while the bytes sit in the old one. The session captured its target projectId at start; if it no longer
-      // matches, discard. (The mic/stream was already released at the top of finalize.)
-      if (!projectIoOwnerCurrent(owner) || String(session.projectId || '') !== String((state.project && state.project.projectId) || '')) {
-        state.timelineStatus = t('status.audioRecording.discardedProjectChanged');
         guardedRender('timing', renderTimingDashboard);
         return false;
       }
       let before = null;
       let beforeSelection = null;
       try {
-        const clipId = session.clipId || ('audio-record-' + Date.now().toString(36) + '-' + Math.abs(hashString(String(session.startedAt || Date.now()))));
-        const mime = session.mimeType || recordedFile.type || 'audio/webm';
-        const endedAt = Math.max(Number(session.stoppedAt) || 0, Number(session.startedAt) || 0);
-        const fallbackFrames = Math.max(1, Math.round(((endedAt - session.startedAt) / 1000) * mediaFpsForProject(state.project)));   // Wall-clock seconds → frames on the media rate
+        const clipId = target.clipId;
+        const mime = target.mimeType;
+        const seconds = Math.max(0, recording.stoppedAt - recording.startedAt) / 1000;
+        const fallbackFrames = Math.max(1, Math.round(seconds * mediaFpsForProject(owner.project)));
         const clip = {
           id: clipId,
           type: 'audio',
@@ -56730,24 +56841,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           characterGender: '',
           characterAge: '',
           text: recordedAudioClipLabel(),
-          audioFileName: session.storageKind === 'workspace' ? (session.fileName || '') : '',
+          audioFileName: target.storageKind === 'workspace' ? (target.fileName || '') : '',
           audioMime: mime,
-          audioDurationFrames: 0,
+          audioDurationFrames: fallbackFrames,
           audioTrimStartFrames: 0,
-          audioTrimDurationFrames: 0,
+          audioTrimDurationFrames: fallbackFrames,
           ttsProvider: 'recording',
           ttsText: '',
           ttsVersion: 0,
-          startFrame: Math.max(0, Math.round(Number(session.startFrame) || 0)),
+          startFrame: Math.max(0, Math.round(Number(target.startFrame) || 0)),
           durationFrames: fallbackFrames,
-          trackId: session.trackId || 'dialog-main'
+          trackId: target.trackId || 'dialog-main'
         };
-        clip.audioDurationFrames = fallbackFrames;
-        clip.audioTrimStartFrames = 0;
-        clip.audioTrimDurationFrames = fallbackFrames;
-        clip.durationFrames = fallbackFrames;
-        // Resolve a bounded take's true media length before the undo snapshot and timeline publication.
-        // Long takes retain the recording clock estimate; their later waveform decode never changes edits.
         if (recordedAudioCanDecodeForDuration(recordedFile, fallbackFrames)) {
           const measured = Object.assign({}, clip, { durationFrames: 0, audioTrimDurationFrames: 0 });
           if (await analyzeAudioBlobForClip(measured, recordedFile)) {
@@ -56757,10 +56862,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           assertProjectIoOwner(owner);
         }
         let audioStored = true;
-        if (session.storageKind === 'workspace') {
+        if (target.storageKind === 'workspace') {
           clip.audioStorage = {
             kind: 'workspace',
-            dir: state.project.settings.localWorkspace.audioDir,
+            dir: owner.settings.audioDir,
             fileName: clip.audioFileName,
             size: Math.round(Number(recordedFile.size) || 0),
             savedAt: new Date().toISOString()
@@ -56775,7 +56880,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         before = captureAudioTimelineHistoryState(state.project);
         beforeSelection = captureTimelineSelectionState();
         state.project.audio.clips.push(clip);
-        placeAudioClipFast(state.project, clip, session.trackId || 'dialog-main', { existingLaneOnly: true });
+        placeAudioClipFast(state.project, clip, target.trackId || 'dialog-main', { existingLaneOnly: true });
         sortAudioClips(state.project);
         writeTimelineTracks(state.project);
         bumpAudioCycle();
@@ -56794,7 +56899,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           beforeSelection: beforeSelection,
           afterSelection: afterSelection
         });
-        state.timelineStatus = !audioStored ? t('msg.workspace.saveFailed', t('msg.project.audioKeptInline')) : t('status.audioRecording.recorded', session.storageKind === 'workspace' ? clip.audioFileName : 'IndexedDB');
+        state.timelineStatus = !audioStored ? t('msg.workspace.saveFailed', t('msg.project.audioKeptInline')) : t('status.audioRecording.recorded', target.storageKind === 'workspace' ? clip.audioFileName : 'IndexedDB');
         if (state.videoEditMode) {
           guardedRender('timing', renderTimingDashboard);
           guardedRender('inspector', renderInspector);
@@ -56802,7 +56907,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         } else {
           refresh({ skipSource: true, skipMemo: true });
         }
-        if (session.storageKind === 'workspace') scheduleWorkspaceProjectSave(1400);
+        if (target.storageKind === 'workspace') scheduleWorkspaceProjectSave(1400);
         else scheduleIndexedDbAutosave(700);
         requestAudioSourcePeaks(clip);
         return true;
@@ -74269,21 +74374,22 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Project tabs and recent projects
-    // Forces the save point the project-tab-bar's "no confirm dialog" premise depends on: a tab click is a
-    // deliberate switch, not the passive autosave the toggle above governs (off by default on desktop, so the
-    // gated function would silently lose unsaved edits).
-    // Propagate failure before switching. Otherwise the next project's pruning could discard drawings still held only in RAM.
-    // Recording failures are already shown. Proceed with the recordings that finished.
-    async function snapshotCurrentProjectForTabSwitch() {
-      if (!state.projectActive || !indexedDbAvailable()) return { ok: true, skipped: 'no-project' };
+    async function snapshotCurrentProjectForTabSwitch(owner = projectIoOwner()) {
       try {
-        await awaitAudioRecordingPublications(state.project);   // Recording failures are already reported. Save the recordings that completed.
-        const owner = projectIoOwner();
-        await drawingFlushPending(); assertProjectIoOwner(owner);
-        const saved = await writeProjectToIndexedDbSlot({ retainHistory: true });
+        if (!await settleAudioRecordingBeforeProjectExit(owner)) return { ok: false, code: 'recording-during-switch' };
+        const revision = audioRecordingRevision(owner.project);
+        const canLeaveRecording = function() {
+          return !audioRecordingInProgress(owner.project) && revision === audioRecordingRevision(owner.project);
+        };
+        if (!canLeaveRecording()) return { ok: false, code: 'recording-during-switch' };
+        if (!owner.active || !indexedDbAvailable()) return { ok: true, canLeaveRecording: canLeaveRecording };
+        await drawingFlushPending();
+        assertProjectIoOwner(owner);
+        const saved = await writeProjectToIndexedDbSlot({ owner: owner, retainHistory: true });
         assertProjectIoOwner(owner);
         if (saved.ok) {
-          if (saved.payload !== projectUnsavedSnapshot()) return { ok: false, code: 'edited-during-save' };
+          if (!canLeaveRecording() || saved.payload !== projectUnsavedSnapshot()) return { ok: false, code: 'edited-during-save' };
+          saved.canLeaveRecording = canLeaveRecording;
           saved.history = retainProjectTabHistory(saved.projectId, saved.payload);
         }
         return saved;
@@ -74293,8 +74399,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return { ok: false, code: 'publish', error: error };
       }
     }
-    // Opening a file earns a durable slot independently of its passive-autosave preference.
-    // A failed slot snapshot leaves the loaded editor available and reports the save failure.
     async function snapshotLoadedProject(owner) {
       assertProjectIoOwner(owner);
       if (!indexedDbAvailable()) return;
@@ -74307,22 +74411,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!projectSaveFailureNotices.has(String(state.project.projectId))) showToast(message, { warn: true });
       }
     }
-    // Explicit switches can await completion. Stay on the current project if saving fails.
     async function switchToProjectTab(id, options) {
       options = options || {};
       if (!id || (!options.recovery && state.projectActive && state.project && state.project.projectId === id)) return;
       const request = beginProjectFileLoad();
       const recoveringCurrent = options.recovery && state.projectActive && String(state.project.projectId) === String(id);
-      if (recoveringCurrent && await confirmProjectReplacement(request.owner, 'msg.project.unsavedClose') === null) return;
+      const replacement = recoveringCurrent ? await confirmProjectReplacement(request.owner, 'msg.project.unsavedClose') : null;
+      if (recoveringCurrent && replacement === null) return;
       const outgoing = state.project;
       if (!recoveringCurrent) projectTabBarShowPending(id);
       let saved;
       try {
-        saved = recoveringCurrent ? { ok: true } : await snapshotCurrentProjectForTabSwitch();
+        saved = recoveringCurrent ? { ok: true } : await snapshotCurrentProjectForTabSwitch(request.owner);
+        request.canLeaveRecording = saved.canLeaveRecording;
         if (!projectIoOwnerCurrent(request.owner)) { console.info('[project-load] Previous tab switch discarded'); return; }
         if (saved && !saved.ok) { alert(t('msg.project.switchBlockedBySave')); return; }
         const index = await loadIndexedDbProjectIndex();
         if (!projectIoOwnerCurrent(request.owner)) return;
+        if (saved.canLeaveRecording?.() === false) { alert(t('msg.project.switchBlockedBySave')); return; }
         const slot = index.slots.find(function(item) { return item.id === id; });
         const session = !options.recovery ? projectSessionSnapshots.get(id) : null;
         const source = session ? session.source : !options.recovery && slot ? slot.source : null;
@@ -74333,16 +74439,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             request: request,
             source: source,
             session: session,
-            canContinue: saved.payload ? function() { return projectUnsavedSnapshot() === saved.payload; } : null,
+            canContinue: function() {
+              if (recoveringCurrent) {
+                assertProjectReplacement(request.owner, replacement);
+                return true;
+              }
+              return saved.canLeaveRecording() && (!saved.payload || projectUnsavedSnapshot() === saved.payload);
+            },
             connection: source && source.kind === 'workspace' ? source : null
           });
         }
-        scheduleStorageSweep('tab-switch'); // Treat the outgoing slot payload as a drawing root.
+        scheduleStorageSweep('tab-switch');
       } finally {
-        // A superseding switch may already have parked a newer entry for this project.
         if (saved && saved.history && state.project === outgoing && projectTabHistories.get(String(outgoing.projectId)) === saved.history) releaseProjectTabHistory(outgoing.projectId);
         trimProjectTabHistories();
-        // On a blocked or failed switch, restore the optimistic active indicator from storage unless a newer switch owns rendering.
         if (projectIoOwnerCurrent(request.owner) && !(state.projectActive && state.project && String(state.project.projectId) === String(id))) renderProjectTabBar();
       }
     }
@@ -74350,18 +74460,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function applyRestoredIndexedDbProject(project, payload, versionRestore) {
       stopTimelinePlayback(false);
       const head = versionRestore && projectSaveHeads.get(String(project.projectId));
-      // The restore caller publishes once media and drawing pixels are ready.
       restoreProject(project, null, { savedPayload: payload, skipRefresh: true });
       if (!versionRestore) restoreProjectTabHistory(project.projectId, payload);
       else releaseProjectTabHistory(project.projectId);
       trimProjectTabHistories();
-      // Restoring a version edits the open project. Keep the current disk head as the save baseline.
       if (head) projectSaveHeads.set(String(project.projectId), head);
       gengaPruneRuntimeStores();
       ensureCurrentProjectId();
     }
 
-    // The start screen offers explicit switching; there is no boot-time project restore.
     function appendProjectStartCurrentRow(host, pinnedIdSet) {
       if (!state.projectActive) return;
       const row = document.createElement('button');
@@ -74372,10 +74479,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const isGenga = !!(state.project && state.project.kind === 'genga');
       kind.className = 'stage-settings-slot-kind' + (isGenga ? ' genga' : '');
       kind.textContent = isGenga ? t('project.start.kind.genga') : t('project.start.kind.conte');
-      // Move the pinned label to the current project row when excluding that project from the list.
-      // Keep its pinned status visible while it is open.
       const isPinnedNow = !!(pinnedIdSet && pinnedIdSet.has(String(state.project && state.project.projectId || '')));
-      // Put the slot label after the project kind, matching the recent list.
       let slotTag = null;
       if (isPinnedNow) {
         slotTag = document.createElement('span');
@@ -74389,7 +74493,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       meta.className = 'es-recent-meta';
       meta.textContent = t('project.start.current');
       row.appendChild(kind);
-      if (slotTag) row.appendChild(slotTag); // Match the recent list's column order.
+      if (slotTag) row.appendChild(slotTag);
       row.appendChild(nm);
       row.appendChild(meta);
       row.addEventListener('click', closeProjectStartOverlay);
@@ -74397,7 +74501,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     let projectStartRecentRenderSeq = 0;
-    // Start screen right column: 「Recent | Dropbox」 when Dropbox can be linked here, else the plain title.
     function projectStartSourceTab() {
       if (!dropboxAvailable()) return 'recent';
       try { return localStorage.getItem('moart-start-source') === 'dropbox' ? 'dropbox' : 'recent'; } catch (error) { return 'recent'; }
@@ -74415,7 +74518,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       Array.from(tabs.children).forEach(function(button) {
         button.setAttribute('aria-pressed', String(button.getAttribute('data-source') === current));
         button.onclick = function() {
-          try { localStorage.setItem('moart-start-source', button.getAttribute('data-source')); } catch (error) { /* stays for this view */ }
+          try { localStorage.setItem('moart-start-source', button.getAttribute('data-source')); } catch (error) { }
           renderProjectStartSource();
         };
       });
@@ -74438,12 +74541,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return;
       }
       if (seq !== projectStartRecentRenderSeq) return;
-      // List pinned and backup slots separately. A single recent-items cap would hide older pins.
-      // Preserve all user-pinned slots up to `PINNED_PROJECT_MAX`. Apply recency only to backups.
-      // Pins come from `pinnedProjectSlots`. Backups are autosave index entries
-      // with pinned IDs removed. Phones have no pins, so all entries are backups.
-      // Report a pinned-list read failure separately from disabled pins.
-      // Otherwise the pinned entries could appear as backups.
       let pinnedIdSet = new Set();
       if (pinnedProjectSlotsEnabled()) {
         try {
@@ -74456,11 +74553,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return;
         }
       }
-      // The open-project row already shows the active project. Exclude it from recent items.
-      // Read the ID without `ensureCurrentProjectId()`, which would assign one on the start screen.
       const currentId = state.projectActive ? String(state.project && state.project.projectId || '') : '';
       const byNewest = function(a, b) { return String(b.savedAt).localeCompare(String(a.savedAt)); };
-      // Preserve unmatched pins visibly; releasing a pin must not delete a possibly recoverable body.
       const indexedIds = new Set(index.slots.map(function(slot) { return slot.id; }));
       const unmatchedPins = Array.from(pinnedIdSet).filter(function(id) { return !indexedIds.has(id); })
         .map(function(id) { return { id: id, title: id, kind: 'conte', unindexed: true }; });
@@ -74492,8 +74586,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const nm = document.createElement('span');
         nm.className = 'es-recent-name';
         nm.textContent = slot.title || t('project.untitled');
-        // Label pinned and backup slots in text as well as color.
-        // Their retention rules differ, so users need an unambiguous label.
         const slotTag = document.createElement('span');
         slotTag.className = 'es-recent-slot' + (isPinned ? ' pinned' : '');
         slotTag.textContent = !slot.source ? t('project.source.backup') : slot.source.kind === 'workspace' ? t('project.source.folder')
@@ -74506,8 +74598,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         row.appendChild(nm);
         row.appendChild(meta);
         row.addEventListener('click', function() { switchToProjectTab(slot.id); });
-        // Place delete beside the button in a shared row wrapper to avoid nested buttons and overlapping clicks.
-        // The deletion kernel handles confirmation.
         const del = document.createElement('button');
         del.type = 'button';
         del.className = 'es-recent-del';
@@ -74527,9 +74617,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
     }
 
-    // Prepare only the incoming assets. A failed read must not replace the live project/Undo.
-    // Restore reads use the shared strict batch reader; normal readers retain their metadata and missing-blob
-    // behavior. A failed batch is omitted so each existing reader retries with its original contract.
     async function readWorkspaceDbRestoreRecords(keys, owner) {
       const records = new Map();
       if (!indexedDbAvailable()) return records;
@@ -74645,7 +74732,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const project = JSON.parse(payload);
         await prepareIndexedDbProjectRestore(project, owner, prepared);
         assertProjectIoOwner(owner);
-        // Finish fallible activation before replacing the live project or releasing its Undo/media.
         if (!versionRestore) await activateProjectSlot(id, payload, owner);
         assertProjectIoOwner(owner);
         if (options.canContinue && !options.canContinue()) throw new DOMException('Recovery surface changed', 'AbortError');
@@ -74676,23 +74762,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         owner = request.owner = projectIoOwner(request);
         await hydrateWorkspaceMediaRefs(owner);
         assertProjectIoOwner(owner);
-        // Treat version restore as an edit when it differs from the current payload on disk.
         if (!versionRestore) {
-          // For a tab that was clean on exit, refresh its baseline after restoration updates generated `historyMeta`.
-          // Otherwise tab switching alone can mark it dirty.
           if (options.session && options.session.source) {
             if (options.session.savedSnapshot === payload) markProjectSavedBaseline();
             else state.projectSavedSnapshot = options.session.savedSnapshot;
           }
           else markProjectSavedBaseline();
         }
-        // Bind only this page's chosen connection after hydration/owner validation.
-        // setProjectActive arms its normal timer for the newly restored project.
         if (!versionRestore && options.session && options.session.recovery) localProjectRecovery.set(state.project, options.session.recovery);
         setProjectActive(true);
         owner = request.owner = projectIoOwner(request);
         gengaTrimDrawStore(null);
-        hideLoadingOverlay(request); // Media is ready; mount once outside the modal inert subtree.
+        hideLoadingOverlay(request);
         refresh();
         warnMissingProjectAssets(collectMissingProjectAssets(state.project));
         warnMissingProjectAssets(collectMissingGengaDrawings(state.project, prepared.missing));
@@ -75247,7 +75328,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Cache clearing, disk sweeps, and work-folder persistence share this busy check and add their own conditions.
     function userActivityBusy() {
       return strokeInProgress() || state.videoPlaying || state.videoPlaybackStarting || gengaPlaybackBusy()
-        || Boolean(state.audioRecordingSession) || Boolean(gengaRecSession);
+        || audioRecordingInProgress(state.project);
     }
     // Both disk cleanup paths also defer during timeline or camera drags.
     function timelineDragActive() {
@@ -75302,59 +75383,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: App updates and safe reload
-    // The separate service worker registration script in `<head>` calls this through `window`.
-    // Open the existing banner markup so it retains the shared layout.
     window.showAppUpdateBar = function() {
       const bar = document.getElementById('appUpdateBar');
       if (!bar || !bar.hidden) return;
       bar.hidden = false;
     };
     let appUpdateReloadReady = false;
-    const audioRecordingPublications = new WeakMap();
-    function trackAudioRecordingPublication(project, job) {
-      let pending = audioRecordingPublications.get(project);
-      if (!pending) { pending = { jobs: new Set(), failed: false }; audioRecordingPublications.set(project, pending); }
-      const tracked = Promise.resolve(job).then(function(ok) { if (ok !== true) pending.failed = true; return ok === true; }, function(error) {
-        pending.failed = true;
-        console.error('[recording] Publication failed', error);
-        return false;
-      }).finally(function() { pending.jobs.delete(tracked); });
-      pending.jobs.add(tracked);
-      return tracked;
-    }
-    // Before reloading for an update or switching tabs, wait for stopped recordings to finish analysis, storage, and publication.
-    // Leaving early fails project ownership checks and discards the recording. Return false if any publication failed since the last check.
-    // Consume the already reported failure here so it does not keep blocking future exits.
-    async function awaitAudioRecordingPublications(project) {
-      const pending = audioRecordingPublications.get(project);
-      if (!pending) return true;
-      while (pending.jobs.size) await Promise.all(Array.from(pending.jobs));
-      const ok = !pending.failed;
-      pending.failed = false;
-      return ok;
-    }
-    async function reloadAfterProjectSave() {
-      const project = state.project;
-      if (state.audioRecordingSession || gengaRecSession || audioInputRequestPending) return false;
-      if (!await awaitAudioRecordingPublications(project)) return false;
-      if (state.project !== project || state.audioRecordingSession || gengaRecSession || audioInputRequestPending) return false;
-      if (state.projectActive) {
-        const result = await writeProjectToIndexedDbSlot();
-        if (!result.ok) return false;
-        // Editing may continue while IDB is working. Only leave the exact saved state.
+    async function reloadAfterProjectSave(reload = function() { location.reload(); }) {
+      const owner = projectIoOwner();
+      const project = owner.project;
+      if (!await awaitStoppedAudioRecordings(project)) return false;
+      if (!projectIoOwnerCurrent(owner) || audioRecordingInputBusy() || audioRecordingInProgress(project)) return false;
+      const revision = audioRecordingRevision(project);
+      if (owner.active) {
+        const result = await writeProjectToIndexedDbSlot({ owner: owner });
+        if (!result.ok || !projectIoOwnerCurrent(owner)) return false;
+        if (audioRecordingRevision(project) !== revision || audioRecordingInputBusy()) return false;
         const head = projectSaveHeads.get(String(project.projectId));
-        if (state.project !== project || !head || head.payload !== serializedProjectJson({ portable: false })) return false;
+        if (!head || head.payload !== serializedProjectJson({ portable: false })) return false;
       }
-      const latest = audioRecordingPublications.get(project);
-      if (state.audioRecordingSession || gengaRecSession || audioInputRequestPending || (latest && (latest.jobs.size || latest.failed))) return false;
       appUpdateReloadReady = true;
-      location.reload();
+      reload();
       return true;
     }
     function bindAppUpdateBar() {
       const reload = document.getElementById('appUpdateReloadBtn');
       const dismiss = document.getElementById('appUpdateDismissBtn');
-      // SW has cached the shell; the document must finish preserving the work first.
       if (reload) reload.addEventListener('click', async function() {
         if (reload.disabled) return;
         reload.disabled = true;
@@ -75362,7 +75416,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         catch (error) { console.error('[reload] Save failed', error); showToast(t('app.update.saveBeforeReload'), { warn: true }); }
         finally { reload.disabled = false; }
       });
-      // Dismiss for this session. The next launch already uses the updated version.
       if (dismiss) dismiss.addEventListener('click', function() {
         const bar = document.getElementById('appUpdateBar');
         if (bar) bar.hidden = true;
@@ -76095,7 +76148,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // The pointer-based check lets autosave run while an unheld curve awaits its next phase.
       if (strokeInProgress() || state.cameraFrameDrag) return false;
       if (state.audioDrag || state.timelinePlayheadDragging || state.timelineScrollbarDragging) return false;
-      if (state.audioRecordingSession) return false;
+      if (audioRecordingInProgress(state.project)) return false;
       return true;
     }
 
@@ -115345,13 +115398,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ['pointerdown', 'keydown', 'wheel', 'input'].forEach(function(type) {
         document.addEventListener(type, pauseStorageSweep, { capture: true, passive: true });
       });
-      // Warn before leaving, because the in-memory project (and its undo stack) does not survive a reload/close.
-      // beforeunload fires however the user leaves (F5, Ctrl+R, Ctrl+W, tab close, back), which key-interception
-      // cannot match (Ctrl+W etc. are browser-reserved). Gate on the real unsaved test, not `undoStack.length > 0`:
-      // saving does not clear undo history, so that proxy would warn on a fully-saved project, where only the undo
-      // history would be lost. The prompt appears exactly when saving would preserve something.
       window.addEventListener('beforeunload', function(event) {
-        if (!appUpdateReloadReady && projectHasUnsavedChanges()) {
+        if (!appUpdateReloadReady && (audioRecordingInProgress(state.project) || projectHasUnsavedChanges())) {
           event.preventDefault();
           event.returnValue = '';
         }
@@ -128235,8 +128283,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
     }
     // ## SECTION: Animation audio lanes and recording
-    // Audio lanes share camera lane height through one CSS variable.
-    // Use the larger of stored and clip-derived lane counts for rendering, drag, and ghosts.
     function gengaAudioClipLaneFloor(gt) {
       return Math.max(1, ((gt && gt.audioClips) || []).reduce(function(m, c) { return Math.max(m, (c.track || 0) + 1); }, 1));
     }
@@ -128247,54 +128293,42 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaAddAudioLane() {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt) return;
-      // Use the project supplied to runCommand's mutator. A captured gt can belong to a replaced project
-      // and leave the current display unchanged.
       gengaAudioLaneEpoch += 1;
       runCommand(t('menu.genga.audio.addLane'), function(proj) {
         const g = proj && proj.gengaTimeline;
         if (!g) return;
         g.audioLanes = gengaAudioLaneCount(g) + 1;
-      });   // A lane count change triggers a full render, rebuilding audio rows.
+      });
     }
-    // Delete the selected lane and its clips in one Undoable command.
-    // Report the removed clip count in status without a separate confirmation.
-    // Make the removal visible in the status strip.
     function gengaRemoveAudioLane(laneIdx) {
       const gt = state.project && state.project.gengaTimeline;
       if (!gt) return;
       const count = gengaAudioLaneCount(gt);
-      if (count <= 1) return;   // Keep at least one lane for clip placement.
+      if (count <= 1) return;
       const idx = Math.max(0, Math.min(count - 1, Math.round(Number(laneIdx)) || 0));
       gengaAudioLaneEpoch += 1;
-      runCommand(t('menu.genga.audio.removeLaneCmd'), function(proj) { // Use the mutator argument instead of the captured gt.
+      runCommand(t('menu.genga.audio.removeLaneCmd'), function(proj) {
         const g = proj && proj.gengaTimeline;
         if (!g) return;
         const before = gengaAudioLaneCount(g);
-        // Remove clips in the deleted lane and decrement track for clips below it
-        // so their positions match the remaining rows.
         g.audioClips = (g.audioClips || []).filter(function(c) { return (c.track || 0) !== idx; })
           .map(function(c) { if ((c.track || 0) > idx) c.track = (c.track || 0) - 1; return c; });
-        // Remove the corresponding volume entry so the next lane keeps its own gain.
         if (Array.isArray(g.audioLaneVol)) g.audioLaneVol.splice(idx, 1);
         g.audioLanes = Math.max(1, before - 1);
       });
-      // Shift selected indexes below the removed lane up. If the removed lane was selected,
-      // keep selection at that slot when a lower lane moves into it.
       const sel = state.gengaSelectedAudioLane;
       if (sel != null) {
         const nowCount = gengaAudioLaneCount(state.project && state.project.gengaTimeline);
-        gengaSelectAudioLane(Math.min(sel > idx ? sel - 1 : sel, Math.max(0, nowCount - 1)));   // Apply selection styling directly to the DOM here.
+        gengaSelectAudioLane(Math.min(sel > idx ? sel - 1 : sel, Math.max(0, nowCount - 1)));
       }
     }
-    // Read the context-menu lane index from the shared data attribute on the lane cell or header.
     function gengaAudioLaneFromEvent(ev) {
       const t0 = ev && ev.currentTarget;
       const el = (t0 && t0.closest) ? t0.closest('[data-audio-lane]') : null;
       const n = el ? Number(el.getAttribute('data-audio-lane')) : NaN;
       if (Number.isFinite(n)) return Math.max(0, Math.round(n));
-      return Math.max(0, Number(state.gengaSelectedAudioLane) || 0);   // Fall back to the selected lane when no target is hit.
+      return Math.max(0, Number(state.gengaSelectedAudioLane) || 0);
     }
-    // Lane cells and headers open the same menu.
     function gengaAudioLaneContextMenu(ev) {
       if (shouldIgnoreContextMenuEvent(ev)) { ev.preventDefault(); return; }
       ev.preventDefault();
@@ -128302,8 +128336,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const project = state.project, gt = project && project.gengaTimeline;
       if (!gt) return;
       const isCurrentTimeline = function() { return state.project === project && project.gengaTimeline === gt; };
-      // Select the right-clicked lane before opening its menu so the visible selection matches
-      // the lane the delete action will remove.
       const lane = gengaAudioLaneFromEvent(ev);
       gengaSelectAudioLane(lane);
       const items = [{ label: t('menu.genga.audio.addLane'), action: function() { if (isCurrentTimeline()) gengaAddAudioLane(); } }, audioInputSettingsMenuItem()];
@@ -128319,14 +128351,12 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       openSimpleContextMenu(ev, items, { width: 220 });
     }
 
-    // Clip length in media-rate frames, at least one. Share rounding across overlap, lane choice, snapping, and linked dialogue.
     function gengaAudioFrameCount(fps, durationSec) {
       return Math.max(1, Math.round((Number(durationSec) || 0) * fps));
     }
 
-    // Test an inclusive interval in one lane, excluding the clip being edited.
     function gengaAudioOverlapsOther(gt, clipId, track, startFrame, durationSec) {
-      const fps = gengaMediaFps(gt);   // Seconds run on the media rate
+      const fps = gengaMediaFps(gt);
       const s = startFrame, e = startFrame + gengaAudioFrameCount(fps, durationSec) - 1;
       return (gt.audioClips || []).some(function(c) {
         if (String(c.id) === String(clipId)) return false;
@@ -128335,17 +128365,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return !(ce < s || cs > e);
       });
     }
-    // first lane at/below `preferred` where [startFrame, +durationSec] doesn't overlap an existing clip
     function gengaAudioFreeTrack(gt, startFrame, durationSec, preferred) {
       let t = Math.max(0, Math.round(Number(preferred) || 0));
       while (gengaAudioOverlapsOther(gt, null, t, startFrame, durationSec)) t++;
       return t;
     }
-    // Lane indexes can change during import or recording because lanes lack persisted IDs.
-    // Capture the initial clip layout. Reject that index if an original clip moved or disappeared,
-    // or the lane count shrank. New clips alone do not invalidate it.
-    // Advance the generation on lane addition, removal, or project restore, including Undo and Redo,
-    // to catch empty-lane changes that clip positions cannot reveal.
     function gengaAudioLaneShape(gt) {
       const tracks = new Map();
       ((gt && gt.audioClips) || []).forEach(function(c) { tracks.set(String(c.id), c.track || 0); });
@@ -128358,7 +128382,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       shape.tracks.forEach(function(track, id) { if (now.get(id) !== track) kept = false; });
       return kept;
     }
-    function gengaReadFile(f, asDataUrl) { // Wrap FileReader in a promise and preserve the rejection reason.
+    function gengaReadFile(f, asDataUrl) {
       return new Promise(function(res, rej) {
         const r = new FileReader();
         r.onload = function() { res(r.result); };
@@ -128366,10 +128390,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (asDataUrl) r.readAsDataURL(f); else r.readAsArrayBuffer(f);
       });
     }
-    // Add a clip from a picker, drop, or recording. Video files supply only their audio.
-    // Native decode detaches its input. Preserve immutable source bytes first, independently of the disk File,
-    // and reuse the decoded buffer. Windowed imports keep their existing post-validation source read.
-    // Use laneShape captured by recording at start, or take a fresh snapshot when absent.
     async function gengaAddAudioFile(f, atFrame, track, tvppRef, laneShapeAtPick) {
       if (!f) return false;
       const project = state.project, laneShape = laneShapeAtPick || gengaAudioLaneShape(project && project.gengaTimeline);
@@ -128377,8 +128397,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!isMedia) return false;
       const fail = function(why) {
         const msg = t('status.genga.audioImport.decodeFailed', f.name || '', why);
-        // Report through gengaShowStatus so the failure also reaches a toast when the storyboard status strip
-        // is hidden in genga.
         gengaShowStatus(msg, { warn: true });
         console.warn('[genga audio] import failed', f.name, f.type, f.size, why);
         renderGengaView();
@@ -128391,6 +128409,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (!pcmInfo || pcmInfo.decodedBytes <= PCM_AUDIO_FULL_LIMIT) {
           const ab = f.arrayBuffer ? await f.arrayBuffer() : await gengaReadFile(f, false);
           source = new Blob([ab], { type: f.type || 'application/octet-stream' });
+          // AudioContext.decodeAudioData detaches the ArrayBuffer.
           buf = await new Promise(function(res, rej) { ctx.decodeAudioData(ab, res, rej); });
         } else {
           pcmPrepared = {blob: f, info: pcmInfo, windows: new Map(), pending: new Map()};
@@ -128402,12 +128421,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return false;
       }
       if (state.project !== project) { console.info('[genga audio] Project changed; discarded decoded audio.'); return false; }
-      if (!buf && !pcmInfo) { fail('empty audio'); return false; } // Decode succeeded but there is no audio track.
+      if (!buf && !pcmInfo) { fail('empty audio'); return false; }
       if (!source) {
         try { source = await gengaReadFile(f, true); } catch (e) { fail((e && e.message ? e.message : String(e))); return false; }
       }
       if (state.project !== project) { console.info('[genga audio] Project changed; discarded prepared audio.'); return false; }
-      // A relink target removed during asynchronous decode must not become an unrelated full-volume clip.
       if (tvppRef && !gengaTvppAudioFind(project.gengaTimeline, tvppRef)) {
         console.info('[genga audio] Relink target changed; discarded prepared audio.');
         return false;
@@ -128427,10 +128445,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         const gt = proj.gengaTimeline;
         if (!Array.isArray(gt.audioClips)) gt.audioClips = [];
         const sf = Math.max(1, Math.round(atFrame) || 1);
-        // If the lane layout changed, use a new bottom lane without discarding sound or mixing it into another lane.
         const want = gengaAudioLaneShapeKept(gt, laneShape) ? track : gengaAudioLaneCount(gt);
-        const tr = gengaAudioFreeTrack(gt, sf, length, want); // would overlap in the target lane → next free lane (created below when needed)
-        // Native mute is represented by the existing volume model. Capture placement and link in this same Undo.
+        const tr = gengaAudioFreeTrack(gt, sf, length, want);
         const native = tvppRef && gengaTvppAudioFind(gt, tvppRef);
         const volume = native ? native.mute ? 0 : Math.max(0, Math.min(1, Number.isFinite(native.volume) ? native.volume : 1)) : 1;
         gt.audioClips.push({
@@ -128445,14 +128461,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         });
         if (native) native.clipId = clipId;
       });
-      return clipId;   // Return clipId on success for relinking. Recording translates the result to a boolean.
+      return clipId;
     }
     function gengaImportAudio() {
       openFilePicker('audio/*,video/*', function(files) {
-        gengaAddAudioFile(files[0], gengaCurrentFrame(), state.gengaSelectedAudioLane || 0); // lands on the selected lane
+        gengaAddAudioFile(files[0], gengaCurrentFrame(), state.gengaSelectedAudioLane || 0);
       });
     }
-    // drag & drop audio/video files onto the audio lane → clip starts at the drop frame (multi-file: side by side)
     function gengaAudioLaneDragOver(ev) {
       if (!(ev.dataTransfer && Array.from(ev.dataTransfer.types || []).indexOf('Files') >= 0)) return;
       ev.preventDefault();
@@ -128468,14 +128483,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       let track;
       const laneAttr = ev.currentTarget && ev.currentTarget.getAttribute && ev.currentTarget.getAttribute('data-audio-lane');
       if (laneAttr != null) track = Math.max(0, Math.round(Number(laneAttr) || 0));
-      else { // dropped on the region (scroller edges / empty strip) → lane from the Y position, one past the end allowed (= new lane)
+      else {
         const wrap = document.querySelector('#gengaStage .genga-audio-lanes-wrap');
         const laneCount = Math.max(1, wrap ? wrap.querySelectorAll('.genga-audio-lane').length : 1);
-        track = wrap ? Math.max(0, Math.min(laneCount, Math.floor((uiPointerY(ev.clientY) - wrap.getBoundingClientRect().top) / uiReadScale() / gengaCamLaneH()))) : 0; // Map pointer to rect space and viewport to local pixels. The CSS variable owns lane height.
+        track = wrap ? Math.max(0, Math.min(laneCount, Math.floor((uiPointerY(ev.clientY) - wrap.getBoundingClientRect().top) / uiReadScale() / gengaCamLaneH()))) : 0;
       }
       Array.from(files).forEach(function(f) { gengaAddAudioFile(f, atFrame, track); });
     }
-    // Confirm only audio linked to dialogue, as in storyboard. Removing it unlinks the dialogue.
     async function gengaDeleteAudioClip(id) {
       const project = state.project, gt0 = project && project.gengaTimeline;
       const clip = gt0 && (gt0.audioClips || []).find(function(c) { return String(c.id) === String(id); });
@@ -128485,20 +128499,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (String(state.gengaSelectedAudioId) === String(id)) state.gengaSelectedAudioId = null;
       gengaRemoveAudioClip(id);
     }
-    // Delete without prompting after caller confirmation or from tools/moart-agent. Normalization only clears the dialogue link.
     function gengaRemoveAudioClip(id) {
       runCommand('音声削除', function(proj) {
         const gt = proj.gengaTimeline;
         gt.audioClips = (gt.audioClips || []).filter(function(c) { return String(c.id) !== String(id); });
       });
     }
-    // Razor splits the audio and dialogue at frame f, which starts the right piece.
-    // Use Split at Current Playhead Position to split linked dialogue and audio together.
-    // gengaNormalizeDialogue derives the dialogue span from the trimmed clip, so splitting only one would restore the full clip span.
-    // Require f strictly inside the visible span to avoid an empty piece.
     function gengaAudioSplitAllowed(gt, clip, f) { const span = gengaDialogueClipSpan(gt, clip); return f > span.from && f <= span.to; }
     function gengaDialogueSplitAllowed(entry, f) { return f > entry.from && f <= entry.to; }
-    // Split inside the command. The right clip uses a later sourceOffsetSec. Trim and fade-in stay left and fade-out stays right.
     function gengaSplitAudioClipAt(gt, clip, f) {
       if (!gengaAudioSplitAllowed(gt, clip, f)) return null;
       const fps = gengaMediaFps(gt), start = Math.max(1, Math.round(Number(clip.startFrame) || 1));
@@ -128520,8 +128528,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gt.audioClips.push(right);
       return right;
     }
-    // Assign characters before f to the left and the rest to the right. Preserve displayed positions as integer frames
-    // so text and 口パク stay in place. Use default layout when there are more characters than frames.
     function gengaSplitDialogueEntryAt(d, entry, f) {
       if (!gengaDialogueSplitAllowed(entry, f)) return null;
       const chars = gengaDialogueChars(entry.text),
@@ -128531,7 +128537,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       while (k < chars.length && entry.from + offs[k] < f) k++;
       const shift = f - entry.from;
       const right = { id: newGengaDialogueId(), lane: entry.lane, from: f, to: entry.to, speaker: entry.speaker, text: chars.slice(k).join('') };
-      if (entry.layerId) right.layerId = entry.layerId;   // Preserve the linked mouth layers on both sides.
+      if (entry.layerId) right.layerId = entry.layerId;
       if (fixed && k < chars.length) right.chars = fixed.slice(k).map(function(v) { return v - shift; });
       entry.text = chars.slice(0, k).join('');
       entry.to = f - 1;
@@ -128539,7 +128545,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       d.entries.push(right);
       return right;
     }
-    // The dialogue and clip menus both split the linked partner at the same f and reconnect the right pieces.
     function gengaSplitAtPlayhead(kind, id) {
       const f = gengaCurrentFrame();
       runCommand(kind === 'dialogue' ? 'セリフ分割' : '音声分割', function(p) { gengaSplitMediaAt(p, kind, id, f); });
@@ -128554,7 +128559,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const rightEntry = entry ? gengaSplitDialogueEntryAt(d, entry, f) : null;
       if (rightEntry && rightClip) rightEntry.audioClipId = String(rightClip.id);
     }
-    // Split only selected audio when present. Otherwise split audio and dialogue at the playhead with partners in one Undo step.
     function gengaSplitMediaAtPlayhead() {
       const p = state.project, gt = p && p.kind === 'genga' && p.gengaTimeline;
       if (!gt || paintStrokeInProgress()) return;
@@ -128569,9 +128573,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!targets.length) return;
       runCommand('音声分割', function(project) { targets.forEach(function(t) { gengaSplitMediaAt(project, t.kind, t.id, f); }); });
     }
-    function gengaAudioClipContextMenu(ev) { // shared by desktop contextmenu + iPad long-press (bindTouchLongPressContextMenu)
-      // Ignore native touch contextmenu so it cannot bypass the app's long-press timing
-      // or movement threshold.
+    function gengaAudioClipContextMenu(ev) {
       if (shouldIgnoreContextMenuEvent(ev)) { ev.preventDefault(); return; }
       ev.preventDefault();
       ev.stopPropagation();
@@ -128592,13 +128594,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         { label: t('menu.genga.audio.delete'), action: function() { if (isCurrentClip()) gengaDeleteAudioClip(id); } }
       ], { width: 220 });
     }
-    // ---- clip-bar audio FX (all in place): white grips trim the playback region; a trimmed span shows dark
-    // (muted). The sub-handle under the grip pulls up → FI/FO (single-clip gain ramp) / down → hard trim.
-    // Volume lives in a one-line popover (right-click → 音量). ----
     function gengaAudioTrimPointerDown(ev) {
       if (ev.button != null && ev.button !== 0) return;
       ev.stopPropagation();
-      ev.preventDefault(); // don't start a clip move
+      ev.preventDefault();
       const h = ev.currentTarget, id = h.getAttribute('data-genga-audio'), side = h.getAttribute('data-genga-fade');
       const project = state.project, gt = project && project.gengaTimeline;
       const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === String(id); });
@@ -128611,27 +128610,23 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         el: el,
         rect: el.getBoundingClientRect(),
         dur: Math.max(0.05, clip.durationSec),
-        fps: gengaMediaFps(gt),   // Px → seconds
+        fps: gengaMediaFps(gt),
         base: (side === 'in') ? Math.max(0, Number(clip.trimStartSec) || 0) : Math.max(0, Number(clip.trimEndSec) || 0),
         other: (side === 'in') ? Math.max(0, Number(clip.trimEndSec) || 0) : Math.max(0, Number(clip.trimStartSec) || 0),
         next: null
       };
-      // Thin spec on beginDragStrand. capture:true keeps the genga trio's document-capture listening, so the
-      // ordering against genga's other pointer handlers is unchanged; the drag state is the closure the kernel
-      // provides.
       beginDragStrand(ev, {
         capture: true,
         onMove: function(mv) {
           const secPerPx = 1 / (gengaCellW() * d.fps);
-          let sec = (d.side === 'in') ? (uiPointerX(mv.clientX) - d.rect.left) / uiReadScale() * secPerPx : (d.rect.right - uiPointerX(mv.clientX)) / uiReadScale() * secPerPx; // Pointer→rect space before secPerPx
-          sec = Math.max(0, Math.min(sec, Math.max(0, d.dur - d.other - 0.02))); // the two trims may not cross
+          let sec = (d.side === 'in') ? (uiPointerX(mv.clientX) - d.rect.left) / uiReadScale() * secPerPx : (d.rect.right - uiPointerX(mv.clientX)) / uiReadScale() * secPerPx;
+          sec = Math.max(0, Math.min(sec, Math.max(0, d.dur - d.other - 0.02)));
           d.next = sec;
           d.el.style.setProperty(d.side === 'in' ? '--fi' : '--fo', Math.min(100, sec / d.dur * 100).toFixed(2) + '%');
         },
-        onCancel: function() { if (d.next != null) gengaResetAudioTrimPreview(d); }, // discard only the live --fi/--fo preview, no full timeline rebuild
+        onCancel: function() { if (d.next != null) gengaResetAudioTrimPreview(d); },
         onCommit: function() {
           if (d.next == null) return;
-          // Only the clip/geometry pressed at the start owns this trim preview.
           if (state.project !== project || project.gengaTimeline !== gt || !(gt.audioClips || []).includes(clip) ||
               clip.startFrame !== start || clip.track !== track || clip.durationSec !== duration ||
               Math.max(0, Number(d.side === 'in' ? clip.trimStartSec : clip.trimEndSec) || 0) !== d.base ||
@@ -128661,15 +128656,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!clip) return;
       const cur = side === 'in' ? Boolean(clip.fadeIn) : Boolean(clip.fadeOut);
       const d = { side: side, startY: ev.clientY, dy: 0 };
-      // Thin spec on beginDragStrand (capture:true, same as its trim sibling above)
       beginDragStrand(ev, {
         capture: true,
         onMove: function(mv) { d.dy = mv.clientY - d.startY; },
-        onCancel: function() {}, // no toggle from a canceled press — and nothing was previewed, so nothing to undo
+        onCancel: function() {},
         onCommit: function() {
           if (state.project !== project || project.gengaTimeline !== gt || !(gt.audioClips || []).includes(clip) ||
               (d.side === 'in' ? Boolean(clip.fadeIn) : Boolean(clip.fadeOut)) !== cur) return;
-          // pull up ≥5px → fade on; push down ≥5px → hard trim; a plain tap toggles
           const next = d.dy <= -5 ? true : (d.dy >= 5 ? false : !cur);
           if (next === cur) return;
           runCommand(next ? (d.side === 'in' ? '音声FI' : '音声FO') : '音声フェード解除', function() {
@@ -128683,7 +128676,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const clip = gt && (gt.audioClips || []).find(function(c) { return String(c.id) === String(id); });
       if (!clip) return;
       const pct = Math.round((clip.volume != null ? clip.volume : 1) * 100);
-      openAnchoredPopover({ // anchored-popover kernel (position+outside+ESC live there)
+      openAnchoredPopover({
         id: 'gengaAVolPop',
         className: 'genga-avol-pop',
         clientX: x,
@@ -128692,112 +128685,62 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         html: escapeHtml(t('af.volume')) + ' ' + gengaGaugeHtml('genga-aclip-vol:' + id, 0, 200, 1, pct, 'width:110px;height:14px') + '<span class="genga-avol-val">' + pct + '%</span>'
       });
     }
-    // ---- mic recording (genga-native): ● starts, ● again stops → the take lands as a clip at the frame where
-    // recording started (free lane if the target overlaps). The take goes in like a dropped file: blob → gengaAddAudioFile → gengaAudioStore (Blob). ----
-    let gengaRecSession = null;
-    function gengaUpdateRecBtn() {
-      const b = document.getElementById('gengaRecBtn');
-      if (!b) return;
-      b.classList.toggle('recording', !!gengaRecSession);
-      b.title = t(gengaRecSession ? 'project.genga.audio.recordStopTitle' : 'project.genga.audio.recordTitle');
+    function gengaAudioRecordingActive() {
+      return activeAudioRecording?.kind === 'genga';
     }
-    // Invalidate the owner before stopping: late recorder events must not clear a newer session.
-    function gengaReleaseRecording(session, message) {
-      if (!session) return;
-      const current = gengaRecSession === session;
-      if (current) { gengaRecSession = null; gengaUpdateRecBtn(); }
-      const rec = session.recorder, stream = session.stream;
-      session.recorder = null;
-      session.stream = null;
-      session.chunks.length = 0;
-      if (rec && rec.state !== 'inactive') {
-        try { rec.stop(); } catch (error) { console.warn('[genga recording] Recorder stop failed.', error); }
-      }
-      if (stream) stream.getTracks().forEach(function(track) {
-        try { track.stop(); } catch (error) { console.warn('[genga recording] Track release failed.', error); }
-      });
-      if (current && message) gengaShowStatus(message, { warn: true });
+
+    function gengaAudioRecordingTitle() {
+      return t(gengaAudioRecordingActive() ? 'project.genga.audio.recordStopTitle' : 'project.genga.audio.recordTitle');
     }
-    function gengaStopRecording(session, cancel) {
-      if (!session || gengaRecSession !== session) return;
-      if (cancel || !session.recorder) { gengaReleaseRecording(session, t('status.genga.micRecord.cancelled')); return; }
-      if (session.recorder.state === 'inactive') return; // The queued stop event owns completion.
-      try { session.recorder.stop(); }
-      catch (error) { gengaReleaseRecording(session, t('msg.genga.record.failed', error && error.message ? error.message : error)); }
+
+    function gengaRenderRecordingState() {
+      const button = document.getElementById('gengaRecBtn');
+      if (!button) return;
+      button.classList.toggle('recording', gengaAudioRecordingActive());
+      button.title = gengaAudioRecordingTitle();
     }
+
     function gengaToggleRecording() {
-      if (gengaRecSession) { gengaStopRecording(gengaRecSession); return; }
-      if (!(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function' && typeof MediaRecorder !== 'undefined')) {
+      if (gengaAudioRecordingActive()) return stopAudioRecording(activeAudioRecording);
+      if (!audioRecordingSupported()) {
         alert(t('msg.genga.record.unsupported'));
         return;
       }
-      const session = { recorder: null, stream: null, chunks: [] };
-      gengaRecSession = session;
-      gengaUpdateRecBtn();
-      Promise.resolve().then(function() {
-        if (gengaRecSession !== session) return null;
-        closeAudioInputSettings();
-        return requestAudioInputStream();
-      }).then(function(stream) {
-        if (!stream) return;
-        session.stream = stream;
-        if (gengaRecSession !== session) {
-          gengaReleaseRecording(session);
-          console.info('[genga recording] Discarded cancelled microphone request.');
-          return;
-        }
-        const options = audioRecordingOptions();
-        const mime = options.mimeType || '';
-        const rec = new MediaRecorder(stream, options);
-        session.recorder = rec;
-        const atFrame = gengaCurrentFrame();
-        const atLane = state.gengaSelectedAudioLane || 0; // land on the lane selected when recording started
-        const atLaneShape = gengaAudioLaneShape(state.project && state.project.gengaTimeline); // Reject the original lane index if it changes during recording.
-        // In-memory take caps (iPad safety). Bytes reuse conte's mic cap (MOBILE_RECORDING_MAX_BYTES, 64MB
-        // backstop); the 5-min time cap is the real iPad bound — genga decodes the whole take (trim = gain
-        // envelope), and 300s × 48kHz × 2ch × 4B ≈ 110MB PCM fits the mobile audio
-        // byte budget (128MB, shared with conte — trimDecodedAudioCaches) as one cache item. Hitting a cap auto-stops the recorder: the take so far still
-        // lands as a clip and the user is told why (never a silent drop).
-        let recBytes = 0, recCapReason = '';
-        const recStartMs = Date.now();
-        const GENGA_REC_MAX_MS = 5 * 60 * 1000;
-        rec.addEventListener('dataavailable', function(e) {
-          if (gengaRecSession !== session) return;
-          if (e.data && e.data.size) { session.chunks.push(e.data); recBytes += e.data.size; }
-          if (!recCapReason) {
-            if (recBytes > MOBILE_RECORDING_MAX_BYTES) recCapReason = t('msg.recording.capSize');
-            else if (Date.now() - recStartMs > GENGA_REC_MAX_MS) recCapReason = t('msg.recording.capTime');
-            if (recCapReason) gengaStopRecording(session);
-          }
-        });
-        rec.addEventListener('stop', function() {
-          if (gengaRecSession !== session) { gengaReleaseRecording(session); return; }
-          const blob = new Blob(session.chunks, { type: rec.mimeType || mime || 'audio/webm' });
-          gengaReleaseRecording(session);
-          if (recCapReason) { // Explicit auto-stop notice — the take up to the cap is still placed below
-            showToast(t('msg.recording.autoStopToast', recCapReason), { warn: true });
-          }
-          if (!blob.size) {
+      if (audioRecordingInputBusy()) {
+        gengaShowStatus(t('msg.audio.recordingInProgress'), { warn: true });
+        return;
+      }
+      const chunks = [];
+      let startFrame, lane, laneShape, bytes = 0, capReason = '';
+      return startAudioRecording('genga', {
+        render: gengaRenderRecordingState,
+        started(session) {
+          startFrame = gengaCurrentFrame();
+          lane = state.gengaSelectedAudioLane || 0;
+          laneShape = gengaAudioLaneShape(session.owner.project.gengaTimeline);
+        },
+        chunk(session, chunk) {
+          chunks.push(chunk);
+          bytes += chunk.size;
+          if (capReason) return;
+          if (bytes > MOBILE_RECORDING_MAX_BYTES) capReason = t('msg.recording.capSize');
+          else if (performance.now() - session.startedAt > 5 * 60 * 1000) capReason = t('msg.recording.capTime');
+          if (capReason) stopAudioRecording(session);
+        },
+        async publish(session) {
+          if (capReason) showToast(t('msg.recording.autoStopToast', capReason), { warn: true });
+          if (!chunks.length) {
             gengaShowStatus(t('status.genga.micRecord.noData'), { warn: true });
             renderGengaView();
-            return;
+            return false;
           }
           const stamp = new Date();
-          const name = '録音_' + String(stamp.getHours()).padStart(2, '0') + String(stamp.getMinutes()).padStart(2, '0') + String(stamp.getSeconds()).padStart(2, '0') + '.' + extensionForMime(blob.type || 'audio/webm');
-          trackAudioRecordingPublication(state.project, gengaAddAudioFile(new File([blob], name, { type: blob.type || 'audio/webm' }), atFrame, atLane, null, atLaneShape).then(function(id) { return !!id; })); // decode + free-lane placement + undoable add
-        });
-        rec.addEventListener('error', function(event) {
-          const error = event.error || new Error('MediaRecorder error');
-          console.warn('[genga recording] Recorder failed.', error);
-          gengaReleaseRecording(session, t('msg.genga.record.failed', error.message || String(error)));
-        });
-        rec.start(250);
-        gengaUpdateRecBtn();
-      }).catch(function(error) {
-        const current = gengaRecSession === session;
-        gengaReleaseRecording(session);
-        if (current) alert(t('msg.genga.record.startFailed', error && error.message ? error.message : error));
-        else console.info('[genga recording] Cancelled microphone request failed.', error);
+          const name = '録音_' + String(stamp.getHours()).padStart(2, '0') + String(stamp.getMinutes()).padStart(2, '0') + String(stamp.getSeconds()).padStart(2, '0') + '.' + extensionForMime(session.mimeType);
+          return Boolean(await gengaAddAudioFile(new File(chunks, name, { type: session.mimeType }), startFrame, lane, null, laneShape));
+        },
+        cancelled() { gengaShowStatus(t('status.genga.micRecord.cancelled'), { warn: true }); },
+        startFailed(error) { alert(t('msg.genga.record.startFailed', error.message || String(error))); },
+        saveFailed(error) { gengaShowStatus(t('msg.genga.record.failed', error.message || String(error)), { warn: true }); }
       });
     }
     function setGengaAudioClipVolume(id, vol) {
@@ -128807,8 +128750,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!clip || (clip.volume != null ? clip.volume : 1) === v) return;
       runCommand('音声クリップ音量', function() { clip.volume = v; });
     }
-    // Share clip, lane, and legacy master volume plus trim and fades across buffer, PCM, scrub, and export paths.
-    // Only scrubbing caps maxVolume at 4.
     function gengaClipGain(ctx, gt, clip, when, offset, dur, maxVolume) {
       const lane = gt.audioLaneVol && gt.audioLaneVol[clip.track || 0] != null ? gt.audioLaneVol[clip.track || 0] : 1;
       let volume = (clip.volume != null ? clip.volume : 1) * lane * (gt.audioVolume != null ? gt.audioVolume : 1);
@@ -128818,9 +128759,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         Math.max(0, Number(clip.trimStartSec) || 0), Boolean(clip.fadeIn), Math.max(0, Number(clip.trimEndSec) || 0), Boolean(clip.fadeOut));
       return gain;
     }
-    // trim/FI/FO envelope over the clip's own time axis (p = 0..dur sec), scheduled from ctx time `when` at buffer
-    // offset `offset`. Head span [0,tin): FI → ramp 0→base, hard trim → muted then step to base at the grip.
-    // Tail span (dur-tout,dur]: FO → ramp base→0, hard trim → step to 0 at the grip.
     function gengaScheduleClipGain(param, when, offset, dur, base, tin, fadeIn, tout, fadeOut) {
       tin = Math.max(0, tin || 0);
       tout = Math.max(0, tout || 0);
@@ -128834,7 +128772,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       param.setValueAtTime(valAt(offset), when);
       if (tin > offset + 0.001) {
         if (fadeIn) param.linearRampToValueAtTime(valAt(tin), when + (tin - offset));
-        else param.setValueAtTime(valAt(Math.min(dur, tin + 0.0001)), when + (tin - offset)); // hard trim → step up at the grip
+        else param.setValueAtTime(valAt(Math.min(dur, tin + 0.0001)), when + (tin - offset));
       }
       if (tout > 0) {
         if (q > offset + 0.001) {
@@ -128842,9 +128780,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
             param.setValueAtTime(valAt(q), when + (q - offset));
             param.linearRampToValueAtTime(0, when + (dur - offset));
           }
-          else param.setValueAtTime(0, when + (q - offset)); // hard trim → step down at the grip
+          else param.setValueAtTime(0, when + (q - offset));
         } else if (fadeOut && dur > offset + 0.001) {
-          param.linearRampToValueAtTime(0, when + (dur - offset)); // started inside the tail fade
+          param.linearRampToValueAtTime(0, when + (dur - offset));
         }
       }
     }
@@ -128873,12 +128811,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!clip) return;
       const content = document.querySelector('#gengaStage .genga-tl-content');
       if (!content) return;
-      // Use gengaAudioLaneCount, including empty lanes, as rendering and lane edits do.
-      // This defines vertical drag limits and audio region height.
       const laneCount = gengaAudioLaneCount(gt);
       const baseTrack = Math.max(0, clip.track || 0);
-      // selecting: a press marks this clip as the standalone audio selection (Delete removes it) and its lane
-      // as the selected audio lane. Selection persists after release (the lane click handler skips clip clicks).
       gengaClearStandalone();
       state.gengaSelectedAudioId = String(id);
       document.querySelectorAll('#gengaStage .genga-audio-clip.selected').forEach(function(x) { x.classList.remove('selected'); });
@@ -128904,10 +128838,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         laneCount: laneCount,
         durSec: Math.max(0.05, clip.durationSec)
       };
-      // Thin spec on beginDragStrand (capture:true — the genga trios listen on document in the capture phase on
-      // purpose). The move/finish bodies read gengaAudioDrag in a dozen places, so the module variable stays as
-      // the trio's state and only the listener plumbing and the cancel branch live in the kernel. A foreign pointer
-      // cannot drive or end the drag, and cancel reaches its own callback instead of a mid-function return.
       beginDragStrand(ev, {
         key: 'genga-audio-clip',
         capture: true,
@@ -128916,8 +128846,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         onCommit: function() { gengaAudioClipDragFinish(false); }
       });
     }
-    // Snap within 8 px to other clip starts, their first frame after the end, or the playhead.
-    // Check both edges of the moving clip.
     function gengaAudioSnapStart(gt, clipId, f, durSec) {
       const fps = gengaMediaFps(gt), len = gengaAudioFrameCount(fps, durSec), tol = 8 / Math.max(1, gengaCellW());
       const cands = [gengaCurrentFrame()];
@@ -128934,19 +128862,15 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       });
       return Math.max(1, best);
     }
-    // For overlaps, choose the nearest available existing lane, including the lane the clip vacates.
-    // Choosing a new lane first could trigger compaction after drop and disagree with preview.
     function gengaAudioLandingTrack(gt, clipId, target, startFrame, durationSec, laneCount) {
       if (!gengaAudioOverlapsOther(gt, clipId, target, startFrame, durationSec)) return target;
-      let best = -1, bestD = Infinity;   // Add a lane only if none of the existing ones is available.
+      let best = -1, bestD = Infinity;
       for (let t = 0; t < laneCount; t++) {
         const dist = Math.abs(t - target);
         if (dist < bestD && !gengaAudioOverlapsOther(gt, clipId, t, startFrame, durationSec)) { best = t; bestD = dist; }
       }
       return best >= 0 ? best : laneCount;
     }
-    // Share empty-lane compaction between normalizeGengaTimeline and drag preview. Keep one empty lane through the last occupied lane.
-    // For occupied tracks, slots maps new indexes to surviving original lanes, remap maps occupied originals back, and maxT is the last occupied lane.
     function gengaAudioLaneCompaction(tracks) {
       const used = new Set(tracks),
         maxT = tracks.reduce(function(m, t) { return Math.max(m, t); }, 0),
@@ -128959,7 +128883,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return { slots: slots, remap: remap, maxT: maxT };
     }
-    // Preview the final lane after compaction so drop lands at that position.
     function gengaAudioCompactedTrack(gt, clipId, landTrack) {
       const tracks = (gt.audioClips || []).filter(function(c) { return String(c.id) !== String(clipId); }).map(function(c) { return c.track || 0; });
       return gengaAudioLaneCompaction(tracks.concat([landTrack])).remap[landTrack];
@@ -128979,20 +128902,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (f !== gengaAudioDrag.start) gengaAudioDrag.moved = true;
       gengaAudioDrag.to = f;
       if (gengaAudioDrag.el) gengaAudioDrag.el.style.left = ((f - 1) * cw) + 'px';
-      // vertical: dragging below the last lane adds one (target == laneCount) — like pulling komas to a new row
       const d = gengaAudioDrag;
-      const t = Math.max(0, Math.min(d.laneCount, d.baseTrack + Math.round(uiPointerLocalY(ev.clientY - d.startY) / gengaCamLaneH()))); // Convert pointer delta to local pixels. The CSS variable owns lane height.
+      const t = Math.max(0, Math.min(d.laneCount, d.baseTrack + Math.round(uiPointerLocalY(ev.clientY - d.startY) / gengaCamLaneH())));
       if (t !== d.toTrack) { d.toTrack = t; d.moved = true; }
-      // Use gengaCamLaneH() in preview so its row heights match the actual lanes.
-      // For overlapping placements, use the nearest available lane or add a new one.
-      // Preview its location after compaction.
       const gtd = state.project && state.project.gengaTimeline;
       d.landTrack = (gtd && d.toTrack < d.laneCount) ? gengaAudioLandingTrack(gtd, d.id, d.toTrack, f, d.durSec, d.laneCount) : d.toTrack;
-      const shown = gtd ? gengaAudioCompactedTrack(gtd, d.id, d.landTrack) : d.landTrack;   // Final lane after compaction.
+      const shown = gtd ? gengaAudioCompactedTrack(gtd, d.id, d.landTrack) : d.landTrack;
       if (d.el) d.el.style.transform = (shown !== d.baseTrack) ? ('translateY(' + ((shown - d.baseTrack) * gengaCamLaneH()) + 'px)') : '';
-      // New-lane ghost: crossing below the last lane materializes a dashed row inside the audio scroller (clipped by
-      // the timeline area, so it never pokes out over the inspector) and temporarily grows the region by one row so
-      // the row + the moved clip are visible; leaving removes both again.
       const wrap = document.querySelector('#gengaStage .genga-audio-lanes-wrap');
       if (wrap) {
         let ghost = wrap.querySelector('.genga-audio-lane-ghost');
@@ -129025,7 +128941,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const d = gengaAudioDrag;
       gengaAudioDrag = null;
       if (!d) return;
-      { // shrink the region back to its compact height (commit/revert re-renders override this anyway)
+      {
         const hpx = (gengaCamLaneH() * Math.min(3, d.laneCount)) + 'px';
         const sc = document.querySelector('#gengaStage .genga-audio-scroll'),
           heads = document.querySelector('#gengaStage .genga-audio-scroll-heads');
@@ -129037,10 +128953,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           !(gt.audioClips || []).includes(clip) || clip.startFrame !== d.start ||
           Math.max(0, clip.track || 0) !== d.baseTrack || clip.durationSec !== d.duration) {
             gengaResetAudioClipDragPreview(d);
-            return; // Discard the old preview without a command/Undo.
+            return;
       }
       const frameMoved = d.moved && d.to !== d.start;
-      // Drop on the previewed lane. landTrack equal to laneCount creates a new one.
       if (d.landTrack != null) d.toTrack = d.landTrack;
       const trackMoved = d.toTrack !== d.baseTrack;
       if (!frameMoved && !trackMoved) {
@@ -156764,7 +156679,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       state.gengaPanX = 0;
       state.gengaPanY = 0;
       gengaPointerCanvasRect = null;
-      gengaStopRecording(gengaRecSession, true);
       const preview = document.getElementById('gengaPreviewCanvas');
       if (preview && preview.paintScratch && preview.paintScratch.preview) {
         paintReleaseCanvas(preview.paintScratch.preview);
@@ -166577,7 +166491,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
 
           '<label class="genga-audio-vol" title="' + escapeAttr(t('project.genga.audio.laneVolTitle', ahl + 1, lvPct)) + '">' + gengaGaugeHtml('genga-lane-vol:' + ahl, 0, 100, 1, lvPct, 'width:40px;height:10px') + '</label>' +
           (ahl === 0 ?
-            '<button id="gengaRecBtn" class="genga-audio-rec' + (gengaRecSession ? ' recording' : '') + '" type="button" title="' + escapeAttr(t('project.genga.audio.recordTitle')) + '"><svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true"><circle cx="12" cy="12" r="7" fill="currentColor"/></svg></button>' +
+            '<button id="gengaRecBtn" class="genga-audio-rec' + (gengaAudioRecordingActive() ? ' recording' : '') + '" type="button" title="' + escapeAttr(gengaAudioRecordingTitle()) + '"><svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true"><circle cx="12" cy="12" r="7" fill="currentColor"/></svg></button>' +
             '<button class="genga-audio-add" type="button" title="' + escapeAttr(t('project.genga.audio.addFileTitle')) + '" aria-label="' + escapeAttr(t('project.genga.audio.addFileTitle')) + '">' + appIconSvg('plus') + '</button>' : '') +
           '</div>';
       }
