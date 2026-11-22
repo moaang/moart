@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3548</title>
+  <title>MoArt ver3549</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -19856,7 +19856,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //
     // Drawing pixels, fill and recording
     //   Fill masks and pixel processing
-    //   Layer bitmaps and thumbnails
+    //   Drawing bitmap sources and thumbnails
     //   Stroke rasterization
     //   Timelapse recording
     //   Fill requests and work queue
@@ -19869,7 +19869,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //   Timeline Dojo
     //
     // Canvas interaction and editor controls
-    //   Selection overlays and transforms
+    //   Selection overlays and shared raster transforms
     //   Canvas zoom, rotation and gestures
     //   Storyboard and memo drawing gestures
     //   Paint tool windows and docking
@@ -27167,7 +27167,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           clearLayerLiveBitmap(ref);
         }
         clearPaintPixelDerivedEditState(ref); // undo/redo keeps the lasso selection (marquee is a fixed window)
-        clearLayerDrawingDataUrlCacheForRef(ref);
+        invalidateLayerDrawingSurfaces(ref);
         // No stage invalidation: undo/redo changes only layer pixels, so the line below repaints the existing
         // canvases in place (sync via the content cache). A full rebuild here would flicker.
         redrawVisibleLayerCanvasesForRef(ref);
@@ -38005,7 +38005,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (scaledDrawings) {
         project.layerDrawings = scaledDrawings;
         scaleConteEffects(project, value.scale);
-        Object.keys(scaledDrawings).forEach(function(ref) { clearLayerLiveBitmap(ref); clearLayerDrawingDataUrlCacheForRef(ref); });
+        Object.keys(scaledDrawings).forEach(function(ref) { clearLayerLiveBitmap(ref); invalidateLayerDrawingSurfaces(ref); });
       }
       const old = project.contePaper;
       const guide = defaultPaperFrameSettings(project.settings && project.settings.paperFrame);
@@ -41440,7 +41440,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         clearLayerLiveBitmap(ref);
         clearPaintPixelDerivedEditState(ref);
         touchLayerDrawing(drawing);
-        clearLayerDrawingDataUrlCacheForRef(ref);
         invalidateVideoPreviewForDrawingRef(ref);
       });
       const after = captureLayerDrawingEditState(state.project, refs);
@@ -45021,7 +45020,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     //     auto-keyed by videoTimelineSignature()   (bump historyMeta.videoTimelineRevision to auto-expire)
     //   preview DOM (stage.previewKey/seekUnitKey) invalidateVideoPreviewRenderCache()    preview content change
     //     scoped to one drawing                    invalidateVideoPreviewForDrawingRef(ref)
-    //   matching layer canvases' draw keys        clearLayerDrawingDataUrlCacheForRef    a layer drawing edited
+    //   matching layer canvases' draw keys        invalidateLayerDrawingSurfaces    a layer drawing edited
     //                                             (ref); also stage keys when onion skin is enabled
     //   audioWaveformCssCache[clipId]              delete on the clip                     audio clip trim / edit
     //   audio buffers by character                 invalidateAudioForCharacter(p, name)   voice / character change
@@ -75603,6 +75602,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       MEMORY_ADDITIONAL_OWNERS.forEach(function(owner) { if (owner.drop) owner.drop(ownershipOnly !== false); });
       [state.videoPreloadedLayerImages, layerPreviewImageCacheMap(), gengaImageCache, onionGhostCache, gengaVectorBakeCache, gengaVectorThumbCache]
         .forEach(function(map) { map.clear(); });
+      trimLayerBitmapUrlSerials(null, true);
       videoExportResetFrameCache();
       gengaSilInvalidateCaches();
     }
@@ -95915,11 +95915,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (engine === 'conte') {
         const drawing = project.layerDrawings && project.layerDrawings[asset.drawingRef];
         if (!drawing) throw new Error('Animation source asset is missing');
-        image = layerLiveBitmapFor(asset.drawingRef) || cachedLayerPreviewImage(layerDrawingContentKey(asset.drawingRef, drawing));
-        if (!image) {
-          if (!drawing.bitmapDataUrl) throw new Error('Animation source pixels are unavailable');
-          image = await loadImageAsync(drawing.bitmapDataUrl);
-        }
+        const key = layerDrawingContentKey(asset.drawingRef, drawing);
+        image = layerDrawingBitmapSource(asset.drawingRef, drawing) || await requestLayerDrawingBitmap(asset.drawingRef, drawing);
+        if (!image || key !== layerDrawingContentKey(asset.drawingRef, drawing)) throw new Error('Animation source pixels are unavailable');
         placement = layerDrawingBitmapRect(drawing);
       } else {
         let drawing = gengaResolveDrawing(asset);
@@ -96765,7 +96763,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ===========================================================================================
 
-    // ## SECTION: Layer bitmaps and thumbnails
+    // ## SECTION: Drawing bitmap sources and thumbnails
     // ===========================================================================================
     function normalizeLayerDrawingSnapshot(value) {
       if (value && typeof value === 'object') {
@@ -96977,7 +96975,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           else if (drawing.fillModel) drawing.fillModel = paintFillModelState(drawing.fillModel, 'stale');
           clearLayerLiveBitmap(ref); // Trimmed to empty — no live pixels
-          clearLayerDrawingDataUrlCacheForRef(ref);
+          invalidateLayerDrawingSurfaces(ref);
           redrawVisibleLayerCanvasesForRef(ref, { skipThumbnails: options.skipThumbnails === true });
           if (options.skipMemoRedraw !== true) {
             scheduleMemoCanvasRedraw(); // paper memo only (the video stage has no glass canvas)
@@ -97035,7 +97033,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // The live bitmap already satisfies layerDrawingHasInk(drawing, ref). PNG encoding remains deferred.
         invalidateTimelineLayerThumbnailForRef(ref, { immediate: true });
       }
-      clearLayerDrawingDataUrlCacheForRef(ref);
+      invalidateLayerDrawingSurfaces(ref);
       scheduleLayerBitmapEncode(ref); // proactively materialize the PNG off the hot path
       if (options.preserveActiveCanvas) {
         const rect = { x: bitmapX, y: bitmapY, w: bitmapWidth, h: bitmapHeight };
@@ -97084,7 +97082,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // (painted with a padded rect) or only the paper window of a bitmap that spills past it (preserveActiveCanvasRect
       // after the previous commit) — cloning it would bake the effect in, or drop the outside ink, at the next commit.
       // Only when the committed pixels are not in memory (decode still pending) is the canvas itself the base.
-      const committed = hasInk && ref ? (layerLiveBitmapFor(ref) || cachedLayerPreviewImage(layerDrawingContentKey(ref, drawing))) : null;
+      const committed = hasInk && ref ? layerDrawingBitmapSource(ref, drawing) : null;
       const baseRect = committed ? rect : currentRect;
       const source = committed ? document.createElement('canvas') : cloneCanvas(canvas);
       if (committed) {
@@ -97103,10 +97101,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return targetRect;
     }
 
-    // Preview decoding uses layerDrawingContentKey: live-canvas identity when present, otherwise
-    // ref + URL length/tail + bitmap rect. An already decoded source can be reused across undo or
-    // rebuilt DOM; cache misses still decode asynchronously. Live pixels need no PNG serialization
-    // just to obtain this key.
+    // Render identity combines placement with the live snapshot or the encoded source's exact identity.
+    // A new DOM surface can reuse the same decoded image. Live pixels need no PNG serialization.
     // ── canvas-backed layer bitmaps with lazy dataUrl serialization ─────────────────────────────────
     // A synchronous sourceCanvas.toDataURL('image/png') on stroke commit costs milliseconds at 480 and a
     // multi-frame freeze at 2480x3485, blocking higher canvas resolutions. At commit we keep only a canvas
@@ -97204,7 +97200,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const drawing = drawings[ref];
         if (drawing && drawing._liveBitmap) { canvases.set(ref, drawing._liveBitmap); delete drawing._liveBitmap; }
       });
-      Array.from(map.keys()).forEach(function(ref) { if (!canvases.has(ref)) { map.delete(ref); clearLayerDrawingDataUrlCacheForRef(ref); } });
+      Array.from(map.keys()).forEach(function(ref) { if (!canvases.has(ref)) { map.delete(ref); invalidateLayerDrawingSurfaces(ref); } });
       canvases.forEach(function(canvas, ref) {
         const drawing = drawings[ref], entry = map.get(ref);
         if (!drawing) { map.delete(ref); return; }
@@ -97217,7 +97213,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           return;
         }
         setLayerLiveBitmap(ref, canvas, drawing.version);
-        clearLayerDrawingDataUrlCacheForRef(ref);
+        invalidateLayerDrawingSurfaces(ref);
         scheduleLayerBitmapEncode(ref);
       });
     }
@@ -97231,12 +97227,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       live.clear();
       layerPreviewImageCacheMap().clear();
       const pending = layerPreviewPendingDecodeMap();
-      pending.forEach(function(entry) {
-        entry.image.onload = entry.image.onerror = null;
-        entry.waiters.clear();
-        entry.finish(false);
-      });
+      pending.forEach(function(entry) { entry.cancel(); });
       pending.clear();
+      layerBitmapUrlSerials.clear();
+      layerBitmapUrlBytes = 0;
     }
     // Synchronous readers materialize the PNG before reading drawing.bitmapDataUrl. Folder saves and idle
     // preparation use the shared asynchronous encoder below; exit/export keeps this immediate fallback.
@@ -97370,7 +97364,53 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // re-attach the snapshot's own canvas), so its IDENTITY names the pixels. drawing.version does not: undo restores the
     // older number and the next commit issues it again for different pixels.
     const layerLiveCanvasSerials = new WeakMap();
-    let layerLiveCanvasSerialNext = 0;
+    const drawingBitmapUrlSerials = new WeakMap();
+    let layerBitmapSerialNext = 0;
+    // Genga's references are stable; this identity is for transient inline raster records.
+    // Compare the exact source because unrelated PNGs can have the same length and tail.
+    function drawingBitmapUrlIdentity(drawing, url) {
+      let entry = drawingBitmapUrlSerials.get(drawing);
+      if (!entry || entry.url !== url) {
+        entry = { url: url, serial: ++layerBitmapSerialNext };
+        drawingBitmapUrlSerials.set(drawing, entry);
+      }
+      return entry;
+    }
+    // Conte history clones drawing records. Intern the exact encoded source, keeping compact
+    // render keys and reusing the decoded image even when a preview surface is rebuilt.
+    const layerBitmapUrlSerials = new Map();
+    let layerBitmapUrlBytes = 0;
+    function trimLayerBitmapUrlSerials(protectUrl, clear) {
+      const budget = bitmapCacheShareBytes('preview');
+      const overBudget = function() { return layerBitmapUrlSerials.size > 1024 || layerBitmapUrlBytes > budget; };
+      if (!clear && !overBudget()) return;
+      const retained = new Set([protectUrl]);
+      const retainImageUrl = function(image) { retained.add(image.getAttribute?.('src')); };
+      layerPreviewImageCacheMap().forEach(retainImageUrl);
+      state.videoPreloadedLayerImages.forEach(retainImageUrl);
+      layerPreviewPendingDecodeMap().forEach(function(entry) { retained.add(entry.image.getAttribute('src')); });
+      for (const url of layerBitmapUrlSerials.keys()) {
+        if (!clear && !overBudget()) break;
+        if (retained.has(url)) continue;
+        layerBitmapUrlSerials.delete(url);
+        layerBitmapUrlBytes -= url.length * 2;
+      }
+    }
+    function layerBitmapUrlKey(url) {
+      if (!url) return 'u0';
+      if (/^blob:/i.test(url)) return 'b' + url;
+      const cached = layerBitmapUrlSerials.get(url);
+      if (cached) {
+        layerBitmapUrlSerials.delete(url);
+        layerBitmapUrlSerials.set(url, cached); // LRU touch
+        return 'u' + cached;
+      }
+      const serial = ++layerBitmapSerialNext;
+      layerBitmapUrlSerials.set(url, serial);
+      layerBitmapUrlBytes += url.length * 2; // Conservative UTF-16 accounting.
+      trimLayerBitmapUrlSerials(url, false);
+      return 'u' + serial;
+    }
     function layerDrawingContentKey(ref, drawing) {
       // When a live canvas backs this ref, key on that canvas's identity so the decode cache is stable without a
       // materialized dataUrl. Loaded projects (no live canvas) keep the dataUrl-identity key.
@@ -97378,11 +97418,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const live = layerLiveBitmapMap().get(String(ref || ''));
       if (live && live.canvas) {
         let serial = layerLiveCanvasSerials.get(live.canvas);
-        if (!serial) { serial = ++layerLiveCanvasSerialNext; layerLiveCanvasSerials.set(live.canvas, serial); }
+        if (!serial) { serial = ++layerBitmapSerialNext; layerLiveCanvasSerials.set(live.canvas, serial); }
         return [ref, 'c' + serial, rect.x, rect.y, rect.w, rect.h].join(':');
       }
-      const dataUrl = String(drawing && drawing.bitmapDataUrl || '');
-      return [ref, dataUrl.length, dataUrl.slice(-32), rect.x, rect.y, rect.w, rect.h].join(':');
+      return [ref, layerBitmapUrlKey(drawing && drawing.bitmapDataUrl), rect.x, rect.y, rect.w, rect.h].join(':');
     }
 
     function cacheLayerPreviewImage(contentKey, image) {
@@ -97423,42 +97462,121 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return entry;
     }
 
-    function layerPreviewDecode(ref, drawing, contentKey) {
+    const drawingImageDecodes = new WeakMap();
+    function createDrawingImageDecode(onSettled) {
+      const image = new Image();
+      let finish;
+      const done = new Promise(function(resolve) { finish = resolve; });
+      const settle = function(ok) {
+        image.removeEventListener('load', loaded);
+        image.removeEventListener('error', failed);
+        try { if (onSettled) onSettled(ok ? image : null); }
+        finally { finish(ok ? image : null); }
+      };
+      const loaded = function() { settle(image.naturalWidth > 0); };
+      const failed = function() { settle(false); };
+      image.addEventListener('load', loaded, { once: true });
+      image.addEventListener('error', failed, { once: true });
+      drawingImageDecodes.set(image, done);
+      return { image: image, done: done, cancel: failed };
+    }
+    function drawingImageReady(image) {
+      if (!image) return Promise.resolve(null);
+      return drawingImageDecodes.get(image) || Promise.resolve(image.naturalWidth ? image : null);
+    }
+
+
+    // Decoded raster images use an LRU cache keyed by gengaRasterCacheKey, with a byte budget and item-count backstop.
+    // Eviction drops decoded images without changing stored drawing data; a later request can decode them again.
+    const GENGA_IMAGE_CACHE_MAX = 120;
+    const gengaImageCache = new Map(); // Map iteration order = insertion order → delete+set re-insert = LRU touch
+    // Use gengaRasterCacheKey instead of the base64 source. A base64 key would retain the entire source string
+    // after gengaPruneRuntimeStores removes the orphan ref from gengaDrawStore.
+    // Eviction must release decoded images independently without retaining their sources as cache keys.
+    function gengaImageFor(dr, onReady) {
+      if (!embeddedMediaUrl(dr && dr.dataUrl)) return null;
+      const key = gengaRasterCacheKey(dr);
+      if (!key) return null;
+      // A failed decode is recorded instead of cached; direct callers (layer thumbs) must not
+      // start a fresh Image on every render while that failure is backing off.
+      const failureKey = dr.ref || dr.dataUrl;
+      if (gengaDrawingFailureBlocks(failureKey, dr.dataUrl)) return null;
+      let img = gengaImageCache.get(key);
+      const owner = state.project;
+      if (img) {
+        gengaImageCache.delete(key);
+        gengaImageCache.set(key, img); // LRU touch, also for a pending image.
+      } else {
+        const decode = createDrawingImageDecode(function(image) {
+          if (image || gengaImageCache.get(key) !== img) return;
+          gengaImageCache.delete(key);
+          if (state.project !== owner) return;
+          console.error('[gengaImage] decode failed - will retry after a backoff');
+          gengaNoteDrawingFailure(failureKey, dr.dataUrl, 'retryable');
+        });
+        img = decode.image;
+        retrimBudgetedMapOnDecode(gengaImageCache, img, key, GENGA_IMAGE_CACHE_MAX, 'image');
+        budgetedMapSet(gengaImageCache, key, img, GENGA_IMAGE_CACHE_MAX, 'image');
+        img.src = dr.dataUrl;
+      }
+      if (img.complete && img.naturalWidth) return img;
+      if (onReady) drawingImageReady(img).then(function(image) {
+        if (image && state.project === owner) onReady();
+      });
+      return null;
+    }
+    async function gengaDecodeIntoCache(dr) {
+      const owner = state.project, key = gengaRasterCacheKey(dr);
+      if (!key) return false;
+      const img = gengaImageFor(dr, null) || gengaImageCache.get(key);
+      return Boolean(await drawingImageReady(img) && state.project === owner);
+    }
+
+    function layerDrawingBitmapSource(ref, drawing) {
+      return layerLiveBitmapFor(ref) || cachedLayerPreviewImage(layerDrawingContentKey(ref, drawing));
+    }
+
+    // The same pending decode serves paper, video preview, memo, fill and off-screen transforms.
+    // An interested canvas registers just its latest guarded paint. Apply holds its own image
+    // for the transaction even if the decoded cache is evicted before the other targets settle.
+    function requestLayerDrawingBitmap(ref, drawing, canvas, waiter) {
+      const source = layerDrawingBitmapSource(ref, drawing);
+      if (source) {
+        if (waiter) waiter.paint(source);
+        return Promise.resolve(source);
+      }
+      const url = embeddedMediaUrl(drawing && drawing.bitmapDataUrl);
+      if (!url) return Promise.resolve(null);
+      const contentKey = layerDrawingContentKey(ref, drawing);
+      const pending = layerPreviewPendingDecodeMap();
+      let entry = pending.get(contentKey);
+      if (entry) {
+        if (waiter) entry.waiters.set(canvas, waiter);
+        return entry.done;
+      }
       const rect = layerDrawingBitmapRect(drawing);
-      const pendingDecodes = layerPreviewPendingDecodeMap();
-      let decodeEntry = pendingDecodes.get(contentKey);
-      const startDecode = !decodeEntry;
-      if (startDecode) {
-        const image = new Image();
-        decodeEntry = { image: image, waiters: new Map() };
-        decodeEntry.done = new Promise(function(resolve) { decodeEntry.finish = resolve; });
-        pendingDecodes.set(contentKey, decodeEntry);
-        image.onload = function() {
-          if (pendingDecodes.get(contentKey) !== decodeEntry) { decodeEntry.finish(false); return; }
-          pendingDecodes.delete(contentKey);
-          image.onload = image.onerror = null;
-          // Report a mismatch between decoded dimensions and the placement rect without rebaking the bitmap.
+      entry = createDrawingImageDecode(function(image) {
+        if (pending.get(contentKey) !== entry) return;
+        pending.delete(contentKey);
+        try {
+          if (!image) return;
           if (image.naturalWidth !== rect.w || image.naturalHeight !== rect.h) {
             console.warn('[invariant] layer bitmap natural ' + image.naturalWidth + 'x' + image.naturalHeight +
               ' != rect ' + rect.w + 'x' + rect.h + ' for ' + ref + ' — fix the DATA; the runtime does not correct this.');
           }
           cacheLayerPreviewImage(contentKey, image);
-          try { decodeEntry.waiters.forEach(function(w, targetCanvas) {
-              if (w.current ? !w.current() : !targetCanvas.isConnected) return;
-              w.paint(image);
-              // A delayed decode must wake bounds derived from this surface, including Undo/Redo.
-              if (targetCanvas.isConnected && targetCanvas.dataset.layerPreviewDrawKey === w.key) schedulePaintEditOverlaysRedraw(w.ref);
-            }); } finally { decodeEntry.waiters.clear(); decodeEntry.finish(true); }
-        };
-        image.onerror = function() {
-          if (pendingDecodes.get(contentKey) !== decodeEntry) { decodeEntry.finish(false); return; }
-          pendingDecodes.delete(contentKey);
-          image.onload = image.onerror = null;
-          decodeEntry.waiters.clear();
-          decodeEntry.finish(false);
-        };
-      }
-      return { entry: decodeEntry, start: startDecode };
+          entry.waiters.forEach(function(w, targetCanvas) {
+            if (w.current ? !w.current() : !targetCanvas.isConnected) return;
+            w.paint(image);
+            if (targetCanvas.isConnected && targetCanvas.dataset.layerPreviewDrawKey === w.key) schedulePaintEditOverlaysRedraw(w.ref);
+          });
+        } finally { entry.waiters.clear(); }
+      });
+      entry.waiters = new Map();
+      if (waiter) entry.waiters.set(canvas, waiter);
+      pending.set(contentKey, entry);
+      entry.image.src = url;
+      return entry.done;
     }
 
     // A freshly committed bitmap is painted from its live canvas (layerLiveBitmapFor) — no decode and no cache
@@ -97531,12 +97649,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         canvas.dataset.layerPreviewPainted = '';
         // Keep the current pixels and geometry until the replacement bitmap is ready, then commit them together.
         // Share decoding; each canvas retains only its latest paint request.
-        const decode = layerPreviewDecode(ref, drawing, contentKey);
-        const decodeEntry = decode.entry;
-        const startDecode = decode.start;
-        decodeEntry.waiters.set(canvas, { key: key, ref: ref, paint: paint, current: requestCurrent });
-        if (startDecode) decodeEntry.image.src = bitmapUrl;
-        return decodeEntry.done;
+        return requestLayerDrawingBitmap(ref, drawing, canvas, { key: key, ref: ref, paint: paint, current: requestCurrent })
+          .then(Boolean);
       } else {
         // Decode cache needs no per-ref eviction here (bounded LRU handles it)
         resetLayerCanvasBitmapGeometry(canvas, geometry); // also sizes the canvas to the paper
@@ -97703,7 +97817,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       stage.dataset.previewSeekUnitKey = '';
     }
 
-    function clearLayerDrawingDataUrlCacheForRef(drawingRef) {
+    function invalidateLayerDrawingSurface(canvas) {
+      delete canvas.dataset.layerPreviewDrawKey;
+    }
+    function invalidateLayerDrawingSurfaces(drawingRef) {
       const ref = String(drawingRef || '');
       // The drawing's content changed — drop the per-canvas dedup key so the next in-place repaint cannot skip
       // itself. The commit path skips repainting the active edit canvas (its live pixels already show the
@@ -97714,9 +97831,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         document.querySelectorAll(
           '.picture-layer-canvas[data-layer-drawing-ref="' + cssEscapeValue(ref)
           + '"], .video-preview-layer-canvas[data-layer-drawing-ref="' + cssEscapeValue(ref) + '"]'
-        ).forEach(function(canvas) {
-          delete canvas.dataset.layerPreviewDrawKey;
-        });
+        ).forEach(invalidateLayerDrawingSurface);
       }
       // No stage invalidation here. This runs on every stroke commit and undo/redo, and wiping previewKey
       // would force a full off-screen stage rebuild + atomic swap each time — recreating the picture
@@ -101368,7 +101483,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (!canvas || !canvas.isConnected || String(canvas.dataset.layerDrawingRef || '') !== ref) return;
         // The op that just ended drew on this edit surface without committing, so the painter's dedup key no longer
         // describes these pixels — drop it, or the painter skips the restore and the abandoned gesture stays on screen.
-        delete canvas.dataset.layerPreviewDrawKey;
+        invalidateLayerDrawingSurface(canvas);
         drawLayerDrawingPreviewToCanvas(canvas, ref);
       });
     }
@@ -101729,8 +101844,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function memoPageBitmap(pageNo) {
       const drawing = memoPageDrawing(pageNo);
       if (!drawing) return null;
-      const ref = memoPageDrawingRef(pageNo);
-      return layerLiveBitmapFor(ref) || cachedLayerPreviewImage(layerDrawingContentKey(ref, drawing));
+      return layerDrawingBitmapSource(memoPageDrawingRef(pageNo), drawing);
     }
     function prepareMemoPageBitmap(pageNo) {
       const drawing = memoPageDrawing(pageNo);
@@ -101738,15 +101852,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!bitmapUrl || memoPageBitmap(pageNo)) return null;
       const project = state.project, ref = memoPageDrawingRef(pageNo);
       const key = layerDrawingContentKey(ref, drawing);
-      const decode = layerPreviewDecode(ref, drawing, key), entry = decode.entry;
       const canvas = document.getElementById('memoCanvas');
-      entry.waiters.set(canvas, { key: key, ref: ref,
+      return requestLayerDrawingBitmap(ref, drawing, canvas, { key: key, ref: ref,
         current: function() { return state.project === project && memoPageDrawing(pageNo) === drawing &&
-          memoPageKey(state.project.currentPage) === memoPageKey(pageNo); },
+          layerDrawingContentKey(ref, drawing) === key && memoPageKey(state.project.currentPage) === memoPageKey(pageNo); },
         paint: function() { redrawMemoCanvas(); updatePaintEditOverlays(ref); }
-      });
-      if (decode.start) entry.image.src = bitmapUrl;
-      return entry.done;
+      }).then(Boolean);
     }
     function captureMemoPageEditState(pageNo) {
       return { strokes: fastClone(memoPageHistory(pageNo)), redo: fastClone(memoPageHistory(pageNo, 'redo')),
@@ -103974,7 +104085,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (ev.key === 'Escape' && tlTut && !document.querySelector('dialog[open]')){ ev.preventDefault(); ev.stopPropagation(); tlTutExit(); }
     }, true);
 
-    // ## SECTION: Selection overlays and transforms
+    // ## SECTION: Selection overlays and shared raster transforms
     // 適用先: genga has cel groups; conte offers the same choices without them. Options carry data-i18n, so a
     // language switch relabels them; they are rebuilt only when the engine's set changes.
     function transformApplyOnModes() {
@@ -104574,17 +104685,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!ctx || !selection || !selection.maskCanvas || !src || !(src.w > 0) || !(src.h > 0)) return false;
       const quad = paintTransformBoxQuadArray(preview.box);
       if (!Array.isArray(quad) || quad.length !== 4) return false;
-      const offsetX = Math.round(Number(preview.layerCanvasOffsetX) || 0);
-      const offsetY = Math.round(Number(preview.layerCanvasOffsetY) || 0);
-      const maskX = paintSelectionPlaneX(selection) + offsetX;
-      const maskY = paintSelectionPlaneY(selection) + offsetY;
+      const offset = paintTransformWorkOffset(preview);
+      const mask = paintTransformMaskOrigin(selection, preview);
       // Pass only the UV-to-quad mapping. The shared kernel handles plotting, dashes, and pixel alignment.
       // Measure dash spacing in screen coordinates after projection so it stays uniform under perspective.
       return drawMarqueeContourDashes(ctx, selection.maskCanvas, color, function(mx, my) {
-        const u = (maskX + mx - src.x) / src.w;
-        const v = (maskY + my - src.y) / src.h;
+        const u = (mask.x + mx - src.x) / src.w;
+        const v = (mask.y + my - src.y) / src.h;
         const p = paintQuadBilinearPoint(quad, u, v);
-        return { x: p.x - offsetX, y: p.y - offsetY };
+        return { x: p.x - offset.x, y: p.y - offset.y };
       });
     }
 
@@ -105008,63 +105117,39 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return canvas;
     }
 
-    function layerWorkCanvasFromVisibleLayerCanvas(visibleCanvas, drawing, extraLayerBounds, sourceRect, geometry) {
-      // Place the visible layer canvas at its own current bitmap rect, not the drawing's stored data rect. A lasso
-      // reaching past the paper expands the live edit canvas (e.g. 561×588 at bitmapY=-192, recorded in its dataset
-      // and selection.bitmapY) while the data rect stays 561×396 at y=0 (a select commits no bitmap change). The data
-      // rect would squash an expanded canvas and shift the band captured by the transform box.
-      // currentLayerCanvasBitmapRect equals the data rect when not expanded.
-      const rect = sourceRect || currentLayerCanvasBitmapRect(visibleCanvas) || layerDrawingBitmapRect(drawing || {});
-      const extra = extraLayerBounds || null;
-      // The work canvas covers at least the current paper (paper-origin space) plus the bitmap and extra bounds;
-      // art past the paper keeps negative/overflow coords, absorbed by the offset shift.
-      const paper = geometry.paper;
-      const minX = Math.min(0, rect.x, extra ? Math.floor(Number(extra.x) || 0) : 0);
-      const minY = Math.min(0, rect.y, extra ? Math.floor(Number(extra.y) || 0) : 0);
-      const maxX = Math.max(paper.w, rect.x + rect.w, extra ? Math.ceil((Number(extra.x) || 0) + Math.max(1, Number(extra.w) || 1)) : paper.w);
-      const maxY = Math.max(paper.h, rect.y + rect.h, extra ? Math.ceil((Number(extra.y) || 0) + Math.max(1, Number(extra.h) || 1)) : paper.h);
-      const offsetX = Math.round(-minX);
-      const offsetY = Math.round(-minY);
+    // Build the same working plane for the active drawing and each off-screen batch target.
+    // Bitmap placement and stencil bounds are in layer coordinates. Do not clip outside paper.
+    function layerTransformWorkTarget(image, drawing, selection, geometry) {
+      const rect = layerDrawingBitmapRect(drawing);
+      const extra = paintSelectionLayerBounds(selection) || rect;
+      const minX = Math.min(0, rect.x, extra.x), minY = Math.min(0, rect.y, extra.y);
+      const maxX = Math.max(geometry.paper.w, rect.x + rect.w, extra.x + extra.w);
+      const maxY = Math.max(geometry.paper.h, rect.y + rect.h, extra.y + extra.h);
       const canvas = document.createElement('canvas');
       canvas.width = Math.max(1, Math.ceil(maxX - minX));
       canvas.height = Math.max(1, Math.ceil(maxY - minY));
-      if (!visibleCanvas) return { canvas: canvas, offsetX: offsetX, offsetY: offsetY };
-      const ctx = canvas.getContext('2d');
-      // rect (currentLayerCanvasBitmapRect): w/h equal the visible canvas's own size, so this places it 1:1,
-        // including the lasso-expanded region.
-      ctx.drawImage(visibleCanvas, rect.x + offsetX, rect.y + offsetY, rect.w, rect.h);
-      return { canvas: canvas, offsetX: offsetX, offsetY: offsetY };
+      if (image) canvas.getContext('2d').drawImage(image, rect.x - minX, rect.y - minY, rect.w, rect.h);
+      return { canvas: canvas, layerCanvasOffsetX: -minX, layerCanvasOffsetY: -minY, selection: selection };
     }
 
     function prepareLayerRasterTarget(layerTarget) {
       if (layerTarget && layerTarget.type === 'memo-page') return prepareMemoPageRasterTarget(layerTarget);
-      const geometry = contePaperGeom(state.project);
       if (!layerTarget || !layerTarget.drawingRef) return null;
+      const geometry = contePaperGeom(state.project);
       setActiveLayerCanvasTargets(layerTarget);
       const visibleCanvas = firstActiveLayerCanvas();
       if (!visibleCanvas) return null;
-      const drawing = ensureLayerDrawingData(state.project, layerTarget.drawingRef);
+      const ref = layerTarget.drawingRef;
+      const drawing = ensureLayerDrawingData(state.project, ref);
       // Do not stamp a new model key onto bounds from pixels still awaiting decode.
-      if (layerDrawingHasInk(drawing, layerTarget.drawingRef) && visibleCanvas.dataset.layerPreviewPainted !== '1') return null;
+      if (layerDrawingHasInk(drawing, ref) && visibleCanvas.dataset.layerPreviewPainted !== '1') return null;
+      const image = layerDrawingBitmapSource(ref, drawing);
+      if (!image && layerDrawingHasInk(drawing, ref)) return null;
       const inputFx = contePaintInputFx(layerTarget);
-      const selection = contePaintFxSelection(ensurePaintSelectionForDrawingRef(layerTarget.drawingRef), inputFx, true);
-      const selectionLayerBounds = selection ? paintSelectionLayerBounds(selection) : null;
-      const raw = layerLiveBitmapFor(layerTarget.drawingRef) || cachedLayerPreviewImage(layerDrawingContentKey(layerTarget.drawingRef, drawing));
-      if (!raw && layerDrawingHasInk(drawing, layerTarget.drawingRef)) return null;
-      const work = layerWorkCanvasFromVisibleLayerCanvas(raw, drawing, selectionLayerBounds, layerDrawingBitmapRect(drawing), geometry);
-      const canvas = work.canvas;
-      return {
-        target: layerTarget,
-        inputFx: inputFx,
-        canvas: canvas,
-        visibleCanvas: visibleCanvas,
-        drawing: drawing,
-        drawingRef: layerTarget.drawingRef,
-        geometry: geometry,
-        layerCanvasOffsetX: Math.round(Number(work.offsetX) || 0),
-        layerCanvasOffsetY: Math.round(Number(work.offsetY) || 0),
-        selection: selection
-      };
+      const selection = contePaintFxSelection(ensurePaintSelectionForDrawingRef(ref), inputFx, true);
+      return Object.assign(layerTransformWorkTarget(image, drawing, selection, geometry), {
+        target: layerTarget, inputFx: inputFx, visibleCanvas: visibleCanvas, drawing: drawing, drawingRef: ref, geometry: geometry
+      });
     }
 
     // Self-validating transform UI: a transform/perspective box (or live preview) for `ref` is valid only while the
@@ -105082,44 +105167,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // bounds uses work-canvas coordinates and patch has the same dimensions.
     function paintTransformInkRegion(target) {
       if (!target || !target.canvas) return null;
-      const offsetX = Math.round(Number(target.layerCanvasOffsetX) || 0);
-      const offsetY = Math.round(Number(target.layerCanvasOffsetY) || 0);
       const selection = target.selection;
-      if (selection) {
-        const selPatch = selectedPatchCanvasFromTarget(target);        // selection-rect sized, masked to the selection
-        if (selPatch) {
-          // An explicit selection sets the box, including any transparent area inside the lasso.
-          // Recropping to ink would shift the box when the drawing changes.
-          // Keep patch aligned to the same bounds. Ink bounds apply only without a selection.
-          // The box and source patch always describe the same region.
-          // A large lasso around small ink still maps correctly. The mesh also covers the empty area.
-          const layerBounds = paintSelectionLayerBounds(selection) || selection.bounds;
-          return {
-            selection: selection,
-            patch: selPatch,
-            bounds: {
-              x: Math.round(Number(layerBounds.x) || 0) + offsetX,
-              y: Math.round(Number(layerBounds.y) || 0) + offsetY,
-              w: selPatch.width,
-              h: selPatch.height
-            }
-          };
-        }
-        return null; // Do not substitute the whole drawing when the selection cannot be read.
-      }
-      const inkBounds = paintCanvasInkBounds(target.canvas); // already in work-canvas space
-      if (inkBounds) {
-        const patch = document.createElement('canvas');
-        patch.width = inkBounds.w;
-        patch.height = inkBounds.h;
-        patch.getContext('2d').drawImage(
-          target.canvas,
-          inkBounds.x, inkBounds.y, inkBounds.w, inkBounds.h,
-          0, 0, inkBounds.w, inkBounds.h
-        );
-        return { selection: null, patch: patch, bounds: inkBounds };
-      }
-      return null; // SAFE-STOP: blank async work canvas, or a truly empty layer (nothing to transform)
+      if (selection && !selection.maskCanvas) return null;
+      // A user stencil defines the source rectangle, including its transparent margin.
+      const bounds = selection ? paintSelectionWorkRect(selection, target) : paintCanvasInkBounds(target.canvas);
+      if (!bounds) return null;
+      const patch = paintCropTransformRaster(target.canvas, bounds);
+      if (selection) paintMaskTransformRaster(patch, selection.maskCanvas, 0, 0, 'destination-in', selection.bounds);
+      return { selection: selection, patch: patch, bounds: bounds };
     }
     function paintTransformBoundsForTarget(target) {
       const region = paintTransformInkRegion(target);
@@ -105182,17 +105237,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return selPart + '|' + inkPart + '|' + memoInk + (fx ? '|' + [fx.x, fx.y, fx.e.tx, fx.e.ty, fx.e.rot, fx.e.scale].join(',') : '');
     }
 
-    function paintTransformPaperQuad(quad, box) {
-      const x = Number(box.layerCanvasOffsetX) || 0, y = Number(box.layerCanvasOffsetY) || 0;
-      return quad.map(function(p) { return [p[0] - x, p[1] - y]; });
+    function paintTransformQuadInFrame(quad, from, to) {
+      const source = paintTransformWorkOffset(from), target = paintTransformWorkOffset(to);
+      const dx = target.x - source.x, dy = target.y - source.y;
+      return quad.map(function(p) { return [(Number(p[0]) || 0) + dx, (Number(p[1]) || 0) + dy]; });
+    }
+    function paintTransformRectQuad(rect) {
+      const x = rect.x, y = rect.y, r = x + rect.w, b = y + rect.h;
+      return [[x, y], [r, y], [r, b], [x, b]];
     }
     function paintTransformKeepsakeFromBox(box) {
-      return transformKeepsakeFrom(paintTransformPaperQuad(box.quad, box), paintTransformPaperQuad(box.baseQuad, box));
+      return transformKeepsakeFrom(paintTransformQuadInFrame(box.quad, box), paintTransformQuadInFrame(box.baseQuad, box));
     }
     function paintTransformReapplyToBox(keep, baseQuad, box) {
-      const quad = transformReapplyQuad(keep, paintTransformPaperQuad(baseQuad, box));
-      const x = Number(box.layerCanvasOffsetX) || 0, y = Number(box.layerCanvasOffsetY) || 0;
-      return quad && quad.map(function(p) { return [p[0] + x, p[1] + y]; });
+      return drawingTransformQuadForTarget(keep, baseQuad, box);
     }
     function ensurePaintTransformBoxForTarget(layerTarget, activeTarget, forceReset) {
       const target = activeTarget || prepareLayerRasterTarget(layerTarget);
@@ -105219,12 +105277,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const carry = !forceReset && state.paintTransformBox
         && Array.isArray(state.paintTransformBox.quad) && state.paintTransformBox.quad.length === 4
         ? state.paintTransformBox : null;
-      const identityQuad = [
-        [bounds.x, bounds.y],
-        [bounds.x + bounds.w, bounds.y],
-        [bounds.x + bounds.w, bounds.y + bounds.h],
-        [bounds.x, bounds.y + bounds.h]
-      ];
+      const identityQuad = paintTransformRectQuad(bounds);
       // One representation for both tools: the quad ([[x,y]×4] TL,TR,BR,BL, kernel format). 'transform' is
       // the affine-constrained drag-mode set over the same quad (the genga model).
       state.paintTransformBox = {
@@ -105248,12 +105301,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         baseKey: baseKey, // Key for the selection or ink bounds that produced this base.
         // Keep the original base quad as the pending-state reference. Drag, numeric edits, and Undo replace only quad.
         // Cloning carries the reference forward.
-        baseQuad: [
-          [bounds.x, bounds.y],
-          [bounds.x + bounds.w, bounds.y],
-          [bounds.x + bounds.w, bounds.y + bounds.h],
-          [bounds.x, bounds.y + bounds.h]
-        ]
+        baseQuad: identityQuad
       };
       state.paintTransformPreview = null;
       if (paintTransformBoxIsPending(state.paintTransformBox)) {
@@ -105302,29 +105350,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return ensurePaintTransformBoxForTarget(target, activeTarget, forceReset);
     }
 
-    function selectedPatchCanvasFromTarget(target) {
-      if (!target || !target.selection || !target.canvas) return null;
-      const b = target.selection.bounds;
-      const layerBounds = paintSelectionLayerBounds(target.selection) || b;
-      const offsetX = Math.round(Number(target.layerCanvasOffsetX) || 0);
-      const offsetY = Math.round(Number(target.layerCanvasOffsetY) || 0);
-      const patch = document.createElement('canvas');
-      patch.width = b.w;
-      patch.height = b.h;
-      const patchCtx = patch.getContext('2d');
-      patchCtx.drawImage(target.canvas, layerBounds.x + offsetX, layerBounds.y + offsetY, b.w, b.h, 0, 0, b.w, b.h);
-      patchCtx.globalCompositeOperation = 'destination-in';
-      patchCtx.drawImage(target.selection.maskCanvas, b.x, b.y, b.w, b.h, 0, 0, b.w, b.h);
-      patchCtx.globalCompositeOperation = 'source-over';
-      return patch;
+    // Mask-local bounds -> layer plane -> work canvas. Genga uses the paper canvas, whose offset is zero.
+    function paintSelectionWorkRect(selection, target) {
+      const bounds = paintSelectionLayerBounds(selection);
+      const offset = paintTransformWorkOffset(target);
+      return bounds && { x: bounds.x + offset.x, y: bounds.y + offset.y, w: bounds.w, h: bounds.h };
     }
 
-    function clearMaskPixelsFromCanvas(canvas, maskCanvas, offsetX, offsetY) {
-      if (!canvas || !maskCanvas) return;
+    function paintTransformWorkOffset(target) {
+      return { x: Math.round(Number(target && target.layerCanvasOffsetX) || 0),
+        y: Math.round(Number(target && target.layerCanvasOffsetY) || 0) };
+    }
+    function paintTransformMaskOrigin(selection, target) {
+      const offset = paintTransformWorkOffset(target);
+      return { x: paintSelectionPlaneX(selection) + offset.x, y: paintSelectionPlaneY(selection) + offset.y };
+    }
+    function paintCropTransformRaster(source, rect, readback) {
+      const canvas = readback ? createReadbackCanvas() : document.createElement('canvas');
+      canvas.width = rect.w;
+      canvas.height = rect.h;
+      canvas.getContext('2d').drawImage(source, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+      return canvas;
+    }
+    function paintMaskTransformRaster(canvas, mask, x, y, composite, crop) {
       const ctx = canvas.getContext('2d');
       ctx.save();
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.drawImage(maskCanvas, Math.round(Number(offsetX) || 0), Math.round(Number(offsetY) || 0));
+      ctx.globalCompositeOperation = composite;
+      if (crop) ctx.drawImage(mask, crop.x, crop.y, crop.w, crop.h, x, y, crop.w, crop.h);
+      else ctx.drawImage(mask, x, y);
       ctx.restore();
     }
 
@@ -105340,9 +105393,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function paintLayerPointToWorkCanvasPxRaw(point, target) {
       // Work-canvas px = LAYER px + work offset (offset maps layer→work space).
+      const offset = paintTransformWorkOffset(target);
       return {
-        x: conteNormToPlaneX(point && point.x, target.geometry.paper) + Math.round(Number(target && target.layerCanvasOffsetX) || 0),
-        y: conteNormToPlaneY(point && point.y, target.geometry.paper) + Math.round(Number(target && target.layerCanvasOffsetY) || 0)
+        x: conteNormToPlaneX(point && point.x, target.geometry.paper) + offset.x,
+        y: conteNormToPlaneY(point && point.y, target.geometry.paper) + offset.y
       };
     }
 
@@ -105617,17 +105671,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!target || !target.canvas) return null;
       // Use the same bounds as the box. Display an empty explicit selection without creating an edit or history.
       const region = paintTransformInkRegion(target);
-      if (!region || (region.selection && !paintCanvasInkBounds(region.patch))) return null;
+      if (!region) return null;
+      if (region.selection && !paintCanvasInkBounds(region.patch)) {
+        paintReleaseCanvas(region.patch);
+        return null;
+      }
       const baseCanvas = cloneCanvas(target.canvas);
       if (region.selection) {
-        const offsetX = Math.round(Number(target.layerCanvasOffsetX) || 0);
-        const offsetY = Math.round(Number(target.layerCanvasOffsetY) || 0);
-        clearMaskPixelsFromCanvas(
-          baseCanvas,
-          region.selection.maskCanvas,
-          paintSelectionPlaneX(region.selection) + offsetX,
-          paintSelectionPlaneY(region.selection) + offsetY
-        );
+        const mask = paintTransformMaskOrigin(region.selection, target);
+        paintMaskTransformRaster(baseCanvas, region.selection.maskCanvas, mask.x, mask.y, 'destination-out');
       } else {
         // no selection: lift the ink-region rectangle out of the base
         baseCanvas.getContext('2d').clearRect(region.bounds.x, region.bounds.y, region.bounds.w, region.bounds.h);
@@ -105673,11 +105725,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintWarpQuadMesh(ctx, patch, w, h, quad, paintQuadMeshDivisions(ctx, quad, maxError));
     }
 
-    function drawPaintPatchMovedExact(ctx, source, dx, dy) {
-      if (!ctx || !source || !source.patchCanvas || !source.sourceBounds) return;
-      const x = Math.round((Number(source.sourceBounds.x) || 0) + (Number(dx) || 0));
-      const y = Math.round((Number(source.sourceBounds.y) || 0) + (Number(dy) || 0));
-      ctx.drawImage(source.patchCanvas, x, y);
+    // Both engines compose the same base and warped patch. The caller owns clipping and output bounds.
+    function drawTransformedRaster(ctx, base, patch, quad, maxError, exactMove) {
+      if (base) ctx.drawImage(base, 0, 0);
+      if (!patch) return;
+      if (exactMove) ctx.drawImage(patch, exactMove.x, exactMove.y);
+      else paintDrawPatchThroughQuad(ctx, patch, patch.width, patch.height, quad, maxError);
     }
 
     function paintQuadBilinearPoint(quad, u, v) {
@@ -105727,8 +105780,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // One pending Apply owns its loading status. Other status writes revoke only that display ownership.
     // Notify through the storyboard status strip or gengaShowStatus when genga hides its strip.
     // Both write status, so they share ownsStatus and the same cleanup rule.
-    function transformApplyAfterLoading(loads, stillPending, retry, redraw, notify) {
-      const show = notify || function(message) { state.timelineStatus = message; };
+    // Apply owns the readiness barrier for the whole batch. Each engine supplies its drawing references
+    // and commit/history adapter. No drawing is written while another target is pending or unavailable.
+    function applyDrawingTransformBatch(targets, prepare, commit, waiting) {
+      const loads = [];
+      let unavailable = false;
+      const show = waiting.notify || function(message) { state.timelineStatus = message; };
+      for (const target of targets) {
+        const result = prepare(target);
+        if (result.status === 'error') unavailable = true;
+        if (result.status === 'pending') loads.push(result.promise);
+      }
+      if (unavailable) {
+        Promise.allSettled(loads);
+        show(t('status.drawing.unavailable'), { warn: true });
+        waiting.redraw();
+        return;
+      }
+      if (!loads.length) return commit();
+      const { stillPending, retry, redraw } = waiting;
       show(t('status.transform.loading', loads.length));
       const request = { ownsStatus: true, stillPending: stillPending };
       timelineStatusState.applyRequest = request;
@@ -105746,10 +105816,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
       Promise.all(loads).then(function() { finish(false); }, function() { finish(true); });
     }
-    // Apply on (both engines): carry the pending quad relation onto another drawing base in the same coordinate frame.
-    // Invalid inputs or non-finite results return null; crossing the vanishing line uses the affine fallback.
-    function transformQuadForTarget(quad, baseQuad, targetBaseQuad) {
-      return transformReapplyQuad(transformKeepsakeFrom(quad, baseQuad), targetBaseQuad);
+    // A batch carries one relationship computed in the layer or paper plane.
+    // Convert destination quads back to their own work canvas only after rebasing.
+    function drawingTransformQuadForTarget(keep, targetBaseQuad, targetFrame) {
+      const quad = transformReapplyQuad(keep, paintTransformQuadInFrame(targetBaseQuad, targetFrame));
+      return quad && paintTransformQuadInFrame(quad, null, targetFrame);
     }
     function transformReapplyQuad(keep, baseQuad) {
       if (!keep || !Array.isArray(baseQuad) || baseQuad.length !== 4) return null;
@@ -105953,20 +106024,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         && Math.abs(q[0][1] - ((Number(sb.y) || 0) + (Number(preview.moveDy) || 0))) < 0.001;
     }
 
-    // The caller supplies the quality target. Default to stationary or commit quality independently of global drag state.
-    function drawPaintTransformPatch(ctx, preview, maxError) {
-      if (!ctx || !preview || !preview.source || !preview.source.patchCanvas) return;
-      if (paintTransformIsPureMove(preview)) {
-        drawPaintPatchMovedExact(ctx, preview.source, preview.moveDx || 0, preview.moveDy || 0);
-        return;
-      }
-      // Use one drawing entry point for perspective and affine transforms. paintTransformBoxQuadArray supplies the quad,
-      // and its shape selects the affine or mesh path.
-      const patch = preview.source.patchCanvas;
-      paintDrawPatchThroughQuad(ctx, patch, patch.width, patch.height, paintTransformBoxQuadArray(preview.box),
-        maxError);
-    }
-
     // Pending ink and committed ink use the same layer canvas/CSS sampling, opacity and FX path.
     // Cache immutable source bounds once; rebuild the pending bitmap only for a new quad or mesh quality.
     let paintTransformPreviewCache = null; // one pending bitmap; released when the preview ends
@@ -105987,8 +106044,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!result) return null;
       cache.source = source; cache.geometry = key; cache.canvas = result.canvas;
       cache.key = 'transform-preview:' + (++paintTransformPreviewRevision);
-      cache.drawing = { bitmapX: result.bounds.x - Math.round(Number(preview.layerCanvasOffsetX) || 0),
-        bitmapY: result.bounds.y - Math.round(Number(preview.layerCanvasOffsetY) || 0),
+      const offset = paintTransformWorkOffset(preview);
+      cache.drawing = { bitmapX: result.bounds.x - offset.x,
+        bitmapY: result.bounds.y - offset.y,
         bitmapWidth: result.bounds.w, bitmapHeight: result.bounds.h };
       paintTransformPreviewCache = cache;
       return cache;
@@ -106010,13 +106068,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Apply on (conte): a koma is a layer, its lane (line key, shared across cuts) the layer row. Selected komas define
     // the timeline slots; with one koma it is the playhead's slot. 'layer' keeps the current lane, 'selected' the lanes of
     // the selected komas, 'all' every lane. Locked komas stay untouched and a drawing shared by komas is baked once.
-    function conteTransformTargetRefs() {
+    function conteTransformTargets() {
       const target = currentPaintTransformLayerTarget();
       if (!target || target.type === 'memo-page') return [];
       const project = state.project, komas = [];
       (project.cuts || []).forEach(function(cut) {
         (cut.conteLayers || []).forEach(function(k) {
-          komas.push({ koma: k, range: layerSlotIndexRange(project, k, cut) });
+          komas.push({ cut: cut, koma: k, range: layerSlotIndexRange(project, k, cut) });
         });
       });
       const primary = komas.find(function(e) { return String(e.koma.id) === String(target.layerId); });
@@ -106028,73 +106086,43 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       else slotIndexes.add(videoSlotIndexOfCut(buildVideoTimelineCached(project), target.cutId));
       const mode = state.paintTransformApplyOn;
       const lanes = mode === 'all' ? null : new Set((mode === 'selected' ? picked : [primary]).map(function(e) { return conteLayerLineKey(e.koma); }));
-      const seen = new Set([String(target.drawingRef || '')]), refs = [];
+      const seen = new Set([String(target.drawingRef || '')]), targets = [];
       komas.forEach(function(e) {
         const ref = String(e.koma.drawingRef || '');
         if (e.koma.locked || !ref || seen.has(ref) || (lanes && !lanes.has(conteLayerLineKey(e.koma)))) return;
         if (!Array.from(slotIndexes).some(function(i) { return i >= e.range.startIndex && i <= e.range.endIndex; })) return;
         seen.add(ref);
-        if (layerDrawingHasInk(ensureLayerDrawingData(project, ref), ref)) refs.push(ref);
+        const drawing = ensureLayerDrawingData(project, ref);
+        if (layerDrawingHasInk(drawing, ref)) targets.push({
+          type: 'video-conte-layer', drawingRef: ref, drawing: drawing, layerId: e.koma.id, cutId: e.cut.id
+        });
       });
-      return refs;
+      return targets;
     }
-    // Pixels of a drawing that is not on screen: live canvas, the decoded preview cache, or a load made for this apply.
-    function conteTransformImageFor(ref, loaded) {
-      const drawing = ensureLayerDrawingData(state.project, ref), key = layerDrawingContentKey(ref, drawing);
-      return layerLiveBitmapFor(ref) || cachedLayerPreviewImage(key) || loaded && loaded.get(key) || null;
-    }
-    // The same coordinate rules as the primary: the selection's region, or (no selection) the target's own ink bounds
-    // carrying the pending relation in layer coordinates (work canvas = layer + offset).
-    function conteBakeTransformTarget(preview, ref, loaded) {
+
+    function conteBakeTransformTarget(preview, target, image, keep) {
       const geometry = contePaperGeom(state.project);
-      const image = conteTransformImageFor(ref, loaded);
-      if (!image) return null;
-      const drawing = ensureLayerDrawingData(state.project, ref);
-      const found = selectedConteLayerIdArray().map(function(id) { return findConteLayerById(state.project, id); }).find(function(f) { return f && f.layer.drawingRef === ref; });
-      const inputFx = found && contePaintInputFx({
-        type: 'video-conte-layer',
-        layerId: found.layer.id,
-        cutId: found.ownerCut.id,
-        drawingRef: ref,
-        drawing: drawing
-      });
+      const ref = target.drawingRef, inputFx = contePaintInputFx(target);
       const selection = preview.source.selection ? contePaintFxSelection(state.paintSelection, inputFx, true) : null;
-      const work = layerWorkCanvasFromVisibleLayerCanvas(
-        image,
-        drawing,
-        selection ? paintSelectionLayerBounds(selection) : null,
-        layerDrawingBitmapRect(drawing),
-        geometry
-      );
-      const source = preparePaintTransformSource({
-        canvas: work.canvas,
-        layerCanvasOffsetX: work.offsetX,
-        layerCanvasOffsetY: work.offsetY,
-        selection: selection
-      });
-      if (!source || !source.sourceBounds) return null;
-      const b = source.sourceBounds, box = preview.box;
-      const base = [[b.x, b.y], [b.x + b.w, b.y], [b.x + b.w, b.y + b.h], [b.x, b.y + b.h]];
-      const carried = transformQuadForTarget(paintTransformPaperQuad(box.quad, box), paintTransformPaperQuad(box.baseQuad, box),
-        base.map(function(p) { return [p[0] - work.offsetX, p[1] - work.offsetY]; }));
-      if (!carried) return null;
-      const targetBox = {
-        quad: carried.map(function(p) { return [p[0] + work.offsetX, p[1] + work.offsetY]; }),
-        baseQuad: base,
-        refW: b.w,
-        refH: b.h,
-        layerCanvasOffsetX: work.offsetX,
-        layerCanvasOffsetY: work.offsetY
-      };
-      const result = paintTransformResultCanvas({
-        drawingRef: ref,
-        mode: preview.mode,
-        source: source,
-        box: targetBox,
-        layerCanvasOffsetX: work.offsetX,
-        layerCanvasOffsetY: work.offsetY
-      });
-      return result && result.canvas ? { ref: ref, result: result, offsetX: work.offsetX, offsetY: work.offsetY, inputFx: inputFx } : null;
+      const work = layerTransformWorkTarget(image, target.drawing, selection, geometry);
+      let source;
+      try {
+        source = preparePaintTransformSource(work);
+        if (!source) return null;
+        const quad = drawingTransformQuadForTarget(keep, paintTransformRectQuad(source.sourceBounds), work);
+        if (!quad) return null;
+        const result = paintTransformResultCanvas({
+          drawingRef: ref, mode: preview.mode, source: source, box: { quad: quad }
+        });
+        return result && { ref: ref, result: result, offset: paintTransformWorkOffset(work), inputFx: inputFx };
+      } finally {
+        if (source) {
+          paintReleaseCanvas(source.baseCanvas);
+          paintReleaseCanvas(source.patchCanvas);
+        }
+        paintReleaseCanvas(work.canvas);
+        if (inputFx && selection) paintReleaseCanvas(selection.maskCanvas);
+      }
     }
     function paintTransformResultCanvas(op, options) {
       if (!op || !op.source || !op.source.baseCanvas) return null;
@@ -106127,8 +106155,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       ctx.clearRect(0, 0, w, h);
       ctx.save();
       ctx.translate(-x, -y);
-      ctx.drawImage(op.source.baseCanvas, 0, 0);
-      drawPaintTransformPatch(ctx, preview, options && options.maxError); // commit has no preview options
+      let exactMove = null;
+      if (paintTransformIsPureMove(preview)) {
+        const bounds = op.source.sourceBounds;
+        exactMove = { x: Math.round(bounds.x + preview.moveDx), y: Math.round(bounds.y + preview.moveDy) };
+      }
+      drawTransformedRaster(ctx, op.source.baseCanvas, op.source.patchCanvas,
+        paintTransformBoxQuadArray(preview.box), options && options.maxError, exactMove);
       ctx.restore();
       return { canvas: canvas, bounds: { x: x, y: y, w: w, h: h } };
     }
@@ -106285,14 +106318,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintDrawPatchThroughQuad(octx, mask, mask.width, mask.height, corners);
       return { canvas: out, x: x, y: y };
     }
+    function paintTransformCroppedMask(mask, bounds, origin, source, quad) {
+      const crop = paintCropTransformRaster(mask, bounds);
+      try { return paintMaskWarpedThroughQuad(crop, origin.x + bounds.x, origin.y + bounds.y, source, quad); }
+      finally { paintReleaseCanvas(crop); }
+    }
     function paintSelectionAfterTransform(preview) {
       const selection = preview && preview.source && preview.source.selection;
       if (!selection || !selection.maskCanvas) return null;
-      const offsetX = Math.round(Number(preview.layerCanvasOffsetX) || 0);
-      const offsetY = Math.round(Number(preview.layerCanvasOffsetY) || 0);
-      const mask = selection.maskCanvas;
-      const maskX = paintSelectionPlaneX(selection) + offsetX;   // mask rect in work-canvas space
-      const maskY = paintSelectionPlaneY(selection) + offsetY;
+      const offset = paintTransformWorkOffset(preview);
+      const mask = selection.maskCanvas, origin = paintTransformMaskOrigin(selection, preview);
       // The output is sized to where the mask lands, never to the layer's result bounds: those hug the ink (base
       // ink ∪ moved patch), so sizing to them crops the lasso's slack away.
       // Use paintMaskWarpedThroughQuad for the shared UV extension in the warp path.
@@ -106300,8 +106335,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const pureMove = paintTransformIsPureMove(preview);
       let out, x, y;
       if (pureMove) {
-        x = Math.floor(maskX + (preview.moveDx || 0));
-        y = Math.floor(maskY + (preview.moveDy || 0));
+        x = Math.floor(origin.x + (preview.moveDx || 0));
+        y = Math.floor(origin.y + (preview.moveDy || 0));
         out = createReadbackCanvas();                              // read back once by paintCanvasInkBounds
         out.width = mask.width;
         out.height = mask.height;
@@ -106312,15 +106347,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // perspective commit would build a canvas of tens of millions of px and a selection that no longer matches
         // the baked ink (the genga caller crops for the same reason). This rect is the patch frame (sourceBounds),
         // so uv spans exactly [0,1].
-        const sb = selection.bounds;
-        const sub = document.createElement('canvas');
-        sub.width = sb.w;
-        sub.height = sb.h;
-        sub.getContext('2d').drawImage(mask, sb.x, sb.y, sb.w, sb.h, 0, 0, sb.w, sb.h);
-        let warped;
-        try {
-          warped = paintMaskWarpedThroughQuad(sub, maskX + sb.x, maskY + sb.y, preview.source.sourceBounds, paintTransformBoxQuadArray(preview.box));
-        } finally { paintReleaseCanvas(sub); }
+        const warped = paintTransformCroppedMask(mask, selection.bounds, origin,
+          preview.source.sourceBounds, paintTransformBoxQuadArray(preview.box));
         if (!warped) return null;
         out = warped.canvas;
         x = warped.x;
@@ -106331,8 +106359,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return {
         drawingRef: String(preview.drawingRef || ''),
         maskCanvas: out,
-        bitmapX: x - offsetX,   // mask-local bounds above are read against this origin, as everywhere else
-        bitmapY: y - offsetY,
+        bitmapX: x - offset.x,
+        bitmapY: y - offset.y,
         bounds: bounds,
         inverted: !!selection.inverted
       };
@@ -106368,38 +106396,52 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // so the saved relation remains separate from the pending box.
       const nextKeepsake = state.paintTransformBox
         ? paintTransformKeepsakeFromBox(state.paintTransformBox) : null;
-      const targets = state.paintTransformBox ? conteTransformTargetRefs() : [];
-      const missing = targets.filter(function(ref) { return !conteTransformImageFor(ref, loaded); });
-      if (missing.length) {
-        const images = loaded || new Map();
-        const project = state.project, box = state.paintTransformBox, preview = state.paintTransformPreview;
-        const selection = state.paintSelection, toolEpoch = imageBrushRuntime.toolEpoch;
-        const selected = state.selectedConteLayerIds;
-        const requestKey = function() {
-          const target = currentPaintTransformLayerTarget();
-          return JSON.stringify([state.videoEditMode, state.paintEditTool, state.videoPlayheadFrames,
-            target && [target.cutId, target.layerId, target.drawingRef, paintTransformBaseKey(target)],
-            state.paintTransformApplyOn, Array.from(selectedConteLayerSet()), conteTransformTargetRefs(), box.quad,
-            paintSelectionLayerBounds(state.paintSelection),
-            targets.map(function(ref) {
-              const drawing = project.layerDrawings[ref];
-              return [ref, drawing && drawing.version, drawing && layerDrawingContentKey(ref, drawing)];
-            })]);
-        };
-        const key = requestKey();
-        const stillPending = function() {
-          return state.project === project && state.paintTransformBox === box && state.paintTransformPreview === preview
-            && state.paintSelection === selection && state.selectedConteLayerIds === selected
-            && imageBrushRuntime.toolEpoch === toolEpoch && paintTransformUiRefValid(box.drawingRef) && requestKey() === key;
-        };
-        const loads = missing.map(function(ref) {
-          const drawing = ensureLayerDrawingData(state.project, ref), key = layerDrawingContentKey(ref, drawing);
-          return drawing.bitmapDataUrl ? loadImageAsync(drawing.bitmapDataUrl).then(function(image) { if (stillPending()) images.set(key, image); }) : Promise.reject(new Error('no pixels'));
+      if (!state.paintTransformPreview) return;
+      const targets = conteTransformTargets(), images = loaded || new Map();
+      const project = state.project, box = state.paintTransformBox, preview = state.paintTransformPreview;
+      const selection = state.paintSelection, toolEpoch = imageBrushRuntime.toolEpoch;
+      const selected = state.selectedConteLayerIds;
+      const requestKey = function() {
+        const primary = currentPaintTransformLayerTarget();
+        return JSON.stringify([state.videoEditMode, state.paintEditTool, state.videoPlayheadFrames,
+          primary && [primary.cutId, primary.layerId, primary.drawingRef, paintTransformBaseKey(primary)],
+          state.paintTransformApplyOn, Array.from(selectedConteLayerSet()), box.quad, paintSelectionLayerBounds(state.paintSelection),
+          conteTransformTargets().map(function(target) {
+            return [target.layerId, target.drawingRef, target.drawing.version,
+              layerDrawingContentKey(target.drawingRef, target.drawing), contePaintInputFx(target)];
+          })]);
+      };
+      let key;
+      const stillPending = function() {
+        return state.project === project && state.paintTransformBox === box && state.paintTransformPreview === preview
+          && state.paintSelection === selection && state.selectedConteLayerIds === selected
+          && imageBrushRuntime.toolEpoch === toolEpoch && paintTransformUiRefValid(box.drawingRef) && requestKey() === key;
+      };
+      const prepare = function(target) {
+        const ref = target.drawingRef, drawing = target.drawing, contentKey = layerDrawingContentKey(ref, drawing);
+        const source = layerDrawingBitmapSource(ref, drawing) || images.get(contentKey);
+        if (source) {
+          images.set(contentKey, source);
+          return { status: 'ready' };
+        }
+        if (!embeddedMediaUrl(drawing.bitmapDataUrl)) return { status: 'error' };
+        if (!key) key = requestKey();
+        return { status: 'pending', promise: requestLayerDrawingBitmap(ref, drawing).then(function(image) {
+          if (!image) throw new Error('Transform drawing is unavailable');
+          images.set(contentKey, image);
+        }) };
+      };
+      const commit = function() {
+        const extras = targets.map(function(target) {
+          return { target: target, image: images.get(layerDrawingContentKey(target.drawingRef, target.drawing)) };
         });
-        transformApplyAfterLoading(loads, stillPending, function() { applyPaintTransformKeepingUI(tool, images); }, updatePaintUI);
-        return;
-      }
-      const committed = commitPaintTransformPreview(targets, loaded);
+        return commitPaintTransformPreview(extras, nextKeepsake);
+      };
+      const committed = applyDrawingTransformBatch(targets, prepare, commit, {
+        stillPending: stillPending,
+        retry: function() { applyPaintTransformKeepingUI(tool, images); },
+        redraw: updatePaintUI
+      });
       // Preserve the last committed transform relation
       // Keep the saved relation when nothing was baked or the mapping is identity.
       // Check the return value of commitPaintTransformPreview
@@ -106414,7 +106456,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
 
-    function commitPaintTransformPreview(extraRefs, loaded) {
+    function commitPaintTransformPreview(targets, keep) {
       const preview = state.paintTransformPreview;
       if (!preview || !preview.drawingRef || !preview.source) return false;
       // Recheck visibility immediately before writing so every Enter or Apply caller
@@ -106452,21 +106494,23 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const result = paintTransformResultCanvas(preview);
       if (!result || !result.canvas || !result.bounds) return false;
       const selectionBefore = snapshotPaintSelection(); // Capture these values in the same Undo step as the drawing.
-      const extras = (extraRefs || []).map(function(r) { return conteBakeTransformTarget(preview, r, loaded); }).filter(Boolean); // Capture before the selection follows the drawing.
+      // Capture every target before moving the global stencil with the primary.
+      const extras = targets.map(function(entry) {
+        return conteBakeTransformTarget(preview, entry.target, entry.image, keep);
+      }).filter(Boolean);
       if (preview.source.selection && state.paintSelection) { // The global stencil has no layer owner to compare.
         state.paintSelection = contePaintFxSelection(paintSelectionAfterTransform(preview), contePaintInputFx(currentPaintTransformLayerTarget()), false); // Move the selection with the drawing.
       }
       state.paintTransformPreview = null;
       state.paintTransformBox = null;
-      const offsetX = Math.round(Number(preview.layerCanvasOffsetX) || 0);
-      const offsetY = Math.round(Number(preview.layerCanvasOffsetY) || 0);
+      const offset = paintTransformWorkOffset(preview);
       const refs = [ref].concat(extras.map(function(e) { return e.ref; }));
       const beforeAll = extras.length ? captureLayerDrawingEditState(state.project, refs) : null;
       const selectionHistory = { before: selectionBefore, after: snapshotPaintSelection() };
       const writeBitmap = memoTarget ? function(_ref, canvas, _history, options) { return commitMemoPageBitmap(canvas, options); } : setLayerDrawingBitmapFromCanvas;
       writeBitmap(ref, result.canvas, true, {
-        bitmapX: result.bounds.x - offsetX,
-        bitmapY: result.bounds.y - offsetY,
+        bitmapX: result.bounds.x - offset.x,
+        bitmapY: result.bounds.y - offset.y,
         bitmapWidth: result.bounds.w,
         bitmapHeight: result.bounds.h,
         trimAlpha: true,
@@ -106476,8 +106520,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       extras.forEach(function(e) {
         setLayerDrawingBitmapFromCanvas(e.ref, e.result.canvas, true, {
-          bitmapX: e.result.bounds.x - e.offsetX,
-          bitmapY: e.result.bounds.y - e.offsetY,
+          bitmapX: e.result.bounds.x - e.offset.x,
+          bitmapY: e.result.bounds.y - e.offset.y,
           bitmapWidth: e.result.bounds.w,
           bitmapHeight: e.result.bounds.h,
           trimAlpha: true,
@@ -106534,13 +106578,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (memoTarget ? !memoPageHasInk(target.target.pageNo) : !layerDrawingHasInk(drawing, ref)) return true;
       const canvas = target.canvas;
       const sel = target.selection;
-      const offsetX = Math.round(Number(target.layerCanvasOffsetX) || 0);
-      const offsetY = Math.round(Number(target.layerCanvasOffsetY) || 0);
-      const ctx = canvas.getContext('2d');
-      ctx.save();
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.drawImage(sel.maskCanvas, paintSelectionPlaneX(sel) + offsetX, paintSelectionPlaneY(sel) + offsetY);
-      ctx.restore();
+      const mask = paintTransformMaskOrigin(sel, target);
+      paintMaskTransformRaster(canvas, sel.maskCanvas, mask.x, mask.y, 'destination-out');
       const writeBitmap = memoTarget ? function(_ref, source, _history, options) { return commitMemoPageBitmap(source, options); } : setLayerDrawingBitmapFromCanvas;
       writeBitmap(ref, canvas, true, {
         bitmapX: target.bitmapX,
@@ -106579,7 +106618,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           drawing.bitmapY = Math.round(Number(drawing.bitmapY) || 0) + Math.round(dy);
           drawing.strokes = [];
           touchLayerDrawing(drawing);
-          clearLayerDrawingDataUrlCacheForRef(ref);
+          invalidateLayerDrawingSurfaces(ref);
           if (state.paintTransformPreview && String(state.paintTransformPreview.drawingRef || '') === ref) state.paintTransformPreview = null;
           // Keep the box and move both baseQuad and quad by the same delta as drawing.bitmapX/Y.
           // Leaving them in the old absolute position would detach the box from the nudged ink.
@@ -119878,7 +119917,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const eachDrawing = function(pageNos, fn) {
         const visit = function(ref, drawing) {
           const bitmapUrl = embeddedMediaUrl(drawing && drawing.bitmapDataUrl);
-          if (bitmapUrl && !layerLiveBitmapFor(ref)) fn(ref, drawing, layerDrawingContentKey(ref, drawing), bitmapUrl);
+          if (bitmapUrl && !layerLiveBitmapFor(ref)) fn(ref, drawing, layerDrawingContentKey(ref, drawing));
         };
         state.project.cuts.forEach(function(cut) {
           if (pageNos.indexOf(cut.pageNo) < 0) return;
@@ -119901,10 +119940,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         fits(drawing);
         if (image) cacheLayerPreviewImage(key, image);
       });
-      eachDrawing(neighbors, function(ref, drawing, key, bitmapUrl) {
+      eachDrawing(neighbors, function(ref, drawing, key) {
         if (cachedLayerPreviewImage(key) || !fits(drawing)) return;
-        const decode = layerPreviewDecode(ref, drawing, key);
-        if (decode.start) decode.entry.image.src = bitmapUrl;
+        requestLayerDrawingBitmap(ref, drawing);
       });
     }
     function fitExportPaperPreview(host) {
@@ -126929,6 +126967,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       // Read existing hybrids even though new drawings no longer create them.
       if (u) {
         const out = { ref: d.ref, w: d.w, h: d.h, dataUrl: u };
+        // Repeated views of a legacy inline drawing share its decode and render identity.
+        if (!d.ref) drawingBitmapUrlSerials.set(out, drawingBitmapUrlIdentity(d, u));
         if (Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))) { out.x = d.x; out.y = d.y; }
         if (d.strokes) out.strokes = d.strokes;
         return out;
@@ -127229,7 +127269,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaDrawingCacheKey(dr) {
       if (!dr) return '';
       if (dr.ref) return String(dr.ref);
-      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return dr.dataUrl.slice(-40);
+      if (typeof dr.dataUrl === 'string' && dr.dataUrl) return 'inline:' + drawingBitmapUrlIdentity(dr, dr.dataUrl).serial;
       const st = gengaDrawingStrokes(dr);
       return st ? gengaVectorStrokesKey(st) : '';
     }
@@ -127345,10 +127385,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         }
         const pending = gengaImageCache.get(gengaRasterCacheKey(dr));
         if (!pending || pending.complete) return { status: 'error' };
-        start = function() { return new Promise(function(resolve) {
-          pending.addEventListener('load', function() { resolve(Boolean(pending.naturalWidth)); }, { once: true });
-          pending.addEventListener('error', function() { resolve(false); }, { once: true });
-        }); };
+        start = function() { return drawingImageReady(pending).then(Boolean); };
       } else {
         const strokes = gengaDrawingStrokes(dr);
         return strokes ? { status: 'ready', drawing: dr, strokes: strokes } : { status: 'error' };
@@ -130233,23 +130270,6 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // Otherwise gengaDrawDrawingInto can return false and compositeDrawItems can omit the layer
     // without warning. Return failure so callers decide whether to stop.
     // Share the key with gengaImageFor to avoid duplicate cache entries.
-    function gengaDecodeIntoCache(dr) {
-      return new Promise(function(res) {
-        const key = gengaRasterCacheKey(dr);
-        if (!key) { res(false); return; }
-        const owner = state.project;
-        // gengaImageFor owns decode startup, cache insertion, and failure backoff. During backoff it returns null with no cached image.
-        const img = gengaImageFor(dr, null) || gengaImageCache.get(key);
-        if (!img) { res(false); return; }
-        const finish = function(ok) { res(Boolean(ok && state.project === owner && img.naturalWidth)); };
-        if (img.complete) { finish(true); return; }
-        img.addEventListener('load', function() { finish(true); }, { once: true });
-        img.addEventListener('error', function() {
-          console.error('[gengaDecode] image decode failed - anything composited from it will be missing this layer');
-          finish(false);
-        }, { once: true });
-      });
-    }
     // Report a failed 用紙 draw because the exported cel or instruction image will omit the paper.
     // Cel, camera, and cel-move exports share this helper. Notify on the first failure
     // and log later failures to avoid repeated batch toasts.
@@ -148885,56 +148905,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!mode && !(owner && owner.collapsed)) beginGengaLayerSort(ev, head, id, click);
       else beginDragStrand(ev, { on: 'document', onMove: function() {}, onCancel: function() {}, onCommit: click });
     }
-    // Decoded raster images use an LRU cache keyed by gengaRasterCacheKey, with a byte budget and item-count backstop.
-    // Eviction drops decoded images without changing stored drawing data; a later request can decode them again.
-    const GENGA_IMAGE_CACHE_MAX = 120;
-    const gengaImageCache = new Map(); // Map iteration order = insertion order → delete+set re-insert = LRU touch
     let gengaPreviewXform = null;
     let gengaDrawSession = null;
     let gengaStrokeSeq = 0;   // Stroke identity counter for each ink session's strokeKey.
-    // Use gengaRasterCacheKey instead of the base64 source. A base64 key would retain the entire source string
-    // after gengaPruneRuntimeStores removes the orphan ref from gengaDrawStore.
-    // Eviction must release decoded images independently without retaining their sources as cache keys.
-    function gengaImageFor(dr, onReady) {
-      if (!embeddedMediaUrl(dr && dr.dataUrl)) return null;
-      const key = gengaRasterCacheKey(dr);
-      if (!key) return null;
-      // A failed decode is recorded instead of cached; direct callers (layer thumbs) must not
-      // start a fresh Image on every render while that failure is backing off.
-      const failureKey = dr.ref || dr.dataUrl;
-      if (gengaDrawingFailureBlocks(failureKey, dr.dataUrl)) return null;
-      let img = gengaImageCache.get(key);
-      const owner = state.project;
-      if (img) {
-        gengaImageCache.delete(key);
-        gengaImageCache.set(key, img); // LRU touch
-        if (img.complete) return img;
-        // still decoding → stack this caller's callback too (dropping it would leave whoever asked second —
-        // typically the preview after the thumb — unredrawn until something else forces a redraw).
-        if (onReady) img.addEventListener('load', function() {
-          if (state.project === owner) onReady();
-        }, { once: true });
-        return null;
-      }
-      img = new Image();
-      if (onReady) img.addEventListener('load', function() {
-        if (state.project === owner) onReady();
-      }, { once: true });
-      // Invalid base64 can yield complete=true with naturalWidth=0, and drawImage then does nothing.
-      // gengaDrawDrawingInto may still report success, leaving a blank ghost in the onion cache.
-      // Wire onerror to report the failure. gengaDrawnBounds also checks for zero naturalWidth.
-      img.addEventListener('error', function() {
-        if (gengaImageCache.get(key) !== img) return;
-        console.error('[gengaImage] decode failed - will retry after a backoff');
-        // Keeping the broken Image would make every later lookup an immediate, permanent error.
-        if (gengaImageCache.get(key) === img) gengaImageCache.delete(key);
-        gengaNoteDrawingFailure(failureKey, dr.dataUrl, 'retryable');
-      }, { once: true });
-      retrimBudgetedMapOnDecode(gengaImageCache, img, key, GENGA_IMAGE_CACHE_MAX, 'image');
-      img.src = dr.dataUrl;
-      budgetedMapSet(gengaImageCache, key, img, GENGA_IMAGE_CACHE_MAX, 'image'); // LRU by bytes (item cap is the backstop)
-      return img.complete ? img : null;
-    }
     // Return the last frame of one exposure. Apply Math.max(1, …) so gengaOnionInstanceFrames agrees
     // on both exposure membership and loop end when hold is nonpositive.
     // gengaExposureEndFrame(layers, seed) instead computes the maximum end across layers.
@@ -151005,13 +150978,11 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         ? state.paintTransformPreview : null;
       const source = existingPreview && existingPreview.source ? existingPreview.source : preparePaintTransformSource(target);
       if (!source) return false;
-      const sourceX = Number(existingPreview ? existingPreview.layerCanvasOffsetX : target.layerCanvasOffsetX) || 0;
-      const sourceY = Number(existingPreview ? existingPreview.layerCanvasOffsetY : target.layerCanvasOffsetY) || 0;
-      const dx = sourceX - (Number(box.layerCanvasOffsetX) || 0), dy = sourceY - (Number(box.layerCanvasOffsetY) || 0);
+      const frame = existingPreview || target, offset = paintTransformWorkOffset(frame);
       const nb = clonePaintTransformBox(box);
-      nb.layerCanvasOffsetX = sourceX; nb.layerCanvasOffsetY = sourceY;
-      nb.baseQuad = nb.baseQuad.map(function(q) { return [q[0] + dx, q[1] + dy]; });
-      nb.quad = nextQuad.map(function(q) { return [(Number(q[0]) || 0) + dx, (Number(q[1]) || 0) + dy]; });
+      nb.layerCanvasOffsetX = offset.x; nb.layerCanvasOffsetY = offset.y;
+      nb.baseQuad = paintTransformQuadInFrame(nb.baseQuad, box, frame);
+      nb.quad = paintTransformQuadInFrame(nextQuad, box, frame);
       state.paintTransformBox = nb;
       state.paintTransformPreview = {
         drawingRef: target.drawingRef,
@@ -151019,8 +150990,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         source: source,
         hit: { action: 'corner' }, // numeric edit = a generic handle edit (never the pure-move blit)
         box: nb,
-        layerCanvasOffsetX: sourceX,
-        layerCanvasOffsetY: sourceY,
+        layerCanvasOffsetX: offset.x,
+        layerCanvasOffsetY: offset.y,
         moveDx: existingPreview ? existingPreview.moveDx || 0 : 0,
         moveDy: existingPreview ? existingPreview.moveDy || 0 : 0,
       };
@@ -157053,19 +157024,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // ## SECTION: Animation selection compositing and transforms
     // identity quad = the bounds rect corners — "no transform pending".
     function gengaSelIdentityQuad(sel) {
-      const b = sel.bounds;
-      return [[b.x, b.y], [b.x + b.w, b.y], [b.x + b.w, b.y + b.h], [b.x, b.y + b.h]];
-    }
-    // Conte and genga share the affine fast path and destination-pixel mesh accuracy.
-    function gengaSelApplyTransform(ctx, sel, crop, cw, ch) {
-      paintDrawPatchThroughQuad(
-        ctx,
-        crop,
-        cw,
-        ch,
-        gengaResolveQuad(sel),
-        gengaSelDrag ? PAINT_TRANSFORM_DRAG_ERROR_PX : PAINT_TRANSFORM_ERROR_PX
-      );
+      return paintTransformRectQuad(sel.bounds);
     }
     // One transient entry per selection; never serialized or added to the drawing bake cache.
     // Membership depends on the lifted source/mask, geometry on the quad. Preview and commit share both.
@@ -157215,10 +157174,9 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const c = readback ? createReadbackCanvas() : document.createElement('canvas');
       c.width = pw;
       c.height = ph;
-      const cc = c.getContext('2d');
-      if (sel.base) cc.drawImage(sel.base, 0, 0);
       const crop = gengaSelPatchCrop(sel, readback);
-      gengaSelApplyTransform(cc, sel, crop.canvas, crop.w, crop.h);
+      drawTransformedRaster(c.getContext('2d'), sel.base, crop.canvas, gengaResolveQuad(sel),
+        gengaSelDrag ? PAINT_TRANSFORM_DRAG_ERROR_PX : PAINT_TRANSFORM_ERROR_PX);
       return c;
     }
     // Warp the stencil by the current quad and return it in paper space. 原画 masks are paper-sized.
@@ -157233,12 +157191,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!sel || !sel.mask || !quad) return null;
       const mb = gengaCanvasInkBounds(sel.mask);
       if (!mb) return null; // An empty mask has nothing to retain.
-      const sub = document.createElement('canvas');
-      sub.width = mb.w;
-      sub.height = mb.h;
-      sub.getContext('2d').drawImage(sel.mask, mb.x, mb.y, mb.w, mb.h, 0, 0, mb.w, mb.h);
-      const warped = paintMaskWarpedThroughQuad(sub, mb.x, mb.y, sel.bounds, quad);
-      paintReleaseCanvas(sub);
+      const warped = paintTransformCroppedMask(sel.mask, mb, { x: 0, y: 0 }, sel.bounds, quad);
       if (!warped) return null;
       const m = document.createElement('canvas');
       m.width = sel.mask.width;
@@ -157264,10 +157217,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function gengaSelPatchCrop(sel, readback) {
       if (sel.patchCrop) return sel.patchCrop;
       const b = sel.bounds, w = Math.max(1, Math.round(b.w)), h = Math.max(1, Math.round(b.h));
-      const cn = readback ? createReadbackCanvas() : document.createElement('canvas');
-      cn.width = w;
-      cn.height = h;
-      cn.getContext('2d').drawImage(sel.patch, Math.round(b.x), Math.round(b.y), w, h, 0, 0, w, h);
+      const cn = paintCropTransformRaster(sel.patch, { x: Math.round(b.x), y: Math.round(b.y), w: w, h: h }, readback);
       sel.patchCrop = { canvas: cn, w: w, h: h };
       return sel.patchCrop;
     }
@@ -157336,7 +157286,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           drawGengaPreview();
         }
       }
-      const out = selStrokes0 ? null : (rasterComposite || gengaSelCompositeFrom(sel, true)); // Clear coordinates only after baking to preserve the pending transform.
+      const emptyPatch = !selStrokes0 && !sel.auto && !rasterComposite && !paintCanvasInkBounds(gengaSelPatchCrop(sel, true).canvas);
+      const out = selStrokes0 || emptyPatch ? null : (rasterComposite || gengaSelCompositeFrom(sel, true));
       const scan = out ? gengaSelectionCommitScan(sel, out) : null;
       // Batch publication owns all drawings together. Keep its compact whole-raster representation;
       // per-stroke tiles retain substantially more decoded pixels for a many-drawing transform.
@@ -157353,6 +157304,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         paintReleaseCanvas(nextMask);
         throw error;
       }
+      if (emptyPatch && !(extraBakes && extraBakes.length)) {
+        paintReleaseCanvas(nextMask);
+        gengaUnliftSelection(sel, true);
+        drawGengaPreview();
+        drawGengaLayerThumbs();
+        return;
+      }
       preparedEncodes.forEach(gengaStartDrawingEncode);
       // Commit consumes the pending transform, as in storyboard commitPaintTransformPreview and Apply's forceReset.
       // Keeping it would apply baked coordinates again to the next selection.
@@ -157361,7 +157319,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (extraBakes) {
         const gtp = state.project.gengaTimeline;
         const primary = selStrokes0 ? (nextStrokes ? { w: gtp.paper.w, h: gtp.paper.h, strokes: nextStrokes } : undefined)
-          : prepared.drawing;
+          : prepared ? prepared.drawing : undefined;
         const edits = (primary === undefined ? [] : [{ layerId: sel.layerId, frame: sel.frame, drawing: primary }]).concat(extraBakes);
         if (edits.length) runCommand('原画変形', function(proj) {
           edits.forEach(function(edit) {
@@ -157405,6 +157363,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       updateUndoHistoryWindow();
       drawGengaPreview();
       drawGengaLayerThumbs();
+      return true;
     }
     // ══ Pending transform targets the currently viewed drawing ══
     // A lift that stays tied to its original frame can leave the gizmo and ants moved while the current artwork stays put.
@@ -157488,41 +157447,32 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const nextKeepsake = (gengaSel && gengaTransformBox)
         ? transformKeepsakeFrom(gengaTransformBox.quad, gengaSelIdentityQuad(gengaSel)) : null;
       const targets = gengaSel && gengaTransformBox ? gengaTransformExtraTargets(gengaSel) : [];
-      const loads = [], primary = ensureGengaSelectedLayer();
-      const preparedTargets = [{ layer: primary, frame: gengaCurrentFrame() }].concat(targets);
-      let unavailable = false;
-      preparedTargets.forEach(function(target) {
+      const preparedTargets = [{ layer: activeLayer, frame: gengaCurrentFrame() }].concat(targets);
+      const prepare = function(target) {
         const drawing = gengaExposureDrawing(target.layer, gengaExposureAt(target.layer, target.frame));
         const pixels = gengaPrepareDrawing(drawing);
-        if (pixels.status === 'error') unavailable = true;
-        else if (pixels.status === 'pending') loads.push(pixels.promise.then(function() {
+        if (pixels.status !== 'pending') return pixels;
+        return { status: 'pending', promise: pixels.promise.then(function() {
           const settled = gengaPrepareDrawing(drawing);
           if (settled.status !== 'ready' && settled.status !== 'empty') throw new Error('Transform drawing is unavailable');
-        }));
-      });
-      if (unavailable) {
-        gengaShowStatus(t('status.drawing.unavailable'), { warn: true });
-        drawGengaPreview();
-        return;
-      }
-      if (loads.length) {
-        const sel = gengaSel, box = gengaTransformBox, quad = JSON.stringify(box && box.quad);
-        const project = state.project, range = state.gengaCellSel, rangeValue = JSON.stringify(range);
-        const layerId = state.gengaSelectedLayerId, frame = gengaCurrentFrame(), mode = state.paintTransformApplyOn;
-        const epoch = gengaTransformApplyEpoch, toolEpoch = imageBrushRuntime.toolEpoch;
-        transformApplyAfterLoading(loads, function() {
+        }) };
+      };
+      const sel = gengaSel, box = gengaTransformBox, quad = JSON.stringify(box && box.quad);
+      const project = state.project, range = state.gengaCellSel, rangeValue = JSON.stringify(range);
+      const layerId = state.gengaSelectedLayerId, frame = gengaCurrentFrame(), mode = state.paintTransformApplyOn;
+      const epoch = gengaTransformApplyEpoch, toolEpoch = imageBrushRuntime.toolEpoch;
+      const committed = applyDrawingTransformBatch(preparedTargets, prepare, function() {
+        return gengaCommitSelection(targets);
+      }, {
+        stillPending: function() {
           return state.project === project && state.gengaCellSel === range && JSON.stringify(state.gengaCellSel) === rangeValue
             && state.gengaSelectedLayerId === layerId && gengaCurrentFrame() === frame && state.paintTransformApplyOn === mode
             && gengaTransformApplyEpoch === epoch && imageBrushRuntime.toolEpoch === toolEpoch
             && gengaSel === sel && gengaTransformBox === box && JSON.stringify(box && box.quad) === quad;
         },
-          gengaApplySelectionTransform, renderGengaView, gengaShowStatus);
-        return;
-      }
-      // Omit identity relationships as in storyboard. 原画 commit returns no value,
-      // and an unbaked transform already leaves gengaTransformBox absent, so check only identity here.
-      gengaCommitSelection(targets);
-      if (nextKeepsake && !transformKeepsakeIsIdentity(nextKeepsake)) gengaTransformKeepsake = nextKeepsake;
+        retry: gengaApplySelectionTransform, redraw: renderGengaView, notify: gengaShowStatus
+      });
+      if (committed && nextKeepsake && !transformKeepsakeIsIdentity(nextKeepsake)) gengaTransformKeepsake = nextKeepsake;
     }
     // Apply on: the layers the pending transform reaches. A timeline koma range (gengaCellSel) widens each layer to
     // every instance overlapping it; otherwise the instance at the selection's frame. Locked layers stay untouched.
@@ -157566,6 +157516,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const gt = state.project.gengaTimeline, pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
       let fullMask = null;
       const quad = gengaTransformBox.quad, base = gengaSelIdentityQuad(sel), bakes = [];
+      const keep = transformKeepsakeFrom(quad, base);
       const dx = quad[0][0] - base[0][0], dy = quad[0][1] - base[0][1];
       // Whole-drawing integer translation needs neither a target ink bbox nor a floating mask/patch.
       // Other transforms retain their existing crop/resampling and perspective extrapolation contracts.
@@ -157616,7 +157567,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
               wk = gengaPlainDrawingCanvasFor(target.layer, target.frame, true);
               const sourceRect = vector ? null : gengaDrawingSeedRect(wk.drawing, pw, ph);
               bounds = wk.hasContent ? gengaCanvasInkBounds(wk.cv, sourceRect) : null;
-              carried = bounds && transformQuadForTarget(quad, base, gengaSelIdentityQuad({ bounds: bounds }));
+              carried = bounds && drawingTransformQuadForTarget(keep, paintTransformRectQuad(bounds));
               if (!carried) return;
               if (vector && !fullMask) {
                 fullMask = document.createElement('canvas');
@@ -157641,6 +157592,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
               const next = strokes && gengaSelTransformStrokes(tsel, strokes);
               if (next) bakes.push({ layerId: target.layer.id, frame: target.frame, drawing: { w: pw, h: ph, strokes: next } });
             } else {
+              if (!tsel.auto && !paintCanvasInkBounds(gengaSelPatchCrop(tsel, true).canvas)) return;
               const canvas = gengaSelCompositeFrom(tsel, true);
               if (canvas) bakes.push({
                 layerId: target.layer.id,
@@ -159297,7 +159249,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     function invalidateLayerDrawingPastePreview(drawingRef) {
       const ref = String(drawingRef || '');
       if (!ref) return;
-      clearLayerDrawingDataUrlCacheForRef(ref);
+      invalidateLayerDrawingSurfaces(ref);
       const stageEl = document.getElementById('conteVideoStage');
       if (stageEl) stageEl.dataset.previewKey = '';
     }
@@ -161324,23 +161276,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const wk = working || gengaPlainDrawingCanvasFor(layer, sel.frame);
       if (!wk.hasContent) { paintReleaseCanvas(wk.cv); return false; }
       gengaEnsureSelMask(sel);
-      const pw = wk.pw, ph = wk.ph;
-      const patch = document.createElement('canvas');
-      patch.width = pw;
-      patch.height = ph;
-      const px = patch.getContext('2d');
-      px.drawImage(wk.cv, 0, 0);
-      px.globalCompositeOperation = 'destination-in';
-      px.drawImage(sel.mask, 0, 0);
-      px.globalCompositeOperation = 'source-over';
-      const base = document.createElement('canvas');
-      base.width = pw;
-      base.height = ph;
-      const bx = base.getContext('2d');
-      bx.drawImage(wk.cv, 0, 0);
-      bx.globalCompositeOperation = 'destination-out';
-      bx.drawImage(sel.mask, 0, 0);
-      bx.globalCompositeOperation = 'source-over';
+      const patch = cloneCanvas(wk.cv);
+      paintMaskTransformRaster(patch, sel.mask, 0, 0, 'destination-in');
+      const base = cloneCanvas(wk.cv);
+      paintMaskTransformRaster(base, sel.mask, 0, 0, 'destination-out');
       sel.base = base;
       sel.patch = patch;
       sel.patchCrop = null;
