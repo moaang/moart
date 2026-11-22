@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3545</title>
+  <title>MoArt ver3546</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -27104,12 +27104,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       writeTimelineTracks(state.project);
       bumpAudioCycle();
       applyTimelineSelectionState(selection);
-      refreshPlayingAudio();
-      if (state.videoEditMode) {
-        guardedRender('timing', renderTimingDashboard);
-        guardedRender('inspector', renderInspector);
-        guardedRender('chrome', updateChromeControls);
-      } else {
+      if (state.videoEditMode) refreshMediaCommandViews(['audio']);
+      else {
+        refreshPlayingAudio();
         refresh({ skipSource: true, skipMemo: true });
       }
     }
@@ -27430,7 +27427,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (tlTut) { try { tlTutOnCommand(command.name); } catch (e) { console.warn('[tlTut] 도장 명령 감지 실패 — 진행 도장이 안 찍힐 수 있다', e); } }
     }
 
-    function pushRedoCommand(command, options) {
+    function pushRedoCommand(command) {
       storageRootsChanged();
       if (!command) return;
       state.redoStack.push(command);
@@ -27957,26 +27954,32 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       refreshPlayingAudio(before);
       const gengaRenderPlan = gengaRenderPlanForProjects(before, after);
 
-      // `refreshOptions.selectionRider` attaches the selection snapshot to the same Undo step.
-      pushUndoCommand(attachSelectionRider({
+      commitProjectCommand({
         name: name,
         before: before,
         after: after,
-        gengaPixels: refreshOptions && refreshOptions.gengaPixels,
-        gengaDrawingContext: refreshOptions && refreshOptions.gengaDrawingContext,
         gengaRenderPlan: gengaRenderPlan,
         conteDialogCutId: refreshOptions && refreshOptions.conteDialogCutId,
         conteGeometryUi: refreshOptions && refreshOptions.conteGeometryUi,
-        gengaGeometryUi: refreshOptions && refreshOptions.gengaGeometryUi,
-        recordingKind: refreshOptions && refreshOptions.recordingKind
-      }, refreshOptions && refreshOptions.selectionRider));
-
-      const effectiveRefreshOptions = Object.assign({}, refreshOptions || {});
-      const plan = gengaPresetRenderPlan(effectiveRefreshOptions.gengaRenderPlan, gengaRenderPlan);
-      if (plan) effectiveRefreshOptions.gengaRenderPlan = plan;
-      if (genga) effectiveRefreshOptions.gengaPreviewCachesSettled = true;
-      refresh(effectiveRefreshOptions);
+        gengaGeometryUi: refreshOptions && refreshOptions.gengaGeometryUi
+      }, refreshOptions, gengaRenderPlan);
       gengaNoticeEmptiedLayers(before, after); // Central check for an empty layer.
+    }
+
+    // Full snapshots and layer patches have the same attachment and publication contract.
+    // Their callers own model reconciliation and cache invalidation before reaching this boundary.
+    function commitProjectCommand(command, options, gengaRenderPlan) {
+      options = options || {};
+      command.gengaPixels = options.gengaPixels;
+      command.gengaDrawingContext = options.gengaDrawingContext;
+      command.recordingKind = options.recordingKind;
+      pushUndoCommand(attachSelectionRider(command, options.selectionRider));
+
+      const effective = Object.assign({}, options);
+      const plan = gengaPresetRenderPlan(effective.gengaRenderPlan, gengaRenderPlan);
+      if (plan) effective.gengaRenderPlan = plan;
+      if (state.project.kind === 'genga') effective.gengaPreviewCachesSettled = true;
+      refresh(effective);
     }
 
     // Synchronize camera instruction layers only when `runCommand` changes frame geometry, camera work, or 尺 (`markOut` or `totalFrames`).
@@ -28140,7 +28143,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       writeTimelineTracks(state.project);
       bumpAudioCycle();
       const after = captureAudioTimelineHistoryState(state.project);
-      refreshPlayingAudio();
       const afterSelection = captureTimelineSelectionState();
       if (!jsonDeepEquals(before, after) || !jsonDeepEquals(beforeSelection, afterSelection)) {
         pushUndoCommand({
@@ -28154,10 +28156,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
       if (state.videoEditMode) {
         clampCurrentPage();
-        guardedRender('timing', renderTimingDashboard);
-        guardedRender('inspector', renderInspector);
-        guardedRender('chrome', updateChromeControls);
+        refreshMediaCommandViews(['audio']);
       } else {
+        refreshPlayingAudio();
         refresh();
       }
     }
@@ -28233,19 +28234,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return out;
     }
 
-    function applyAudioClipEditState(project, clipId, data) {
-      normalizeAudioClips(project);
-      const clip = project.audio.clips.find(function(item) { return item.id === clipId; });
-      if (!clip || !data) return null;
-      AUDIO_CLIP_EDIT_FIELDS.forEach(function(field) {
+    function applyClipEditFields(clip, data, fields) {
+      fields.forEach(function(field) {
         if (Object.prototype.hasOwnProperty.call(data, field.key)) field.apply(clip, data[field.key]);
       });
-      if (state.audioWaveformCssCache) delete state.audioWaveformCssCache[clip.id];
-      // Advance the cache cycle after mutating a clip directly.
-      if (project === state.project) bumpAudioCycle();
-      sortAudioClips(project);
-      writeTimelineTracks(project);
-      return clip;
     }
 
     // Which schema fields differ between two captured states -- the history window's per-command detail.
@@ -28262,70 +28254,24 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // Refresh the audio edit UI here. The caller updates cut links one clip at a time through `updateSingleAudioClipToCuts`.
-    function updateAudioTimelineEdit(options) {
-      options = options || {};
-      if (state.audioPerfTrace) console.time('updateAudioTimelineEdit');
-      updateVideoOverlaysAtFrame();
-      // `skipWriteTrack` means `runAudioClipEditCommand` already called `writeTimelineTracks`.
-      if (!options.skipWriteTrack) {
-        if (state.audioPerfTrace) console.time('updateAudioTimelineEdit:writeTimelineTracks');
-        writeTimelineTracks(state.project);
-        if (state.audioPerfTrace) console.timeEnd('updateAudioTimelineEdit:writeTimelineTracks');
+    // Initial edits and replay enter the same view publication path after their model is settled.
+    function refreshMediaCommandViews(lanes) {
+      const audio = lanes.includes('audio');
+      if (audio) {
+        updateVideoOverlaysAtFrame();
+        refreshPlayingAudio();
       }
-      refreshPlayingAudio();
-      // `skipRender` means the caller patches the DOM, such as moving one dropped clip to another lane.
-      if (options.skipRender) {
-        if (state.audioPerfTrace) console.timeEnd('updateAudioTimelineEdit');
-        return;
+      renderTimelineScoped({ changed: lanes });
+      if (lanes.includes('videoMedia')) {
+        guardedRender('stage', function() { renderVideoPreview(videoTimelineDisplayTotalFrames(state.project)); });
       }
-      // A full `refresh()` also redraws paper, memo, and the source blocks.
-      // Audio drag, trim, and move need only timing, inspector, and chrome updates.
-      if (state.audioPerfTrace) console.time('updateAudioTimelineEdit:guardedRenders');
-      // Video-edit mode: only the audio lane changed, so the conte track DOM and its layer thumbnails stay. A full
-      // renderTimingDashboard (or an unscoped partial) would rebuild every conte thumbnail and flash. Falls back
-      // to full when the partial bails.
-      renderTimelineScoped({ changed: ['audio'] });
       guardedRender('inspector', renderInspector);
       guardedRender('chrome', updateChromeControls);
-      // bindAudioFxControls syncs the Audio FX window only during its own drag; undo/redo and other non-drag edits
-      // of clip.volume/audioFx would leave an open window at stale values. updateAudioFxWindow() no-ops when the
-      // window is closed (audioFxTargetClip() returns null once state.audioFxClipId is cleared), so it is called
-      // unconditionally, like gengaFxPanelUpdate's render-pass wiring.
-      updateAudioFxWindow();
-      updateAudioSourceLibraryWindow(); // Match 履歴: skip the update while the window is closed.
-      if (state.audioPerfTrace) console.timeEnd('updateAudioTimelineEdit:guardedRenders');
-      if (state.audioPerfTrace) console.timeEnd('updateAudioTimelineEdit');
-    }
-
-    // Move the clip DOM directly to its new track lane and update its position variables.
-    // Avoid rebuilding the timeline on drop.
-    function partialUpdateAudioClipDom(clipId, newTrackId, newStartFrame, durationFrames, totalFrames) {
-      try {
-        const root = document.querySelector('.video-editor-timeline');
-        if (!root) return false;
-        const clipEl = root.querySelector('[data-audio-clip-id="' + cssEscapeValue(String(clipId || '')) + '"]');
-        if (!clipEl) return false;
-        if (newTrackId) {
-          const currentLane = clipEl.parentNode;
-          const targetTrackEl = root.querySelector('[data-audio-track-id="' + cssEscapeValue(String(newTrackId || '')) + '"]');
-          const targetLane = targetTrackEl ? targetTrackEl.querySelector('.timeline-lane') : null;
-          // Return false for a missing lane so the caller renders the clip in its current lane.
-          if (!targetLane) return false;
-          if (currentLane !== targetLane) targetLane.appendChild(clipEl);
-        }
-        // FramePercent is the kernel every other clip position goes through; a hand copy of its arithmetic drifts
-        // (the kernel returns 0 for a non-positive target).
-        const total = Math.max(1, Math.round(Number(totalFrames) || 0));
-        const left = framePercent(newStartFrame, total);
-        const width = Math.max(0.01, framePercent(durationFrames, total));
-        clipEl.style.setProperty('--left', left.toFixed(4) + '%');
-        clipEl.style.setProperty('--width', width.toFixed(4) + '%');
-        return true;
-      } catch (error) {
-        return false;
+      if (audio) {
+        updateAudioFxWindow();
+        updateAudioSourceLibraryWindow();
       }
     }
-
 
     function captureConteLayerTimelineState(project, drawingRefs) {
       project = project || state.project || {};
@@ -28799,71 +28745,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       writeTimelineTracks(project);
     }
 
-    function commitAudioClipMoveFast(name, clipId, nextStartFrame, preferredTrackId) {
-      normalizeAudioClips(state.project);
-      const linkedVideo = audioClipLinkedVideoClip(state.project, audioClipById(state.project, clipId));   // A linked pair moves as one command
+    function commitAudioClipMove(clipId, nextStartFrame, preferredTrackId) {
+      const project = state.project, clip = audioClipById(project, clipId);
+      if (!clip || timelineMediaRefuseLocked(project, [{ kind: 'audio', clip: clip }])) return;
+      const nextStart = Math.max(0, Math.round(Number(nextStartFrame) || 0));
+      const linkedVideo = audioClipLinkedVideoClip(project, clip);
       if (linkedVideo) {
-        const current = audioClipById(state.project, clipId);
-        const moved = commitLinkedClipMoveBy(
-          linkedVideo.id, clipId,
-          Math.max(0, Math.round(Number(nextStartFrame) || 0)) - current.startFrame,
-          '', preferredTrackId
-        );
-        return moved ? {
-          clip: moved.audio,
-          trackId: moved.audio.trackId,
-          startFrame: moved.audio.startFrame,
-          durationFrames: moved.audio.durationFrames,
-          createdTrack: true
-        } : null;
+        commitLinkedClipMoveBy(linkedVideo.id, clipId, nextStart - clip.startFrame, '', preferredTrackId);
+        return;
       }
-
-      const clip = state.project.audio.clips.find(function(item) { return item.id === clipId; });
-      if (!clip || timelineMediaRefuseLocked(state.project, [{ kind: 'audio', clip: clip }])) return null;
-
-      const before = captureAudioClipEditState(clip);
-      const beforeDialogue = captureDialogueState(state.project);
-
-      clip.startFrame = Math.max(0, Math.round(Number(nextStartFrame) || 0));
-      clip.trackId = preferredTrackId || clip.trackId || 'dialog-main';
-      const placement = placeAudioClipFast(state.project, clip, clip.trackId);
-      updateSingleAudioClipToCuts(state.project, clip);
-      bumpAudioCycle();
-      sortAudioClips(state.project);   // the frame lookups (activeAudioClipsFromList) binary-search this list by startFrame
-
-      const after = captureAudioClipEditState(clip);
-      pushUndoCommand({
-        name: name,
-        audioClipEdit: true,
-        clipId: clipId,
-        before: before,
-        after: after,
-        beforeDialogue: beforeDialogue,
-        afterDialogue: captureDialogueState(state.project)
+      runAudioClipEditCommand('Move dialog audio', clipId, function(target, liveProject) {
+        target.startFrame = nextStart;
+        placeAudioClipFast(liveProject, target, preferredTrackId);
       });
-
-      if (before.trackId !== after.trackId || placement.createdTrack) writeTimelineTracks(state.project);
-      refreshPlayingAudio();   // a move during playback reschedules the running queue, like every other audio edit commit
-      return {
-        clip: clip,
-        trackId: after.trackId,
-        startFrame: after.startFrame,
-        durationFrames: after.durationFrames,
-        createdTrack: placement.createdTrack
-      };
-    }
-
-    function removeAudioClipDom(clipId) {
-      try {
-        const root = document.querySelector('.video-editor-timeline');
-        if (!root) return false;
-        const clipEl = root.querySelector('[data-audio-clip-id="' + cssEscapeValue(String(clipId || '')) + '"]');
-        if (!clipEl) return false;
-        clipEl.remove();
-        return true;
-      } catch (error) {
-        return false;
-      }
     }
 
     // Undo/redo for "the clip is gone from the array". The inverse of a splice-out is a splice-in at the same index,
@@ -28917,81 +28811,80 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         afterDialogue: captureDialogueState(state.project)
       });
 
-      removeAudioClipDom(clipId);
+      refreshMediaCommandViews(['audio']);
       return true;
     }
 
-    function runAudioClipEditCommand(name, clipId, mutator, options) {
-      options = options || {};
-      const trace = state.audioPerfTrace ? function(label) { console.timeEnd(label); } : null;
-      const traceStart = state.audioPerfTrace ? function(label) { console.time(label); } : null;
-      if (traceStart) traceStart('audioEdit:total');
-      if (traceStart) traceStart('audioEdit:normalize');
-      normalizeAudioClips(state.project);
-      if (trace) trace('audioEdit:normalize');
-      const clip = state.project.audio.clips.find(function(item) { return item.id === clipId; });
-      if (!clip) {
-        if (trace) trace('audioEdit:total');
-        return;
-      }
-
-      const before = captureAudioClipEditState(clip);
-      const beforeDialogue = captureDialogueState(state.project);
-      if (traceStart) traceStart('audioEdit:mutator');
-      mutator(clip, state.project);
-      if (trace) trace('audioEdit:mutator');
-      // Advance the cache cycle after modifying a clip directly.
-      bumpAudioCycle();
+    function settleAudioClipEdit(project, clip, before, options) {
       if (!clip.audioTrimDurationFrames) clip.audioTrimDurationFrames = clip.durationFrames;
-      if (!options.skipWaveform) {
-        // A trim/move changes which slice of the source this clip shows, never the peaks (those belong to the
-        // source), so dropping the cached picture is the whole invalidation.
-        if (state.audioWaveformCssCache) delete state.audioWaveformCssCache[clip.id];
+      if (!(options && options.skipWaveform) && state.audioWaveformCssCache) delete state.audioWaveformCssCache[clip.id];
+      bumpAudioCycle();
+      sortAudioClips(project);
+      if (before && (before.trackId !== clip.trackId || before.startFrame !== clip.startFrame || before.durationFrames !== clip.durationFrames
+          || before.audioTrimStartFrames !== clip.audioTrimStartFrames || before.audioTrimDurationFrames !== clip.audioTrimDurationFrames)) {
+        updateSingleAudioClipToCuts(project, clip);
       }
+      writeTimelineTracks(project);
+    }
 
-      if (traceStart) traceStart('audioEdit:sortAndWrite');
-      sortAudioClips(state.project);
-      // Write once here, including skipRender edits; updateAudioTimelineEdit receives skipWriteTrack below.
-      writeTimelineTracks(state.project);
-      if (trace) trace('audioEdit:sortAndWrite');
+    const MEDIA_CLIP_EDIT_SPECS = {
+      audio: {
+        flag: 'audioClipEdit', lane: 'audio',
+        normalize: normalizeAudioClips, find: audioClipById, capture: captureAudioClipEditState,
+        fields: function() { return AUDIO_CLIP_EDIT_FIELDS; }, settle: settleAudioClipEdit
+      },
+      video: {
+        flag: 'videoClipEdit', lane: 'videoMedia',
+        normalize: normalizeVideoClips, find: videoMediaClipById, capture: captureVideoClipEditState,
+        fields: function() { return VIDEO_CLIP_EDIT_FIELDS; }, settle: settleVideoClipEdit
+      }
+    };
 
-      const after = captureAudioClipEditState(clip);
-      // For a track-only edit, `startFrame`, `durationFrames`, and the audio trim fields stay unchanged.
-      // Skip `applyAudioTimelineToCuts` because clip overlaps with cuts cannot change.
-      const trackIdOnlyChange = Boolean(before && after
-        && before.startFrame === after.startFrame
-        && before.durationFrames === after.durationFrames
-        && before.audioTrimStartFrames === after.audioTrimStartFrames
-        && before.audioTrimDurationFrames === after.audioTrimDurationFrames);
-      if (!trackIdOnlyChange) updateSingleAudioClipToCuts(state.project, clip);
-      Object.assign(after, captureAudioClipEditState(clip));
-      pushUndoCommand({
-        name: name,
-        audioClipEdit: true,
-        clipId: clipId,
-        before: before,
-        after: after,
-        beforeDialogue: beforeDialogue,
-        afterDialogue: captureDialogueState(state.project)
-      });
+    // Placement can add a single lane as part of a light clip edit. Keep its record with the command so
+    // Undo can remove exactly that lane and Redo can restore it, including its persisted defaults.
+    function runMediaClipEditCommand(kind, name, clipId, mutator, options) {
+      const spec = MEDIA_CLIP_EDIT_SPECS[kind], project = state.project, audio = kind === 'audio';
+      spec.normalize(project);
+      const clip = spec.find(project, clipId);
+      if (!clip) return null;
+      const before = spec.capture(clip);
+      const trackIds = new Set(project.timeline.tracks.map(function(track) { return track.id; }));
+      const beforeDialogue = audio ? captureDialogueState(project) : null;
+      mutator(clip, project);
+      spec.settle(project, clip, before, options);
+      const after = spec.capture(clip);
+      const addedTrack = project.timeline.tracks.find(function(track) { return !trackIds.has(track.id) && track.id === after.trackId; });
+      const command = { name: name, [spec.flag]: true, clipId: clipId, before: before, after: after };
+      if (addedTrack) command.addedTrack = fastClone(addedTrack);
+      if (audio) {
+        command.beforeDialogue = beforeDialogue;
+        command.afterDialogue = captureDialogueState(project);
+      }
+      pushUndoCommand(command);
+      refreshMediaCommandViews([spec.lane]);
+      if (audio) preloadAudioBufferForClip(clip); // A trim can expose a new slice of the source.
+      return clip;
+    }
 
-      // Forward `skipRender` to `updateAudioTimelineEdit` to avoid rebuilding the whole view.
-      // Set `skipWriteTrack` because this command already wrote the tracks.
-      if (traceStart) traceStart('audioEdit:refresh');
-      updateAudioTimelineEdit({
-        skipRender: Boolean(options.skipRender),
-        skipWriteTrack: true
-      });
-      if (trace) trace('audioEdit:refresh');
-      // Trimming changes `clipSourceSliceRange` and thus the decode cache key.
-      // The first playback afterward can miss the slice cache and skip ticks without a decoded buffer.
-      // Prefetch edited clips to avoid delayed sound when playback starts.
-      // Reuse the split path from `primeSplitClipAudioUrl` to `preloadAudioBufferForClip`.
-      // Moving `startFrame` alone keeps the slice unchanged.
-      // Cache and pending checks return early so repeated edits do not enqueue duplicate decoding.
-      preloadAudioBufferForClip(clip);
-      if (state.audioPerfTrace) console.log('[audioEdit] trackIdOnly=' + trackIdOnlyChange + ', skipRender=' + Boolean(options.skipRender));
-      if (trace) trace('audioEdit:total');
+    function applyMediaClipEditHistory(kind, command, payload, undoing) {
+      const spec = MEDIA_CLIP_EDIT_SPECS[kind], project = state.project;
+      spec.normalize(project);
+      const clip = spec.find(project, command.clipId);
+      if (!clip || !payload) return;
+      applyClipEditFields(clip, payload, spec.fields());
+      if (command.addedTrack) {
+        const tracks = project.timeline.tracks;
+        if (undoing) project.timeline.tracks = tracks.filter(function(track) { return track.id !== command.addedTrack.id; });
+        else if (!tracks.some(function(track) { return track.id === command.addedTrack.id; })) tracks.push(fastClone(command.addedTrack));
+      }
+      spec.settle(project, clip);
+      const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
+      if (dialogue) applyDialogueState(project, dialogue);
+      refreshMediaCommandViews([spec.lane]);
+    }
+
+    function runAudioClipEditCommand(name, clipId, mutator, options) {
+      return runMediaClipEditCommand('audio', name, clipId, mutator, options);
     }
 
     // pushSelectionEditCommand records both engines; Undo and Redo restore through this registry.
@@ -29018,12 +28911,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       paintDiscardPendingBucketFill();
       stack.pop();
 
-      // Tag every counter-push as a traversal so the memory budget skips it: moving a command between stacks
-      // allocates nothing, and trimming here would eat the far end of the stack the user is walking. Wrapped here,
-      // not at the pushOther(command) call sites, so the dispatcher alone knows this is a traversal.
-      const pushOther = undoing
-        ? function(cmd) { pushRedoCommand(cmd, { historyTraversal: true }); }
-        : function(cmd) { pushUndoCommand(cmd, { historyTraversal: true }); };
       // Wrap command restoration once so all branches apply selection after the command body.
       // Keeping it outside the branches also covers future command kinds.
       // Restore the project first because selection restoration redraws against the restored project.
@@ -29042,7 +28929,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const timelineSelection = command.gengaTimelineSelection;
       const restoreSelection = timelineSelection && gengaTimelineSelectionMatches(undoing ? timelineSelection.after : timelineSelection.before);
       const restoredPixels = gengaApplyHistoryPixels(command, undoing);
-      applyHistoryCommandPayload(command, undoing, pushOther);
+      // Traversal transfers an existing entry without restamping it or evicting other steps.
+      if (undoing) pushRedoCommand(command);
+      else pushUndoCommand(command, { historyTraversal: true });
+      applyHistoryCommandPayload(command, undoing);
       revealHistoryCommand(command, false); // Structural edits may change the frame range; retain payload selection.
       conteCarryLayerVisibility(conteViewBefore);
       if (viewBefore && state.project && state.project.gengaTimeline && gengaCarryLayerViewState(viewBefore, state.project.gengaTimeline.layers)) {
@@ -29132,13 +29022,31 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Add new command kinds here. Fall back to full project restore at the end of `applyHistoryCommandPayload`.
     const HISTORY_COMMAND_HANDLERS = [
       {
+        flag: 'selectionEdit',
+        viewport: false,
+        apply: function(command, payload) {
+          const engine = SELECTION_EDIT_ENGINES[command.engineId];
+          if (engine) engine.restore(payload);
+        }
+      },
+      {
+        flag: 'memoPageEdit',
+        viewport: false,
+        apply: function(command, payload) {
+          const page = ensureMemoPageData(command.pageNo);
+          page.strokes = payload && Array.isArray(payload.strokes) ? fastClone(payload.strokes) : [];
+          page.redo = payload && Array.isArray(payload.redo) ? fastClone(payload.redo) : [];
+          if (payload && payload.drawings) applyLayerDrawingEditState(state.project, payload.drawings);
+          redrawMemoCanvas();
+          updatePaintUndoRedoButtonsOnly();
+          scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
+        }
+      },
+      {
         flag: 'audioClipEdit',
         viewport: true,
         apply: function(command, payload, undoing) {
-          applyAudioClipEditState(state.project, command.clipId, payload);
-          const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
-          if (dialogue) applyDialogueState(state.project, dialogue);   // Both producers include dialogue state through `captureDialogueState`.
-          updateAudioTimelineEdit();
+          applyMediaClipEditHistory('audio', command, payload, undoing);
         }
       },
       {
@@ -29148,15 +29056,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           applyAudioClipRemoveState(state.project, command.clipId, payload);
           const dialogue = undoing ? command.beforeDialogue : command.afterDialogue;
           if (dialogue) applyDialogueState(state.project, dialogue);
-          updateAudioTimelineEdit();
+          refreshMediaCommandViews(['audio']);
         }
       },
       {
         flag: 'videoClipEdit',
         viewport: true,
-        apply: function(command, payload) {
-          applyVideoClipEditState(state.project, command.clipId, payload);
-          updateVideoMediaTimelineEdit();
+        apply: function(command, payload, undoing) {
+          applyMediaClipEditHistory('video', command, payload, undoing);
         }
       },
       {
@@ -29164,7 +29071,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         viewport: true,
         apply: function(command, payload) {
           applyVideoClipRemoveState(state.project, command.clipId, payload);
-          updateVideoMediaTimelineEdit();
+          refreshMediaCommandViews(['videoMedia']);
         }
       },
       // The shared `applySelectionRider` restores selection once outside these handlers,
@@ -29304,36 +29211,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         }
       }
     ];
-    function applyHistoryCommandPayload(command, undoing, pushOther) {
+    function applyHistoryCommandPayload(command, undoing) {
       const payload = undoing ? command.before : command.after;
-      if (command.selectionEdit) { // Conte lasso / conte gizmo / genga floating selection — one type
-        pushOther(command);
-        const engine = SELECTION_EDIT_ENGINES[command.engineId];
-        if (engine) engine.restore(payload); // Defend like applySelectionRider does — a stale engineId is "no-op", not a throw
-        return;
-      }
-      // Whole-page memo clear and move restore stroke and Redo snapshots without moving the timeline viewport.
-      if (command.memoPageEdit) {
-        pushOther(command);
-        const page = ensureMemoPageData(command.pageNo);
-        page.strokes = (payload && Array.isArray(payload.strokes)) ? fastClone(payload.strokes) : [];
-        page.redo = (payload && Array.isArray(payload.redo)) ? fastClone(payload.redo) : [];
-        if (payload && payload.drawings) applyLayerDrawingEditState(state.project, payload.drawings);
-        redrawMemoCanvas();
-        updatePaintUndoRedoButtonsOnly();
-        scheduleIndexedDbAutosave(INDEXED_DB_AUTOSAVE_DELAY_MS);
-        return;
-      }
       const handler = HISTORY_COMMAND_HANDLERS.find(function(h) { return command[h.flag]; });
       const historyViewport = (!handler || handler.viewport) ? captureTimelineViewportForHistory() : null;
       if (handler) {
-        pushOther(command);
         handler.apply(command, payload, undoing);
         if (handler.viewport) restoreTimelineViewportForHistory(historyViewport);
         return;
       }
       const memoPages = snapshotMemoPages();
-      pushOther(command);
       // Preserve the history entry as captured. Editing a restored object must not mutate the stored entry.
       restoreProject(cloneHistoryProjectPayload(payload), memoPages, {
         sameProject: true, // Use same-project restoration for history traversal so Undo and Redo preserve selection.
@@ -43009,10 +42896,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (kind !== 'audio' && state.selectedVideoClipId) {
         const vclip = videoMediaClipById(state.project, state.selectedVideoClipId);   // Delete linked pairs together, matching the menu and audio path.
         if (vclip && videoMediaLinkedAudioClip(state.project, vclip)) { confirmDeleteVideoMediaClip(vclip.id); return true; }
-        if (commitVideoMediaClipRemove(state.selectedVideoClipId)) {   // a stale id must not re-render twice for nothing
-          guardedRender('inspector', renderInspector);
-          guardedRender('chrome', updateChromeControls);
-        }
+        commitVideoMediaClipRemove(state.selectedVideoClipId);
         return true;
       }
       const trackId = state.selectedAudioTrackId;
@@ -43261,7 +43145,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const linked = audioClipLinkedDialogBlocks(project, clip);
       // Skip confirmation for ordinary, undoable deletion. Apply the same check for menu and keyboard actions.
       if (!audioClipDeleteTakesMore(project, clip)) {
-        if (commitAudioClipRemoveFast(clipId)) { guardedRender('inspector', renderInspector); guardedRender('chrome', updateChromeControls); }
+        commitAudioClipRemoveFast(clipId);
         return;
       }
       const snapshot = function() {
@@ -43626,58 +43510,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Light toggle path: a visibility/mute flip changes one boolean, never timeline topology, clip data or cuts. It
     // patches the DOM nodes the flag affects and pushes a tiny {trackId, property} undo entry instead of deep-cloning
     // the project for undo and rebuilding the timeline innerHTML (visible lag per click on large projects).
-    function applyTimelineTrackToggleDom(trackId, property) {
-      const timeline = document.querySelector('.video-editor-timeline');
-      if (!timeline) return false;
-      const track = ensureTimelineTrackById(state.project, trackId);
-      if (!track) return false;
-      const isVideo = track.type === 'video';
-      if (property === 'editLocked') {
-        // its own row class and button; the hidden/muted classes and the eye/speaker icons are never touched here
-        const locked = Boolean(track.editLocked);
-        const row = timeline.querySelector(isVideo ? '[data-video-media-track-id="' + cssEscapeValue(trackId) + '"]' : '[data-audio-track-id="' + cssEscapeValue(trackId) + '"]');
-        if (row) row.classList.toggle('track-edit-locked', locked);
-        const html = timelineTrackLockButtonHtml(trackId, locked);
-        timeline.querySelectorAll('.timeline-track-toggle[data-track-id="' + cssEscapeValue(trackId) + '"][data-track-toggle="editLocked"]').forEach(function(btn) {
-          const wrap = document.createElement('div');
-          wrap.innerHTML = html;
-          const next = wrap.firstElementChild;
-          btn.className = next.className;
-          btn.title = next.title;
-          btn.setAttribute('aria-pressed', String(locked));
-          btn.innerHTML = next.innerHTML;
-        });
-        return true;
-      }
-      const off = Boolean(track[property]);
-      // row class (dims the lane): conte main / video media / audio rows each carry their own class
-      if (trackId === 'video-main') {
-        const row = timeline.querySelector('.conte-video-track');
-        if (row) row.classList.toggle('video-hidden', off);
-      } else if (isVideo) {
-        const row = timeline.querySelector('[data-video-media-track-id="' + cssEscapeValue(trackId) + '"]');
-        if (!row) return false;
-        if (!off && !videoMediaLaneDomMatchesModel(timeline)) {
-          const totalFrames = videoTimelineDisplayTotalFrames(state.project);
-          if (!patchVideoMediaLaneStructure(timeline, buildVideoTimeline(state.project), totalFrames)) return false;
-          bindVideoMediaTimelineDrag(timeline, totalFrames);
-          updateVideoMediaClipPixelStyles(timeline, totalFrames);
-        }
-        row.classList.toggle('video-hidden', off);   // V lanes have the eye only — footage is always silent (its sound is a linked audio clip)
-      } else {
-        const row = timeline.querySelector('[data-audio-track-id="' + cssEscapeValue(trackId) + '"]');
-        if (row) row.classList.toggle('audio-muted', off);
-      }
-      // every toggle button for this track (label rail + hidden in-content copy)
-      timeline.querySelectorAll('.timeline-track-toggle[data-track-id="' + cssEscapeValue(trackId) + '"][data-track-toggle="' + property + '"]').forEach(function(btn) {
-        btn.classList.toggle('off', off);
-        btn.setAttribute('aria-pressed', String(!off));
-        btn.innerHTML = timelineTrackToggleIconHtml(isVideo, off);   // same (isVideo, off) pair as timelineTrackLabelHtml: V lanes draw the eye, audio lanes the speaker
-        btn.title = timelineTrackToggleTitle(isVideo, off);
-      });
-      return true;
-    }
-
     // selection: the clip selection that goes with this flag value (editLocked only — locking drops the lane's clips
     // from the selection, and Undo of the lock gives them back).
     function applyTimelineTrackFlagState(trackId, property, value, selection) {
@@ -43685,24 +43517,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!track) return;
       track[property] = Boolean(value);
       writeTimelineTracks(state.project);
-      if (selection) {
-        applyTimelineSelectionState(selection);
-        updateTimelineSelectionDom(document.getElementById('timingDashboard'), { thumbnails: false });
-        guardedRender('inspector', renderInspector);
-        guardedRender('chrome', updateChromeControls);
-      }
+      if (selection) applyTimelineSelectionState(selection);
       if (property === 'muted') {
         bumpAudioCycle();
-        refreshPlayingAudio();
         syncVideoMediaPlayback();
       }   // mute is audio-only; syncVideoMediaPlayback re-syncs the pooled <video> to the playhead
-      const patched = state.videoEditMode && applyTimelineTrackToggleDom(trackId, property);
-      if (!patched) {
-        if (state.videoEditMode) guardedRender('timing', renderTimingDashboard);
-        else refresh({ skipSource: true });
-      }
-      if (property === 'hidden' && state.videoEditMode) {
+      if (!state.videoEditMode) {
+        refresh({ skipSource: true });
+      } else if (trackId === 'video-main') {
+        renderTimelineScoped({ changed: ['conte'] });
         guardedRender('stage', function() { renderVideoPreview(videoTimelineDisplayTotalFrames(state.project)); });
+      } else {
+        refreshMediaCommandViews([track.type === 'video' ? 'videoMedia' : 'audio']);
       }
     }
 
@@ -44992,18 +44818,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       VIDEO_CLIP_EDIT_FIELDS.forEach(function(field) { out[field.key] = field.capture(clip); });
       return out;
     }
-    function applyVideoClipEditState(project, clipId, data) {
-      const clip = videoMediaClipById(project, clipId);
-      if (!clip || !data) return null;
-      VIDEO_CLIP_EDIT_FIELDS.forEach(function(field) {
-        if (Object.prototype.hasOwnProperty.call(data, field.key)) field.apply(clip, data[field.key]);
-      });
-      clip.sourceShort = videoMediaClipSourceShort(clip, mediaFpsForProject(project));   // derived from the fields just restored
-      if (project === state.project) bumpVideoClipCycle();
+    function syncVideoClipSourceWindow(clip, fps) {
+      const sourceRate = videoMediaClipSourceRate(clip, fps);
+      clip.sourceOffsetFrames = Math.max(0, Math.round(clip.sourceOffsetSec * sourceRate));
+      clip.sourceDurationFrames = Math.max(0, Math.round(clip.sourceDurationSec * sourceRate));
+    }
+
+    function settleVideoClipEdit(project, clip) {
+      const fps = mediaFpsForProject(project);
+      syncVideoClipSourceWindow(clip, fps);
+      clip.sourceShort = videoMediaClipSourceShort(clip, fps);
+      bumpVideoClipCycle();
       writeTimelineTracks(project);
       updateVideoMediaFlagsForCuts(project, [clip.panelCutId, clip.sourceCutId]);
-      return clip;
     }
+
     // the one selection shape every V1 clip commit leaves behind (import · move · trim)
     function videoMediaSelectClipState(clipId) {
       clearTimelineMediaSelection();
@@ -45011,20 +44840,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       state.activeConteSelectionType = clipId ? 'video' : '';
     }
     function runVideoClipEditCommand(name, clipId, mutator) {
-      const project = state.project;
-      normalizeVideoClips(project);
-      const clip = videoMediaClipById(project, clipId);
-      if (!clip) return null;
-      const before = captureVideoClipEditState(clip);
-      mutator(clip, project);
-      clip.sourceShort = videoMediaClipSourceShort(clip, mediaFpsForProject(project));   // the mutator moved the box / window after the normalize above
-      bumpVideoClipCycle();
-      writeTimelineTracks(project);
-      updateVideoMediaFlagsForCuts(project, [clip.panelCutId, clip.sourceCutId]);
-      const after = captureVideoClipEditState(clip);
-      pushUndoCommand({ name: name, videoClipEdit: true, clipId: clipId, before: before, after: after });
-      updateVideoMediaTimelineEdit();
-      return clip;
+      return runMediaClipEditCommand('video', name, clipId, mutator);
     }
     // payload {clip,index} = put it back, null = take it out again (double-undo / double-redo guarded)
     function applyVideoClipRemoveState(project, clipId, payload) {
@@ -45049,16 +44865,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       updateVideoMediaFlagsForCuts(project, [touched.panelCutId, touched.sourceCutId]);
       return restored;
     }
-    // What a V1 clip edit repaints: the V lane (scoped partial render — lane patch + pixel styles), the
-    // stage (the clip under the playhead may have moved or changed), inspector and chrome. Twin of
-    // updateAudioTimelineEdit without the audio-only work (waveforms, FX window, playback refresh).
-    function updateVideoMediaTimelineEdit() {
-      renderTimelineScoped({ changed: ['videoMedia'] });
-      guardedRender('stage', function() { renderVideoPreview(videoTimelineDisplayTotalFrames(state.project)); });
-      guardedRender('inspector', renderInspector);
-      guardedRender('chrome', updateChromeControls);
-    }
-
     function normalizeVideoClips(project) {
       const clips = ensureVideoClipList(project);
       const video = buildVideoTimelineCached(project);
@@ -45098,11 +44904,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const hasSec = function(value) { return value != null && value !== '' && Number.isFinite(Number(value)); };
         clip.sourceOffsetSec = hasSec(clip.sourceOffsetSec) ? Math.max(0, Number(clip.sourceOffsetSec)) : clip.sourceOffsetFrames / mediaFps;
         clip.sourceDurationSec = hasSec(clip.sourceDurationSec) ? Math.max(0, Number(clip.sourceDurationSec)) : clip.sourceDurationFrames / mediaFps;
-        const sourceRate = videoMediaClipSourceRate(clip, mediaFps);
-        clip.sourceOffsetFrames = Math.max(0, Math.round(clip.sourceOffsetSec * sourceRate));
-        clip.sourceDurationFrames = Math.max(0, Math.round(clip.sourceDurationSec * sourceRate));
+        syncVideoClipSourceWindow(clip, mediaFps);
         clip.linkedAudioClipId = clip.linkedAudioClipId && audioClipById(project, clip.linkedAudioClipId) ? String(clip.linkedAudioClipId) : '';
-        // a replaced source may be shorter than the box needs — flagged, never stretched, the cut never moved
+        // Flag a shorter replacement source without stretching it or moving the cut.
         clip.sourceShort = videoMediaClipSourceShort(clip, mediaFps);
         // Store position, scale, rotation, opacity, blur, and keys in the same shape as Storyboard layer FX.
         // This lets `conteFxChannels` and `layerEffectAtFrame` evaluate both.
@@ -49727,7 +49531,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const wants = renderLaneWants(options);
       if (wants('audio')) ensureTimelineTracksFresh(state.project);
       const video = buildVideoTimelineCached(state.project);
-      const audioClips = audioTimelineDisplayClips(state.project);
       voicevoxGenerationStats(); // Keep its audio/profile normalization at the existing point in the render.
       const targetFrames = projectTargetFrames(state.project);
       const totalFrames = videoTimelineDisplayTotalFrames(state.project);
@@ -49745,24 +49548,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Sibling-column structure: the scroll content reserves no label zone — labels live in a real flex
       // sibling column (.timeline-label-col). Content x=0 is frame 0.
       const innerStyle = 'width:' + innerWidth + 'px;--timeline-label-width:0px';
-      const continuationIds = audioContinuationClipIds(audioClips, video.groups);
-      const dialogGlowIds = selectedDialogBlockClipIds(state.project);
       const audioTracks = audioTimelineTracks(state.project);
-      const videoMediaClips = videoTimelineDisplayClips(state.project);
       const videoMediaTracks = videoMediaDisplayTracks(state.project);   // Top = highest V
       state.timelineVideoSectionTrackCount = videoMediaTracks.length;
-      const clipsByTrack = new Map();
-      audioClips.forEach(function(clip) {
-        const trackId = clip.trackId || 'dialog-main';
-        if (!clipsByTrack.has(trackId)) clipsByTrack.set(trackId, []);
-        clipsByTrack.get(trackId).push(clip);
-      });
-      const videoClipsByTrack = new Map();
-      videoMediaClips.forEach(function(clip) {
-        const trackId = clip.trackId || 'video-media-main';
-        if (!videoClipsByTrack.has(trackId)) videoClipsByTrack.set(trackId, []);
-        videoClipsByTrack.get(trackId).push(clip);
-      });
+      const mediaCtx = { totalFrames: totalFrames, video: video };
       // Match the three-part Animation info button. Storyboard displays export dimensions in place of the camera frame.
       // Omit only the dimensions part when it is unavailable.
       const conteOut = state.project && state.project.contePaper && state.project.contePaper.output;
@@ -49814,12 +49603,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
                 '<div class="timeline-scroll-section-content">',
                   // A new V track appears above, so its drop row sits at the top of the section
                   state.timelineVideoTracksCollapsed ? '' : videoMediaNewTrackDropHtml(state.project),
-                  videoMediaTracks.map(function(track) { return externalVideoTrackHtml(track, videoClipsByTrack.get(track.id) || [], totalFrames); }).join(''),
+                  mediaLaneTracksHtml(VIDEO_MEDIA_LANE_SPEC, videoMediaTracks, mediaCtx),
                 '</div>',
               '</div>',
               '<div class="timeline-scroll-section timeline-audio-scroll-section" data-timeline-scroll-section="audio">',
                 '<div class="timeline-scroll-section-content">',
-                  audioTracks.map(function(track) { return audioTimelineTrackHtml(track, clipsByTrack.get(track.id) || [], totalFrames, continuationIds, dialogGlowIds); }).join(''),
+                  mediaLaneTracksHtml(AUDIO_LANE_SPEC, audioTracks, mediaCtx),
                   state.timelineAudioTracksCollapsed ? '' : audioNewTrackDropHtml(state.project),
                 '</div>',
               '</div>',
@@ -49887,8 +49676,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // The timeline's string-built tracks, one entry each. `applyTimelineTrack` owns "build it, compare it, swap or
     // patch it, remember the string" — per-caller copies forget the last step, and then the cache claims the DOM
     // holds something it no longer does (pointless redraws). The audio lanes and the external-video lane are not
-    // here: they are N tracks with their own structural check, waveform re-apply and re-binding
-    // (laneDomMatchesModel + patchLaneStructure with the AUDIO_LANE_SPEC / VIDEO_MEDIA_LANE_SPEC).
+    // here: their repeated rows are rendered and patched by the media-lane specs.
     const TIMELINE_TRACKS = [
       { id: 'ruler', lane: 'chrome', selector: '.timeline-ruler',
         build: function(ctx) { return timelineRulerTrackHtml(ctx.totalFrames, ctx.innerWidth, ctx.rulerLabelEvery); } },
@@ -50133,135 +49921,51 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // compare; an after-the-fact refresh has no "before", so this compares the screen against the data directly.
     // One kernel for the audio and V1 lanes; the spec supplies the selectors and the data lists.
     const AUDIO_LANE_SPEC = {
-      trackSelector: '.audio-track[data-audio-track-id]', trackIdKey: 'audioTrackId',
-      clipSelector: '.audio-clip[data-audio-clip-id]', clipIdKey: 'audioClipId', defaultTrackId: 'dialog-main',
-      tracks: function() { return audioTimelineTracks(state.project); },
+      trackSelector: '.audio-track[data-audio-track-id]', trackIdKey: 'audioTrackId', defaultTrackId: 'dialog-main',
       clips: function() { return audioTimelineDisplayClips(state.project); },
-      prepare: function(ctx, clips) {
-        ctx.continuationIds = audioContinuationClipIds(clips, ctx.video.groups);
-        ctx.dialogGlowIds = selectedDialogBlockClipIds(state.project);
-      },
-      trackHtml: function(track, clips, ctx) { return audioTimelineTrackHtml(track, clips, ctx.totalFrames, ctx.continuationIds, ctx.dialogGlowIds); }
+      trackBuilder: function(ctx, clips) {
+        const continuationIds = audioContinuationClipIds(clips, ctx.video.groups);
+        const dialogGlowIds = selectedDialogBlockClipIds(state.project);
+        return function(track, laneClips) {
+          return audioTimelineTrackHtml(track, laneClips, ctx.totalFrames, continuationIds, dialogGlowIds);
+        };
+      }
     };
     const VIDEO_MEDIA_LANE_SPEC = {
-      trackSelector: '.media-video-track[data-video-media-track-id]', trackIdKey: 'videoMediaTrackId',
-      clipSelector: '.video-media-clip[data-video-media-clip-id]', clipIdKey: 'videoMediaClipId', defaultTrackId: 'video-media-main',
-      tracks: function() { return videoMediaTimelineTracks(state.project); },
+      trackSelector: '.media-video-track[data-video-media-track-id]', trackIdKey: 'videoMediaTrackId', defaultTrackId: 'video-media-main',
       clips: function() { return videoTimelineDisplayClips(state.project); },
-      prepare: null,
-      trackHtml: function(track, clips, ctx) { return externalVideoTrackHtml(track, clips, ctx.totalFrames); }
+      trackBuilder: function(ctx) {
+        return function(track, laneClips) { return externalVideoTrackHtml(track, laneClips, ctx.totalFrames); };
+      }
     };
-    function laneDomMatchesModel(timelineEl, spec) {
-      if (!timelineEl || !timelineEl.querySelectorAll) return false;
-      const trackEls = timelineEl.querySelectorAll(spec.trackSelector);
-      const tracks = spec.tracks();
-      if (trackEls.length !== tracks.length) return false;
-      const domTrackIds = new Set();
-      trackEls.forEach(function(el) { domTrackIds.add(String(el.dataset[spec.trackIdKey] || '')); });
-      for (let index = 0; index < tracks.length; index += 1) {
-        if (!domTrackIds.has(String(tracks[index] && tracks[index].id || ''))) return false;
-      }
-      const clips = spec.clips();
-      const clipEls = timelineEl.querySelectorAll(spec.trackSelector + ' ' + spec.clipSelector);
-      if (clipEls.length !== clips.length) return false;
-      const laneOf = new Map();
-      clipEls.forEach(function(el) {
-        const trackEl = el.closest ? el.closest(spec.trackSelector) : null;
-        laneOf.set(String(el.dataset[spec.clipIdKey] || ''), trackEl ? String(trackEl.dataset[spec.trackIdKey] || '') : '');
-      });
-      for (let index = 0; index < clips.length; index += 1) {
-        const clip = clips[index];
-        if (laneOf.get(String(clip.id || '')) !== String(clip.trackId || spec.defaultTrackId)) return false;
-      }
-      return true;
-    }
-    function audioLaneDomMatchesModel(timelineEl) { return laneDomMatchesModel(timelineEl, AUDIO_LANE_SPEC); }
-    function videoMediaLaneDomMatchesModel(timelineEl) { return laneDomMatchesModel(timelineEl, VIDEO_MEDIA_LANE_SPEC); }
-
-    // Bring the lanes back in line with the data without a full render: build the lane HTML and let the keyed patch
-    // kernel (the one the conte track uses) add, drop and move clip nodes by id. Returns false when the track set
-    // itself changed, since creating or removing a lane container is the full render's job. A full render on a large
-    // project visibly freezes undoing a delete; building the HTML, not the patch, is the expensive part here. Same
-    // kernel for the audio and V lanes (the spec supplies the builder).
-    function patchLaneStructure(timelineEl, video, totalFrames, spec) {
-      if (!timelineEl || !video) return false;
-      const tracks = spec.tracks();
-      const trackEls = timelineEl.querySelectorAll(spec.trackSelector);
-      if (trackEls.length !== tracks.length) return false;
-      const domByTrackId = new Map();
-      trackEls.forEach(function(el) { domByTrackId.set(String(el.dataset[spec.trackIdKey] || ''), el); });
-      for (let index = 0; index < tracks.length; index += 1) {
-        if (!domByTrackId.has(String(tracks[index] && tracks[index].id || ''))) return false;
-      }
+    function mediaLaneTracksHtml(spec, tracks, ctx) {
       const clips = spec.clips();
       const clipsByTrack = new Map();
       clips.forEach(function(clip) {
-        const trackId = clip.trackId || spec.defaultTrackId;
-        if (!clipsByTrack.has(trackId)) clipsByTrack.set(trackId, []);
-        clipsByTrack.get(trackId).push(clip);
+        const id = clip.trackId || spec.defaultTrackId;
+        if (!clipsByTrack.has(id)) clipsByTrack.set(id, []);
+        clipsByTrack.get(id).push(clip);
       });
-      const ctx = { totalFrames: totalFrames, video: video };
-      if (spec.prepare) spec.prepare(ctx, clips);
+      const trackHtml = spec.trackBuilder(ctx, clips);
+      return tracks.map(function(track) { return trackHtml(track, clipsByTrack.get(track.id) || [], ctx); }).join('');
+    }
+
+    // Patch full-render markup. A changed track order or set needs the shell and its label rail rebuilt.
+    // Keep the clip nodes that stay in their lane so their bindings survive the patch.
+    function patchMediaLanes(timeline, spec, tracks, ctx) {
+      const rows = Array.from(timeline.querySelectorAll(spec.trackSelector));
+      if (rows.length !== tracks.length || !rows.every(function(row, index) {
+        return row.dataset[spec.trackIdKey] === String(tracks[index].id);
+      })) return false;
       const wrap = document.createElement('div');
-      wrap.innerHTML = tracks.map(function(track) {
-        return spec.trackHtml(track, clipsByTrack.get(track.id) || [], ctx);
-      }).join('');
-      let ok = true;
-      Array.from(wrap.children).forEach(function(sourceTrack) {
-        const targetTrack = domByTrackId.get(String(sourceTrack.dataset[spec.trackIdKey] || ''));
-        if (!targetTrack) { ok = false; return; }
-        const targetLane = targetTrack.querySelector('.timeline-lane');
-        const sourceLane = sourceTrack.querySelector('.timeline-lane');
-        if (!targetLane || !sourceLane) { ok = false; return; }
-        updateElementAttributes(targetTrack, sourceTrack); // muted / hidden / collapsed classes ride on the track element
-        if (!keyedPatchTimelineLaneChildren(targetLane, sourceLane)) ok = false;
+      wrap.innerHTML = mediaLaneTracksHtml(spec, tracks, ctx);
+      return rows.every(function(row, index) {
+        const source = wrap.children[index];
+        if (!source) return false;
+        updateElementAttributes(row, source);
+        updateTimelineChildElement(row.querySelector('.timeline-track-label'), source.querySelector('.timeline-track-label'));
+        return keyedPatchTimelineLaneChildren(row.querySelector('.timeline-lane'), source.querySelector('.timeline-lane'));
       });
-      return ok;
-    }
-    function patchAudioLaneStructure(timelineEl, video, totalFrames) { return patchLaneStructure(timelineEl, video, totalFrames, AUDIO_LANE_SPEC); }
-    function patchVideoMediaLaneStructure(timelineEl, video, totalFrames) { return patchLaneStructure(timelineEl, video, totalFrames, VIDEO_MEDIA_LANE_SPEC); }
-
-    function updateAudioClipPixelStyles(root, totalFrames) {
-      try {
-        const scope = root || document.querySelector('.video-editor-timeline');
-        if (!scope) return;
-        const total = Math.max(1, Math.round(Number(totalFrames) || 1));
-        const clips = audioTimelineDisplayClips(state.project);
-        clips.forEach(function(clip) {
-          const clipEl = scope.querySelector('[data-audio-clip-id="' + cssEscapeValue(String(clip.id || '')) + '"]');
-          if (!clipEl) return;
-          clipEl.style.setProperty('--left', framePercent(clip.startFrame, total).toFixed(4) + '%');
-          clipEl.style.setProperty('--width', Math.max(0.01, framePercent(clip.durationFrames, total)).toFixed(4) + '%');
-          // Volume-line position + dB label: beginAudioClipVolumeDrag's apply() syncs them live during a drag, but
-          // non-drag paths (undo/redo, the Audio FX slider committing via runAudioClipEditCommand, the
-          // reset-to-default menu action) change clip.volume without it, so sync both here unconditionally.
-          const lineEl = clipEl.querySelector('[data-audio-volume-line]');
-          if (lineEl) lineEl.style.setProperty('--vol-top', audioVolumeToLineTopPercent(clip.volume).toFixed(2) + '%');
-          const labelEl = clipEl.querySelector('.audio-volume-label');
-          if (labelEl) labelEl.textContent = audioClipVolumeDbLabel(clip.volume);
-        });
-      } catch (error) { console.warn('[timeline] 음성 클립 픽셀 스타일 갱신 실패 — 화면에 옛 위치가 남는다', error); }
-    }
-
-    function updateVideoMediaClipPixelStyles(root, totalFrames) {
-      try {
-        const scope = root || document.querySelector('.video-editor-timeline');
-        if (!scope) return;
-        const total = Math.max(1, Math.round(Number(totalFrames) || 1));
-        const clips = videoTimelineDisplayClips(state.project);
-        clips.forEach(function(clip) {
-          const clipEl = scope.querySelector('[data-video-media-clip-id="' + cssEscapeValue(String(clip.id || '')) + '"]');
-          if (!clipEl) return;
-          clipEl.style.setProperty('--left', framePercent(Math.max(0, clip.startFrame || 0), total).toFixed(4) + '%');
-          clipEl.style.setProperty('--width', Math.max(0.001, framePercent(Math.max(1, clip.durationFrames || 1), total)).toFixed(4) + '%');
-          const label = videoMediaClipLabel(clip);
-          if (clipEl.getAttribute('title') !== label) {
-            clipEl.setAttribute('title', label);
-            const titleEl = clipEl.querySelector('.video-media-title');
-            if (titleEl) titleEl.textContent = label || 'media';
-          }
-        });
-      } catch (error) { console.warn('[timeline] 영상 클립 픽셀 스타일 갱신 실패 — 화면에 옛 위치가 남는다', error); }
     }
 
     function renderTimelineScoped(options, allowPartial) {
@@ -50299,24 +50003,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const prevTotal = targetRoot.dataset ? (Number(targetRoot.dataset.timelineTotalFrames) || 0) : 0;
         if (prevTotal !== totalFrames) return false;
       }
-      // The gate above only catches a length change. Structure (which clips exist and which lane each sits in)
-      // is checked here rather than in the callers: a caller that forgets it gets a silently stale lane. A
-      // conte-lane render never touches the audio lane, so it is exempt. A mismatch patches the lane by clip id
-      // first; only a change to the track set (a lane container to create or remove) falls back, since the patch
-      // is several times cheaper than a full render.
-      let audioLanesPatched = false;
-      if (wants('audio') && !audioLaneDomMatchesModel(timeline)) {
-        if (!patchAudioLaneStructure(timeline, video, totalFrames)) return false;
-        audioLanesPatched = true;
-      }
-      let videoLanesPatched = false;   // the V lane has the same patcher — a move / trim / delete needs no full render
-      if (wants('videoMedia') && !videoMediaLaneDomMatchesModel(timeline)) {
-        if (!patchVideoMediaLaneStructure(timeline, video, totalFrames)) return false;
-        videoLanesPatched = true;
-      }
       updateTargetTimeInputs(targetFrames);
       state.videoPlayheadFrames = clampTimelinePlayheadFrame(state.videoPlayheadFrames, totalFrames);
       if (!options.skipPlayheadSelectionSync) updateTimelineRenderSelectionToPlayhead(state.project);
+      const mediaCtx = { totalFrames: totalFrames, video: video };
+      if (wants('audio') && !patchMediaLanes(timeline, AUDIO_LANE_SPEC, audioTracks, mediaCtx)) return false;
+      if (wants('videoMedia') && !patchMediaLanes(timeline, VIDEO_MEDIA_LANE_SPEC, videoMediaTracks, mediaCtx)) return false;
 
       const framePx = conteTimelineFramePx();
       const viewportWidth = scroll.clientWidth ? Math.max(360, scroll.clientWidth) : (targetRoot.clientWidth ? Math.max(360, targetRoot.clientWidth - 24) : (state.timelineViewportWidth || 960));
@@ -50368,19 +50060,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         bindAudioTrackLabelMenus(fixedOverlay, targetRoot);
       }
       if (wants('audio')) {
-        // Nodes the patch cloned in carry no listeners; bindAudioTimelineDrag skips the ones that
-        // already have them (data-audio-clip-bound), so this only wires the new arrivals.
-        if (audioLanesPatched) bindAudioTimelineDrag(targetRoot, totalFrames);
-        updateAudioClipPixelStyles(timeline, totalFrames);
-        // A trim moves which slice of the source the clip shows, so the picture has to be rebuilt too; otherwise a
-        // trim that leaves totalFrames alone (left-edge trim keeps the clip's end) resizes the box while the waveform
-        // keeps the pre-trim slice. Cheap: the CSS value is cached per clip and misses only when slice or width changed.
+        bindAudioTimelineDrag(targetRoot, totalFrames);
         applyAudioClipWaveformStyles(timeline);
       }
-      if (wants('videoMedia')) {   // its own lane gate, so a render scoped to anything else still repositions V1 clips when asked
-        if (videoLanesPatched) bindVideoMediaTimelineDrag(targetRoot, totalFrames);   // Cloned-in nodes carry no listeners; the binder skips the already-bound ones (data-video-clip-bound)
-        updateVideoMediaClipPixelStyles(timeline, totalFrames);
-      }
+      if (wants('videoMedia')) bindVideoMediaTimelineDrag(targetRoot, totalFrames);
+      if (wants('audio') || wants('videoMedia')) bindTimelineTrackLabelControls(timeline);
       updateTimelineSelectionDom(targetRoot, { thumbnails: false });
       // ── reads from here ──
       const timelineViewportApplied = restoreTimelineScroll(targetRoot, innerWidth, {
@@ -53127,8 +52811,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       '</div>';
     }
 
-    // the V1 clip's lane label — also re-synced by the partial render (updateVideoMediaClipPixelStyles): a trim or its
-    //   Undo can flip the short-source marker without a lane rebuild
+    // A trim or its Undo can flip the short-source marker in the lane label.
     function videoMediaClipLabel(clip) {
       return String(clip.mediaFileName || (clip.mediaStorage && clip.mediaStorage.fileName) || clip.sourceType || 'media').replace(/\.[^.]+$/, '')   // IndexedDB / inline clips keep the original name in mediaStorage
         + (clip.timeMap === 'frame' ? ' [' + t('video.import.frame') + ']' : '') + (clip.sourceShort ? ' !' : '');   // Interpretation and short-source markers
@@ -59354,7 +59037,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         before: { clip: removed, index: index },
         after: null
       });
-      updateVideoMediaTimelineEdit();
+      refreshMediaCommandViews(['videoMedia']);
       return true;
     }
 
@@ -59827,7 +59510,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function bindTimelineClipDrag(root, totalFramesAtBind, spec) {
       // Use the current rendered scale when starting a clip move.
-      // Partial renders keep prior clip bindings while `updateAudioClipPixelStyles` positions them at the new total.
+      // Partial renders keep prior clip bindings while patching positions at the new total.
       // A binding-time total would interpret the current clip location incorrectly.
       const liveTotalFrames = function() { return runtimeTimelineTotalFrames(root, null, totalFramesAtBind); };
       root.querySelectorAll(spec.clipSelector).forEach(function(clipEl) {
@@ -59943,23 +59626,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       trackFromPointer: audioTrackFromPointer,
       movePreviewToTrack: moveAudioDragPreviewToTrack,
       removePreview: removeAudioDragPreview,
-      commitMove: function(clipId, nextStart, targetTrackId, ctx) {
-        const result = commitAudioClipMoveFast('Move dialog audio', clipId, nextStart, targetTrackId);
-        if (!result) return;
-        if (result.createdTrack) {
-          guardedRender('timing', renderTimingDashboard);
-          guardedRender('inspector', renderInspector);
-          guardedRender('chrome', updateChromeControls);
-          return;
-        }
-        // False = the lane it should move into is not on screen (the createdTrack branch above
-        // covers the usual case, so this is the belt to that suspenders). A full render builds it.
-        if (!partialUpdateAudioClipDom(clipId, result.trackId, result.startFrame, result.durationFrames, ctx.liveTotalFrames())) {
-          guardedRender('timing', renderTimingDashboard);
-          guardedRender('inspector', renderInspector);
-          guardedRender('chrome', updateChromeControls);
-        }
-      }
+      commitMove: commitAudioClipMove
     };
     function bindAudioTimelineDrag(root, totalFramesAtBind) {
       bindTimelineClipDrag(root, totalFramesAtBind, AUDIO_CLIP_DRAG_SPEC);
@@ -129489,7 +129156,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     }
     function gengaResetAudioClipDragPreview(d) {
       if (!d || !d.el) return;
-      d.el.style.left = ((d.start - 1) * gengaCellW()) + 'px';
+      d.el.style.left = gengaTimelinePx(d.start - 1);
       d.el.style.transform = '';
     }
     function gengaAudioClipDragFinish(canceled) {
@@ -161239,19 +160906,13 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const dependenciesChanged = gengaLayerDependenciesChanged(after.layers.map(function(item) {
         return { before: beforeById.get(String(item.id)), after: item.layer };
       }), state.project.gengaTimeline || {});
-      pushUndoCommand(attachSelectionRider({
+      commitProjectCommand({
         name: name,
         before: before,
         after: after,
         gengaLayerPatchEdit: true,
-        gengaStrokeCommit: isStrokeCommit,
-        gengaPixels: refreshOptions && refreshOptions.gengaPixels,
-        gengaDrawingContext: refreshOptions && refreshOptions.gengaDrawingContext,
-        recordingKind: refreshOptions && refreshOptions.recordingKind
-      }, refreshOptions && refreshOptions.selectionRider)); // Store the selection rider and stroke marker for the Undo and Redo cache predicate.
-      const effectiveRefreshOptions = Object.assign({}, refreshOptions || {}, { gengaPreviewCachesSettled: true });
-      effectiveRefreshOptions.gengaRenderPlan = gengaPresetRenderPlan(effectiveRefreshOptions.gengaRenderPlan, gengaLayerEditRenderPlan(ids, dependenciesChanged));
-      refresh(effectiveRefreshOptions);
+        gengaStrokeCommit: isStrokeCommit
+      }, refreshOptions, gengaLayerEditRenderPlan(ids, dependenciesChanged));
     }
     // The choke point for "this edit rewrites the given layers' own contents and nothing else": lean when the
     // scope rules allow it, full runCommand otherwise. Callers that add/remove a koma must not use this
