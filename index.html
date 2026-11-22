@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3546</title>
+  <title>MoArt ver3547</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -84991,7 +84991,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const fields = paintPresetFieldsFor(tool);
       const out = { tool: tool };
       if (fields.indexOf('size') >= 0) {
-        const size = activePaintSize();
+        const size = paintPresetFieldEnsure('size', tool);
         if (typeof size === 'number' && size > 0) out.size = size;
       }
       PRESET_BRUSH_IDENTITY_FIELDS.forEach(function(name) {
@@ -85936,7 +85936,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { get: function() { return paintBucketOptionVal(name); }, set: function(v) { setPaintBucketOption(name, v); } };
     }
     const PAINT_PRESET_FIELD_IO = {
-      size:      { get: function() { return activePaintSize(); },        set: function(v) { setActivePaintSize(v); } },
       binarize:  { get: function(tool) { return paintToolBinarizeOn(tool); }, set: function(v, tool) { setPaintToolBinarize(tool, v); } },
       tolerance: paintPresetBucketIo('tolerance'),
       gapClose:  paintPresetBucketIo('gapClose'),
@@ -85957,14 +85956,38 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Writing the active slot would persist a value that the intended tool never reads.
     // With no tool argument, capture from the current tool.
     function paintPresetFieldEnsure(name, tool) {
+      if (tool === 'text-stamp' && name === 'size') return activePaintSize();
       const io = PAINT_PRESET_FIELD_IO[name];
       if (io) return io.get(tool);
       return paintBrushEnsureFor(tool ? paintBrushToolSlotKeyOf(tool) : paintBrushToolKey(), name);
     }
     function paintPresetFieldSet(name, value, tool) {
+      if (tool === 'text-stamp' && name === 'size') { setActivePaintSize(value); return; }
       const io = PAINT_PRESET_FIELD_IO[name];
       if (io) io.set(value, tool);
-      else paintBrushSetFor(tool ? paintBrushToolSlotKeyOf(tool) : paintBrushToolKey(), name, value);
+      else {
+        const slot = tool ? paintBrushToolSlotKeyOf(tool) : paintBrushToolKey();
+        if (name === 'size') setPaintSizeForSlot(slot, value);
+        else paintBrushSetFor(slot, name, value);
+      }
+    }
+    // Library records reset absent identity fields; custom presets overlay only recorded fields.
+    // Both use the destination tool, even if applying a record leaves another tool active.
+    function paintApplyBrushRecord(brush, tool, { resetIdentity = false, only = null } = {}) {
+      if (resetIdentity) {
+        for (const name of only || BRUSH_IDENTITY_FIELDS) {
+          if (Object.hasOwn(brush, name) && brush[name] !== undefined) continue;
+          const spec = PAINT_BRUSH_SETTING_SPEC[name];
+          if (spec && Object.hasOwn(spec, 'def')) paintPresetFieldSet(name, spec.def, tool);
+        }
+      }
+      for (const name of paintPresetFieldsFor(tool)) {
+        if (only && !only.includes(name)) continue;
+        if (!Object.hasOwn(brush, name) || brush[name] === undefined) continue;
+        const value = brush[name];
+        if (name === 'size' && !(typeof value === 'number' && value > 0)) continue;
+        paintPresetFieldSet(name, value, tool);
+      }
     }
     function captureCurrentBrushSettings() {
       const tool = state.paintEditTool || state.paintTool || 'pen';
@@ -85995,23 +86018,20 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Preserve current opacity, stabilization, and pressure so applying a size preset keeps the drawing feel.
       // Explicit preset `brush` fields can still set 2値化, as for TP and airbrush.
       // A `scope.all` preset overlays every field, so this restriction does not change its result.
-      const libraryEntry = preset.libraryId && brushLibraryFindEntry(preset.libraryId);
-      if (libraryEntry && !(libraryEntry.brush && libraryEntry.brush.imageBrushRef)) brushLibraryApplyEntry(preset.libraryId, { only: PRESET_BRUSH_IDENTITY_FIELDS, tool: preset.brush && preset.brush.tool });   // Reset identity on the preset's tool slot, not the pen entry's
       const b = preset.brush;
+      const entry = preset.libraryId && brushLibraryFindEntry(preset.libraryId);
+      const linkedBrush = entry && entry.brush && !entry.brush.imageBrushRef;
+      const selectedTool = linkedBrush ? paintApplyLibraryBrush(entry, b.tool, PRESET_BRUSH_IDENTITY_FIELDS) : null;
       // Restore a recorded tool through the shared setter before color/fields. Field setters below
       // target the explicit preset tool (pen for legacy records). Missing tool/size supply no restore
       // value of their own; the library application above may already have selected its tool.
-      if (b.tool) setActivePaintTool(b.tool);
+      if (b.tool && b.tool !== selectedTool) setActivePaintTool(b.tool);
       if (preset.color) setPaintBrushColor(preset.color, { record: true });
       // Restore only the fields this preset carries; the rest stay as the user has them. Writing every field
       // would let a `transform` preset (no brush settings) overwrite the live pen.
-      const tool = b.tool || 'pen';
-      paintPresetFieldsFor(tool).forEach(function(name) {
-        if (!Object.prototype.hasOwnProperty.call(b, name) || b[name] === undefined) return;
-        if (name === 'size' && !(typeof b.size === 'number' && b.size > 0)) return; // a bad saved size must not zero the brush
-        paintPresetFieldSet(name, b[name], tool);
-      });
+      paintApplyBrushRecord(b, b.tool || 'pen');
       updatePaintUI();
+      if (linkedBrush) brushLibraryRenderGrid();
     }
 
     // ## SECTION: Stroke dynamics, sampling and round rendering
@@ -86694,7 +86714,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // Resolve shared brush options from the fields already attached to the stroke for `paintFillVariableWidthBody`.
     // Pass the paper origin when the context has another origin so grain stays paper-fixed.
-    // Callers supply their own `alphaFor` and `roundBatch`.
+    // paintRenderStrokeBody adds per-frame options and the captured alpha and round-batch settings.
     function paintBrushLookOptions(src, originX, originY) {
       const grain = paintGrainOptionsFrom(src);
       if (grain && originX != null) { grain.originX = originX; grain.originY = originY; }
@@ -88622,13 +88642,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (e.brush && e.brush.imageBrushRef) imageBrushReleaseAsset(e.brush.imageBrushRef).catch(imageBrushReportFailure);
       brushLibraryRenderGrid();
     }
-    // Tile click applies through the preset field setters. An active shape tool stays active,
-    // so its outline can use the selected brush without switching to the entry's pen/eraser tool.
-    // Pass that shape or the selected entry/preset tool explicitly to each field setter.
-    // opts.only selects fields by Set or array. Omit it to apply the whole entry.
-    // Custom panel presets select the tool, brush, and size while keeping the user's opacity, stabilization, and pressure settings.
-    // Selecting a tile in the library applies the entire brush.
-    function brushLibraryApplyEntry(id, opts) {
+    // Catalog selection restores an image brush or applies a complete brush record.
+    function brushLibraryApplyEntry(id) {
       const e = brushLibraryFindEntry(id);
       if (!e || !e.brush) return;
       paintCancelBrushDrags();
@@ -88645,36 +88660,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         });
         return;
       }
-      const only = (opts && opts.only) ? (opts.only instanceof Set ? opts.only : new Set(opts.only)) : null;
-      const b = e.brush;
-      const shapeNow = paintShapeToolKind(); // One of line, curve, rect, ellipse, or null.
-      const entryTool = (opts && opts.tool) || b.tool;   // A preset can target its own tool slot (custom-panel apply); library grid passes none = the entry's tool
-      if (!shapeNow && entryTool) setActivePaintTool(entryTool);
-      // The value is saved, but 用紙 notes use the default brush.
-      // Notify the user at selection time so the choice does not appear to silently fail.
-      if (paintTargetIsMemoPage() && b.tipId) showToast(t('brushLibrary.memoPageWarn'), { warn: true });
-      // Use the tool key when choosing fields in paintPresetFieldsFor. A slot key such as lassoFill falls back to all pen fields.
-      // PAINT_PRESET_FIELD_IO.binarize also indexes 2値化 by tool key.
-      // paintBrushSet and paintBinarizeSlotKey resolve shared slots downstream.
-      const tool = shapeNow || entryTool || 'pen';
-      // Reset missing identity fields to factory defaults. SUT entries contain only axes present in the imported brush.
-      // Without the reset, a later brush can inherit ribbon rendering or a pressure curve.
-      // BRUSH_IDENTITY_FIELDS covers every identity axis emitted by the SUT importer.
-      BRUSH_IDENTITY_FIELDS.forEach(function(name) {
-        if (only && !only.has(name)) return;
-        if (Object.prototype.hasOwnProperty.call(b, name) && b[name] !== undefined) return;
-        const spec = PAINT_BRUSH_SETTING_SPEC[name];
-        if (spec && Object.prototype.hasOwnProperty.call(spec, 'def')) paintPresetFieldSet(name, spec.def, tool);
-      });
-      paintPresetFieldsFor(tool).forEach(function(name) {
-        if (only && !only.has(name)) return;
-        if (!Object.prototype.hasOwnProperty.call(b, name) || b[name] === undefined) return;
-        if (name === 'size' && !(typeof b.size === 'number' && b.size > 0)) return;
-        paintPresetFieldSet(name, b[name], tool);
-      });
-      brushLibrarySelectedId = id;
+      paintApplyLibraryBrush(e);
       updatePaintUI();
       brushLibraryRenderGrid();
+    }
+    // A shape retains its tool. A linked preset can select its own tool and limit the identity overlay.
+    function paintApplyLibraryBrush(entry, presetTool, only = null) {
+      const brush = entry.brush;
+      const shape = paintShapeToolKind();
+      const tool = presetTool || brush.tool;
+      const selectedTool = !shape && tool;
+      if (selectedTool) setActivePaintTool(selectedTool);
+      if (paintTargetIsMemoPage() && brush.tipId) showToast(t('brushLibrary.memoPageWarn'), { warn: true });
+      paintApplyBrushRecord(brush, shape || tool || 'pen', { resetIdentity: true, only });
+      brushLibrarySelectedId = entry.id;
+      return selectedTool;
     }
     // Import pipeline driven by dropped files. Keep file-specific settings out of the code.
     async function brushLibraryImportPngFile(file, options) { // File and media imports share this registration path.
@@ -93691,7 +93691,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       opts = opts || {};
       const tip = opts.tip, grain = opts.grain, alphaFor = opts.alphaFor;
       // Reuse the stable range with liveHost. Genga final rendering also completes that session.
-      const s = paintInkSessionStep(opts.liveHost || null, ctx, pts, radii, color, opts);
+      const s = paintInkSessionStep(ctx, pts, radii, color, opts);
       paintRecordStrokeCoverage(ctx.canvas, s);
       // Skip texture multiplication here if the session already baked perDab grain.
       // Stroke-level grain sets depth from starting pressure. Ribbons and unsupported perDab combinations use this route too.
@@ -97804,7 +97804,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           let f = fields.get(m.id);
           if (m.seed) {
             closeField(f);
-            f = { cv: new OffscreenCanvas(m.w, m.h), assets: new Map(), tailBox: m.previousTail, tailBak: null };
+            f = { w: m.w, h: m.h, cv: new OffscreenCanvas(m.w, m.h), assets: new Map(), tailBox: m.previousTail, tailBak: null };
             f.cv.getContext('2d').drawImage(m.seed, 0, 0);
             m.seed.close();
             if (m.seedTail) {
@@ -97825,7 +97825,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             if (f.shadeTile && !f.shadeMask) throw new Error('Material grain unavailable');
           }
           const start = performance.now(), ctx = f.cv.getContext('2d');
-          if (f.tailBox && f.tailBak) paintInkTailCanvasRestore(ctx, f.tailBak, f.tailBox);
           const pts = [], radii = [], av = [], data = m.points;
           for (let i = 0; i < data.length; i += 7) {
             pts.push({
@@ -97852,21 +97851,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             ctx.globalCompositeOperation = 'source-over';
             return box;
           }
-          const b = draw(walk);
-          m.tailBox = walk.pointLimit < pts.length ? paintStrokeScratchBox(null, pts, radii, m.w, m.h, true, m.tip, Math.max(0, walk.pointLimit - 1)) : null;
-          f.tailBox = m.tailBox;
-          if (m.tailBox) f.tailBak = paintInkTailCanvasBackup(f.cv, f.tailBak, m.tailBox);
-          const tb = walk.pointLimit < pts.length ? draw(Object.assign({}, walk, { pointLimit: pts.length })) : null;
-          const box = b && tb ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) } : b || tb;
-          m.rect = paintBoxUnion(box ? paintStrokeScratchBox(box, null, null, m.w, m.h, true) : null, m.previousTail);
-          m.box = box && m.previousBox
-            ? {
-            x0: Math.min(box.x0, m.previousBox.x0),
-            y0: Math.min(box.y0, m.previousBox.y0),
-            x1: Math.max(box.x1, m.previousBox.x1),
-            y1: Math.max(box.y1, m.previousBox.y1)
-          }
-            : box || m.previousBox;
+          const { box, restored } = paintInkWalkStep(f, ctx, pts, radii, m.tip, walk, walk.pointLimit, draw);
+          m.tailBox = f.tailBox;
+          m.rect = paintBoxUnion(box ? paintStrokeScratchBox(box, null, null, m.w, m.h, true) : null, restored);
+          m.box = paintInkBoundsUnion(m.previousBox, box);
           // Synchronous snapshots: a release/next job cannot mutate these while publication is queued.
           if (m.rect) {
             const c = new OffscreenCanvas(m.rect.w, m.rect.h);
@@ -97919,8 +97907,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           [paintMeshGl, paintMeshReleaseTexture, paintMeshBindTexture, paintMeshDrawBatches, paintInkTailCanvasBackup, paintInkTailCanvasRestore,
             paintRibbonMeshBatch, paintMaterialMeshAdd, paintMeshTipLevel, paintMaterialMeshSource, paintGrainBakedFull, paintGrainPatternTransform, paintMaterialWalk, paintWalkTipDabs, paintInkDabAlphaFor,
             paintDabThickness, paintNativeDabSize, paintDabSize, paintTipSmallDab, paintDabPressure, paintCurveEvalPts,
+            paintInkWalkStep, paintInkTailRestore, paintInkTailBackup, paintInkBoundsUnion,
             paintLerpSmooth, paintLerpAngleDeg, paintJitterUnit, paintStrokeScratchBox, paintBoxUnion].map(fn => fn.toString()).join('\n') +
           '\n(' + paintMaterialWorkerBoot.toString() + ')();';
+    }
+    function paintMaterialWorkerFail(st, error) {
+      if (paintMaterialWorkerState !== st) return;
+      paintMaterialWorkerFailed = true;
+      paintMaterialWorkerState = null;
+      st.worker.terminate();
+      const jobs = Array.from(st.jobs.values());
+      st.jobs.clear();
+      for (const job of jobs) job({ error });
     }
     function paintMaterialWorkerEnsure() {
       if (paintMaterialWorkerFailed || paintMaterialWorkerPolicy === 'off') return null;
@@ -97930,18 +97928,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       try {
         const body = paintMaterialWorkerSource();
         url = URL.createObjectURL(new Blob([body], { type: 'text/javascript' }));
-        const st = { worker: new Worker(url), ready: false, jobs: new Map() };
+        const st = { worker: new Worker(url), jobs: new Map() };
         paintMaterialWorkerState = st;
         st.worker.onmessage = function(event) {
           const m = event.data;
           if ('ready' in m) {
-            if (!m.ready) {
-              paintMaterialWorkerFailed = true;
-              st.worker.terminate();
-              const jobs = Array.from(st.jobs.values());
-              st.jobs.clear();
-              for (const job of jobs) job({ error: 'Material worker unavailable' });
-            } else st.ready = true;
+            if (!m.ready) paintMaterialWorkerFail(st, 'Material worker unavailable');
             return;
           }
           const job = st.jobs.get(m.id);
@@ -97954,24 +97946,25 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           }
           job(m);
         };
-        st.worker.onerror = function() {
-          paintMaterialWorkerFailed = true;
-          st.worker.terminate();
-          for (const job of st.jobs.values()) job({ error: 'Material worker failed' });
-          st.jobs.clear();
-        };
+        st.worker.onerror = function() { paintMaterialWorkerFail(st, 'Material worker failed'); };
         return st;
       } catch (e) { paintMaterialWorkerFailed = true; return null; }
       finally { if (url) URL.revokeObjectURL(url); }
     }
+    function paintMaterialWorkerSettle(m) {
+      clearTimeout(m.timeout);
+      m.inflight = false;
+      paintInputMaterialSettled(m);
+    }
     function paintMaterialWorkerRelease(s) {
       const m = s && s.materialWorker;
       if (!m) return;
-      m.closed = true; clearTimeout(m.timeout);
-      paintInputMaterialSettled(m);
-      const st = paintMaterialWorkerState;
-      if (st) { st.jobs.delete(m.id); st.worker.postMessage({ id: m.id, release: true }); }
+      m.closed = true;
       s.materialWorker = null;
+      paintMaterialWorkerSettle(m);
+      const st = m.workerState;
+      st.jobs.delete(m.id);
+      if (st === paintMaterialWorkerState) st.worker.postMessage({ id: m.id, release: true });
     }
     function paintMaterialWorkerStep(s, host, cx, pts, radii, opts, tipImage, confirmN, grew) {
       if (!host || opts.final || s.workerDisabled
@@ -97987,8 +97980,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // A stalled/slow worker must not hold the preview indefinitely. Resume the published checkpoint.
           s.workerDisabled = true;
           paintMaterialWorkerRelease(s);
-          paintMaterialWorkerFailed = true;
-          paintMaterialWorkerState.worker.terminate();
+          paintMaterialWorkerFail(m.workerState, 'Material worker timed out');
           return false;
         }
         s.clean = true;
@@ -98004,6 +97996,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!st) return false; // Messages queue behind worker boot; a rejected boot fails its jobs explicitly.
       if (!m) m = s.materialWorker = {
         id: ++paintMaterialWorkerId,
+        workerState: st,
         assets: new Map(),
         seeded: false,
         closed: false,
@@ -98041,9 +98034,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         // Publication can win the race against the FIFO's first wait check.
         const ending = Boolean(endQueue && !endQueue.sync && endQueue.owner === host
             && endEntry && endEntry.event && endEntry.event.type === 'pointerup');
-        clearTimeout(m.timeout);
-        m.inflight = false;
-        paintInputMaterialSettled(m);
+        paintMaterialWorkerSettle(m);
         if (m.closed || host.livePaint !== s) {
           if (result.patch) result.patch.close();
           if (result.tail) result.tail.close();
@@ -98176,7 +98167,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
             }
           }
           if (m.closed) { for (const item of transfers) if (item.close) item.close(); return; }
-          if (paintMaterialWorkerFailed) throw new Error('Material worker unavailable');
+          if (paintMaterialWorkerState !== st) throw new Error('Material worker unavailable');
           st.jobs.set(m.id, publish);
           st.worker.postMessage(msg, transfers);
           m.seeded = true;
@@ -98256,13 +98247,33 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       s.tailBox = null;
       return box;
     }
+    function paintInkBoundsUnion(a, b) {
+      if (!a || !b) return a || b;
+      return { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) };
+    }
+    // Advance the confirmed walk once, then render the mutable tail against a disposable walk.
+    // The backup includes any mixer and color state that a provisional stamp can change.
+    function paintInkWalkStep(s, cx, pts, radii, tip, walk, confirmN, stamp) {
+      const restored = paintInkTailRestore(s, cx);
+      walk.pointLimit = confirmN;
+      const splitRibbon = confirmN < pts.length && tip && tip.ribbon;
+      const fixedBox = stamp(walk, splitRibbon ? pts.slice(0, confirmN) : pts, splitRibbon ? radii.slice(0, confirmN) : radii);
+      if (confirmN >= pts.length) return { box: fixedBox, restored };
+      paintInkTailBackup(s, pts, radii, confirmN, s.w, s.h, tip);
+      const tailBox = stamp(Object.assign({}, walk, { pointLimit: pts.length, cacheTail: true }), pts, radii);
+      return { box: paintInkBoundsUnion(fixedBox, tailBox), restored };
+    }
     // A live host retains a freehand path's stable prefix; shapes and Shift replacements rebuild
     // geometry and must not borrow that session. n >= s.done is append eligibility, not a no-change
     // test: pointRevision/final also participate in paintInkSessionStep. Each live builder uses this
     // gate; the pre-stroke base for mixing (mixBase) is a separate ownership question.
     function paintIncrementalInkHost(host, shapeKind, shiftLine) {
-      if (!host || shapeKind || shiftLine === true) return null;
-      return host;
+      if (shapeKind || shiftLine === true) {
+        // A one-shot replacement must not receive late patches for the suspended freehand view.
+        paintMaterialWorkerRelease(host && host.livePaint);
+        return null;
+      }
+      return host || null;
     }
     // Both engines select interval density here, before the session and stampers.
     // Matched against CSP taps (fixed interval, nonmixing circle/material).
@@ -98347,120 +98358,36 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return Boolean(dirty || prevTail);
     }
     function paintInkSessionStampStep(s, cx, pts, radii, opts, tipImage, confirmN) {
-      const w = s.w, h = s.h, flow = s.flow;
-      const tailHold = confirmN < pts.length;
-      const ribbon = Boolean(opts.tip && opts.tip.ribbon);
-      const confirmedPts = ribbon && tailHold ? pts.slice(0, confirmN) : pts;
-      const confirmedRadii = ribbon && tailHold ? radii.slice(0, confirmN) : radii;
-      let cvChanged = false;
-      const grainPD = s.grainPD, n = pts.length;
-      // Restore the prior tail, append the stable range, then draw the new provisional tail.
-      const prevTail = paintInkTailRestore(s, cx);
-      // Keep the later neighbors needed for calculation and limit only the emitted range.
+      const w = s.w, h = s.h, tip = opts.tip;
       if (s.walk.dabCache) {
         if (!s.walk.dabCache.keepKeys) s.walk.dabCache.keepKeys = new Set();
         else s.walk.dabCache.keepKeys.clear();
       }
-      s.walk.pointLimit = confirmN;
-      const b = paintStampInkField(
-        cx,
-        confirmedPts,
-        confirmedRadii,
-        opts.tip,
-        tipImage,
-        s.av,
-        s.walk,
-        s.mixTipFor,
-        s.colorCtx,
-        flow,
-        grainPD
-      );
-      let tb = null;
-      if (tailHold) {
-        paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
-        // Copy progress state. Share the tangent cache so stable rendering sees later neighbors.
-        tb = paintStampInkField(
-          cx,
-          pts,
-          radii,
-          opts.tip,
-          tipImage,
-          s.av,
-          Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }),
-          s.mixTipFor,
-          s.colorCtx,
-          flow,
-          grainPD
-        );
-      }
-      // Keep committed masks intact and retain only what the current provisional tail needs.
+      const { box, restored } = paintInkWalkStep(s, cx, pts, radii, tip, s.walk, confirmN, function(walk, points, widths) {
+        return paintStampInkField(cx, points, widths, tip, tipImage, s.av, walk, s.mixTipFor, s.colorCtx, s.flow, s.grainPD);
+      });
       paintInkDabCachePrune(s.walk.dabCache);
-      const b2 = (b && tb)
-        ? { x0: Math.min(b.x0, tb.x0), y0: Math.min(b.y0, tb.y0), x1: Math.max(b.x1, tb.x1), y1: Math.max(b.y1, tb.y1) }
-        : (b || tb);
-      // The stamper returns current-call bounds for incremental grain. s.box accumulates
-      // the union across the entire stroke.
-      // Rebuild the restored prior tail area as part of this frame's work.
-      s.newBox = paintBoxUnion(b2 ? paintStrokeScratchBox(b2, null, null, w, h, true) : null, prevTail);
-      if (prevTail) cvChanged = true;   // Restoring the tail changed s.cv.
-      if (b2) {
-        // B2 bounds the actual stamps. Count a change only if it intersects the canvas.
-        if (b2.x1 > 0 && b2.y1 > 0 && b2.x0 < w && b2.y0 < h) cvChanged = true;
-        s.box = s.box
-          ? {
-          x0: Math.min(s.box.x0, b2.x0),
-          y0: Math.min(s.box.y0, b2.y0),
-          x1: Math.max(s.box.x1, b2.x1),
-          y1: Math.max(s.box.y1, b2.y1)
-        }
-          : b2;
-      }
-      return cvChanged;
+      s.newBox = paintBoxUnion(box ? paintStrokeScratchBox(box, null, null, w, h, true) : null, restored);
+      s.box = paintInkBoundsUnion(s.box, box);
+      return Boolean(restored || (box && box.x1 > 0 && box.y1 > 0 && box.x0 < w && box.y0 < h));
     }
     function paintInkSessionTipStep(s, cx, pts, radii, opts, tipImage, confirmN) {
-      const w = s.w, h = s.h, flow = s.flow;
+      const w = s.w, h = s.h, tip = opts.tip;
       const tailHold = confirmN < pts.length;
-      const ribbon = Boolean(opts.tip && opts.tip.ribbon);
-      const confirmedPts = ribbon && tailHold ? pts.slice(0, confirmN) : pts;
-      const confirmedRadii = ribbon && tailHold ? radii.slice(0, confirmN) : radii;
-      let cvChanged = false;
-      const color = s.color, n = pts.length;
-      // Match the ink-field order: restore, stamp the stable range, then stamp the new tail.
-      const prevTail = paintInkTailRestore(s, cx);
-      // Include the preceding point when bounding this frame's dabs.
-      // A dab can fall between that point and the first new point.
+      // Dab mixing applies color per stamp; ribbons use the tinted strip.
+      const tipSrc = s.mixTipFor && !(tip && tip.ribbon) ? tipImage : paintTintedTip(tipImage, s.color);
+      const { restored } = paintInkWalkStep(s, cx, pts, radii, tip, s.walk, confirmN, function(walk, points, widths) {
+        paintStampTexturedPath(cx, points, widths, tipSrc, tip, walk, s.mixTipFor, s.flow);
+      });
+      // Include the preceding point because a stamp can fall between samples.
       const from = Math.max(0, s.done - 1);
-      s.newBox = paintBoxUnion(paintStrokeScratchBox(null, pts, radii, w, h, true, opts.tip, from), prevTail);   // Include scattering with the same padding as the tail backup.
-      // The raw box clamps x and y at zero, so check only the lower and right edges.
-      // A box fully above or left of the canvas already returns null.
-      const rawBox = paintStrokeScratchBox(null, pts, radii, 1e9, 1e9, false, opts.tip, from);
-      if (rawBox && rawBox.x < w && rawBox.y < h) cvChanged = true;
-      if (prevTail) cvChanged = true;   // Restoring the tail changed s.cv.
-      // Pass an untinted tip for mixing because each dab applies its own color.
-      // Otherwise reuse one tinted tip. Ribbon pieces never use dab-based mixing, so a ribbon
-      // takes the tinted tip even with a mixer (the raw material is black).
-      const tipSrc = (s.mixTipFor && !(opts.tip && opts.tip.ribbon)) ? tipImage : paintTintedTip(tipImage, color);
-      s.walk.pointLimit = confirmN;
-      paintStampTexturedPath(cx, confirmedPts, confirmedRadii, tipSrc, opts.tip, s.walk, s.mixTipFor, flow);
-      if (tailHold) {
-        paintInkTailBackup(s, pts, radii, confirmN, w, h, opts.tip);
-        paintStampTexturedPath(
-          cx,
-          pts,
-          radii,
-          tipSrc,
-          opts.tip,
-          Object.assign({}, s.walk, { pointLimit: n, cacheTail: true }),
-          s.mixTipFor,
-          flow
-        );
-        s.newBox = paintBoxUnion(s.newBox, s.tailBox);
-        cvChanged = true;
-      }
-      return cvChanged;
+      s.newBox = paintBoxUnion(paintStrokeScratchBox(null, pts, radii, w, h, true, tip, from), restored);
+      if (tailHold) s.newBox = paintBoxUnion(s.newBox, s.tailBox);
+      const rawBox = paintStrokeScratchBox(null, pts, radii, 1e9, 1e9, false, tip, from);
+      return Boolean(tailHold || restored || (rawBox && rawBox.x < w && rawBox.y < h));
     }
-    function paintInkSessionStep(host, ctx, pts, radii, color, opts) {
-      if (host && host.materialFinal) opts = Object.assign({}, opts, { final: true });
+    function paintInkSessionStep(ctx, pts, radii, color, opts) {
+      const host = opts.liveHost;
       const n = pts.length;
       if (!n) return null;
       const tipId = (opts.tip && opts.tip.id) || '';
@@ -98634,7 +98561,18 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (opts && opts.fill) ctx.fillStyle = ctx.strokeStyle;
     }
 
-    function drawPaintStroke(ctx, stroke, width, height, offsetX, offsetY, liveHost, mixBase) {
+    // Collect renderer options once from the captured brush. Callers supply paper geometry,
+    // the immutable mixing base, and the preview/final frame of their engine.
+    function paintRenderStrokeBody(ctx, stroke, points, radii, color, frame) {
+      return paintFillVariableWidthBody(ctx, points, radii, color, {
+        ...paintBrushLookOptions(stroke, frame.originX, frame.originY),
+        roundBatch: stroke.roundBatch,
+        alphaFor: paintStrokeAlphaFor(stroke),
+        ...frame
+      });
+    }
+
+    function drawPaintStroke(ctx, stroke, width, height, offsetX, offsetY, liveHost, mixBase, final) {
       stroke = paintStrokeLineView(stroke);
       const points = Array.isArray(stroke.points) ? stroke.points : [];
       if (!points.length) return;
@@ -98643,7 +98581,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const base = paintScratchCanvas(owner, 'replaceBase', w, h), buf = paintScratchCanvas(owner, 'replaceStroke', w, h);
         base.getContext('2d').drawImage(ctx.canvas, 0, 0);
         paintStrokeCoverage.delete(buf);
-        drawPaintStroke(buf.getContext('2d'), paintStrokeBufferView(stroke), width, height, offsetX, offsetY, liveHost, mixBase);
+        drawPaintStroke(buf.getContext('2d'), paintStrokeBufferView(stroke), width, height, offsetX, offsetY, liveHost, mixBase, final);
         paintCompositeBufferOnto(ctx, base, buf, { replaceAlpha: true, alpha: paintStrokeOpacityVal(stroke), scratchOwner: owner });
         return;
       }
@@ -98677,19 +98615,12 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           a: points[0].a
         }];   // Use the unmodified point for taps, excluding the attack cap.
         const radii = paintVariableWidthRadii(ptsPx, ctx.lineWidth, function(p, t) { return paintPressureWidthFactor(stroke, p, t); }, paintStrokeEmaKOf(stroke));
-        paintFillVariableWidthBody(
-          ctx,
-          ptsPx,
-          radii,
-          stroke.color,
-          {
-            ...paintBrushLookOptions(stroke, ox, oy),
-            brushWidth: stroke.aa === false ? 0 : ctx.lineWidth,
-            roundBatch: stroke.roundBatch,
-            alphaFor: paintStrokeAlphaFor(stroke),
-            mixBase: mixBase
-          }
-        );
+        paintRenderStrokeBody(ctx, stroke, ptsPx, radii, stroke.color, {
+          originX: ox,
+          originY: oy,
+          brushWidth: stroke.aa === false ? 0 : ctx.lineWidth,
+          mixBase
+        });
       } else if (paintStrokeWantsWholePath(stroke) && !stroke.shapeFill) {
         // Reserve this path for outlines. It ignores stroke.shapeFill, so a filled rectangle or ellipse
         // would lose its fill when tip or grain is active.
@@ -98712,23 +98643,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const onMaterialReady = liveHost && state.paintRasterOp === liveHost && liveHost.type === 'draw' ? function() {
           if (state.paintRasterOp === liveHost) paintLiveStrokeRedraw(liveHost);
         } : null;
-        paintFillVariableWidthBody(
-          ctx,
-          ptsPx,
-          radii,
-          stroke.color,
-          {
-            ...paintBrushLookOptions(stroke, ox, oy),
-            brushWidth: stroke.aa === false ? 0 : ctx.lineWidth,
-            onMaterialReady: onMaterialReady,
-            roundBatch: stroke.roundBatch,
-            alphaFor: paintStrokeAlphaFor(stroke),
-            mixBase: mixBase,
-            liveHost: liveHost,
-            confirmedCount: widthState.confirmedCount,
-            strokeKey: stroke.id
-          }
-        );
+        paintRenderStrokeBody(ctx, stroke, ptsPx, radii, stroke.color, {
+          originX: ox,
+          originY: oy,
+          brushWidth: stroke.aa === false ? 0 : ctx.lineWidth,
+          onMaterialReady,
+          mixBase,
+          liveHost,
+          confirmedCount: widthState.confirmedCount,
+          strokeKey: stroke.id,
+          final
+        });
       } else if (stroke.pressure || paintStrokeUsesTilt(stroke)) {
         // Render pressure strokes segment by segment when whole-path rendering is unnecessary.
         // Pressure capture is independent of whether size, opacity, or tilt effects are enabled.
@@ -98970,7 +98895,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           op.geometry.paper.w, op.geometry.paper.h,
           op.bitmapX, op.bitmapY,
           options.liveHost || null,
-          op.modeBaseCanvas || null
+          op.modeBaseCanvas || null,
+          options.final === true
         ); // position=paper
         // Alpha thresholding is independent per pixel, so limiting the rect preserves output.
         // Genga uses gengaScanRectFor. The SVG threshold has largely fixed cost,
@@ -98994,7 +98920,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // The visible canvas already owns its unchanged base. Even a freshly cleared scratch only needs
       // to prepare the stroke's cumulative window; resized/new targets receive a complete first presentation.
       const ink = options.liveHost && options.liveHost.livePaint;
-      const sameSize = op.materialPresentW === w && op.materialPresentH === h;
+      const shiftView = stroke.shiftLine === true;
+      // The previous Shift line may extend beyond the restored freehand ink bounds.
+      const sameView = op.materialPresentW === w && op.materialPresentH === h && op.materialPresentShift === shiftView;
       // Plain paths and filled shapes stay inside their point hull plus the round-cap radius.
       // Include the previous shape so shrinking/replacing it restores its old pixels too.
       const basic = !options.skipStroke && (stroke.shapeFill || !paintStrokeWantsWholePath(stroke));
@@ -99005,9 +98933,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         x1: pointBounds.x + pointBounds.w - op.bitmapX,
         y1: pointBounds.y + pointBounds.h - op.bitmapY
       }, null, null, w, h, true) : null;
-      const rect = hardRect || (sameSize && currentBounds ? paintUnionLayerRect(op.compositeBounds, currentBounds) : null)
+      const rect = hardRect || (sameView && currentBounds ? paintUnionLayerRect(op.compositeBounds, currentBounds) : null)
           || (!options.skipStroke && stroke.tipSampling === 'mesh' && !stroke.waterEdge && !stroke.dualMask
-          && sameSize && ink && ink.box ? paintStrokeScratchBox(ink.box, null, null, w, h) : null);
+          && sameView && ink && ink.box ? paintStrokeScratchBox(ink.box, null, null, w, h) : null);
       op.compositeBounds = currentBounds;
       const surface = op.canvas.isConnected ? paintScratchCanvas(op.canvas, 'preview', w, h, rect) : op.canvas;
       const spec = paintStrokeCompositeSpec(stroke, paintStrokeErases(stroke), false);   // Include partial erasing and 透明色.
@@ -99024,14 +98952,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (surface !== op.canvas) paintPresentCanvas(op.canvas, surface, rect);
       op.materialPresentW = w;
       op.materialPresentH = h;
+      op.materialPresentShift = shiftView;
     }
 
     function paintRecompositeStrokeForMode(op) {
       if (!op || op.type !== 'draw' || !op.modeBaseCanvas || !op.canvas || !op.stroke) return;
       const resumable = (op.stroke.roundBatch === 1 && op.livePaint && op.livePaint.roundMode) || (op.stroke.tipSampling === 'mesh' && op.stroke.tipDarken);
       const host = resumable ? paintIncrementalInkHost(op, op.shapeKind, op.stroke.shiftLine) : null;
-      if (host) host.materialFinal = true;
-      paintRenderStrokeOverBase(op, host ? { liveHost: host } : {});
+      paintRenderStrokeOverBase(op, { liveHost: host, final: true });
       op.modeBaseCanvas = null;
     }
 
@@ -110326,8 +110254,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function setActivePaintSize(px) {
       if (state.paintEditTool === 'text-stamp') { PB_ROWS.textStampSize.set(px); return textStampSession.size; }
-      const next = paintSizeClamp(px, activePaintSize());
-      paintBrushSet('size', next); // The store persists it, so width survives a reload like everything else
+      return setPaintSizeForSlot(paintBrushToolKey(), px);
+    }
+    function setPaintSizeForSlot(slot, px) {
+      const next = paintSizeClamp(px, paintBrushEnsureFor(slot, 'size'));
+      paintBrushSetFor(slot, 'size', next);
       return next;
     }
 
@@ -154947,8 +154878,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           // Canvas stroke() cannot render a tip image.
           // Keep width uniform. Fix pressure at 1 and use the shared radius rule.
           const shapeRadii = paintVariableWidthRadii(shapePts, sess.shapeLineWidth, function() { return 1; });
-          paintFillVariableWidthBody(b, shapePts, shapeRadii, sess.shapeColor, {
-            ...paintBrushLookOptions(sess),
+          paintRenderStrokeBody(b, sess, shapePts, shapeRadii, sess.shapeColor, {
+            roundBatch: undefined,
             // Enable mixing with liveHost=null because the whole shape is rebuilt each frame.
             // Pass the underlying color separately as mixBase.
             alphaFor: null,
@@ -155931,7 +155862,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaCaptureHistoryBefore(s, gengaScanClamp(s.inkScan, s.canvas));
       f();
     }
-    function gengaPenOutlineRedraw(sess) {
+    function gengaPenOutlineRedraw(sess, final = false) {
       if (!sess || !sess.shapeBuf || !Array.isArray(sess.pts) || !sess.pts.length) return;
       const b = sess.shapeBuf.getContext('2d');
       b.save();
@@ -155970,26 +155901,17 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         gengaPenOutlineRedraw(sess);
         scheduleGengaPreviewRedraw();
       } : null;
-      sess.outlineBounds = paintFillVariableWidthBody(
-        b,
-        outPts,
-        radii,
-        sess.penColor,
-        {
-          ...paintBrushLookOptions(sess),
-          brushWidth: sess.binarizeOutline ? 0 : sess.penBaseWidth,
-          outputHost: sess.binarizeOutline ? null : sess,
-          onMaterialReady: onMaterialReady,
-          roundBatch: sess.roundBatch,
-          alphaFor: paintStrokeAlphaFor(sess),
-          mixBase: sess.shapeBase || null,
-          liveHost: liveHostForFill,
-          confirmedCount: widthState.confirmedCount,
-          pointRevision: sess.arc ? sess.arc.revision : 0,
-          final: gengaDrawSession !== sess,
-          strokeKey: sess.strokeKey
-        }
-      );
+      sess.outlineBounds = paintRenderStrokeBody(b, sess, outPts, radii, sess.penColor, {
+        brushWidth: sess.binarizeOutline ? 0 : sess.penBaseWidth,
+        outputHost: sess.binarizeOutline ? null : sess,
+        onMaterialReady,
+        mixBase: sess.shapeBase || null,
+        liveHost: liveHostForFill,
+        confirmedCount: widthState.confirmedCount,
+        pointRevision: sess.arc ? sess.arc.revision : 0,
+        final,
+        strokeKey: sess.strokeKey
+      });
       b.restore();
       // For 2値化 with a tip or grain, share the shape threshold and bounds optimization (gengaShapeRedraw).
       // Threshold only the scanned region to avoid processing the full paper.
@@ -156211,7 +156133,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           // and adds no synthetic point.
           const tailQ = sess.arc ? paintArcResampleFlush(sess.arc) : null;
           if (tailQ && sess.pts) { sess.pts.push(tailQ); gengaScanMark(sess, tailQ.x, tailQ.y, (sess.penBaseWidth || 1) / 2 + 1); }
-          gengaPenOutlineRedraw(sess);
+          gengaPenOutlineRedraw(sess, true);
         } else {
           // Flush pending buffer composition for non-outline strokes via gengaPenCompositeFlush.
           // That helper already returns early when buffering is off.
