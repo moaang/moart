@@ -34,7 +34,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3553</title>
+  <title>MoArt ver3554</title>
 
   <!-- Dropbox callbacks must finish before app startup and usage reporting. -->
   <script id="moart-dropbox-callback">
@@ -26343,7 +26343,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // A finger owns the genga stroke: drop the single-finger ops as a pinch does (only the open engine has any).
       if (gengaDrawSession && fingerPointersDown.has(gengaDrawSession.pointerId)) paintCancelSingleFingerOps();
       if (state.paintRasterOp && fingerPointersDown.has(state.paintPointerId)) discardActivePaintStrokeForGesture();
-      if (state.paintPendingBucketFill && fingerPointersDown.has(state.paintPendingBucketFill.pointerId)) paintDiscardPendingBucketFill();   // Put pending fill here until finger release.
+      if (paintBucket.pending && fingerPointersDown.has(paintBucket.pending.pointerId)) paintBucketDropPending();
     }
     window.addEventListener('pointerdown', function(event) {
       if (event.pointerType === 'touch') fingerPointersDown.add(event.pointerId);
@@ -28583,7 +28583,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return 0;
     }
     function runTimelineStructureCommand(name, mutator, options) {
-      paintDiscardPendingBucketFill();
+      paintBucketCancel();
       options = options || {};
       const project = state.project;
       const before = captureTimelineStructureState(project);
@@ -28913,10 +28913,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function applyHistoryCommand(dir) {
       const undoing = dir === 'undo';
       const stack = undoing ? state.undoStack : state.redoStack;
+      paintBucketCancel();
       const command = stack[stack.length - 1];
       if (!command || revealHistoryCommand(command)) return false;
       if (state.project && state.project.kind === 'genga') gengaSelectionRequest = null;
-      paintDiscardPendingBucketFill();
       stack.pop();
 
       // Wrap command restoration once so all branches apply selection after the command body.
@@ -29319,6 +29319,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // Block Undo during a stroke. Pen-up would commit against the pre-stroke source and overwrite the restored state.
       if (paintStrokeInProgress()) return false;
       if (paintInputDeferAction(runPrimaryUndo)) return false; // Choose the history after pending input commits.
+      paintBucketCancel();
       // A pending transform is cancellable even before the first history command.
       if (cancelPendingPaintTransform() || cancelPendingGengaTransform()) return false;
       const memoSeq = paintMemoTopHistorySeq('undo');
@@ -30862,8 +30863,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // (new project / load / restore / undo-redo restore); otherwise it shows stale data or a freed layer. Call this
     // before state.project is replaced so each closer still reads the outgoing project while it commits/cleans up.
     function teardownProjectFloatingWindows() {
-      state.paintFillCache = null;
-      state.paintFillInspection = null;
+      paintBucket.cache = null;
       gengaCloseSerifuDialog();
       gengaCloseSerifuSheet();
       gengaCloseRasterPop();
@@ -39651,7 +39651,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     function setCurrentPicturePanelId(panelId) {
       const id = String(panelId || '');
-      if (state.selectedPicturePanelId !== id) paintDiscardPendingBucketFill();
+      if (state.selectedPicturePanelId !== id) paintBucketCancel();
       state.selectedPicturePanelId = id;
       return id;
     }
@@ -39890,7 +39890,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       const nextPrimaryId = ids.length ? String(primaryLayerId || ids[ids.length - 1] || '') : '';
       if (state.selectedConteLayerId !== nextPrimaryId) {
-        paintDiscardPendingBucketFill();
+        paintBucketCancel();
         if (state.paintRasterOp && state.paintRasterOp.type === 'transform-edit') {
           const pointerId = state.paintPointerId;
           paintAbortGestureSession();
@@ -62101,7 +62101,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintCancelSingleFingerOps() {
       gengaEndDrawSession();                // genga stroke/shape session
       discardActivePaintStrokeForGesture(); // conte / 用紙 raster stroke
-      paintDiscardPendingBucketFill();      // Discard the pending fill that has not been applied.
+      paintBucketCancel();
       if (gengaFlipTouch) { gengaFlipTouch = null; gengaSetParaparaFrame(null); }
       if (state.previewPanelFlipTouch) {
         state.previewPanelFlipTouch = null;
@@ -75543,7 +75543,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       });
       add('settings.memory.work', [Array.from(document.querySelectorAll('canvas')), gengaPreviewRender,
         paintStrokeBufferPool, paintWarpMeshScratch, gengaDrawSession, state.paintRasterOp, state.paintCurrentStroke,
-        gengaSel, gengaStampDrag, state.paintFillCache]);
+        gengaSel, gengaStampDrag, paintBucket.cache]);
       add('settings.memory.brush', [PAINT_TIP_LIBRARY, imageBrushRuntime.current, paintBrushPreviewCache(),
         paintTipLumCache, Array.from(paintGrainMaskLru.keys()), paintGrainScaledCache, paintGrainTiledCache, paintBinAlphaScratch,
         paintGrainScratch, paintInkDabScratch, paintInkGrainScratch, paintInkAlphaScratch, paintPixelReadCanvas]);
@@ -95799,11 +95799,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { canvas: canvas, regions: inspection.regions, unfilled: inspection.unfilled, ambiguous: inspection.ambiguous };
     }
     function paintFillWorkerCancel() {
-      if (!state.paintFillWorkerJob) return;
-      const job = state.paintFillWorkerJob;
-      state.paintFillWorkerJob = null; clearTimeout(job.timer);
-      if (state.paintFillWorker) state.paintFillWorker.terminate();
-      state.paintFillWorker = null;
+      if (!paintBucket.animationJob) return;
+      const job = paintBucket.animationJob;
+      paintBucket.animationJob = null; clearTimeout(job.timer);
+      if (paintBucket.animationWorker) paintBucket.animationWorker.terminate();
+      paintBucket.animationWorker = null;
       job.resolve({ cancelled: true });
     }
     function paintFillReplyValid(value, job) {
@@ -95819,35 +95819,34 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         d.x >= 0 && d.y >= 0 && d.w > 0 && d.h > 0 && d.x + d.w <= m.width && d.y + d.h <= m.height);
     }
     function paintFillWorkerRun(job) {
-      if (state.paintFillWorkerJob) return Promise.reject(new Error('Animation calculation is already running'));
-      if (state.paintFillWorker == null) {
+      if (paintBucket.animationJob) return Promise.reject(new Error('Animation calculation is already running'));
+      if (paintBucket.animationWorker == null) {
         let url;
         try {
           const source = document.getElementById('moart-fill-kernel').textContent;
           url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-          state.paintFillWorker = new Worker(url);
+          paintBucket.animationWorker = new Worker(url);
         } catch (error) {
-          state.paintFillWorker = false;
+          paintBucket.animationWorker = false;
           console.warn('[paint] Worker unavailable; using the same calculation on main', error);
         } finally { if (url) URL.revokeObjectURL(url); }
       }
-      if (!state.paintFillWorker) return Promise.resolve().then(function() { return paintFillCompute(job); });
-      const worker = state.paintFillWorker, seq = (state.paintFillWorkerSeq || 0) + 1;
-      state.paintFillWorkerSeq = seq;
+      if (!paintBucket.animationWorker) return Promise.resolve().then(function() { return paintFillCompute(job); });
+      const worker = paintBucket.animationWorker, seq = ++paintBucket.animationSeq;
       return new Promise(function(resolve, reject) {
         const pending = { resolve: resolve, reject: reject, timer: null };
-        state.paintFillWorkerJob = pending;
-        const settle = function() { clearTimeout(pending.timer); state.paintFillWorkerJob = null; };
+        paintBucket.animationJob = pending;
+        const settle = function() { clearTimeout(pending.timer); paintBucket.animationJob = null; };
         const fail = function(error) {   // the worker is not trusted again this session
-          if (state.paintFillWorkerJob !== pending) return;
+          if (paintBucket.animationJob !== pending) return;
           settle();
-          worker.terminate(); state.paintFillWorker = false;
+          worker.terminate(); paintBucket.animationWorker = false;
           reject(error);
         };
         worker.onerror = function() { fail(new Error('Animation calculation worker failed')); };
         worker.onmessageerror = function() { fail(new Error('Animation calculation reply could not be read')); };
         worker.onmessage = function(event) {
-          if (state.paintFillWorkerJob !== pending) return;
+          if (paintBucket.animationJob !== pending) return;
           const m = event.data;
           if (!m || m.seq !== seq) { fail(new Error('Animation calculation reply identity changed')); return; }
           if (typeof m.error === 'string') { settle(); reject(new Error(m.error)); return; }
@@ -95924,7 +95923,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         if (choice === 'current') return null;
         use = Object.assign({}, model, { state: 'active', sourceSignature: context.sourceSignature || model.sourceSignature });
       }
-      const cache = state.paintFillCache;
+      const cache = paintBucket.cache;
       if (cache && cache.projectId === context.project.projectId && cache.key === paintFillCacheKey(use) && cache.base) {
         return { model: use, base: cache.base, sources: [] };
       }
@@ -96000,7 +95999,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       // The calculation now owns its fresh images; unused signature pixels can be released.
       if (context.sourcePixels) context.sourcePixels.clear();
       const cacheKey = paintFillCacheKey(model);
-      let cache = state.paintFillCache;
+      let cache = paintBucket.cache;
       if (!cache || cache.key !== cacheKey || cache.projectId !== context.project.projectId) {
         if (!images.length) throw new Error(t('paint.fill.noSource'));
         // Fresh readbacks belong to this calculation. Prepared model images are borrowed;
@@ -96018,7 +96017,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const valid = context.isCurrent || function() { return true; };
       if (!valid()) return { cancelled: true, changed: false };
       // Cache ownership travels with the job and returns with its result. No second worker cache.
-      state.paintFillCache = null;
+      paintBucket.cache = null;
       const computed = await paintFillWorkerRun({
         model: model,
         cache: cache,
@@ -96031,7 +96030,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         operation: operation || 'fill'
       });
       if (computed.cancelled || !valid()) return { cancelled: true, changed: false };
-      state.paintFillCache = computed.cache;
+      paintBucket.cache = computed.cache;
       const result = computed.result;
       if (result.inspection) result.inspection = paintFillInspectionCanvas(result.inspection);
       if (result.image) {
@@ -96606,10 +96605,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // Run the same Canvas fill kernel in the worker.
     // Keep input canvases with the owner so a failure or save boundary can rerun the fill synchronously.
     // Apply the result to a private canvas. Publish it only after checking queue identity and history.
-    let paintBucketWorkerPool = null;
     // After a worker failure or timeout, use synchronous fill for the rest of the session
     // to avoid waiting on the same timeout for each fill.
-    let paintBucketWorkerOff = false;
     function paintBucketWorkerMain() {
       const surface = function(bitmap) {
         const cv = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -96638,8 +96635,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         '\n(' + paintBucketWorkerMain.toString() + ')();';
     }
     function paintBucketWorkerClose() {
-      tvppWorkerPoolClose(paintBucketWorkerPool);
-      paintBucketWorkerPool = null;
+      tvppWorkerPoolClose(paintBucket.ordinaryPool);
+      paintBucket.ordinaryPool = null;
     }
     // Flush synchronously for save and pagehide. Close and discard late worker replies.
     function paintBucketPrepareCanvas(canvas, x, y, color, options) {
@@ -96649,15 +96646,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         prepared.settled = true;
         prepared.changed = paintBucketFillCanvas(canvas, x, y, color, options, prepared.result);
       };
-      if (paintBucketWorkerOff || !offscreenWorkerSupported()) {
+      if (paintBucket.ordinaryWorkerOff || !offscreenWorkerSupported()) {
         prepared.flush();
         return prepared;
       }
-      if (paintBucketWorkerPool && paintBucketWorkerPool.dead) paintBucketWorkerClose();
-      if (!paintBucketWorkerPool) paintBucketWorkerPool = tvppWorkerPoolOpen(paintBucketWorkerSource(), 1, 'bucket');
-      const pool = paintBucketWorkerPool;
+      if (paintBucket.ordinaryPool && paintBucket.ordinaryPool.dead) paintBucketWorkerClose();
+      if (!paintBucket.ordinaryPool) paintBucket.ordinaryPool = tvppWorkerPoolOpen(paintBucketWorkerSource(), 1, 'bucket');
+      const pool = paintBucket.ordinaryPool;
       if (!pool || pool.dead) {
-        paintBucketWorkerOff = true;
+        paintBucket.ordinaryWorkerOff = true;
         paintBucketWorkerClose();
         prepared.flush();
         return prepared;
@@ -96713,7 +96710,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           // A null result from a settled or canceled job leaves the worker pool active.
           if (prepared.settled) return;
           console.warn('[bucket] worker failed - synchronous fills for this session', error);
-          paintBucketWorkerOff = true;
+          paintBucket.ordinaryWorkerOff = true;
           tvppWorkerPoolClose(pool);
           prepared.flush();
         }
@@ -100445,49 +100442,55 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     // ## SECTION: Fill requests and work queue
-    // Resolve bucket input immediately, but defer touch output until release.
-    // A two-finger Undo tap could otherwise fill on first contact and undo that fill instead of the previous edit.
-    // The bucket has no ongoing stroke session. Resolve the fill target on press
-    // and apply it on release.
-    // paintPendingBucketFill waits for touch release. paintBucketQueue serializes fill jobs from both engines.
-    function paintDeferBucketFill(event, run) {
-      if (typeof run !== 'function') return;
-      if (!event || event.pointerType !== 'touch') { run(); return; }   // Mouse and pen have no two-finger tap.
-      state.paintPendingBucketFill = { pointerId: event.pointerId, run: run };
-      // Capture a deferred pointer so release still arrives outside the canvas.
-      capturePaintPointer(event, event.target);
+    // Both engines capture the target on press. Touch waits for release so that a
+    // two-finger Undo tap can undo the preceding edit without first painting.
+    const paintBucket = {
+      generation: 0,
+      pending: null,
+      queue: null,
+      inspection: null,
+      cache: null,
+      animationWorker: null,
+      animationSeq: 0,
+      animationJob: null,
+      ordinaryPool: null,
+      ordinaryWorkerOff: false
+    };
+
+    function paintBucketDropPending() {
+      const entry = paintBucket.pending;
+      paintBucket.pending = null;
+      if (entry) entry.resolve({ status: 'cancelled' });
     }
-    // Fill only on a clean release. Cancellation or gesture takeover drops the pending fill.
-    // While a two-finger candidate is active, drop the fill here as on tap cancellation
-    // or pinch commitment.
-    function paintFlushPendingBucketFill(event) {
-      // Genga pointer ownership ends at up: later cancel/capture events cannot cancel an executing fill.
-      // Tool/project/history changes and two-finger gestures still discard the operation explicitly.
-      const pending = state.paintPendingBucketFill;
-      // Check the waiting finger before cancel: document receives other pointers too.
-      if (pending && event && event.pointerId != null && pending.pointerId !== event.pointerId) return;
-      if (event && event.type === 'pointercancel' && !(state.project && state.project.kind === 'genga')) { paintDiscardPendingBucketFill(); return; }
-      if (!pending) return;
-      state.paintPendingBucketFill = null;
-      if (!event || event.type !== 'pointerup') return;
-      if (twoFingerTapCandidate) return;
-      pending.run();
+
+    function paintBucketPointerEnd(event) {
+      const entry = paintBucket.pending;
+      if (!entry || entry.pointerId !== event.pointerId) return false;
+      if (event.type !== 'pointerup' || twoFingerTapCandidate) {
+        paintBucketDropPending();
+      } else {
+        paintBucket.pending = null;
+        paintBucketEnqueue(entry);
+      }
+      return true;
     }
-    function paintDiscardPendingBucketFill() {
-      state.paintFillInspection = null;
+
+    function paintBucketCancel() {
+      paintBucket.generation += 1;
+      paintBucket.inspection = null;
+      paintBucketDropPending();
+      const queue = paintBucket.queue;
+      paintBucket.queue = null;
+      if (queue) {
+        if (queue.progress) queue.progress.remove();
+        queue.entries.forEach(function(entry) {
+          if (entry.prepared?.work) entry.prepared.work.settled = true;
+          entry.resolve({ status: 'cancelled' });
+        });
+      }
       paintFillWorkerCancel();
-      // Reuse idle workers for the next fill and cancel only jobs still preparing or running.
-      const pool = paintBucketWorkerPool;
+      const pool = paintBucket.ordinaryPool;
       if (pool && (pool.jobs.size || pool.queue.length || pool.idle.length < pool.all.length)) paintBucketWorkerClose();
-      state.paintPendingBucketFill = null;
-      state.paintBucketGeneration = (state.paintBucketGeneration || 0) + 1;
-      const queue = state.paintBucketQueue;
-      state.paintBucketQueue = null;
-      if (queue && queue.progress) queue.progress.remove();
-      if (queue) queue.entries.splice(0).forEach(function(entry) {
-        if (entry.cancel) entry.cancel();
-        entry.resolve({ status: 'cancelled' });
-      });
     }
 
     function paintFillUpdateSettings(change) {
@@ -100626,7 +100629,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     // that its validity is checked against).
     function gengaBucketRequest(layerId) {
       const paper = state.project.gengaTimeline.paper;
-      return { project: state.project, generation: state.paintBucketGeneration || 0, layerId: String(layerId || ''),
+      return { project: state.project, generation: paintBucket.generation, layerId: String(layerId || ''),
         frame: gengaCurrentFrame(), paper: { x: 0, y: 0, w: paper.w, h: paper.h } };
     }
     function paintFillCurrentRequest(input, operation, target) {
@@ -100643,20 +100646,16 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       request.operation = operation;
       return request;
     }
-    function paintFillSubmit(request) {
-      if (!request) return Promise.resolve({ status: 'cancelled' });
-      return paintBucketApply(request);
-    }
     function paintRemoveRegisteredTraces() {
       const input = paintBucketCaptureInput(state.project.kind === 'genga' ? gengaSelectionClip() : null);
       input.mode = 'current'; input.options.animation = paintFillSettings();
-      return paintFillSubmit(paintFillCurrentRequest(input, 'remove'));
+      return paintBucketApply(paintFillCurrentRequest(input, 'remove'));
     }
     function paintFillInspectionCurrent() {
-      const check = state.paintFillInspection;
+      const check = paintBucket.inspection;
       if (!check) return null;
       const valid = check.historySeq === paintHistorySeqLast && paintBucketEngine(check.request.project).valid(check.request);
-      if (!valid) { state.paintFillInspection = null; return null; }
+      if (!valid) { paintBucket.inspection = null; return null; }
       return check;
     }
     function paintFillDrawInspection(ctx) {
@@ -100669,7 +100668,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       }
     }
     function paintFillShowInspection(request, inspection, rect) {
-      state.paintFillInspection = Object.assign(inspection, { request: request, rect: rect, historySeq: paintHistorySeqLast });
+      paintBucket.inspection = Object.assign(inspection, { request: request, rect: rect, historySeq: paintHistorySeqLast });
       paintFillRefreshInspection();
       return { status: 'inspected', regions: inspection.regions, unfilled: inspection.unfilled, ambiguous: inspection.ambiguous };
     }
@@ -100680,13 +100679,13 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     function paintFillToggleInspection() {
       if (paintFillInspectionCurrent()) {
-        state.paintFillInspection = null;
+        paintBucket.inspection = null;
         paintFillRefreshInspection();
         return Promise.resolve({ status: 'hidden' });
       }
       const input = paintBucketCaptureInput();
       input.options.animation = paintFillSettings();
-      return paintFillSubmit(paintFillCurrentRequest(input, 'check'));
+      return paintBucketApply(paintFillCurrentRequest(input, 'check'));
     }
     function paintFillClosedInput(clip) {
       if (paintBucketOptionVal('closedOnly') !== '1') return null;
@@ -100714,7 +100713,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         paintClipCanvasTo(mask, { canvas: selection, x: 0, y: 0 });
       }
       input.clip = { canvas: mask, x: rect.x, y: rect.y };
-      return paintFillSubmit(request);
+      return paintBucketApply(request);
     }
 
     function paintBucketCloneClip(clip) {
@@ -100740,11 +100739,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
     // The request was made in this project and no bucket reset (generation bump) came since.
     function paintBucketRequestCurrent(request) {
-      return request.project === state.project && request.generation === (state.paintBucketGeneration || 0);
-    }
-    // The queue a prepared request belongs to is still the live one, with no history step since it was opened.
-    function paintBucketQueueCurrent(queue) {
-      return state.paintBucketQueue === queue && queue.historySeq === paintHistorySeqLast;
+      return request.project === state.project && request.generation === paintBucket.generation;
     }
 
     function paintBucketCompositeCanvas(items, rect) {
@@ -100756,10 +100751,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return canvas;
     }
 
-    function gengaBucketRequestValid(request, queue) {
+    function gengaBucketRequestValid(request) {
       if (!paintBucketRequestCurrent(request) || state.project.kind !== 'genga' || gengaDrawSession ||
           request.frame !== gengaCurrentFrame() || request.layerId !== String(state.gengaSelectedLayerId || '')) return false;
-      if (queue && !paintBucketQueueCurrent(queue)) return false;
       const layer = gengaLayerById(request.layerId), paper = state.project.gengaTimeline.paper;
       if (layer && !gengaExposureAt(layer, request.frame) && !autoCreateKomaOnDrawEnabled(state.project)) return false;
       return Boolean(layer && !gengaLayerEffLocked(layer) && !gengaLayerDrawsVector(layer) && gengaLayerDrawsInComposite(layer) && paper.w === request.paper.w && paper.h === request.paper.h);
@@ -100770,14 +100764,15 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       context = Object.assign({ project: request.project, operation: request.operation, sourcePixels: sourcePixels }, context);
       try {
         context.sourceSignature = await paintFillSourceSignature(sources, sourcePixels);
+        if (!context.isCurrent()) return;
         prepared.context = context;
         prepared.previousModel = modelOf();
         if (request.operation === 'remove') return;
-        prepared.fill = await paintFillPrepareModel(prepared.previousModel, request.input, context);
+        const fill = await paintFillPrepareModel(prepared.previousModel, request.input, context);
         if (!context.isCurrent()) return;
         const target = targetOf();
         prepared.canvas = target.canvas;
-        prepared.result = await paintFillApply(target.canvas, target.x, target.y, target.input, sources, context, prepared.fill, request.operation);
+        prepared.result = await paintFillApply(target.canvas, target.x, target.y, target.input, sources, context, fill, request.operation);
       } finally { sourcePixels.clear(); }
     }
     // The engine's commit callback retains its own transaction and Undo ownership.
@@ -100788,9 +100783,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!result.changed) return { status: 'unchanged' };
       return commit(result);
     }
-    function gengaBucketPrepare(request) {
+    function gengaBucketPrepare(request, isCurrent, target) {
       if (!request.input.options.animation) {
-        const layer = gengaLayerById(request.layerId), target = gengaPrepareDrawTarget(request.event, layer);
+        const layer = gengaLayerById(request.layerId);
         if (!target) return { blocked: true };
         const canvas = cloneCanvas(target.cv);
         const ref = gengaBucketReferenceCanvas(layer, request.frame, request.input.mode, canvas);
@@ -100799,12 +100794,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           drawGengaPreview();
           return { blocked: true };
         }
-        const prepared = paintBucketPrepareOrdinary(request, canvas, ref ? ref.canvas : null, request.paper);
+        const work = paintBucketPrepareOrdinary(request, canvas, ref ? ref.canvas : null, request.paper);
         const current = gengaExposureDrawing(layer, gengaExposureAt(layer, request.frame));
-        prepared.beforeRef = current && current.ref || null;
-        return prepared;
+        return { canvas: canvas, work: work, ready: work.ready, beforeRef: current && current.ref || null };
       }
-      const prepared = {}, queue = state.paintBucketQueue;
+      const prepared = {};
       prepared.ready = (async function() {
         const layer = gengaLayerById(request.layerId), paper = request.paper;
         const existing = gengaExposureDrawing(layer, gengaExposureAt(layer, request.frame));
@@ -100812,6 +100806,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           const ready = gengaPrepareDrawing(existing, null);
           if (ready.status === 'pending') await ready.promise;
         }
+        if (!isCurrent()) return;
         const current = gengaExposureDrawing(layer, gengaExposureAt(layer, request.frame));
         const canvas = paintBucketCompositeCanvas([{ draw: function(ctx) {
               if (gengaDrawingHasArt(current) && !gengaDrawDrawingInto(ctx, current, paper.w, paper.h, null)) throw new Error('Bucket target is not ready');
@@ -100819,13 +100814,14 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         let reference = gengaBucketReferenceCanvas(layer, request.frame, request.input.mode, canvas, true);
         if (reference.pending) {
           await reference.ready;
+          if (!isCurrent()) return;
           reference = gengaBucketReferenceCanvas(layer, request.frame, request.input.mode, canvas, true);
         }
         if (reference.pending || reference.failed) throw new Error(t('paint.bucketRef.failed'));
         prepared.canvas = canvas;
         prepared.sources = reference.sources;
         await paintBucketPrepareAnimation(request, prepared, reference.sources, { engine: 'genga', rect: request.paper,
-          isCurrent: function() { return gengaBucketRequestValid(request, queue); } }, function() {
+          isCurrent: isCurrent }, function() {
           prepared.beforeRef = current && current.ref || null;
           return current && current.fillModel;
         }, function() {
@@ -100835,20 +100831,19 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       })();
       return prepared;
     }
-    function gengaBucketCommit(request, prepared, queue) {
-      if (!gengaBucketRequestValid(request, queue)) return { status: 'cancelled' };
+    function gengaBucketCommit(request, prepared) {
       if (prepared.blocked) return { status: 'unchanged' };
       if (!request.input.options.animation) {
         const layer = gengaLayerById(request.layerId),
           current = gengaExposureDrawing(layer, gengaExposureAt(layer, request.frame));
         if ((current && current.ref || null) !== prepared.beforeRef) return { status: 'cancelled' };
-        if (!prepared.changed) { drawGengaPreview(); return { status: 'unchanged' }; }
+        if (!prepared.work.changed) { drawGengaPreview(); return { status: 'unchanged' }; }
         gengaCommitCanvas(
           request.layerId,
           request.frame,
           prepared.canvas,
           '塗りつぶし',
-          gengaCommitScanRect(prepared.canvas, prepared.result.dirty)
+          gengaCommitScanRect(prepared.canvas, prepared.work.result.dirty)
         );
         return { status: 'changed' };
       }
@@ -100937,7 +100932,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       const seed = contePaintInverseFxPoint(point, inputFx, paper);
       return {
         project: state.project,
-        generation: state.paintBucketGeneration || 0,
+        generation: paintBucket.generation,
         cutId: String(target.cutId),
         layerId: String(target.layerId),
         drawingRef: String(target.drawingRef),
@@ -100952,11 +100947,10 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       };
     }
 
-    function conteBucketRequestValid(request, queue) {
+    function conteBucketRequestValid(request) {
       if (!paintBucketRequestCurrent(request) || !state.videoEditMode || state.paintRasterOp || state.paintCurrentStroke ||
           request.frame !== state.videoPlayheadFrames || request.cutId !== currentPicturePanelId() ||
           request.layerId !== String(state.selectedConteLayerId || '')) return false;
-      if (queue && !paintBucketQueueCurrent(queue)) return false;
       const paper = contePaperBitmapRectRuntime(request.project);
       if (paper.w !== request.paper.w || paper.h !== request.paper.h) return false;
       const found = findConteLayerById(state.project, request.layerId);
@@ -100999,8 +100993,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       } };
     }
 
-    function conteBucketPrepare(request) {
-      const sources = conteBucketSources(request), waits = [], queue = state.paintBucketQueue;
+    function conteBucketPrepare(request, isCurrent) {
+      const sources = conteBucketSources(request), waits = [];
       if (request.inputFx && request.input.options.animation) {
         const clip = request.sourceClip;
         if (clip) paintFillCoverage({ canvas: clip.canvas, x: 0, y: 0 }, clip.canvas.width, clip.canvas.height);
@@ -101018,13 +101012,17 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const target = sources.find(function(source) { return source.target; });
         const rect = request.rect;
         prepared.ready = Promise.resolve(prepared.ready).then(async function() {
-          prepared.fillSources = sources.filter(function(source) { return request.input.mode === 'current' ? source.target : source.reference; }).map(function(source) {
-            return { key: source.layerId, target: source.target, canvas: paintBucketCompositeCanvas([conteBucketSourceItem(source)], rect) };
+          if (!isCurrent()) return;
+          // An included target is both a reference and the result surface. Computation reads
+          // its pixels before the reply paints into it, so one snapshot serves both roles.
+          const canvas = paintBucketCompositeCanvas([conteBucketSourceItem(target)], rect);
+          const references = sources.filter(function(source) { return request.input.mode === 'current' ? source.target : source.reference; }).map(function(source) {
+            return { key: source.layerId, target: source.target, canvas: source.target ? canvas : paintBucketCompositeCanvas([conteBucketSourceItem(source)], rect) };
           });
-          await paintBucketPrepareAnimation(request, prepared, prepared.fillSources, { engine: 'conte', rect: rect,
-            isCurrent: function() { return conteBucketRequestValid(request, queue); } }, function() { return target.drawing.fillModel; }, function() {
+          await paintBucketPrepareAnimation(request, prepared, references, { engine: 'conte', rect: rect,
+            isCurrent: isCurrent }, function() { return target.drawing.fillModel; }, function() {
             return {
-              canvas: paintBucketCompositeCanvas([conteBucketSourceItem(target)], rect),
+              canvas: canvas,
               x: request.x - rect.x,
               y: request.y - rect.y,
               input: paintBucketLocalInput(request.input, rect)
@@ -101035,24 +101033,21 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!request.input.options.animation) {
         const ready = prepared.ready;
         const compute = function() {
-          if (!conteBucketRequestValid(request, queue)) return;
+          if (!isCurrent()) return;
           const rect = request.rect, target = sources.find(function(s) { return s.target; });
           const canvas = paintBucketCompositeCanvas([conteBucketSourceItem(target)], rect);
           const reference = request.input.mode === 'current' ? null :
             paintBucketCompositeCanvas(sources.filter(function(s) { return s.reference; }).map(conteBucketSourceItem), rect);
-          const fill = paintBucketPrepareOrdinary(request, canvas, reference, rect);
           prepared.canvas = canvas;
-          prepared.fill = fill;
-          prepared.flush = fill.flush;
-          return fill.ready;
+          prepared.work = paintBucketPrepareOrdinary(request, canvas, reference, rect);
+          return prepared.work.ready;
         };
         prepared.ready = ready ? ready.then(compute) : compute();
       }
       return prepared;
     }
 
-    function conteBucketCommit(request, prepared, queue) {
-      if (!conteBucketRequestValid(request, queue)) return { status: 'cancelled' };
+    function conteBucketCommit(request, prepared) {
       const sources = prepared.sources, current = conteBucketSources(request);
       if (sources.length !== current.length || sources.some(function(s, i) {
         const c = current[i];
@@ -101069,7 +101064,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
           input: paintBucketLocalInput(request.input, rect) },
           function(result) { return conteFillCommit(request, canvas, rect, result); });
       }
-      if (!prepared.fill.changed) return { status: 'unchanged' };
+      if (!prepared.work.changed) return { status: 'unchanged' };
       // The commit function captures Undo without acquiring or rebinding the active DOM canvas.
       const committed = setLayerDrawingBitmapFromCanvas(request.drawingRef, canvas, true, {
         bitmapX: rect.x, bitmapY: rect.y, bitmapWidth: canvas.width, bitmapHeight: canvas.height,
@@ -101080,95 +101075,152 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { status: 'changed' };
     }
 
-    // Each drawing engine resolves its own pixels and commit; the queue, worker and animation fill are shared.
+    // Adapters resolve drawing pixels and use the engine's existing history transaction.
     function paintBucketEngine(project) {
       return project.kind === 'genga'
-        ? { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit }
+        ? { valid: gengaBucketRequestValid, prepare: gengaBucketPrepare, commit: gengaBucketCommit,
+            target: gengaBucketTarget, pick: gengaBucketPickColor }
         : { valid: conteBucketRequestValid, prepare: conteBucketPrepare, commit: conteBucketCommit };
     }
-    // The bucket queue stays busy from preparation through commit.
-    // localRecoverySafe and memoryCacheCleanupReady defer recovery and cache cleanup until it drains.
+
+    // Recovery and cache cleanup wait until released requests have finished committing.
     function paintBucketInProgress() {
-      return !!state.paintBucketQueue?.entries.length;
+      return !!paintBucket.queue?.entries.length;
     }
-    function paintBucketApply(request) {
-      const adapter = paintBucketEngine(request.project);
-      if (!adapter.valid(request)) return Promise.resolve({ status: 'cancelled' });
-      let queue = state.paintBucketQueue;
-      if (!queue) {
-        queue = { entries: [], historySeq: paintHistorySeqLast, adapter: adapter };
-        state.paintBucketQueue = queue;
+
+    function paintBucketApply(request, event) {
+      if (event) paintBucketDropPending();
+      if (!request || !paintBucketEngine(request.project).valid(request)) return Promise.resolve({ status: 'cancelled' });
+      const entry = { request: request, prepared: null, resolve: null };
+      entry.completion = new Promise(function(resolve) { entry.resolve = resolve; });
+      if (event && event.pointerType === 'touch') {
+        entry.pointerId = event.pointerId;
+        paintBucket.pending = entry;
+        capturePaintPointer(event, event.target);
+      } else {
+        paintBucketEnqueue(entry);
       }
-      const start = queue.entries.length === 0;
-      if (start && request.input.options.animation) queue.progress = showToast(t('paint.fill.working'));
-      const entry = { request: request };
-      const completion = new Promise(function(resolve) { entry.resolve = resolve; });
-      entry.completion = completion; queue.entries.push(entry);
-      if (start) paintBucketDrain(queue);
-      return completion;
+      return entry.completion;
+    }
+
+    function paintBucketEnqueue(entry) {
+      const adapter = paintBucketEngine(entry.request.project);
+      if (!adapter.valid(entry.request)) {
+        entry.resolve({ status: 'cancelled' });
+        return;
+      }
+      let queue = paintBucket.queue;
+      if (!queue) {
+        queue = { entries: [], historySeq: paintHistorySeqLast, adapter: adapter, progress: null };
+        paintBucket.queue = queue;
+      }
+      queue.entries.push(entry);
+      if (queue.entries.length === 1) paintBucketDrain(queue);
+    }
+
+    function paintBucketOwns(queue, entry) {
+      return paintBucket.queue === queue && queue.entries[0] === entry;
+    }
+
+    function paintBucketEntryCurrent(queue, entry) {
+      return paintBucketOwns(queue, entry) && queue.historySeq === paintHistorySeqLast && queue.adapter.valid(entry.request);
+    }
+
+    function paintBucketFinish(queue, entry, error) {
+      if (!paintBucketOwns(queue, entry)) return;
+      if (!paintBucketEntryCurrent(queue, entry)) {
+        paintBucketCancel();
+        return;
+      }
+      let result;
+      try {
+        if (error) throw error;
+        result = entry.prepared.blocked ? { status: 'unchanged' } : queue.adapter.commit(entry.request, entry.prepared);
+      } catch (error) {
+        console.error('[paint] bucket preparation/commit failed', error);
+        const message = entry.request.input.options.animation && error.message;
+        gengaShowStatus(message ? (message.startsWith('paint.fill.') ? t(message) : message) : t('paint.bucketRef.failed'), { warn: true });
+        result = { status: 'error' };
+      }
+      if (!paintBucketOwns(queue, entry)) return;
+      queue.entries.shift();
+      queue.historySeq = paintHistorySeqLast;
+      entry.resolve(result);
+      if (result.status === 'error' || result.status === 'cancelled') paintBucketCancel();
+    }
+
+    function paintBucketPrepareEntry(queue, entry) {
+      const request = entry.request, adapter = queue.adapter;
+      const current = function() { return paintBucketEntryCurrent(queue, entry); };
+      if (!current()) return;
+      let target;
+      if (adapter.target && request.event) {
+        target = adapter.target(request);
+        if (!target) {
+          entry.prepared = { blocked: true };
+          return;
+        }
+        // Preparing a floating selection can synchronously record its own edit.
+        // Count that edit before starting the fill's async work.
+        queue.historySeq = paintHistorySeqLast;
+      }
+      if (!current()) return;
+      entry.prepared = adapter.prepare(request, current, target);
+      return entry.prepared.ready;
     }
 
     function paintBucketDrain(queue) {
-      const finish = function(entry, result) {
-        if (state.paintBucketQueue !== queue || queue.entries[0] !== entry) return;
-        entry.flush = null;
-        queue.entries.shift();
-        entry.resolve(result);
-        if (!queue.entries.length && queue.progress) queue.progress.remove();
-        queue.historySeq = paintHistorySeqLast;
-        if (result.status === 'error' || result.status === 'cancelled') paintDiscardPendingBucketFill();
-      };
-      const fail = function(entry, error) {
-        if (state.paintBucketQueue !== queue) return;
-        const valid = queue.adapter.valid(entry.request, queue);
-        if (valid) {
-          console.error('[paint] bucket preparation/commit failed', error);
-          gengaShowStatus(entry.request.input.options.animation && error.message ? (error.message.startsWith('paint.fill.') ? t(error.message) : error.message) : t('paint.bucketRef.failed'), { warn: true });
-        }
-        finish(entry, { status: valid ? 'error' : 'cancelled' });
-      };
-      while (state.paintBucketQueue === queue && queue.entries.length) {
-        const entry = queue.entries[0];
+      while (paintBucket.queue === queue && queue.entries.length) {
+        const entry = queue.entries[0], request = entry.request;
         try {
-          if (!queue.adapter.valid(entry.request, queue)) { finish(entry, { status: 'cancelled' }); break; }
-          const prepared = queue.adapter.prepare(entry.request);
-          entry.cancel = function() {
-            prepared.settled = true;
-            if (prepared.fill) prepared.fill.settled = true;
-          };
-          entry.flush = function() {
-            if (!queue.adapter.valid(entry.request, queue)) {
-              finish(entry, { status: 'cancelled' });
-              return true;
-            }
-            if (!prepared.flush) return false;
-            entry.flush = null;
-            prepared.flush();
-            finish(entry, queue.adapter.commit(entry.request, prepared, queue));
-            return true;
-          };
-          if (prepared.ready) {
-            prepared.ready.then(function() {
-              if (state.paintBucketQueue !== queue || queue.entries[0] !== entry) return;
-              try { finish(entry, queue.adapter.commit(entry.request, prepared, queue)); }
-              catch (error) { fail(entry, error); }
-              paintBucketDrain(queue);
-            }, function(error) { fail(entry, error); });
+          if (!paintBucketEntryCurrent(queue, entry)) {
+            paintBucketCancel();
             return;
           }
-          finish(entry, queue.adapter.commit(entry.request, prepared, queue));
-        } catch (error) { fail(entry, error); }
+          if (request.input.options.animation && !queue.progress) queue.progress = showToast(t('paint.fill.working'));
+          const ready = request.prevColor
+            ? queue.adapter.pick(request, function() { return paintBucketEntryCurrent(queue, entry); }).then(function(ok) {
+                if (ok) return paintBucketPrepareEntry(queue, entry);
+                entry.prepared = { blocked: true };
+              })
+            : paintBucketPrepareEntry(queue, entry);
+          if (ready) {
+            ready.then(function() {
+              if (!paintBucketOwns(queue, entry)) return;
+              paintBucketFinish(queue, entry);
+              paintBucketDrain(queue);
+            }, function(error) { paintBucketFinish(queue, entry, error); });
+            return;
+          }
+          paintBucketFinish(queue, entry);
+        } catch (error) { paintBucketFinish(queue, entry, error); }
       }
-      if (state.paintBucketQueue === queue) state.paintBucketQueue = null;
+      if (paintBucket.queue !== queue) return;
+      if (queue.progress) queue.progress.remove();
+      paintBucket.queue = null;
     }
+
+    // Saving can flush a prepared ordinary job. Its async continuation loses
+    // queue ownership when it is committed here.
     function paintBucketFlush() {
-      let queue = state.paintBucketQueue;
-      while (queue && queue.entries.length && !queue.entries[0].request.input.options.animation) {
+      let queue = paintBucket.queue;
+      while (queue && queue.entries.length) {
         const entry = queue.entries[0];
-        if (!entry.flush || !entry.flush()) break;
+        const work = entry.prepared?.work;
+        if (!work) return;
+        try {
+          if (paintBucketEntryCurrent(queue, entry)) work.flush();
+          paintBucketFinish(queue, entry);
+        } catch (error) { paintBucketFinish(queue, entry, error); }
         paintBucketDrain(queue);
-        queue = state.paintBucketQueue;
+        queue = paintBucket.queue;
       }
+    }
+
+    function paintBucketWaitOrdinary() {
+      const entries = paintBucket.queue?.entries || [];
+      return Promise.all(entries.filter(function(entry) { return !entry.request.input.options.animation; })
+        .map(function(entry) { return entry.completion; }));
     }
 
     // ===========================================================================================
@@ -101411,7 +101463,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function setActiveLayerCanvasTargets(target) {
-      paintDiscardPendingBucketFill(); // A new pen, shape, or selection edit takes ownership of the canvas.
+      paintBucketCancel(); // A new pen, shape, or selection edit takes ownership of the canvas.
       // Layer editing is video-only — paper mode never activates layer canvases.
       // Genga uses its own layer model, so return an empty storyboard layer list here.
       state.paintActiveLayerCanvasEls = state.videoEditMode ? ensureVideoLayerCanvasForTarget(target) : [];
@@ -108262,9 +108314,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         const error = await q.done;
         if (error) throw error;
       }
-      const bucket = state.paintBucketQueue;
-      if (bucket) await Promise.all(bucket.entries.filter(function(entry) { return !entry.request.input.options.animation; })
-        .map(function(entry) { return entry.completion; }));
+      await paintBucketWaitOrdinary();
     }
     function paintPresentQueuedInput() {
       const op = state.paintRasterOp;
@@ -108835,7 +108885,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (state.paintTool === 'bucket') { // instant fill, no gesture session
         // Defer touch fill until release so a two-finger tap undoes the preceding edit.
         const request = conteBucketCaptureRequest(layerTarget, rawPoint);
-        paintDeferBucketFill(event, function() { paintBucketApply(request); });
+        paintBucketApply(request, event);
         state.videoPaintPointerCanvasRect = null;
         return;
       }
@@ -108928,7 +108978,6 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       )) return;
       const endingStroke = state.paintRasterOp;
       try {
-        paintFlushPendingBucketFill(event); // Apply deferred bucket fills before the early returns because the bucket stores no stroke op or pointerId there.
         if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return; } // End the parapara flip
         const owner = state.paintRasterOp && state.paintRasterOp.textOwner;
         if (owner && (owner.project !== state.project || owner.layerId !== state.selectedConteLayerId || owner.frame !== state.videoPlayheadFrames)) { cancelActivePaintRasterStroke(event); return; }
@@ -109018,7 +109067,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (paintInputDeferEvent(event, cancelActivePaintRasterStroke, paintPresentQueuedInput)) return true;
       const endingStroke = state.paintRasterOp;
       try {
-        if (state.paintPendingBucketFill && state.paintPendingBucketFill.pointerId === event.pointerId) paintFlushPendingBucketFill(event);
+        paintBucketPointerEnd(event);
         if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) { endPreviewPanelFlipTouch(event); return true; } // Cancel = end the parapara flip
         const op = state.paintRasterOp;
         if (!op || state.paintPointerId !== event.pointerId) return false;
@@ -109068,8 +109117,8 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     }
 
     function endStoryboardPaintPointer(event) {
-      if ((state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) ||
-          (state.paintPendingBucketFill && state.paintPendingBucketFill.pointerId === event.pointerId)) {
+      if (paintBucketPointerEnd(event)) return;
+      if (state.previewPanelFlipTouch && state.previewPanelFlipTouch.pointerId === event.pointerId) {
         endVideoPaintStroke(event);
         return;
       }
@@ -111997,7 +112046,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
     function paintAbortGestureSession() {
       disposePaintPointer(state.paintPointerId);
       const abandoned = state.paintRasterOp;
-      paintDiscardPendingBucketFill();
+      paintBucketCancel();
       paintReleaseStrokeBuffers(state.paintRasterOp);
       if (abandoned && abandoned.type === 'page-draw') {
         paintRemovePageStroke(abandoned);
@@ -147780,7 +147829,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       n = gengaClampFrame(n);
       if (state.gengaFrame !== n) {
         gengaTransformApplyEpoch += 1;
-        gengaFrameMoveSeq += 1;
+        paintBucketCancel();
         gengaSelectionRequest = null;
         gengaNoteMove();
       }
@@ -155216,8 +155265,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // One transient prepared target: paper coordinates, seeded canvas, and its owner/scan metadata.
     // It consumes the previous active registration and may commit a pending selection
     // (publishing its new ref/active canvas), but creates no draw session. The caller owns that.
-    function gengaPrepareDrawTarget(ev, layer) {
-      const p = gengaPreviewPointerXY(ev);
+    // Animation colouring composes its own sources. It shares readiness and selection
+    // commit here without taking or seeding a stroke canvas.
+    function gengaPrepareDrawTarget(ev, layer, point, preflightOnly) {
+      const p = point || gengaPreviewPointerXY(ev);
       if (!p) return;
       const gt = state.project.gengaTimeline;
       const pw = Math.max(1, gt.paper.w), ph = Math.max(1, gt.paper.h);
@@ -155228,13 +155279,14 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       const activeExp = gengaExposureAt(layer, frame);
       // Entry drawing for the sessions' previewBaseRef; selection commit below may publish a newer ref.
       const activeDr = gengaExposureDrawing(layer, activeExp);
+      const lifted = gengaSelLifted(gengaSel) && String(gengaSel.layerId) === String(layer.id) && gengaSel.frame === frame;
       const reuseActive = Boolean(gengaActiveCanvas && activeExp && (!activeDr || activeDr.ref)
         && gengaActiveCanvas.ref === (activeDr && activeDr.ref || null)
         && String(gengaActiveCanvas.layerId) === String(layer.id)
         && String(gengaActiveCanvas.expId) === String(activeExp.id)
         && gengaActiveCanvas.canvas.width === pw && gengaActiveCanvas.canvas.height === ph
         && !gengaLayerDrawsVector(layer)
-        && !(gengaSelLifted(gengaSel) && String(gengaSel.layerId) === String(layer.id) && gengaSel.frame === frame));
+        && !lifted);
       // Wait for artwork readiness before starting pen, shape, or bucket input, as for lift, select-all, and stamp.
       // An evicted drawing would seed a blank canvas because gengaDrawDrawingInto has no pixels yet.
       // Committing a stroke on that seed could erase all existing artwork. Retry redraws only;
@@ -155260,6 +155312,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         return;
       }
       if (state.timelineStatus === t('status.genga.drawing.notReady') || state.timelineStatus === t('status.drawing.unavailable') || state.timelineStatus === t('status.genga.drawing.retrying')) state.timelineStatus = '';
+      if (preflightOnly) {
+        if (lifted) gengaCommitSelection(null, gengaSelCompositeFrom(gengaSel, true));
+        return true;
+      }
       const cv = reuseActive ? gengaActiveCanvas.canvas : document.createElement('canvas');
       if (!reuseActive) { cv.width = pw; cv.height = ph; }
       const c = cv.getContext('2d');
@@ -155282,7 +155338,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       let seedCanvas = null;
       let seedRect = null;       // The seed's footprint, captured here only
       let scanEligible = true;   // A lifted float's pixels are wherever the transform left them
-      if (gengaSelLifted(gengaSel) && String(gengaSel.layerId) === String(layer.id) && gengaSel.frame === frame) {
+      if (lifted) {
         // Compose once with the commit's readback attributes; the stroke still owns
         // its separate canvas, so drawing cannot mutate the committed selection pixels.
         seedCanvas = gengaSelCompositeFrom(gengaSel, true);
@@ -155309,10 +155365,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
     // drawing is skipped). The point counts as paint only where the 5x5 block around it is opaque and one colour:
     // a line, an edge or an empty spot gives no colour, and the caller then fills nothing instead of guessing.
     // Resolves { color: '#rrggbb' } or { reason: 'none' | 'empty' }.
-    let gengaPrevColorChain = Promise.resolve();   // serialises the colour reads of successive presses
-    let gengaPrevColorWaiting = 0;                 // presses still in that chain
-    let gengaFrameMoveSeq = 0;                     // counts frame changes (setGengaFrame)
-    async function gengaPrevDrawingColorAt(layer, frame, p) {
+    async function gengaPrevDrawingColorAt(layer, frame, p, isCurrent) {
       const paper = state.project.gengaTimeline.paper, here = gengaExposureAt(layer, frame), current = gengaExposureDrawing(layer, here);
       const hereKey = here ? gengaValueKey(here.instanceValue) : null;
       let prev = null;
@@ -155326,6 +155379,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (!prev) return { reason: 'none' };
       const ready = gengaPrepareDrawing(prev, null);
       if (ready.status === 'pending') await ready.promise;
+      if (!isCurrent()) return null;
       const R = 2, x = Math.floor(p.x), y = Math.floor(p.y), size = R * 2 + 1;
       if (x < R || y < R || x >= paper.w - R || y >= paper.h - R) return { reason: 'empty' };
       const block = paintBucketCompositeCanvas([{ draw: function(ctx) {
@@ -155337,52 +155391,39 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return { color: rgbToHex({ r: d[c], g: d[c + 1], b: d[c + 2] }) };
     }
+    function gengaBucketTarget(request) {
+      return gengaPrepareDrawTarget(request.event, gengaLayerById(request.layerId), request, Boolean(request.input.options.animation));
+    }
+
+    async function gengaBucketPickColor(request, isCurrent) {
+      const pick = await gengaPrevDrawingColorAt(gengaLayerById(request.layerId), request.frame, request, isCurrent);
+      if (!pick || !isCurrent()) return false;
+      if (!pick.color) {
+        gengaShowStatus(t(pick.reason === 'none' ? 'paint.bucketPrev.none' : 'paint.bucketPrev.empty'), { warn: true });
+        return false;
+      }
+      request.input.color = pick.color;
+      setPaintBrushColor(pick.color, { custom: true, record: true });
+      saveEditorUiState();
+      updatePaintUI();
+      return true;
+    }
+
     function gengaBeginBucketFill(ev, layer, vectorDraw) {
       const p = gengaPreviewPointerXY(ev);
       if (!p) return;
-      const request = gengaBucketRequest(layer.id), frame = request.frame;
-      // Raster-only operation. A touch waits for up before acquiring the current drawing's canvas.
       if (vectorDraw) {
         gengaShowStatus(t('status.genga.vector.rasterBlocked'), { warn: true });
         drawGengaPreview();
-        ev.preventDefault();
-        return;
+      } else {
+        const request = gengaBucketRequest(layer.id);
+        request.x = p.x;
+        request.y = p.y;
+        request.event = ev;
+        request.input = paintBucketCaptureInput(gengaSelectionClip(), { alphaLock: Boolean(layer.alphaLock) });
+        request.prevColor = paintBucketOptionVal('prevColor') === '1' && !request.input.options.transparent;
+        paintBucketApply(request, ev);
       }
-      // Snapshot input settings before the touch delay. Keep the existing retry notice while 原画 sources are pending.
-      const input = paintBucketCaptureInput(gengaSelectionClip(), { alphaLock: Boolean(layer.alphaLock) });
-      // Snapshot 前の絵の色で塗る at press too. 透明色 erases and has no color to sample.
-      const prevColor = paintBucketOptionVal('prevColor') === '1' && !input.options.transparent;
-      const fill = function() {
-        // Finish existing animation setup and floating selection commit before queuing the input.
-        if (input.options.animation || (gengaSelLifted(gengaSel) && String(gengaSel.layerId) === request.layerId && gengaSel.frame === frame)) {
-          if (!gengaPrepareDrawTarget(ev, gengaLayerById(request.layerId))) return;
-        }
-        paintBucketApply(Object.assign({}, request, { x: p.x, y: p.y, input: input, event: ev }));
-      };
-      paintDeferBucketFill(ev, function() {
-        if (!gengaBucketRequestValid(request)) return;
-        if (!prevColor && !gengaPrevColorWaiting) { fill(); return; }
-        // The picked colour becomes the drawing colour as well, so the swatch shows what was taken (the same result
-        // as picking it with the eyedropper and then filling). Nothing is filled when there is no colour to take.
-        // Reading the colour may wait for a decode, so presses run one after another while a read is waiting (a
-        // later press never fills before an earlier one, with the option on or off) and a request dies when the
-        // frame moves, even if it comes back to the same frame.
-        const moves = gengaFrameMoveSeq, live = function() { return moves === gengaFrameMoveSeq && gengaBucketRequestValid(request); };
-        gengaPrevColorWaiting += 1;
-        gengaPrevColorChain = gengaPrevColorChain.then(function() {
-          return live() && prevColor ? gengaPrevDrawingColorAt(gengaLayerById(request.layerId), frame, p) : null;
-        }).then(function(pick) {
-          if (!live() || prevColor && !pick) return;
-          if (!prevColor) { fill(); return; }
-          if (!pick.color) { gengaShowStatus(t(pick.reason === 'none' ? 'paint.bucketPrev.none' : 'paint.bucketPrev.empty'), { warn: true }); return; }
-          input.color = pick.color;
-          setPaintBrushColor(pick.color, { custom: true, record: true });
-          saveEditorUiState();
-          updatePaintUI();
-          fill();
-        }).catch(function(error) { if (live()) gengaShowStatus(error && error.message || t('paint.bucketRef.failed'), { warn: true }); })
-          .then(function() { gengaPrevColorWaiting -= 1; });
-      });
       ev.preventDefault();
     }
 
@@ -155848,7 +155889,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (ev.type === 'pointerup' && gengaDrawSession && gengaDrawSession.pointerId === ev.pointerId) {
           gengaFlushPendingFirstDab(); // A tap without movement produces one dab here.
         }
-        paintFlushPendingBucketFill(ev); // Run a deferred bucket action here unless pointercancel discards it.
+        paintBucketPointerEnd(ev);
         if (ev.pointerType === 'touch') gengaPointers.delete(ev.pointerId);
         if (gengaPinch) {
           if (gengaPointers.size < 2 || twoFingerPinLost(gengaPointers)) teardownGengaPinch(ev.type); // Share teardown and tap handling. Losing the selected pair also ends the session.
