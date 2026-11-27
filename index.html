@@ -32,7 +32,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
-  <title>MoArt ver3609</title>
+  <title>MoArt ver3610</title>
 
   <script id="moart-dropbox-callback">
     (function () {
@@ -19713,6 +19713,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         'menu.genga.io.clear': { ja: 'イン/アウト クリア', ko: '인/아웃 지우기', en: 'Clear In/Out', zh: '清除入点/出点' },
         'menu.kf.interp.linear': { ja: '線形', ko: '선형', en: 'Linear', zh: '线性' },
         'menu.kf.interp.ease': { ja: 'イーズ（緩急）', ko: '이징(가감속)', en: 'Ease in/out', zh: '缓入缓出' },
+        'menu.kf.interp.smooth': { ja: 'スムーズ（キーで止めず速さをつなぐ）', ko: '스무즈(키에서 멈추지 않고 속도를 이음)', en: 'Smooth (keeps speed through keys)', zh: '平滑（关键帧处不停、速度连续）' },
+        'menu.kf.interp.easeOut': { ja: 'イーズアウト（出だしゆっくり）', ko: '이즈 아웃(출발 천천히)', en: 'Ease out of key (slow start)', zh: '缓出（起步慢）' },
+        'menu.kf.interp.easeIn': { ja: 'イーズイン（止まりゆっくり）', ko: '이즈 인(도착 천천히)', en: 'Ease into next key (slow arrival)', zh: '缓入（到达慢）' },
         'menu.kf.interp.hold': { ja: '停止（ホールド）', ko: '정지(홀드)', en: 'Hold', zh: '定格' },
         'menu.genga.io.setIn': { ja: function(f){ return 'イン点に設定 (In) — F' + f; }, ko: function(f){ return '인점 설정 (In) — F' + f; }, en: function(f){ return 'Set In point (In) — F' + f; }, zh: function(f){ return '设为入点 (In) — F' + f; } },
         'menu.genga.io.setOut': { ja: function(f){ return 'アウト点に設定 (Out) — F' + f; }, ko: function(f){ return '아웃점 설정 (Out) — F' + f; }, en: function(f){ return 'Set Out point (Out) — F' + f; }, zh: function(f){ return '设为出点 (Out) — F' + f; } },
@@ -27394,16 +27397,73 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       return { keys: keys, active: active };
     }
 
-    function keyInterpT(interp, t) {
+    const KEY_INTERPS = ['ease', 'easeIn', 'easeOut', 'smooth', 'hold'];
+    function keyHermite(t, m0, m1) {
+      const t2 = t * t, t3 = t2 * t;
+      return (t3 - 2 * t2 + t) * m0 + (3 * t2 - 2 * t3) + (t3 - t2) * m1;
+    }
+    function keyCurveInterp(curve) { return curve && typeof curve === 'object' ? curve.interp : curve; }
+    function keyInterpT(curve, t) {
+      const interp = keyCurveInterp(curve);
       if (interp === 'hold') return t >= 1 ? 1 : 0;
       if (interp === 'ease') return t * t * (3 - 2 * t);
+      if (interp === 'easeOut') return keyHermite(t, 0, 1.5);
+      if (interp === 'easeIn') return keyHermite(t, 1.5, 0);
+      if (interp === 'smooth') return keyHermite(t, curve && curve.m0 != null ? curve.m0 : 1, curve && curve.m1 != null ? curve.m1 : 1);
       return t;
     }
-    function keyInterpOf(k) { return k && (k.interp === 'ease' || k.interp === 'hold') ? k.interp : undefined; }
+    function keyInterpOf(k) { return k && KEY_INTERPS.indexOf(k.interp) >= 0 ? k.interp : undefined; }
+    function keyInterpCurved(interp) { return !!interp && interp !== 'hold'; }
+    function keySegmentCurve(keys, i, amountOf) {
+      const a = keys && keys[i], b = keys && keys[i + 1], interp = keyInterpOf(a);
+      if (interp !== 'smooth' || !b) return interp;
+      const measure = typeof amountOf === 'function' && amountOf.forKeys ? amountOf.forKeys(keys) : amountOf;
+      const amt = function(j) { return Math.max(0, Number(measure(keys[j], keys[j + 1])) || 0); };
+      const fr = function(j) { return Math.max(1e-6, (Number(keys[j + 1].frame) || 0) - (Number(keys[j].frame) || 0)); };
+      const own = amt(i);
+      if (!(own > 1e-9)) return interp;
+      const same = function(j) {
+        if (!measure.delta) return true;
+        const p = measure.delta(keys[j], keys[j + 1]), q = measure.delta(a, b);
+        let dot = 0;
+        for (let n = 0; n < p.length; n += 1) dot += p[n] * q[n];
+        return dot > 0;
+      };
+      const meet = function(j, atJStart) {
+        if (j < 0 || j >= keys.length - 1) return own / fr(i);
+        const ip = keyInterpOf(keys[j]);
+        if (ip === 'hold') return own / fr(i);
+        if (!same(j)) return 0;
+        if (ip === 'smooth') return (amt(j) + own) / (fr(j) + fr(i));
+        if (ip === 'ease') return 0;
+        if (ip === 'easeOut') return atJStart ? 0 : amt(j) / fr(j) * 1.5;
+        if (ip === 'easeIn') return atJStart ? amt(j) / fr(j) * 1.5 : 0;
+        return amt(j) / fr(j);
+      };
+      const k = fr(i) / own, clamp = function(m) { return Math.max(0, Math.min(3, m)); };
+      return { interp: 'smooth', m0: clamp(meet(i - 1, false) * k), m1: clamp(meet(i + 1, true) * k) };
+    }
+    function keyAmountByProps(props) {
+      const fn = function() { return 0; };
+      fn.forKeys = function(keys) {
+        const range = {};
+        props.forEach(function(p) {
+          let lo = Infinity, hi = -Infinity;
+          keys.forEach(function(k) { const v = Number(k[p]); if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); } });
+          range[p] = hi > lo ? hi - lo : 0;
+        });
+        const delta = function(a, b) { return props.map(function(p) { return range[p] > 0 ? ((Number(b[p]) || 0) - (Number(a[p]) || 0)) / range[p] : 0; }); };
+        const measure = function(a, b) { return delta(a, b).reduce(function(s, d) { return s + Math.abs(d); }, 0); };
+        measure.delta = delta;
+        return measure;
+      };
+      return fn;
+    }
+    const CAMERA_KEY_AMOUNT = keyAmountByProps(['x', 'y', 'w', 'h', 'rotation']);
     const KF_MOTION_TICK_MAX = 600;
     function keyMotionTicksHtml(from, to, interp, visFrom, visTo) {
       const n = to - from;
-      if (n < 2 || interp === 'hold') return '';
+      if (n < 2 || keyCurveInterp(interp) === 'hold') return '';
       const lo = visFrom == null ? from : visFrom, hi = visTo == null ? to : visTo, span = Math.max(1e-6, hi - lo);
       const a = Math.max(from + 1, Math.ceil(lo)), b = Math.min(to - 1, Math.floor(hi));
       if (b - a + 1 > KF_MOTION_TICK_MAX) return '';
@@ -28916,6 +28976,7 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
 
     // ## SECTION: Release notes
     const UPDATE_LOG = [
+      { ver: 3610, items: [{ja:"キー補間に「スムーズ」（キーで止めず速さをつなぐ）・イーズアウト・イーズインを追加しました。",ko:"키 보간에 「스무즈」(키에서 멈추지 않고 속도를 이음)·이즈 아웃·이즈 인을 더했습니다.",en:"Key interpolation adds Smooth (speed continues through keys), Ease out and Ease in.",zh:"关键帧插值新增“平滑”（关键帧处不停、速度连续）、缓出、缓入。"}] },
       { ver: 3609, items: [{ja:"動画点のツメ指示を原画に配置できます。",ko:"동화점의 츠메지시를 원화에 배치할 수 있습니다.",en:"Edit in-between spacing and place the chart on the next key drawing.",zh:"可调整中间画间距并在下一张原画上放置指示图。"}] },
       { ver: 3608, items: [{"ja":"動画自動フィルの中割を従来の枚数割りに戻しました。","ko":"자동동화의 중할을 기존 장수 기준으로 되돌렸습니다.","en":"Automatic in-betweens once again use drawing count for spacing.","zh":"自动中间画已恢复按张数分配间距。"}] },
       { ver: 3606, items: [{"ja": "以前つないだ復元フォルダーが移動・削除されて応答しなくなっていると、ファイルを開く・ドロップしても何も起きないことがありました。応答しないフォルダーは3秒で飛ばしてファイルを開きます。", "ko": "예전에 연결한 복구 폴더가 옮겨지거나 지워져 응답하지 않으면, 파일을 열거나 끌어다 놓아도 아무 반응이 없던 문제를 고쳤습니다. 응답하지 않는 폴더는 3초 뒤 건너뛰고 파일을 엽니다.", "en": "Opening or dropping a file no longer does nothing when a previously connected recovery folder was moved or deleted and stopped answering. Such a folder is skipped after 3 seconds and the file opens.", "zh": "以前连接的恢复文件夹被移动或删除而不再响应时，打开或拖入文件会毫无反应。现在会在3秒后跳过不响应的文件夹并打开文件。"}] },
@@ -43143,8 +43204,9 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
       if (!keyframes || !keyframes.length) return cameraDefaultTransform();
       let previous = null;
       let next = null;
-      keyframes.forEach(function(item) {
-        if (item.frame <= localFrame) previous = item;
+      let previousIndex = -1;
+      keyframes.forEach(function(item, index) {
+        if (item.frame <= localFrame) { previous = item; previousIndex = index; }
         if (!next && item.frame >= localFrame) next = item;
       });
       if (!previous) previous = next;
@@ -43157,7 +43219,11 @@ tmxls94@gmail.com · https://github.com/moaang/moart</div>
         return { x: one.x, y: one.y, scale: one.scale, rotation: one.rotation };
       }
       const rb = next.rect || cameraLegacyToPaperRect(next, cp);
-      const t = keyInterpT(previous.interp, Math.min(1, Math.max(0, (localFrame - previous.frame) / Math.max(1, next.frame - previous.frame))));
+      const rects = keyInterpOf(previous) === 'smooth' ? keyframes.map(function(k) {
+        return Object.assign({ frame: k.frame, interp: k.interp }, k.rect || cameraLegacyToPaperRect(k, cp));
+      }) : null;
+      const curve = rects ? keySegmentCurve(rects, previousIndex, CAMERA_KEY_AMOUNT) : keyInterpOf(previous);
+      const t = keyInterpT(curve, Math.min(1, Math.max(0, (localFrame - previous.frame) / Math.max(1, next.frame - previous.frame))));
       const out = cameraPaperRectToLegacy(lerpCameraRect(ra, rb, t), cp);
       return { x: out.x, y: out.y, scale: out.scale, rotation: out.rotation };
     }
@@ -103252,7 +103318,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         inside(key.frame);
         const next = keys[i + 1];
         if (!next) return;
-        if (key.interp === 'ease') for (let f = key.frame + 1; f < next.frame; f++) inside(f);
+        if (keyInterpCurved(key.interp)) for (let f = key.frame + 1; f < next.frame; f++) inside(f);
         if (key.interp === 'hold') inside(next.frame - 1);
       });
       const poseAt = function(frame) {
@@ -103279,7 +103345,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         inside(key.frame);
         const next = keys[i + 1];
         if (!next) return;
-        if (key.interp === 'ease') for (let f = key.frame + 1; f < next.frame; f++) inside(f);
+        if (keyInterpCurved(key.interp)) for (let f = key.frame + 1; f < next.frame; f++) inside(f);
         if (key.interp === 'hold') inside(next.frame - 1);
       });
       const centre = [cam.w / 2, cam.h / 2];
@@ -113930,6 +113996,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       const refArt = (states.find(function(s) { return s.art; }) || {}).art;
       if (!refArt) return null;
+      gengaMarkStraightPassStates(states, refArt, pw, ph);
       const fxAt = function(f) { return sampleFxTrack(layer.fx.transform, f, GENGA_FX_DEFAULTS.transform); };
       const firstFrame = states[0].frame, lastFrame = states[states.length - 1].frame;
       let l = 0, t = 0, r = pw, b = ph;
@@ -113959,6 +114026,24 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         w: Math.ceil(r + padR) - ox,
         h: Math.ceil(b + padB) - oy
       };
+    }
+    function gengaMarkStraightPassStates(states, art, pw, ph) {
+      const tol = Math.hypot(art.w, art.h) * 0.01;
+      const cornersOf = function(st) { return gengaFxRectCorners(st.fx, art, pw, ph); };
+      let a = states[0];
+      for (let i = 1; i < states.length - 1; i += 1) {
+        const m = states[i], b = states[i + 1];
+        if (Math.abs(m.fx.rot - a.fx.rot) > 0.3 || Math.abs(b.fx.rot - m.fx.rot) > 0.3) { a = m; continue; }
+        if ((m.fx.scale - a.fx.scale) * (b.fx.scale - m.fx.scale) < 0) { a = m; continue; }
+        const pa = cornersOf(a), pm = cornersOf(m), pb = cornersOf(b);
+        m.pass = pm.every(function(p, k) {
+          const dx = pb[k].x - pa[k].x, dy = pb[k].y - pa[k].y, len = Math.hypot(dx, dy);
+          if (len < tol) return Math.hypot(p.x - pa[k].x, p.y - pa[k].y) < tol;
+          const along = ((p.x - pa[k].x) * dx + (p.y - pa[k].y) * dy) / len;
+          return along >= -tol && along <= len + tol && Math.abs((p.x - pa[k].x) * dy - (p.y - pa[k].y) * dx) / len < tol;
+        });
+        if (!m.pass) a = m;
+      }
     }
     function gengaDrawInstructionText(ctx, text, bounds, preferred, fontSize) {
       ctx.save();
@@ -114006,7 +114091,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       try {
         plan.states.forEach(function(state, index) {
-          if (!state.canvas || !state.art) return;
+          if (!state.canvas || !state.art || state.pass) return;
           const corners = gengaFxRectCorners(state.fx, state.art, plan.pw, plan.ph);
           const left = Math.max(0, Math.floor((Math.min(...corners.map(p => p.x)) - plan.ox) * fit) - 1);
           const top = Math.max(0, Math.floor((Math.min(...corners.map(p => p.y)) - plan.oy) * fit) - 1);
@@ -116026,7 +116111,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           from: a.frame,
           to: b.frame,
           info: run.info,
-          interp: keyInterpOf(a),
+          interp: keySegmentCurve(uniq, run.startIdx, CAMERA_KEY_AMOUNT),
           tickFrom: a.tickFrom != null ? a.tickFrom : a.frame,
           tickTo: b.tickTo != null ? b.tickTo : b.frame,
           text: gengaCamRunDirectiveText(run.info, frStart, frEnd),
@@ -116078,7 +116163,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
           as: as,
           bs: bs,
           hold: hold,
-          interp: keyInterpOf(a)
+          interp: keySegmentCurve(tr, i, FX_TRANSFORM_KEY_AMOUNT)
         });
       }
       const trRuns = [];
@@ -129520,7 +129605,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       gengaUpdateStandaloneDom();
     }
     function keyInterpMenuItems(current, set) {
-      return [['', 'menu.kf.interp.linear'], ['ease', 'menu.kf.interp.ease'], ['hold', 'menu.kf.interp.hold']].map(function(row) {
+      return [['', 'menu.kf.interp.linear'], ['smooth', 'menu.kf.interp.smooth'], ['ease', 'menu.kf.interp.ease'], ['easeOut', 'menu.kf.interp.easeOut'],
+        ['easeIn', 'menu.kf.interp.easeIn'], ['hold', 'menu.kf.interp.hold']].map(function(row) {
         return { label: ((current || '') === row[0] ? '✓ ' : '　') + t(row[1]), action: function() { set(row[0] || undefined); } };
       });
     }
@@ -131306,8 +131392,10 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       }
       return lo;
     }
-    function fxKeyProgress(a, b, frame) {
-      return keyInterpT(a.interp, b.frame > a.frame ? (frame - a.frame) / (b.frame - a.frame) : 0);
+    const FX_TRANSFORM_KEY_AMOUNT = keyAmountByProps(['x', 'y', 'scale', 'rot']);
+    function fxKeyProgress(keys, left, frame, amountOf) {
+      const a = keys[left], b = keys[left + 1] || a;
+      return keyInterpT(keySegmentCurve(keys, left, amountOf), b.frame > a.frame ? (frame - a.frame) / (b.frame - a.frame) : 0);
     }
     function sampleFxTrack(keys, frame, defaults) {
       if (!keys || !keys.length) return Object.assign({}, defaults);
@@ -131320,8 +131408,8 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
         if (keys[left].frame <= frame && frame <= keys[right].frame) {
           a = keys[left];
           b = keys[right];
-        }
-        progress = fxKeyProgress(a, b, frame);
+          progress = fxKeyProgress(keys, left, frame, keyAmountByProps(Object.keys(defaults)));
+        } else progress = keyInterpT(keyInterpOf(a), b.frame > a.frame ? (frame - a.frame) / (b.frame - a.frame) : 0);
       }
       const out = {};
       for (const prop in defaults) {
@@ -142871,7 +142959,7 @@ Project	WebCooperationUploadToken	3	0	0	2	0	\N	\N
       if (frame >= kfs[kfs.length - 1].frame) return gengaCamKfRect(kfs[kfs.length - 1]);
       const right = fxKeyRightIndex(kfs, frame);
       const a = kfs[right - 1], b = kfs[right];
-      return lerpCameraRect(gengaCamKfRect(a), gengaCamKfRect(b), fxKeyProgress(a, b, frame));
+      return lerpCameraRect(gengaCamKfRect(a), gengaCamKfRect(b), fxKeyProgress(kfs, right - 1, frame, CAMERA_KEY_AMOUNT));
     }
     function gengaCameraWorkAt(gt, frame, sortedKeys) {
       const cw = gt.cameraWork || gt.camera;
